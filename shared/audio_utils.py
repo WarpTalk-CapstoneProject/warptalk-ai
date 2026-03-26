@@ -11,7 +11,7 @@ def bytes_to_numpy(audio_bytes: bytes, sample_rate: int = 16000) -> np.ndarray:
     """Convert raw audio bytes to numpy array."""
     import soundfile as sf
 
-    audio_data, _ = sf.read(io.BytesIO(audio_bytes), stype="float32")
+    audio_data, _ = sf.read(io.BytesIO(audio_bytes), dtype="float32")
     return audio_data
 
 

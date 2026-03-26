@@ -2,6 +2,9 @@
 requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+include = ["shared*", "stt_worker*", "translation_worker*", "tts_worker*", "ai_assistant_worker*"]
+
 [project]
 name = "warptalk-ai"
 version = "0.1.0"
@@ -28,23 +31,24 @@ dependencies = [
 
 [project.optional-dependencies]
 stt = [
-    "openai-whisper>=20231117",
-    "faster-whisper>=0.10",
+    "faster-whisper>=1.0",
 ]
 translation = [
     "sentencepiece>=0.1.99",
+    "googletrans==4.0.0-rc.1",
 ]
 tts = [
     "TTS>=0.22",
+    "edge-tts>=6.1",
 ]
 assistant = [
     "openai>=1.6",
-    "langchain>=0.1",
 ]
 dev = [
     "pytest>=7.4",
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.1",
+    "fakeredis[lua]>=2.20",
     "ruff>=0.1",
     "mypy>=1.8",
 ]

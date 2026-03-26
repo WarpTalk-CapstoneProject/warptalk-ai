@@ -2,19 +2,21 @@
 
 import asyncio
 
-from shared.logger import get_logger, setup_logging
-from shared.config import settings
+from shared.config import TranslationSettings, WorkerSettings
+from shared.logger import setup_logging
 
-logger = get_logger(__name__)
+from translation_worker.worker import TranslationWorker
 
 
 async def main() -> None:
-    setup_logging(settings.log_level)
-    logger.info("Starting Translation Worker")
-    # TODO: Implement translation worker loop
-    # Consume from stt:results:{meetingId}
-    # Translate text
-    # Publish to translate:results:{meetingId}
+    worker_settings = WorkerSettings()
+    setup_logging(worker_settings.log_level)
+
+    worker = TranslationWorker(
+        translation_settings=TranslationSettings(),
+        settings=worker_settings,
+    )
+    await worker.start()
 
 
 if __name__ == "__main__":

@@ -1,31 +1,92 @@
-# ====================================================================
-# WarpTalk AI Worker — Multi-stage Dockerfile
-# Build: docker build --build-arg WORKER=stt_worker -t warptalk-stt .
-# ====================================================================
+# =============================================================
+# WarpTalk AI Workers — Multi-stage Dockerfile
+# =============================================================
+# Base image: NVIDIA CUDA 12.1 + Python 3.11 (GPU inference)
+# Stages: base → builder → stt | translation | tts | assistant
+#
+# Build:
+#   docker build --target stt -t warptalk-ai/stt .
+#   docker build --target tts -t warptalk-ai/tts .
+#
+# Run:
+#   docker run --gpus all --env-file .env warptalk-ai/stt
+# =============================================================
 
-FROM python:3.11-slim AS base
+# ---- Base: CUDA + Python + system deps ----
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3-pip \
+        libsndfile1 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Symlink python
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python
 
 WORKDIR /app
 
-# System dependencies for audio processing
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    libsndfile1 \
-    && rm -rf /var/lib/apt/lists/*
+# ---- Builder: install deps ----
+FROM base AS builder
 
-# Install Python dependencies
-COPY pyproject.toml .
-RUN pip install --no-cache-dir -e .
+COPY pyproject.toml ./
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Copy source code
+# Install core dependencies
+RUN python -m pip install --no-cache-dir -e "."
+
+# Install all optional deps into a venv-like layer
+RUN python -m pip install --no-cache-dir \
+    "faster-whisper>=1.0" \
+    "sentencepiece>=0.1.99" \
+    "googletrans==4.0.0-rc.1" \
+    "TTS>=0.22" \
+    "edge-tts>=6.1" \
+    "openai>=1.6"
+
+# Copy source
 COPY shared/ shared/
 COPY stt_worker/ stt_worker/
 COPY translation_worker/ translation_worker/
 COPY tts_worker/ tts_worker/
 COPY ai_assistant_worker/ ai_assistant_worker/
 
-# Worker to run (override via build arg or env)
-ARG WORKER=stt_worker
-ENV WORKER_MODULE=${WORKER}
+# ---- STT Worker ----
+FROM builder AS stt
 
-CMD ["sh", "-c", "python -m ${WORKER_MODULE}"]
+# Non-root user for security
+RUN groupadd -r worker && useradd -r -g worker -d /app worker
+USER worker
+
+ENV PYTHONPATH=/app
+CMD ["python", "-m", "stt_worker"]
+
+# ---- Translation Worker ----
+FROM builder AS translation
+
+RUN groupadd -r worker && useradd -r -g worker -d /app worker
+USER worker
+
+ENV PYTHONPATH=/app
+CMD ["python", "-m", "translation_worker"]
+
+# ---- TTS Worker ----
+FROM builder AS tts
+
+RUN groupadd -r worker && useradd -r -g worker -d /app worker
+USER worker
+
+ENV PYTHONPATH=/app
+CMD ["python", "-m", "tts_worker"]
+
+# ---- AI Assistant Worker ----
+FROM builder AS assistant
+
+RUN groupadd -r worker && useradd -r -g worker -d /app worker
+USER worker
+
+ENV PYTHONPATH=/app
+CMD ["python", "-m", "ai_assistant_worker"]

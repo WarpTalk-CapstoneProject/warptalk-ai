@@ -2,19 +2,21 @@
 
 import asyncio
 
-from shared.logger import get_logger, setup_logging
-from shared.config import settings
+from shared.config import TTSSettings, WorkerSettings
+from shared.logger import setup_logging
 
-logger = get_logger(__name__)
+from tts_worker.worker import TTSWorker
 
 
 async def main() -> None:
-    setup_logging(settings.log_level)
-    logger.info("Starting TTS Worker")
-    # TODO: Implement TTS worker loop
-    # Consume from translate:results:{meetingId}
-    # Synthesize speech (with voice cloning)
-    # Publish to tts:results:{meetingId}
+    worker_settings = WorkerSettings()
+    setup_logging(worker_settings.log_level)
+
+    worker = TTSWorker(
+        tts_settings=TTSSettings(),
+        settings=worker_settings,
+    )
+    await worker.start()
 
 
 if __name__ == "__main__":

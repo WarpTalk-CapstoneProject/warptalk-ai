@@ -2,20 +2,21 @@
 
 import asyncio
 
-from shared.logger import get_logger, setup_logging
-from shared.config import settings
+from shared.config import STTSettings, WorkerSettings
+from shared.logger import setup_logging
 
 from stt_worker.worker import STTWorker
 
-logger = get_logger(__name__)
-
 
 async def main() -> None:
-    setup_logging(settings.log_level)
-    logger.info("Starting STT Worker", model=settings.log_level)
+    worker_settings = WorkerSettings()
+    setup_logging(worker_settings.log_level)
 
-    worker = STTWorker()
-    await worker.run()
+    worker = STTWorker(
+        stt_settings=STTSettings(),
+        settings=worker_settings,
+    )
+    await worker.start()
 
 
 if __name__ == "__main__":

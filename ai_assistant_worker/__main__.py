@@ -2,18 +2,21 @@
 
 import asyncio
 
-from shared.logger import get_logger, setup_logging
-from shared.config import settings
+from shared.config import AssistantSettings, WorkerSettings
+from shared.logger import setup_logging
 
-logger = get_logger(__name__)
+from ai_assistant_worker.worker import AIAssistantWorker
 
 
 async def main() -> None:
-    setup_logging(settings.log_level)
-    logger.info("Starting AI Assistant Worker")
-    # TODO: Implement AI assistant worker loop
-    # Consume meeting transcripts
-    # Generate summaries, action items, Q&A
+    worker_settings = WorkerSettings()
+    setup_logging(worker_settings.log_level)
+
+    worker = AIAssistantWorker(
+        assistant_settings=AssistantSettings(),
+        settings=worker_settings,
+    )
+    await worker.start()
 
 
 if __name__ == "__main__":
