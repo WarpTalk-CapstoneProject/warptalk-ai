@@ -1,0 +1,1 @@
+"""WarpTalk AI — Shared utilities."""

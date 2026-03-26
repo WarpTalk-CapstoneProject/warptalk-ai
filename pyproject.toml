@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "warptalk-ai"
+version = "0.1.0"
+description = "WarpTalk AI Workers — STT, Translation, TTS, AI Assistant"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+    # Redis
+    "redis>=5.0",
+    # Audio processing
+    "numpy>=1.26",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+    # AI/ML base
+    "torch>=2.1",
+    "transformers>=4.36",
+    # Utilities
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "structlog>=24.1",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+stt = [
+    "openai-whisper>=20231117",
+    "faster-whisper>=0.10",
+]
+translation = [
+    "sentencepiece>=0.1.99",
+]
+tts = [
+    "TTS>=0.22",
+]
+assistant = [
+    "openai>=1.6",
+    "langchain>=0.1",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.1",
+    "ruff>=0.1",
+    "mypy>=1.8",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
