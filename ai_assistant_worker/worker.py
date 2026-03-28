@@ -12,6 +12,8 @@ independently of the translation worker.
 
 from __future__ import annotations
 
+import time
+
 from shared.base_worker import BaseWorker
 from shared.config import AssistantSettings
 from shared.schemas import STTResultMessage
@@ -92,12 +94,19 @@ class AIAssistantWorker(BaseWorker):
         # Generate summary
         summary = await self.assistant.summarize(transcript_text)
 
-        # Store summary in Redis for the backend to retrieve
+        # Store summary in Redis Hash for persistent retrieval
         await self.redis.hset(
             f"meeting:{meeting_id}:summary",
             "content",
             summary,
         )
+
+        # Publish to stream for gateway to consume via SignalR
+        await self.publish("ai_assistant:results", meeting_id, {
+            "type": "summary",
+            "content": summary,
+            "timestamp_ms": str(int(time.time() * 1000)),
+        })
 
         # Generate action items
         action_items = await self.assistant.extract_action_items(transcript_text)
@@ -106,6 +115,13 @@ class AIAssistantWorker(BaseWorker):
             "action_items",
             action_items,
         )
+
+        # Publish action items to stream
+        await self.publish("ai_assistant:results", meeting_id, {
+            "type": "action_items",
+            "content": action_items,
+            "timestamp_ms": str(int(time.time() * 1000)),
+        })
 
         self.logger.info(
             "summary_generated",

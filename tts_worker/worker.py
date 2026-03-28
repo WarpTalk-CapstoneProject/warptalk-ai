@@ -13,12 +13,13 @@ Progressive Voice Cloning:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 
 from shared.audio_utils import bytes_to_numpy
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
-from shared.schemas import TranslationResultMessage, TTSResultMessage
+from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
 
 from tts_worker.embedding_extractor import EmbeddingExtractor
 from tts_worker.synthesizer import EdgeTTSSynthesizer, XTTSSynthesizer
@@ -30,6 +31,8 @@ class TTSWorker(BaseWorker):
     worker_name = "tts"
     input_stream = "translate:results"
     consumer_group = "tts-workers"
+    _embedding_consumer_group = "embedding-workers"
+    _running = True
 
     def __init__(
         self,
@@ -65,6 +68,49 @@ class TTSWorker(BaseWorker):
             refine_seconds=self.tts_settings.embedding_refine_seconds,
         )
         await self.embedding_extractor.load_model()
+
+        # Start background task to consume audio chunks for embedding extraction
+        asyncio.create_task(self._consume_audio_for_embedding())
+        self.logger.info("embedding_audio_consumer_started")
+
+    async def _consume_audio_for_embedding(self) -> None:
+        """Background task: consume audio:chunks to feed EmbeddingExtractor.
+
+        Uses a separate consumer group ('embedding-workers') so it doesn't
+        compete with the STT worker for audio chunks.
+        """
+        while self._running:
+            try:
+                # Scan for active meeting streams by checking known meetings
+                # The consumer group pattern ensures we only get new chunks
+                async for msg_id, data in self.redis.consume(
+                    stream="audio:chunks:*",
+                    group=self._embedding_consumer_group,
+                    consumer=self._consumer_name,
+                    block_ms=2000,
+                    count=5,
+                ):
+                    try:
+                        chunk = AudioChunkMessage.from_redis(data)
+                        audio_np = bytes_to_numpy(
+                            chunk.audio_data, chunk.sample_rate,
+                        )
+                        await self.embedding_extractor.add_audio(
+                            meeting_id=chunk.meeting_id,
+                            speaker_id=chunk.speaker_id,
+                            audio=audio_np,
+                            sample_rate=chunk.sample_rate,
+                        )
+                    except Exception:
+                        self.logger.exception(
+                            "embedding_audio_chunk_error",
+                            message_id=str(msg_id),
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self.logger.exception("embedding_consumer_error")
+                await asyncio.sleep(2)
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Synthesize text to speech with progressive voice cloning."""

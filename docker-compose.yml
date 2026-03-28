@@ -2,28 +2,16 @@
 # WarpTalk AI Workers — Local Development
 # =============================================================
 # Usage:
-#   docker compose up -d redis          # Start Redis only
 #   docker compose up stt translation   # Start specific workers
 #   docker compose up                   # Start everything
+#
+# IMPORTANT: Requires warptalk-backend stack running first.
+# AI workers connect to the backend's Redis via external network.
 #
 # GPU workers require NVIDIA Container Toolkit:
 #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
 
 services:
-  # ---- Redis ----
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   # ---- STT Worker ----
   stt:
     build:
@@ -31,10 +19,9 @@ services:
       target: stt
     env_file: .env
     environment:
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      redis:
-        condition: service_healthy
+      - REDIS_URL=redis://warptalk-redis:6379
+    networks:
+      - warptalk-backend_warptalk-net
     deploy:
       resources:
         reservations:
@@ -51,10 +38,9 @@ services:
       target: translation
     env_file: .env
     environment:
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      redis:
-        condition: service_healthy
+      - REDIS_URL=redis://warptalk-redis:6379
+    networks:
+      - warptalk-backend_warptalk-net
     deploy:
       resources:
         reservations:
@@ -71,10 +57,9 @@ services:
       target: tts
     env_file: .env
     environment:
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      redis:
-        condition: service_healthy
+      - REDIS_URL=redis://warptalk-redis:6379
+    networks:
+      - warptalk-backend_warptalk-net
     deploy:
       resources:
         reservations:
@@ -91,11 +76,12 @@ services:
       target: assistant
     env_file: .env
     environment:
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      redis:
-        condition: service_healthy
+      - REDIS_URL=redis://warptalk-redis:6379
+    networks:
+      - warptalk-backend_warptalk-net
     restart: unless-stopped
 
-volumes:
-  redis_data:
+# Connect to the backend stack's Redis via shared network
+networks:
+  warptalk-backend_warptalk-net:
+    external: true
