@@ -53,25 +53,34 @@ class TTSWorker(BaseWorker):
         )
         await self.edge_tts.load()
 
-        # XTTS v2 (GPU voice cloning)
-        self.xtts = XTTSSynthesizer(
-            model_name=self.tts_settings.xtts_model,
-            device=self.tts_settings.device,
-            sample_rate=self.tts_settings.sample_rate,
-        )
-        await self.xtts.load()
+        # XTTS v2 (GPU voice cloning) - Try to load, but fallback if not installed
+        try:
+            self.xtts = XTTSSynthesizer(
+                model_name=self.tts_settings.xtts_model,
+                device=self.tts_settings.device,
+                sample_rate=self.tts_settings.sample_rate,
+            )
+            await self.xtts.load()
 
-        # Embedding extractor (shares XTTS model reference)
-        self.embedding_extractor = EmbeddingExtractor(
-            redis=self.redis,
-            min_seconds=self.tts_settings.embedding_min_seconds,
-            refine_seconds=self.tts_settings.embedding_refine_seconds,
-        )
-        await self.embedding_extractor.load_model()
+            # Embedding extractor (shares XTTS model reference)
+            self.embedding_extractor = EmbeddingExtractor(
+                redis=self.redis,
+                min_seconds=self.tts_settings.embedding_min_seconds,
+                refine_seconds=self.tts_settings.embedding_refine_seconds,
+            )
+            await self.embedding_extractor.load_model()
 
-        # Start background task to consume audio chunks for embedding extraction
-        asyncio.create_task(self._consume_audio_for_embedding())
-        self.logger.info("embedding_audio_consumer_started")
+            # Start background task to consume audio chunks for embedding extraction
+            asyncio.create_task(self._consume_audio_for_embedding())
+            self.logger.info("embedding_audio_consumer_started")
+        except Exception as e:
+            self.logger.warning(
+                "xtts_load_failed",
+                reason=str(e),
+                message="XTTS not available. Only EdgeTTS will be used.",
+            )
+            self.xtts = None
+            self.embedding_extractor = None
 
     async def _consume_audio_for_embedding(self) -> None:
         """Background task: consume audio:chunks to feed EmbeddingExtractor.
@@ -122,7 +131,7 @@ class TTSWorker(BaseWorker):
             "embedding",
         )
 
-        if embedding is not None:
+        if embedding is not None and self.xtts is not None:
             # Voice cloning available → use XTTS v2
             audio_bytes, duration_ms = await self.xtts.synthesize(
                 text=translation.translated_text,
@@ -131,7 +140,7 @@ class TTSWorker(BaseWorker):
             )
             voice_type = "cloned"
         else:
-            # No embedding yet → use Edge-TTS default voice
+            # No embedding yet or XTTS disabled → use Edge-TTS default voice
             audio_bytes, duration_ms = await self.edge_tts.synthesize(
                 text=translation.translated_text,
                 language=translation.target_lang,

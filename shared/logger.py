@@ -1,10 +1,13 @@
 """Structured logging configuration."""
 
+import logging
 import structlog
 
 
 def setup_logging(log_level: str = "INFO") -> None:
     """Configure structured JSON logging."""
+    logging.basicConfig(level=getattr(logging, log_level.upper(), logging.INFO))
+
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
@@ -14,7 +17,7 @@ def setup_logging(log_level: str = "INFO") -> None:
         ],
         wrapper_class=structlog.stdlib.BoundLogger,
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
+        logger_factory=structlog.stdlib.LoggerFactory(),
     )
 
 

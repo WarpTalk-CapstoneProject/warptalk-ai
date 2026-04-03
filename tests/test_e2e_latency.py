@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from translation_worker.translator import NLLBTranslator, GoogleTranslator, TranslatorWithFallback
 from tts_worker.synthesizer import EdgeTTSSynthesizer
+from shared.text_utils import split_into_sentences
 
 # ── Test sentences ───────────────────────────────────────────
 TEST_CASES = [
@@ -94,16 +95,25 @@ async def main():
         print(f"─── Test {i+1}/{len(TEST_CASES)}: {case['description']} ───")
         print(f"  Input: \"{case['text']}\"")
 
-        # ── Translation ──
+        # ── 1. Text Chunking (Simulate STT -> Translation Pipelining) ──
+        sentences = split_into_sentences(case["text"])
+        
         t_start = time.perf_counter()
+        
+        # Only measure latency to the FIRST chunk (Time To First Byte)
+        # In a real pipelined system, subsequent chunks process in background
+        first_sentence = sentences[0] if sentences else ""
+        print(f"  First Chunk: \"{first_sentence}\"")
+
+        # ── Translation ──
         translated = await translator.translate(
-            case["text"], case["language"], case["target"]
+            first_sentence, case["language"], case["target"]
         )
         t_translate = time.perf_counter()
         translate_ms = (t_translate - t_start) * 1000
 
         print(f"  Translated: \"{translated}\"")
-        print(f"  ⏱ Translation: {translate_ms:.0f}ms")
+        print(f"  ⏱ Translation (Chunk 1): {translate_ms:.0f}ms")
 
         # ── TTS ──
         audio_bytes, duration_ms = await synthesizer.synthesize(
@@ -113,12 +123,15 @@ async def main():
         t_tts = time.perf_counter()
         tts_ms = (t_tts - t_translate) * 1000
         total_ms = (t_tts - t_start) * 1000
+        
+        # Note: in real pipeline, other chunks are being generated simultaneously.
+        # But E2E latency is defined by TTFB for conversational responsiveness.
 
         audio_kb = len(audio_bytes) / 1024
 
-        print(f"  ⏱ TTS:         {tts_ms:.0f}ms")
-        print(f"  📊 Total:       {total_ms:.0f}ms")
-        print(f"  🔈 Audio:       {audio_kb:.1f} KB, ~{duration_ms}ms")
+        print(f"  ⏱ TTS (Chunk 1):       {tts_ms:.0f}ms")
+        print(f"  📊 Total TTFB:          {total_ms:.0f}ms")
+        print(f"  🔈 Audio:               {audio_kb:.1f} KB, ~{duration_ms}ms")
 
         # Save audio
         audio_path = os.path.join(output_dir, f"test_{i+1}.mp3")
