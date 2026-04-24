@@ -81,6 +81,22 @@ services:
       - warptalk-backend_warptalk-net
     restart: unless-stopped
 
+  # ---- Qdrant Vector DB ----
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: warptalk-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrantdata:/qdrant/storage
+    networks:
+      - warptalk-backend_warptalk-net
+    restart: unless-stopped
+
+volumes:
+  qdrantdata:
+
 # Connect to the backend stack's Redis via shared network
 networks:
   warptalk-backend_warptalk-net:
