@@ -1,0 +1,21 @@
+services:
+  stt:
+    platform: linux/amd64
+    deploy:
+      resources:
+        reservations:
+          devices: null
+  translation:
+    platform: linux/amd64
+    deploy:
+      resources:
+        reservations:
+          devices: null
+  tts:
+    platform: linux/amd64
+    deploy:
+      resources:
+        reservations:
+          devices: null
+  assistant:
+    platform: linux/amd64

@@ -21,7 +21,7 @@ services:
     environment:
       - REDIS_URL=redis://warptalk-redis:6379
     networks:
-      - warptalk-backend_warptalk-net
+      - warptalk-infrastructure_warptalk-net
     deploy:
       resources:
         reservations:
@@ -40,7 +40,7 @@ services:
     environment:
       - REDIS_URL=redis://warptalk-redis:6379
     networks:
-      - warptalk-backend_warptalk-net
+      - warptalk-infrastructure_warptalk-net
     deploy:
       resources:
         reservations:
@@ -59,7 +59,7 @@ services:
     environment:
       - REDIS_URL=redis://warptalk-redis:6379
     networks:
-      - warptalk-backend_warptalk-net
+      - warptalk-infrastructure_warptalk-net
     deploy:
       resources:
         reservations:
@@ -78,7 +78,7 @@ services:
     environment:
       - REDIS_URL=redis://warptalk-redis:6379
     networks:
-      - warptalk-backend_warptalk-net
+      - warptalk-infrastructure_warptalk-net
     restart: unless-stopped
 
   # ---- Qdrant Vector DB ----
@@ -91,7 +91,7 @@ services:
     volumes:
       - qdrantdata:/qdrant/storage
     networks:
-      - warptalk-backend_warptalk-net
+      - warptalk-infrastructure_warptalk-net
     restart: unless-stopped
 
 volumes:
@@ -99,5 +99,5 @@ volumes:
 
 # Connect to the backend stack's Redis via shared network
 networks:
-  warptalk-backend_warptalk-net:
+  warptalk-infrastructure_warptalk-net:
     external: true
