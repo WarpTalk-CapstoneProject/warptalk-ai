@@ -19,7 +19,7 @@ services:
       target: stt
     env_file: .env
     environment:
-      - REDIS_URL=redis://warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
     deploy:
@@ -38,7 +38,7 @@ services:
       target: translation
     env_file: .env
     environment:
-      - REDIS_URL=redis://warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
     deploy:
@@ -57,7 +57,7 @@ services:
       target: tts
     env_file: .env
     environment:
-      - REDIS_URL=redis://warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
     deploy:
@@ -76,7 +76,7 @@ services:
       target: assistant
     env_file: .env
     environment:
-      - REDIS_URL=redis://warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
     restart: unless-stopped

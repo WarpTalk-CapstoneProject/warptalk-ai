@@ -132,23 +132,24 @@ class GoogleTranslator(Translator):
         self._translator = None
 
     async def load(self) -> None:
-        """Initialize googletrans client."""
-        from googletrans import Translator as GTranslator
-
-        self._translator = GTranslator()
+        """Initialize deep-translator client."""
         logger.info("google_translator_loaded")
 
     async def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         if not text.strip():
             return ""
 
-        result = await asyncio.to_thread(
-            self._translator.translate,
-            text,
-            src=source_lang,
-            dest=target_lang,
-        )
-        return result.text
+        from deep_translator import GoogleTranslator as DeepGoogleTranslator
+
+        def _do_translate():
+            # deep-translator uses standard 2-letter codes like 'en', 'vi'
+            src = source_lang.split("-")[0] if source_lang else "auto"
+            tgt = target_lang.split("-")[0]
+            translator = DeepGoogleTranslator(source=src, target=tgt)
+            return translator.translate(text)
+
+        result = await asyncio.to_thread(_do_translate)
+        return result
 
 
 # ---------------------------------------------------------------------------

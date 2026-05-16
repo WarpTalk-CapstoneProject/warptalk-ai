@@ -42,7 +42,7 @@ RUN python -m pip install --no-cache-dir -e "."
 RUN python -m pip install --no-cache-dir \
     "faster-whisper>=1.0" \
     "sentencepiece>=0.1.99" \
-    "googletrans==4.0.0-rc.1" \
+    "deep-translator>=1.11.4" \
     "TTS>=0.22" \
     "edge-tts>=6.1" \
     "openai>=1.6"

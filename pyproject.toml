@@ -35,7 +35,7 @@ stt = [
 ]
 translation = [
     "sentencepiece>=0.1.99",
-    "googletrans==4.0.0-rc.1",
+    "deep-translator>=1.11.4",
 ]
 tts = [
     "TTS>=0.22",
