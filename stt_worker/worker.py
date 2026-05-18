@@ -9,6 +9,7 @@ Pipeline:
 from __future__ import annotations
 
 import asyncio
+import time
 
 from shared.audio_utils import bytes_to_numpy
 from shared.base_worker import BaseWorker
@@ -45,11 +46,20 @@ class STTWorker(BaseWorker):
         """Process one audio chunk: transcribe and publish results."""
         chunk = AudioChunkMessage.from_redis(data)
 
+        if chunk.meeting_id in self._paused_rooms:
+            self.logger.debug("skipping_paused_room", meeting_id=chunk.meeting_id)
+            return
+
+        current_timestamp_ms = int(time.time() * 1000)
+        e2e_latency_ms = current_timestamp_ms - chunk.timestamp_ms
+        await self.redis.publish_telemetry(chunk.meeting_id, self.worker_name, e2e_latency_ms)
+
         self.logger.debug(
             "processing_chunk",
             meeting_id=chunk.meeting_id,
             speaker_id=chunk.speaker_id,
             chunk_index=chunk.chunk_index,
+            is_final=chunk.is_final_chunk,
         )
 
         # Convert audio bytes to numpy array
@@ -78,6 +88,8 @@ class STTWorker(BaseWorker):
                 start_ms=segment.start_ms,
                 end_ms=segment.end_ms,
                 chunk_index=chunk.chunk_index,
+                is_final_chunk=chunk.is_final_chunk,
+                timestamp_ms=chunk.timestamp_ms,
             )
 
             await self.publish("stt:results", chunk.meeting_id, result.to_redis())
@@ -89,3 +101,16 @@ class STTWorker(BaseWorker):
                 language=segment.language,
                 confidence=segment.confidence,
             )
+
+        if not segments and chunk.is_final_chunk:
+            # Emit empty result just to propagate the final chunk flag
+            result = STTResultMessage(
+                meeting_id=chunk.meeting_id,
+                speaker_id=chunk.speaker_id,
+                text="",
+                language=chunk.language,
+                is_final_chunk=True,
+                timestamp_ms=chunk.timestamp_ms,
+            )
+            await self.publish("stt:results", chunk.meeting_id, result.to_redis())
+

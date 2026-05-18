@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import time
 
 from shared.audio_utils import bytes_to_numpy
 from shared.base_worker import BaseWorker
@@ -125,45 +126,99 @@ class TTSWorker(BaseWorker):
         """Synthesize text to speech with progressive voice cloning."""
         translation = TranslationResultMessage.from_redis(data)
 
+        # Check route state
+        route_status = self._route_states.get(translation.meeting_id, "AUDIO_ROUTING_ACTIVE")
+        if route_status == "PAUSED":
+            return
+
+        current_timestamp_ms = int(time.time() * 1000)
+        e2e_latency_ms = current_timestamp_ms - translation.timestamp_ms
+        await self.redis.publish_telemetry(translation.meeting_id, self.worker_name, e2e_latency_ms)
+
+        if route_status == "TEXT_ONLY_MODE" or not translation.translated_text.strip():
+            if translation.is_final_chunk:
+                await self.redis.publish_system_event(
+                    room_id=translation.meeting_id,
+                    event_type="final_chunk_processed",
+                    payload={"segmentId": translation.segment_id}
+                )
+            return
+
         # Check if we have a voice embedding for this speaker
-        embedding = await self.redis.hget(
-            f"speaker:{translation.meeting_id}:{translation.speaker_id}",
-            "embedding",
-        )
+        embedding = None
+        if route_status != "VOICE_CLONE_FALLBACK":
+            try:
+                embedding = await self.redis.redis.hget(
+                    f"speaker:{translation.meeting_id}:{translation.speaker_id}",
+                    "embedding",
+                )
+            except AttributeError:
+                # If self.redis (RedisStreamClient) has hget directly
+                embedding = await getattr(self.redis, "hget")(
+                    f"speaker:{translation.meeting_id}:{translation.speaker_id}",
+                    "embedding",
+                )
+
+        audio_bytes = b""
+        duration_ms = 0
+        voice_type = "default"
 
         if embedding is not None and self.xtts is not None:
             # Voice cloning available → use XTTS v2
-            audio_bytes, duration_ms = await self.xtts.synthesize(
-                text=translation.translated_text,
-                language=translation.target_lang,
-                speaker_embedding=embedding,
+            try:
+                audio_bytes, duration_ms = await self.xtts.synthesize(
+                    text=translation.translated_text,
+                    language=translation.target_lang,
+                    speaker_embedding=embedding,
+                )
+                voice_type = "cloned"
+            except Exception as e:
+                self.logger.error("xtts_synthesis_failed", error=str(e))
+                await self.redis.publish_system_event(
+                    room_id=translation.meeting_id,
+                    event_type="voice_clone_unavailable",
+                    payload={"error": str(e)}
+                )
+                # Fallback to Edge-TTS
+                embedding = None
+
+        if embedding is None or self.xtts is None:
+            # No embedding yet or XTTS disabled/failed → use Edge-TTS default voice
+            try:
+                audio_bytes, duration_ms = await self.edge_tts.synthesize(
+                    text=translation.translated_text,
+                    language=translation.target_lang,
+                )
+                voice_type = "default"
+            except Exception as e:
+                self.logger.error("edge_tts_synthesis_failed", error=str(e))
+                await self.redis.publish_system_event(
+                    room_id=translation.meeting_id,
+                    event_type="edge_tts_unavailable",
+                    payload={"error": str(e)}
+                )
+
+        if audio_bytes:
+            result = TTSResultMessage(
+                segment_id=translation.segment_id,
+                meeting_id=translation.meeting_id,
+                speaker_id=translation.speaker_id,
+                audio_data=audio_bytes,
+                duration_ms=duration_ms,
+                voice_type=voice_type,
+                target_lang=translation.target_lang,
+                is_final_chunk=translation.is_final_chunk,
+                timestamp_ms=translation.timestamp_ms,
             )
-            voice_type = "cloned"
-        else:
-            # No embedding yet or XTTS disabled → use Edge-TTS default voice
-            audio_bytes, duration_ms = await self.edge_tts.synthesize(
-                text=translation.translated_text,
-                language=translation.target_lang,
+
+            await self.publish("tts:results", translation.meeting_id, result.to_redis())
+
+        if translation.is_final_chunk:
+            await self.redis.publish_system_event(
+                room_id=translation.meeting_id,
+                event_type="final_chunk_processed",
+                payload={"segmentId": translation.segment_id}
             )
-            voice_type = "default"
-
-        # Feed original audio to embedding extractor (background)
-        # The original audio comes from the audio:chunks stream;
-        # here we can accumulate from the chunk data if available
-        # This is handled separately by the embedding extractor
-        # listening to audio:chunks or receiving audio via the TTS worker
-
-        result = TTSResultMessage(
-            segment_id=translation.segment_id,
-            meeting_id=translation.meeting_id,
-            speaker_id=translation.speaker_id,
-            audio_data=audio_bytes,
-            duration_ms=duration_ms,
-            voice_type=voice_type,
-            target_lang=translation.target_lang,
-        )
-
-        await self.publish("tts:results", translation.meeting_id, result.to_redis())
 
         self.logger.info(
             "audio_synthesized",
@@ -172,4 +227,5 @@ class TTSWorker(BaseWorker):
             voice_type=voice_type,
             duration_ms=duration_ms,
             text=translation.translated_text[:60],
+            is_final=translation.is_final_chunk,
         )

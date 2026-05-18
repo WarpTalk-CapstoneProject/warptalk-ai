@@ -11,6 +11,7 @@ Improvements over v1:
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 from typing import Any, AsyncIterator
 
@@ -101,6 +102,28 @@ class RedisStreamClient:
             approximate=True,
         )
         return message_id
+
+    async def publish_telemetry(self, room_id: str, worker_type: str, latency_ms: int) -> None:
+        """Publish raw telemetry data to the translationRoom:telemetry Pub/Sub channel."""
+        import time
+        payload = {
+            "roomId": room_id,
+            "routeId": "00000000-0000-0000-0000-000000000000",
+            "workerType": worker_type,
+            "latencyMs": latency_ms,
+            "timestamp": int(time.time() * 1000)
+        }
+        await self._retry(self.redis.publish, "translationRoom:telemetry", json.dumps(payload))
+
+    async def publish_system_event(self, room_id: str, event_type: str, payload: dict[str, Any]) -> str:
+        """Publish an event to the translationRoom:system_events Redis Stream."""
+        data = {
+            "event_type": event_type,
+            "route_id": "00000000-0000-0000-0000-000000000000",
+            "room_id": room_id,
+            "payload": json.dumps(payload)
+        }
+        return await self.publish("translationRoom:system_events", data)
 
     # ------------------------------------------------------------------
     # Consuming

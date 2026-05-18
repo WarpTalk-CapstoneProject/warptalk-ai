@@ -27,6 +27,7 @@ class AudioChunkMessage(BaseModel):
     audio_data: bytes  # Raw audio bytes (WAV/PCM)
     language: str = "auto"  # Source language hint or 'auto' for detection
     sample_rate: int = 16000
+    is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     model_config = {"arbitrary_types_allowed": True}
@@ -40,6 +41,7 @@ class AudioChunkMessage(BaseModel):
             "audio_data": base64.b64encode(self.audio_data).decode("ascii"),
             "language": self.language,
             "sample_rate": str(self.sample_rate),
+            "is_final_chunk": "1" if self.is_final_chunk else "0",
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -54,6 +56,7 @@ class AudioChunkMessage(BaseModel):
             audio_data=base64.b64decode(d["audio_data"]),
             language=d.get("language", "auto"),
             sample_rate=int(d.get("sample_rate", "16000")),
+            is_final_chunk=d.get("is_final_chunk") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 
@@ -75,6 +78,7 @@ class STTResultMessage(BaseModel):
     start_ms: int = 0  # Segment start time relative to meeting
     end_ms: int = 0  # Segment end time relative to meeting
     chunk_index: int = 0
+    is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -88,6 +92,7 @@ class STTResultMessage(BaseModel):
             "start_ms": str(self.start_ms),
             "end_ms": str(self.end_ms),
             "chunk_index": str(self.chunk_index),
+            "is_final_chunk": "1" if self.is_final_chunk else "0",
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -104,6 +109,7 @@ class STTResultMessage(BaseModel):
             start_ms=int(d.get("start_ms", "0")),
             end_ms=int(d.get("end_ms", "0")),
             chunk_index=int(d.get("chunk_index", "0")),
+            is_final_chunk=d.get("is_final_chunk") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 
@@ -126,6 +132,7 @@ class TranslationResultMessage(BaseModel):
     confidence: float = 0.0
     start_ms: int = 0
     end_ms: int = 0
+    is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -140,6 +147,7 @@ class TranslationResultMessage(BaseModel):
             "confidence": str(self.confidence),
             "start_ms": str(self.start_ms),
             "end_ms": str(self.end_ms),
+            "is_final_chunk": "1" if self.is_final_chunk else "0",
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -157,6 +165,7 @@ class TranslationResultMessage(BaseModel):
             confidence=float(d.get("confidence", "0.0")),
             start_ms=int(d.get("start_ms", "0")),
             end_ms=int(d.get("end_ms", "0")),
+            is_final_chunk=d.get("is_final_chunk") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 
@@ -176,6 +185,7 @@ class TTSResultMessage(BaseModel):
     duration_ms: int = 0  # Audio duration in milliseconds
     voice_type: str = "default"  # 'default' | 'cloned'
     target_lang: str = ""
+    is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     model_config = {"arbitrary_types_allowed": True}
@@ -189,6 +199,7 @@ class TTSResultMessage(BaseModel):
             "duration_ms": str(self.duration_ms),
             "voice_type": self.voice_type,
             "target_lang": self.target_lang,
+            "is_final_chunk": "1" if self.is_final_chunk else "0",
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -203,6 +214,7 @@ class TTSResultMessage(BaseModel):
             duration_ms=int(d.get("duration_ms", "0")),
             voice_type=d.get("voice_type", "default"),
             target_lang=d.get("target_lang", ""),
+            is_final_chunk=d.get("is_final_chunk") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 
