@@ -62,6 +62,10 @@ class BaseWorker(ABC):
         self.logger = get_logger(f"worker.{self.worker_name}")
         self._shutdown_event = asyncio.Event()
         self._consumer_name = f"{self.worker_name}-{socket.gethostname()}"
+        self._route_states: dict[str, str] = {}
+        self._paused_rooms: set[str] = set()
+        self._pubsub = None
+        self._listener_task = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -87,7 +91,10 @@ class BaseWorker(ABC):
             await self.load_model()
             self.logger.info("model_loaded")
 
-            # 3. Enter consume loop
+            # 3. Start route updates listener
+            self._listener_task = asyncio.create_task(self._listen_route_updates())
+
+            # 4. Enter consume loop
             await self._consume_loop()
 
         except asyncio.CancelledError:
@@ -101,12 +108,70 @@ class BaseWorker(ABC):
     async def shutdown(self) -> None:
         """Cleanup resources."""
         self.logger.info("worker_shutting_down")
+        if self._listener_task:
+            self._listener_task.cancel()
+            try:
+                await self._listener_task
+            except asyncio.CancelledError:
+                pass
         await self._cleanup()
         await self.redis.disconnect()
         self.logger.info("worker_stopped")
 
     async def _cleanup(self) -> None:
         """Override for worker-specific cleanup (e.g. release GPU memory)."""
+
+    async def _listen_route_updates(self) -> None:
+        import json
+        self._pubsub = self.redis.redis.pubsub()
+        await self._pubsub.psubscribe("translationRoom:*:events")
+        self.logger.info("route_listener_started")
+        try:
+            async for message in self._pubsub.listen():
+                if message["type"] == "pmessage":
+                    try:
+                        data = json.loads(message["data"])
+                        if data.get("type") == "AUDIO_ROUTES_UPDATED":
+                            # Extract room_id from channel: "translationRoom:{roomId}:events"
+                            channel = message.get("channel", "")
+                            if isinstance(channel, bytes):
+                                channel = channel.decode("utf-8")
+                            parts = channel.split(":")
+                            room_id = parts[1] if len(parts) > 1 else data.get("roomId")
+                            
+                            # Extract status from room_status nested inside data payload, or top-level status
+                            status = data.get("status")
+                            if not status and "data" in data and isinstance(data["data"], dict):
+                                status = data["data"].get("room_status")
+                            if not status:
+                                status = data.get("room_status")
+
+                            if room_id and status:
+                                self._route_states[room_id] = status
+                                if status == "PAUSED":
+                                    self._paused_rooms.add(room_id)
+                                else:
+                                    self._paused_rooms.discard(room_id)
+                                
+                                await self._on_route_status_changed(room_id, status)
+                                
+                                if status in ["FAILED", "ENDED", "CANCELLED", "TIMEOUT"]:
+                                    self._cleanup_room(room_id)
+                    except Exception as e:
+                        self.logger.warning("failed_to_parse_route_event", error=str(e))
+        except asyncio.CancelledError:
+            self.logger.info("route_listener_stopped")
+            if self._pubsub:
+                await self._pubsub.close()
+
+    async def _on_route_status_changed(self, room_id: str, new_status: str) -> None:
+        """Override in subclasses to react to route status changes."""
+        pass
+
+    def _cleanup_room(self, room_id: str) -> None:
+        """Override in subclasses to perform room-specific cleanup."""
+        self._route_states.pop(room_id, None)
+        self._paused_rooms.discard(room_id)
 
     # ------------------------------------------------------------------
     # Abstract interface

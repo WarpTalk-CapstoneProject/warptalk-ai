@@ -10,6 +10,8 @@ Passthrough: if source_lang == target_lang, forward without translation.
 
 from __future__ import annotations
 
+import time
+
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings
 from shared.schemas import STTResultMessage, TranslationResultMessage
@@ -57,6 +59,13 @@ class TranslationWorker(BaseWorker):
         """Translate one STT result segment by chunking into sentences."""
         stt_result = STTResultMessage.from_redis(data)
 
+        if stt_result.meeting_id in self._paused_rooms:
+            return
+
+        current_timestamp_ms = int(time.time() * 1000)
+        e2e_latency_ms = current_timestamp_ms - stt_result.timestamp_ms
+        await self.redis.publish_telemetry(stt_result.meeting_id, self.worker_name, e2e_latency_ms)
+
         # Get target language for this meeting/speaker
         target_lang = await self._get_target_language(
             stt_result.meeting_id, stt_result.speaker_id
@@ -66,6 +75,19 @@ class TranslationWorker(BaseWorker):
         sentences = split_into_sentences(stt_result.text)
         
         if not sentences:
+            if stt_result.is_final_chunk:
+                result = TranslationResultMessage(
+                    segment_id=stt_result.segment_id,
+                    meeting_id=stt_result.meeting_id,
+                    speaker_id=stt_result.speaker_id,
+                    original_text="",
+                    translated_text="",
+                    source_lang=stt_result.language,
+                    target_lang=target_lang,
+                    is_final_chunk=True,
+                    timestamp_ms=stt_result.timestamp_ms,
+                )
+                await self.publish("translate:results", stt_result.meeting_id, result.to_redis())
             return
 
         for idx, sentence in enumerate(sentences):
@@ -83,6 +105,8 @@ class TranslationWorker(BaseWorker):
                     target_lang=target_lang,
                 )
 
+            is_final = (idx == len(sentences) - 1) and stt_result.is_final_chunk
+
             result = TranslationResultMessage(
                 segment_id=chunk_segment_id,
                 meeting_id=stt_result.meeting_id,
@@ -94,6 +118,8 @@ class TranslationWorker(BaseWorker):
                 confidence=stt_result.confidence,
                 start_ms=stt_result.start_ms,
                 end_ms=stt_result.end_ms,
+                is_final_chunk=is_final,
+                timestamp_ms=stt_result.timestamp_ms,
             )
 
             # Publish IMMEDIATELY so TTS can synthesize while next chunk is translated
