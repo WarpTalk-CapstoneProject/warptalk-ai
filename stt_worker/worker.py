@@ -20,7 +20,7 @@ from stt_worker.model import WhisperSTT
 
 
 class STTWorker(BaseWorker):
-    """Speech-to-Text worker using Faster-Whisper."""
+    """Speech-to-Text worker using mlx-whisper."""
 
     worker_name = "stt"
     input_stream = "audio:chunks"
@@ -68,13 +68,25 @@ class STTWorker(BaseWorker):
         # Calculate time offset for this chunk
         chunk_offset_ms = chunk.chunk_index * self.settings.chunk_duration_ms
 
-        # Run Whisper inference in thread pool (blocking → non-blocking)
+        # Auto-detect language — works well with VAD-gated audio (no silence)
         language_hint = chunk.language if chunk.language != "auto" else None
+
+        t0 = time.monotonic()
         segments = await asyncio.to_thread(
             self.model.transcribe,
             audio_array,
             language=language_hint,
             chunk_offset_ms=chunk_offset_ms,
+        )
+        inference_ms = int((time.monotonic() - t0) * 1000)
+        audio_ms = int(len(audio_array) / 16000 * 1000)
+
+        self.logger.info(
+            "inference_complete",
+            inference_ms=inference_ms,
+            audio_ms=audio_ms,
+            rtf=round(inference_ms / max(audio_ms, 1), 2),
+            segments=len(segments),
         )
 
         # Publish each transcribed segment
@@ -100,6 +112,7 @@ class STTWorker(BaseWorker):
                 text=segment.text[:80],
                 language=segment.language,
                 confidence=segment.confidence,
+                inference_ms=inference_ms,
             )
 
         if not segments and chunk.is_final_chunk:

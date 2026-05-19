@@ -205,11 +205,16 @@ class BaseWorker(ABC):
         Returns:
             Redis message ID
         """
-        stream_key = f"{stream_prefix}:{meeting_id}"
-        msg_id = await self.redis.publish(stream_key, data)
+        # Publish to per-meeting stream (backend expects e.g. stt:results:{roomId})
+        room_stream = f"{stream_prefix}:{meeting_id}"
+        msg_id = await self.redis.publish(room_stream, data)
+
+        # Also publish to global stream (AI workers consume from here)
+        await self.redis.publish(stream_prefix, data)
+
         self.logger.debug(
             "message_published",
-            stream=stream_key,
+            stream=room_stream,
             message_id=msg_id,
         )
         return msg_id

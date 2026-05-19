@@ -24,14 +24,31 @@ class RedisSettings(BaseSettings):
     retry_base_delay: float = 0.5
 
 
+class LiveKitSettings(BaseSettings):
+    """LiveKit Server connection settings."""
+
+    model_config = {"env_prefix": "LIVEKIT_"}
+
+    url: str = "ws://localhost:7880"
+    api_key: str = "YOUR_LIVEKIT_API_KEY"
+    api_secret: str = "YOUR_LIVEKIT_API_SECRET"
+
+
 class WorkerSettings(BaseSettings):
     """Base worker settings shared by all workers."""
 
     model_config = {"env_prefix": ""}
 
     log_level: str = "INFO"
-    chunk_duration_ms: int = 1000  # 1s chunks for sub-2s latency
+    chunk_duration_ms: int = 3000  # 3s chunk — mlx-whisper has ~4s fixed overhead, longer=better RTF
     redis: RedisSettings = RedisSettings()
+    livekit: LiveKitSettings = LiveKitSettings()
+
+    # VAD gating settings (used by ingress worker)
+    vad_threshold: float = 0.3        # Speech detection threshold
+    vad_pre_speech_ms: int = 300      # Pre-speech buffer to capture word onsets
+    vad_silence_hangover_ms: int = 600  # 600ms hangover — faster turnaround
+    vad_min_speech_ms: int = 500      # Minimum speech length to publish
 
 
 class STTSettings(BaseSettings):
@@ -39,12 +56,12 @@ class STTSettings(BaseSettings):
 
     model_config = {"env_prefix": "STT_"}
 
-    model: str = "medium"  # Whisper model size (medium for speed/accuracy balance)
-    device: str = "cuda"
-    compute_type: str = "int8"  # INT8 quantization for ~150ms inference
-    language: str = "auto"  # Auto-detect or specify (e.g. 'en', 'vi')
-    beam_size: int = 1  # Greedy for lowest latency, increase for accuracy
-    vad_filter: bool = True  # Voice Activity Detection filter
+    model: str = "large-v3-turbo"  # MLX: best Vietnamese accuracy
+    device: str = "cpu"  # Ignored by MLX — auto-selects Apple GPU
+    compute_type: str = "int8"  # Ignored by MLX — uses own quantization
+    language: str = "auto"  # Auto-detect for code-switching (Vi + En)
+    beam_size: int = 1  # Greedy for lowest latency
+    vad_filter: bool = False  # VAD handled by ingress worker, not Whisper
 
 
 class TranslationSettings(BaseSettings):

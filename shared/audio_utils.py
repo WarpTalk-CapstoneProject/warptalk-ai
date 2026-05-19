@@ -8,10 +8,9 @@ import numpy as np
 
 
 def bytes_to_numpy(audio_bytes: bytes, sample_rate: int = 16000) -> np.ndarray:
-    """Convert raw audio bytes to numpy array."""
-    import soundfile as sf
-
-    audio_data, _ = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+    """Convert raw 16-bit PCM audio bytes to float32 numpy array for Whisper."""
+    # Whisper expects float32 in range [-1.0, 1.0]
+    audio_data = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     return audio_data
 
 
