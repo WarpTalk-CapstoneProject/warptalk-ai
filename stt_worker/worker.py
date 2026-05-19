@@ -20,7 +20,7 @@ from stt_worker.model import WhisperSTT
 
 
 class STTWorker(BaseWorker):
-    """Speech-to-Text worker using whisper.cpp (Metal GPU)."""
+    """Speech-to-Text worker using mlx-whisper."""
 
     worker_name = "stt"
     input_stream = "audio:chunks"

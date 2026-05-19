@@ -1,8 +1,7 @@
-"""Whisper STT model wrapper with dual-engine support.
+"""Whisper STT model wrapper for mlx-whisper.
 
-Supports:
-- mlx-whisper: Best Vietnamese accuracy on Apple Silicon (default)
-- whisper.cpp: Fastest inference for languages with good base-model support
+Uses mlx-whisper because it provides the most reliable Vietnamese accuracy on
+Apple Silicon for the current local realtime transcript pipeline.
 
 Provides a synchronous `transcribe()` method designed to be called
 via `asyncio.to_thread()` from the async worker.

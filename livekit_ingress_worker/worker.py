@@ -155,14 +155,6 @@ class LiveKitIngressWorker(BaseWorker):
                 max_prob = prob
         return max_prob
 
-    def _peak_normalize(self, pcm_i16: np.ndarray, target_peak: float = 0.8) -> np.ndarray:
-        """Peak-normalize int16 PCM so peak reaches target_peak (0-1 scale)."""
-        f32 = pcm_i16.astype(np.float32) / 32768.0
-        peak = np.max(np.abs(f32))
-        if peak > 0.001:
-            f32 = f32 * (target_peak / peak)
-        return np.clip(f32 * 32768, -32768, 32767).astype(np.int16)
-
     async def process_audio_track(self, room_name: str, speaker_id: str, track: rtc.Track) -> None:
         """Stream audio from LiveKit, gate with VAD, publish only speech chunks."""
         audio_stream = rtc.AudioStream(track)
