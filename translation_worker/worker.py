@@ -69,9 +69,6 @@ class TranslationWorker(BaseWorker):
             return
 
         for idx, sentence in enumerate(sentences):
-            # Sequence the segment ID so frontend gets consecutive speech segments
-            chunk_segment_id = f"{stt_result.segment_id}-c{idx}"
-
             # Passthrough if same language
             if stt_result.language == target_lang:
                 translated_text = sentence
@@ -84,7 +81,7 @@ class TranslationWorker(BaseWorker):
                 )
 
             result = TranslationResultMessage(
-                segment_id=chunk_segment_id,
+                segment_id=stt_result.segment_id,
                 meeting_id=stt_result.meeting_id,
                 speaker_id=stt_result.speaker_id,
                 original_text=sentence,

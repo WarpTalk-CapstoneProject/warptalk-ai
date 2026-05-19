@@ -116,6 +116,7 @@ class TranslationResultMessage(BaseModel):
 
     __slots__ = ()
 
+    translation_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     segment_id: str
     meeting_id: str
     speaker_id: str
@@ -130,6 +131,7 @@ class TranslationResultMessage(BaseModel):
 
     def to_redis(self) -> dict[str, str]:
         return {
+            "translation_id": self.translation_id,
             "segment_id": self.segment_id,
             "meeting_id": self.meeting_id,
             "speaker_id": self.speaker_id,
@@ -147,6 +149,7 @@ class TranslationResultMessage(BaseModel):
     def from_redis(cls, data: dict[bytes | str, bytes | str]) -> TranslationResultMessage:
         d = _decode_dict(data)
         return cls(
+            translation_id=d.get("translation_id", str(uuid.uuid4())),
             segment_id=d["segment_id"],
             meeting_id=d["meeting_id"],
             speaker_id=d["speaker_id"],
