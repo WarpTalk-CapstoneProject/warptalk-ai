@@ -80,12 +80,20 @@ class TTSSettings(BaseSettings):
 
     model_config = {"env_prefix": "TTS_"}
 
+    anchor_provider: str = "edge"
+    clone_provider: str = "xtts"
     xtts_model: str = "tts_models/multilingual/multi-dataset/xtts_v2"
     device: str = "cuda"
     embedding_min_seconds: float = 5.0  # Min audio for first voice embedding
     embedding_refine_seconds: float = 15.0  # Audio threshold for refined embedding
     default_voice: str = "en-US-AriaNeural"  # Edge-TTS default voice
     sample_rate: int = 24000  # XTTS v2 output sample rate
+    blend_enabled: bool = True
+    min_clone_chars: int = 8
+    default_clone_strength: float = 0.6
+    cache_enabled: bool = True
+    cache_ttl_seconds: int = 900
+    max_synthesis_ms: int = 6000
 
 
 class AssistantSettings(BaseSettings):
@@ -97,3 +105,27 @@ class AssistantSettings(BaseSettings):
     model: str = "gpt-4o"
     max_tokens: int = 2048
     temperature: float = 0.3
+
+
+class EmbeddingSettings(BaseSettings):
+    """Knowledge embedding settings for WarpBot RAG."""
+
+    model_config = {"env_prefix": "EMBEDDING_"}
+
+    provider: str = "openai"
+    api_key: str = ""
+    model: str = "text-embedding-3-small"
+    dimensions: int = 1536
+    batch_size: int = 64
+    timeout_ms: int = 30000
+
+
+class VectorDbSettings(BaseSettings):
+    """Vector database settings for text/RAG embeddings."""
+
+    model_config = {"env_prefix": "VECTOR_DB_"}
+
+    provider: str = "qdrant"
+    url: str = "http://localhost:6333"
+    api_key: str = ""
+    distance_metric: str = "cosine"

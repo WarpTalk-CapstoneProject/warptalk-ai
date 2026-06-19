@@ -58,6 +58,7 @@ class XTTSSynthesizer(Synthesizer):
         device: str = "cuda",
         sample_rate: int = 24000,
     ) -> None:
+        self.provider_name = "xtts"
         self.model_name = model_name
         self.device = device
         self.sample_rate = sample_rate
@@ -133,6 +134,7 @@ class EdgeTTSSynthesizer(Synthesizer):
     """
 
     def __init__(self, default_voice: str = "en-US-AriaNeural") -> None:
+        self.provider_name = "edge"
         self.default_voice = default_voice
 
     async def load(self) -> None:

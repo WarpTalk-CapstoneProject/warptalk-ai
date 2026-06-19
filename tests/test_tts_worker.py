@@ -146,3 +146,81 @@ class TestTTSWorker:
         call_kwargs = worker.xtts.synthesize.call_args
         assert call_kwargs[1].get("speaker_embedding") == fake_embedding or \
                call_kwargs.kwargs.get("speaker_embedding") == fake_embedding
+
+    async def test_uses_standard_voice_for_short_utterance_even_with_embedding(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """Short phrases should stay on anchor voice to protect latency and continuity."""
+        worker = TTSWorker.__new__(TTSWorker)
+        worker.settings = worker_settings
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker.tts_settings = TTSSettings(min_clone_chars=8)
+
+        fake_embedding = np.zeros(256, dtype=np.float32).tobytes()
+        mock_redis_client._redis.hget = AsyncMock(return_value=fake_embedding)
+
+        worker.edge_tts = MagicMock(provider_name="edge")
+        worker.edge_tts.synthesize = AsyncMock(return_value=(b"ok-audio", 300))
+        worker.xtts = MagicMock(provider_name="xtts")
+        worker.xtts.synthesize = AsyncMock()
+
+        msg = TranslationResultMessage(
+            segment_id="seg-1",
+            meeting_id="m1",
+            speaker_id="s1",
+            original_text="Ok",
+            translated_text="Ok",
+            source_lang="en",
+            target_lang="vi",
+        )
+
+        await worker.process(b"msg-1", msg.to_redis())
+
+        worker.edge_tts.synthesize.assert_called_once()
+        worker.xtts.synthesize.assert_not_called()
+        published = mock_redis_client._redis.xadd.call_args.args[1]
+        assert published["voice_type"] == "default"
+        assert published["voice_mode"] == "standard"
+        assert published["clone_strength"] == "0.0"
+        assert published["fallback_reason"] == "short_utterance"
+
+    async def test_publishes_blended_metadata_when_embedding_exists(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """Available clone path should publish blended voice metadata for clients."""
+        worker = TTSWorker.__new__(TTSWorker)
+        worker.settings = worker_settings
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker.tts_settings = TTSSettings(min_clone_chars=4, default_clone_strength=0.6)
+
+        fake_embedding = np.zeros(256, dtype=np.float32).tobytes()
+        mock_redis_client._redis.hget = AsyncMock(return_value=fake_embedding)
+
+        worker.edge_tts = MagicMock(provider_name="edge")
+        worker.edge_tts.synthesize = AsyncMock()
+        worker.xtts = MagicMock(provider_name="xtts")
+        worker.xtts.synthesize = AsyncMock(return_value=(b"cloned-audio", 1500))
+
+        msg = TranslationResultMessage(
+            segment_id="seg-1",
+            meeting_id="m1",
+            speaker_id="s1",
+            original_text="Hello there",
+            translated_text="Xin chào bạn",
+            source_lang="en",
+            target_lang="vi",
+        )
+
+        await worker.process(b"msg-1", msg.to_redis())
+
+        published = mock_redis_client._redis.xadd.call_args.args[1]
+        assert published["voice_type"] == "blended"
+        assert published["voice_mode"] == "blended"
+        assert published["clone_strength"] == "0.6"
+        assert published["anchor_provider"] == "edge"
+        assert published["clone_provider"] == "xtts"
+        assert published["render_location"] == "server"
+        assert published["cache_key"]
+        assert published["cache_hit"] == "false"
