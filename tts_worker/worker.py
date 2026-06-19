@@ -14,7 +14,11 @@ Progressive Voice Cloning:
 from __future__ import annotations
 
 import asyncio
+<<<<<<< Updated upstream
 import base64
+=======
+import hashlib
+>>>>>>> Stashed changes
 import time
 
 from shared.audio_utils import bytes_to_numpy
@@ -125,6 +129,7 @@ class TTSWorker(BaseWorker):
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Synthesize text to speech with progressive voice cloning."""
         translation = TranslationResultMessage.from_redis(data)
+        text = translation.translated_text
 
         # Check route state
         route_status = self._route_states.get(translation.meeting_id, "AUDIO_ROUTING_ACTIVE")
@@ -145,6 +150,7 @@ class TTSWorker(BaseWorker):
             return
 
         # Check if we have a voice embedding for this speaker
+<<<<<<< Updated upstream
         embedding = None
         if route_status != "VOICE_CLONE_FALLBACK":
             try:
@@ -162,9 +168,59 @@ class TTSWorker(BaseWorker):
         audio_bytes = b""
         duration_ms = 0
         voice_type = "default"
+=======
+        embedding = await self.redis.hget(
+            f"speaker:{translation.meeting_id}:{translation.speaker_id}",
+            "embedding",
+        )
+        anchor_provider = self._provider_name(self.edge_tts, self.tts_settings.anchor_provider)
+        clone_provider = self._provider_name(self.xtts, self.tts_settings.clone_provider)
+        should_clone, fallback_reason = self._should_clone(text, embedding)
+        selected_voice_mode = "blended" if should_clone and self.tts_settings.blend_enabled else (
+            "cloned" if should_clone else "standard"
+        )
+        selected_provider = clone_provider if should_clone else anchor_provider
+        cache_key = self._cache_key(
+            speaker_id=translation.speaker_id,
+            target_lang=translation.target_lang,
+            text=text,
+            voice_mode=selected_voice_mode,
+            provider=selected_provider,
+        )
+>>>>>>> Stashed changes
 
-        if embedding is not None and self.xtts is not None:
+        if self.tts_settings.cache_enabled:
+            cached_audio = await self.redis.get(cache_key)
+            if cached_audio:
+                result = TTSResultMessage(
+                    segment_id=translation.segment_id,
+                    meeting_id=translation.meeting_id,
+                    speaker_id=translation.speaker_id,
+                    audio_data=cached_audio,
+                    duration_ms=0,
+                    voice_type="blended" if should_clone and self.tts_settings.blend_enabled else (
+                        "cloned" if should_clone else "default"
+                    ),
+                    voice_mode=selected_voice_mode,
+                    clone_strength=self._clone_strength(embedding) if should_clone else 0.0,
+                    anchor_provider=anchor_provider,
+                    clone_provider=clone_provider if should_clone else "",
+                    render_location="server",
+                    cache_key=cache_key,
+                    cache_hit=True,
+                    fallback_reason=fallback_reason,
+                    target_lang=translation.target_lang,
+                )
+                await self.publish("tts:results", translation.meeting_id, result.to_redis())
+                return
+
+        t0 = time.monotonic()
+        conversion_latency_ms = 0
+        synthesis_latency_ms = 0
+
+        if should_clone:
             # Voice cloning available → use XTTS v2
+<<<<<<< Updated upstream
             try:
                 audio_bytes, duration_ms = await self.xtts.synthesize(
                     text=translation.translated_text,
@@ -219,13 +275,112 @@ class TTSWorker(BaseWorker):
                 event_type="final_chunk_processed",
                 payload={"segmentId": translation.segment_id}
             )
+=======
+            clone_t0 = time.monotonic()
+            audio_bytes, duration_ms = await self.xtts.synthesize(
+                text=text,
+                language=translation.target_lang,
+                speaker_embedding=embedding,
+            )
+            conversion_latency_ms = int((time.monotonic() - clone_t0) * 1000)
+            voice_type = "blended" if self.tts_settings.blend_enabled else "cloned"
+            voice_mode = "blended" if self.tts_settings.blend_enabled else "cloned"
+            clone_strength = self._clone_strength(embedding)
+        else:
+            # No embedding yet or XTTS disabled → use Edge-TTS default voice
+            anchor_t0 = time.monotonic()
+            audio_bytes, duration_ms = await self.edge_tts.synthesize(
+                text=text,
+                language=translation.target_lang,
+            )
+            synthesis_latency_ms = int((time.monotonic() - anchor_t0) * 1000)
+            voice_type = "default"
+            voice_mode = "standard"
+            clone_strength = 0.0
+            clone_provider = ""
+
+        # Feed original audio to embedding extractor (background)
+        # The original audio comes from the audio:chunks stream;
+        # here we can accumulate from the chunk data if available
+        # This is handled separately by the embedding extractor
+        # listening to audio:chunks or receiving audio via the TTS worker
+
+        result = TTSResultMessage(
+            segment_id=translation.segment_id,
+            meeting_id=translation.meeting_id,
+            speaker_id=translation.speaker_id,
+            audio_data=audio_bytes,
+            duration_ms=duration_ms,
+            voice_type=voice_type,
+            voice_mode=voice_mode,
+            clone_strength=clone_strength,
+            anchor_provider=anchor_provider,
+            clone_provider=clone_provider,
+            render_location="server",
+            cache_key=cache_key,
+            cache_hit=False,
+            synthesis_latency_ms=synthesis_latency_ms or int((time.monotonic() - t0) * 1000),
+            conversion_latency_ms=conversion_latency_ms,
+            fallback_reason=fallback_reason,
+            target_lang=translation.target_lang,
+        )
+
+        await self.publish("tts:results", translation.meeting_id, result.to_redis())
+        if self.tts_settings.cache_enabled and audio_bytes:
+            await self.redis.set_with_ttl(
+                cache_key,
+                audio_bytes,
+                self.tts_settings.cache_ttl_seconds,
+            )
+>>>>>>> Stashed changes
 
         self.logger.info(
             "audio_synthesized",
             meeting_id=translation.meeting_id,
             speaker_id=translation.speaker_id,
             voice_type=voice_type,
+            voice_mode=voice_mode,
+            clone_strength=clone_strength,
             duration_ms=duration_ms,
+<<<<<<< Updated upstream
             text=translation.translated_text[:60],
             is_final=translation.is_final_chunk,
+=======
+            text=text[:60],
+>>>>>>> Stashed changes
         )
+
+    def _should_clone(self, text: str, embedding: bytes | None) -> tuple[bool, str]:
+        if len(text.strip()) < self.tts_settings.min_clone_chars:
+            return False, "short_utterance"
+        if embedding is None:
+            return False, "voice_profile_not_ready"
+        if self.xtts is None:
+            return False, "clone_provider_unavailable"
+        return True, ""
+
+    def _clone_strength(self, embedding: bytes | None) -> float:
+        if embedding is None or self.xtts is None:
+            return 0.0
+        return max(0.0, min(1.0, self.tts_settings.default_clone_strength))
+
+    def _cache_key(
+        self,
+        speaker_id: str,
+        target_lang: str,
+        text: str,
+        voice_mode: str,
+        provider: str,
+    ) -> str:
+        normalized = " ".join(text.casefold().split())
+        digest = hashlib.sha256(
+            f"{speaker_id}|{target_lang}|{normalized}|{voice_mode}|{provider}".encode()
+        ).hexdigest()
+        return f"tts:cache:{digest}"
+
+    @staticmethod
+    def _provider_name(provider: object | None, fallback: str) -> str:
+        value = getattr(provider, "provider_name", None)
+        if isinstance(value, str):
+            return value
+        return fallback

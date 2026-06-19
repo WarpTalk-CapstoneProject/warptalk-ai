@@ -46,6 +46,9 @@ When extracting action items:
 
     async def load(self) -> None:
         """Initialize the OpenAI async client."""
+        if not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY is required for WarpBot assistant")
+
         from openai import AsyncOpenAI
 
         self._client = AsyncOpenAI(api_key=self.api_key)

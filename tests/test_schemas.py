@@ -65,6 +65,34 @@ class TestAudioChunkMessage:
         assert restored.meeting_id == "m1"
         assert restored.audio_data == sample_audio_bytes
 
+    def test_from_redis_accepts_gateway_translation_room_id_alias(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """Gateway uses translation_room_id for the same canonical meeting stream."""
+        redis_data = AudioChunkMessage(
+            meeting_id="room-123",
+            speaker_id="s1",
+            chunk_index=1,
+            audio_data=sample_audio_bytes,
+            source_runtime="desktop",
+            vad_confidence=0.84,
+            speech_start_ms=120,
+            speech_end_ms=880,
+            input_lufs=-18.5,
+            noise_suppression_enabled=True,
+        ).to_redis()
+        redis_data["translation_room_id"] = redis_data.pop("meeting_id")
+
+        restored = AudioChunkMessage.from_redis(redis_data)
+
+        assert restored.meeting_id == "room-123"
+        assert restored.source_runtime == "desktop"
+        assert restored.vad_confidence == pytest.approx(0.84)
+        assert restored.speech_start_ms == 120
+        assert restored.speech_end_ms == 880
+        assert restored.input_lufs == pytest.approx(-18.5)
+        assert restored.noise_suppression_enabled is True
+
 
 class TestSTTResultMessage:
     """STTResultMessage tests."""
@@ -143,6 +171,76 @@ class TestTTSResultMessage:
         assert restored.audio_data == audio
         assert restored.duration_ms == 1500
         assert restored.voice_type == "cloned"
+
+    def test_roundtrip_voice_blending_metadata(self) -> None:
+        audio = b"fake-audio-bytes-here"
+        original = TTSResultMessage(
+            segment_id="seg-123",
+            meeting_id="meeting-123",
+            speaker_id="speaker-1",
+            audio_data=audio,
+            duration_ms=1500,
+            voice_type="blended",
+            voice_mode="blended",
+            clone_strength=0.6,
+            anchor_provider="edge",
+            clone_provider="xtts",
+            render_location="server",
+            cache_key="voice-cache-key",
+            cache_hit=True,
+            synthesis_latency_ms=120,
+            conversion_latency_ms=240,
+            fallback_reason="",
+            target_lang="vi",
+        )
+
+        restored = TTSResultMessage.from_redis(original.to_redis())
+
+        assert restored.voice_type == "blended"
+        assert restored.voice_mode == "blended"
+        assert restored.clone_strength == pytest.approx(0.6)
+        assert restored.anchor_provider == "edge"
+        assert restored.clone_provider == "xtts"
+        assert restored.render_location == "server"
+        assert restored.cache_key == "voice-cache-key"
+        assert restored.cache_hit is True
+        assert restored.synthesis_latency_ms == 120
+        assert restored.conversion_latency_ms == 240
+        assert restored.fallback_reason == ""
+
+    def test_from_redis_old_tts_result_defaults_voice_metadata(self) -> None:
+        audio = b"fake-audio-bytes-here"
+        old_payload = TTSResultMessage(
+            segment_id="seg-123",
+            meeting_id="meeting-123",
+            speaker_id="speaker-1",
+            audio_data=audio,
+            duration_ms=1500,
+            voice_type="default",
+            target_lang="vi",
+        ).to_redis()
+        for field in (
+            "voice_mode",
+            "clone_strength",
+            "anchor_provider",
+            "clone_provider",
+            "render_location",
+            "cache_key",
+            "cache_hit",
+            "synthesis_latency_ms",
+            "conversion_latency_ms",
+            "fallback_reason",
+        ):
+            old_payload.pop(field, None)
+
+        restored = TTSResultMessage.from_redis(old_payload)
+
+        assert restored.voice_mode == "standard"
+        assert restored.clone_strength == 0.0
+        assert restored.anchor_provider == ""
+        assert restored.clone_provider == ""
+        assert restored.render_location == "server"
+        assert restored.cache_hit is False
 
 
 @pytest.mark.parametrize(

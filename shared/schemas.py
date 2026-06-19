@@ -27,7 +27,16 @@ class AudioChunkMessage(BaseModel):
     audio_data: bytes  # Raw audio bytes (WAV/PCM)
     language: str = "auto"  # Source language hint or 'auto' for detection
     sample_rate: int = 16000
+<<<<<<< Updated upstream
     is_final_chunk: bool = False
+=======
+    source_runtime: str = "web"  # 'web' | 'desktop'
+    vad_confidence: float = 0.0
+    speech_start_ms: int = 0
+    speech_end_ms: int = 0
+    input_lufs: float = 0.0
+    noise_suppression_enabled: bool = False
+>>>>>>> Stashed changes
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     model_config = {"arbitrary_types_allowed": True}
@@ -41,7 +50,16 @@ class AudioChunkMessage(BaseModel):
             "audio_data": base64.b64encode(self.audio_data).decode("ascii"),
             "language": self.language,
             "sample_rate": str(self.sample_rate),
+<<<<<<< Updated upstream
             "is_final_chunk": "1" if self.is_final_chunk else "0",
+=======
+            "source_runtime": self.source_runtime,
+            "vad_confidence": str(self.vad_confidence),
+            "speech_start_ms": str(self.speech_start_ms),
+            "speech_end_ms": str(self.speech_end_ms),
+            "input_lufs": str(self.input_lufs),
+            "noise_suppression_enabled": _bool_to_redis(self.noise_suppression_enabled),
+>>>>>>> Stashed changes
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -50,13 +68,24 @@ class AudioChunkMessage(BaseModel):
         """Deserialize from Redis Stream fields."""
         d = _decode_dict(data)
         return cls(
-            meeting_id=d["meeting_id"],
+            meeting_id=d.get("meeting_id") or d["translation_room_id"],
             speaker_id=d["speaker_id"],
             chunk_index=int(d["chunk_index"]),
             audio_data=base64.b64decode(d["audio_data"]),
             language=d.get("language", "auto"),
             sample_rate=int(d.get("sample_rate", "16000")),
+<<<<<<< Updated upstream
             is_final_chunk=d.get("is_final_chunk") == "1",
+=======
+            source_runtime=d.get("source_runtime", "web"),
+            vad_confidence=float(d.get("vad_confidence", "0.0")),
+            speech_start_ms=int(d.get("speech_start_ms", "0")),
+            speech_end_ms=int(d.get("speech_end_ms", "0")),
+            input_lufs=float(d.get("input_lufs", "0.0")),
+            noise_suppression_enabled=_redis_to_bool(
+                d.get("noise_suppression_enabled", "false")
+            ),
+>>>>>>> Stashed changes
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 
@@ -184,6 +213,16 @@ class TTSResultMessage(BaseModel):
     audio_data: bytes  # Synthesized audio bytes (WAV)
     duration_ms: int = 0  # Audio duration in milliseconds
     voice_type: str = "default"  # 'default' | 'cloned'
+    voice_mode: str = "standard"  # 'standard' | 'blended' | 'cloned' | 'caption_only'
+    clone_strength: float = 0.0
+    anchor_provider: str = ""
+    clone_provider: str = ""
+    render_location: str = "server"
+    cache_key: str = ""
+    cache_hit: bool = False
+    synthesis_latency_ms: int = 0
+    conversion_latency_ms: int = 0
+    fallback_reason: str = ""
     target_lang: str = ""
     is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
@@ -198,6 +237,16 @@ class TTSResultMessage(BaseModel):
             "audio_data": base64.b64encode(self.audio_data).decode("ascii"),
             "duration_ms": str(self.duration_ms),
             "voice_type": self.voice_type,
+            "voice_mode": self.voice_mode,
+            "clone_strength": str(self.clone_strength),
+            "anchor_provider": self.anchor_provider,
+            "clone_provider": self.clone_provider,
+            "render_location": self.render_location,
+            "cache_key": self.cache_key,
+            "cache_hit": _bool_to_redis(self.cache_hit),
+            "synthesis_latency_ms": str(self.synthesis_latency_ms),
+            "conversion_latency_ms": str(self.conversion_latency_ms),
+            "fallback_reason": self.fallback_reason,
             "target_lang": self.target_lang,
             "is_final_chunk": "1" if self.is_final_chunk else "0",
             "timestamp_ms": str(self.timestamp_ms),
@@ -213,6 +262,16 @@ class TTSResultMessage(BaseModel):
             audio_data=base64.b64decode(d["audio_data"]),
             duration_ms=int(d.get("duration_ms", "0")),
             voice_type=d.get("voice_type", "default"),
+            voice_mode=d.get("voice_mode", "standard"),
+            clone_strength=float(d.get("clone_strength", "0.0")),
+            anchor_provider=d.get("anchor_provider", ""),
+            clone_provider=d.get("clone_provider", ""),
+            render_location=d.get("render_location", "server"),
+            cache_key=d.get("cache_key", ""),
+            cache_hit=_redis_to_bool(d.get("cache_hit", "false")),
+            synthesis_latency_ms=int(d.get("synthesis_latency_ms", "0")),
+            conversion_latency_ms=int(d.get("conversion_latency_ms", "0")),
+            fallback_reason=d.get("fallback_reason", ""),
             target_lang=d.get("target_lang", ""),
             is_final_chunk=d.get("is_final_chunk") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
@@ -232,3 +291,11 @@ def _decode_dict(data: dict[bytes | str, bytes | str]) -> dict[str, str]:
         )
         for k, v in data.items()
     }
+
+
+def _bool_to_redis(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _redis_to_bool(value: str) -> bool:
+    return value.strip().lower() in {"true", "1", "yes"}
