@@ -14,11 +14,8 @@ Progressive Voice Cloning:
 from __future__ import annotations
 
 import asyncio
-<<<<<<< Updated upstream
 import base64
-=======
 import hashlib
->>>>>>> Stashed changes
 import time
 
 from shared.audio_utils import bytes_to_numpy
@@ -150,7 +147,6 @@ class TTSWorker(BaseWorker):
             return
 
         # Check if we have a voice embedding for this speaker
-<<<<<<< Updated upstream
         embedding = None
         if route_status != "VOICE_CLONE_FALLBACK":
             try:
@@ -165,14 +161,6 @@ class TTSWorker(BaseWorker):
                     "embedding",
                 )
 
-        audio_bytes = b""
-        duration_ms = 0
-        voice_type = "default"
-=======
-        embedding = await self.redis.hget(
-            f"speaker:{translation.meeting_id}:{translation.speaker_id}",
-            "embedding",
-        )
         anchor_provider = self._provider_name(self.edge_tts, self.tts_settings.anchor_provider)
         clone_provider = self._provider_name(self.xtts, self.tts_settings.clone_provider)
         should_clone, fallback_reason = self._should_clone(text, embedding)
@@ -187,8 +175,10 @@ class TTSWorker(BaseWorker):
             voice_mode=selected_voice_mode,
             provider=selected_provider,
         )
->>>>>>> Stashed changes
 
+        audio_bytes = b""
+        duration_ms = 0
+        voice_type = "default"
         if self.tts_settings.cache_enabled:
             cached_audio = await self.redis.get(cache_key)
             if cached_audio:
@@ -220,14 +210,17 @@ class TTSWorker(BaseWorker):
 
         if should_clone:
             # Voice cloning available → use XTTS v2
-<<<<<<< Updated upstream
             try:
+                clone_t0 = time.monotonic()
                 audio_bytes, duration_ms = await self.xtts.synthesize(
-                    text=translation.translated_text,
+                    text=text,
                     language=translation.target_lang,
                     speaker_embedding=embedding,
                 )
-                voice_type = "cloned"
+                conversion_latency_ms = int((time.monotonic() - clone_t0) * 1000)
+                voice_type = "blended" if self.tts_settings.blend_enabled else "cloned"
+                voice_mode = "blended" if self.tts_settings.blend_enabled else "cloned"
+                clone_strength = self._clone_strength(embedding)
             except Exception as e:
                 self.logger.error("xtts_synthesis_failed", error=str(e))
                 await self.redis.publish_system_event(
@@ -235,17 +228,22 @@ class TTSWorker(BaseWorker):
                     event_type="voice_clone_unavailable",
                     payload={"error": str(e)}
                 )
-                # Fallback to Edge-TTS
+                should_clone = False
                 embedding = None
 
-        if embedding is None or self.xtts is None:
+        if not should_clone or embedding is None or self.xtts is None:
             # No embedding yet or XTTS disabled/failed → use Edge-TTS default voice
             try:
+                anchor_t0 = time.monotonic()
                 audio_bytes, duration_ms = await self.edge_tts.synthesize(
-                    text=translation.translated_text,
+                    text=text,
                     language=translation.target_lang,
                 )
+                synthesis_latency_ms = int((time.monotonic() - anchor_t0) * 1000)
                 voice_type = "default"
+                voice_mode = "standard"
+                clone_strength = 0.0
+                clone_provider = ""
             except Exception as e:
                 self.logger.error("edge_tts_synthesis_failed", error=str(e))
                 await self.redis.publish_system_event(
@@ -262,12 +260,28 @@ class TTSWorker(BaseWorker):
                 audio_data=audio_bytes,
                 duration_ms=duration_ms,
                 voice_type=voice_type,
+                voice_mode=voice_mode,
+                clone_strength=clone_strength,
+                anchor_provider=anchor_provider,
+                clone_provider=clone_provider,
+                render_location="server",
+                cache_key=cache_key,
+                cache_hit=False,
+                synthesis_latency_ms=synthesis_latency_ms or int((time.monotonic() - t0) * 1000),
+                conversion_latency_ms=conversion_latency_ms,
+                fallback_reason=fallback_reason,
                 target_lang=translation.target_lang,
                 is_final_chunk=translation.is_final_chunk,
                 timestamp_ms=translation.timestamp_ms,
             )
 
             await self.publish("tts:results", translation.meeting_id, result.to_redis())
+            if self.tts_settings.cache_enabled:
+                await self.redis.set_with_ttl(
+                    cache_key,
+                    audio_bytes,
+                    self.tts_settings.cache_ttl_seconds,
+                )
 
         if translation.is_final_chunk:
             await self.redis.publish_system_event(
@@ -275,64 +289,6 @@ class TTSWorker(BaseWorker):
                 event_type="final_chunk_processed",
                 payload={"segmentId": translation.segment_id}
             )
-=======
-            clone_t0 = time.monotonic()
-            audio_bytes, duration_ms = await self.xtts.synthesize(
-                text=text,
-                language=translation.target_lang,
-                speaker_embedding=embedding,
-            )
-            conversion_latency_ms = int((time.monotonic() - clone_t0) * 1000)
-            voice_type = "blended" if self.tts_settings.blend_enabled else "cloned"
-            voice_mode = "blended" if self.tts_settings.blend_enabled else "cloned"
-            clone_strength = self._clone_strength(embedding)
-        else:
-            # No embedding yet or XTTS disabled → use Edge-TTS default voice
-            anchor_t0 = time.monotonic()
-            audio_bytes, duration_ms = await self.edge_tts.synthesize(
-                text=text,
-                language=translation.target_lang,
-            )
-            synthesis_latency_ms = int((time.monotonic() - anchor_t0) * 1000)
-            voice_type = "default"
-            voice_mode = "standard"
-            clone_strength = 0.0
-            clone_provider = ""
-
-        # Feed original audio to embedding extractor (background)
-        # The original audio comes from the audio:chunks stream;
-        # here we can accumulate from the chunk data if available
-        # This is handled separately by the embedding extractor
-        # listening to audio:chunks or receiving audio via the TTS worker
-
-        result = TTSResultMessage(
-            segment_id=translation.segment_id,
-            meeting_id=translation.meeting_id,
-            speaker_id=translation.speaker_id,
-            audio_data=audio_bytes,
-            duration_ms=duration_ms,
-            voice_type=voice_type,
-            voice_mode=voice_mode,
-            clone_strength=clone_strength,
-            anchor_provider=anchor_provider,
-            clone_provider=clone_provider,
-            render_location="server",
-            cache_key=cache_key,
-            cache_hit=False,
-            synthesis_latency_ms=synthesis_latency_ms or int((time.monotonic() - t0) * 1000),
-            conversion_latency_ms=conversion_latency_ms,
-            fallback_reason=fallback_reason,
-            target_lang=translation.target_lang,
-        )
-
-        await self.publish("tts:results", translation.meeting_id, result.to_redis())
-        if self.tts_settings.cache_enabled and audio_bytes:
-            await self.redis.set_with_ttl(
-                cache_key,
-                audio_bytes,
-                self.tts_settings.cache_ttl_seconds,
-            )
->>>>>>> Stashed changes
 
         self.logger.info(
             "audio_synthesized",
@@ -342,12 +298,8 @@ class TTSWorker(BaseWorker):
             voice_mode=voice_mode,
             clone_strength=clone_strength,
             duration_ms=duration_ms,
-<<<<<<< Updated upstream
-            text=translation.translated_text[:60],
-            is_final=translation.is_final_chunk,
-=======
             text=text[:60],
->>>>>>> Stashed changes
+            is_final=translation.is_final_chunk,
         )
 
     def _should_clone(self, text: str, embedding: bytes | None) -> tuple[bool, str]:

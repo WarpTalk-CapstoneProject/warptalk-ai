@@ -27,16 +27,13 @@ class AudioChunkMessage(BaseModel):
     audio_data: bytes  # Raw audio bytes (WAV/PCM)
     language: str = "auto"  # Source language hint or 'auto' for detection
     sample_rate: int = 16000
-<<<<<<< Updated upstream
-    is_final_chunk: bool = False
-=======
     source_runtime: str = "web"  # 'web' | 'desktop'
     vad_confidence: float = 0.0
     speech_start_ms: int = 0
     speech_end_ms: int = 0
     input_lufs: float = 0.0
     noise_suppression_enabled: bool = False
->>>>>>> Stashed changes
+    is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     model_config = {"arbitrary_types_allowed": True}
@@ -50,16 +47,13 @@ class AudioChunkMessage(BaseModel):
             "audio_data": base64.b64encode(self.audio_data).decode("ascii"),
             "language": self.language,
             "sample_rate": str(self.sample_rate),
-<<<<<<< Updated upstream
-            "is_final_chunk": "1" if self.is_final_chunk else "0",
-=======
             "source_runtime": self.source_runtime,
             "vad_confidence": str(self.vad_confidence),
             "speech_start_ms": str(self.speech_start_ms),
             "speech_end_ms": str(self.speech_end_ms),
             "input_lufs": str(self.input_lufs),
             "noise_suppression_enabled": _bool_to_redis(self.noise_suppression_enabled),
->>>>>>> Stashed changes
+            "is_final_chunk": "1" if self.is_final_chunk else "0",
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -74,9 +68,6 @@ class AudioChunkMessage(BaseModel):
             audio_data=base64.b64decode(d["audio_data"]),
             language=d.get("language", "auto"),
             sample_rate=int(d.get("sample_rate", "16000")),
-<<<<<<< Updated upstream
-            is_final_chunk=d.get("is_final_chunk") == "1",
-=======
             source_runtime=d.get("source_runtime", "web"),
             vad_confidence=float(d.get("vad_confidence", "0.0")),
             speech_start_ms=int(d.get("speech_start_ms", "0")),
@@ -85,7 +76,7 @@ class AudioChunkMessage(BaseModel):
             noise_suppression_enabled=_redis_to_bool(
                 d.get("noise_suppression_enabled", "false")
             ),
->>>>>>> Stashed changes
+            is_final_chunk=d.get("is_final_chunk") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 
