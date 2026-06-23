@@ -91,8 +91,12 @@ class AIAssistantWorker(BaseWorker):
             segment_count=len(segments),
         )
 
+        # Fetch context snapshot from Redis
+        context_snapshot_bytes = await self.redis.get(f"meeting:{meeting_id}:context_snapshot")
+        context_snapshot = context_snapshot_bytes.decode("utf-8") if context_snapshot_bytes else ""
+
         # Generate summary
-        summary = await self.assistant.summarize(transcript_text)
+        summary = await self.assistant.summarize(transcript_text, context_snapshot=context_snapshot)
 
         # Store summary in Redis Hash for persistent retrieval
         await self.redis.hset(
@@ -109,7 +113,7 @@ class AIAssistantWorker(BaseWorker):
         })
 
         # Generate action items
-        action_items = await self.assistant.extract_action_items(transcript_text)
+        action_items = await self.assistant.extract_action_items(transcript_text, context_snapshot=context_snapshot)
         await self.redis.hset(
             f"meeting:{meeting_id}:summary",
             "action_items",

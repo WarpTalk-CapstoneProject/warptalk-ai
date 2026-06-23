@@ -54,12 +54,13 @@ When extracting action items:
         self._client = AsyncOpenAI(api_key=self.api_key)
         logger.info("openai_client_initialized", model=self.model)
 
-    async def summarize(self, transcript: str) -> str:
+    async def summarize(self, transcript: str, context_snapshot: str = "") -> str:
         """Generate a meeting summary from the full transcript.
 
         Args:
             transcript: Formatted meeting transcript
                 (e.g. "[Speaker A] Hello everyone...")
+            context_snapshot: Extracted text from RAG documents
 
         Returns:
             Summary text with key decisions, action items, etc.
@@ -67,10 +68,14 @@ When extracting action items:
         if not transcript.strip():
             return "No transcript content to summarize."
 
+        system_content = self.SYSTEM_PROMPT
+        if context_snapshot:
+            system_content += f"\n\nMeeting Context (Reference Documents):\n{context_snapshot}"
+
         response = await self._client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "system", "content": system_content},
                 {
                     "role": "user",
                     "content": f"Please summarize this meeting transcript:\n\n{transcript}",
@@ -82,7 +87,7 @@ When extracting action items:
 
         return response.choices[0].message.content or ""
 
-    async def extract_action_items(self, transcript: str) -> str:
+    async def extract_action_items(self, transcript: str, context_snapshot: str = "") -> str:
         """Extract action items from the transcript.
 
         Returns:
@@ -91,10 +96,14 @@ When extracting action items:
         if not transcript.strip():
             return "No action items found."
 
+        system_content = self.SYSTEM_PROMPT
+        if context_snapshot:
+            system_content += f"\n\nMeeting Context (Reference Documents):\n{context_snapshot}"
+
         response = await self._client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "system", "content": system_content},
                 {
                     "role": "user",
                     "content": f"Extract all action items from this meeting transcript. Format each as a checkbox item:\n\n{transcript}",

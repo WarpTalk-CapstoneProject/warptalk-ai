@@ -207,6 +207,8 @@ class TTSWorker(BaseWorker):
         t0 = time.monotonic()
         conversion_latency_ms = 0
         synthesis_latency_ms = 0
+        voice_mode = "standard"
+        clone_strength = 0.0
 
         if should_clone:
             # Voice cloning available → use XTTS v2
