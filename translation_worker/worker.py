@@ -2,7 +2,7 @@
 
 Pipeline:
     Redis Stream (stt:results:{meetingId})
-    → NLLB / Google Translate
+    → OpenAI gpt-4.1-mini
     → Redis Stream (translate:results:{meetingId})
 
 Passthrough: if source_lang == target_lang, forward without translation.
@@ -13,19 +13,14 @@ from __future__ import annotations
 import time
 
 from shared.base_worker import BaseWorker
-from shared.config import TranslationSettings
+from shared.config import TranslationSettings, resolve_openai_api_key
 from shared.schemas import STTResultMessage, TranslationResultMessage
 from shared.text_utils import split_into_sentences
-
-from translation_worker.translator import (
-    GoogleTranslator,
-    NLLBTranslator,
-    TranslatorWithFallback,
-)
+from translation_worker.translator import OpenAITranslator
 
 
 class TranslationWorker(BaseWorker):
-    """Translation worker using NLLB-200 with Google Translate fallback."""
+    """Translation worker using OpenAI gpt-4.1-mini."""
 
     worker_name = "translation"
     input_stream = "stt:results"
@@ -38,21 +33,16 @@ class TranslationWorker(BaseWorker):
     ) -> None:
         super().__init__(**kwargs)
         self.translation_settings = translation_settings or TranslationSettings()
-        self.translator: TranslatorWithFallback | None = None
+        self.translator: OpenAITranslator | None = None
 
     async def load_model(self) -> None:
-        """Load translation model with optional fallback."""
-        primary = NLLBTranslator(
-            model_name=self.translation_settings.model,
-            device=self.translation_settings.device,
-            max_length=self.translation_settings.max_length,
+        """Initialize OpenAI translation client."""
+        self.translator = OpenAITranslator(
+            api_key=resolve_openai_api_key(self.translation_settings.api_key),
+            model=self.translation_settings.model,
+            max_tokens=self.translation_settings.max_tokens,
+            temperature=self.translation_settings.temperature,
         )
-
-        fallback = None
-        if self.translation_settings.fallback_provider == "google":
-            fallback = GoogleTranslator()
-
-        self.translator = TranslatorWithFallback(primary, fallback)
         await self.translator.load()
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
@@ -73,7 +63,7 @@ class TranslationWorker(BaseWorker):
 
         # Split long STT results into smaller sentences (streaming mechanism)
         sentences = split_into_sentences(stt_result.text)
-        
+
         if not sentences:
             if stt_result.is_final_chunk:
                 result = TranslationResultMessage(
@@ -98,7 +88,7 @@ class TranslationWorker(BaseWorker):
             if stt_result.language == target_lang:
                 translated_text = sentence
             else:
-                # Translates quickly because NLLB handles partial sentences ~5-15 words
+                # gpt-4.1-mini: ~200-400ms per call, quality >> NLLB for all language pairs
                 translated_text = await self.translator.translate(
                     sentence,
                     source_lang=stt_result.language,
@@ -147,5 +137,5 @@ class TranslationWorker(BaseWorker):
         if cached:
             return cached.decode() if isinstance(cached, bytes) else cached
 
-        # Default fallback
-        return "vi"
+        # Global fallback — avoid assuming Vietnamese for all users
+        return "en"

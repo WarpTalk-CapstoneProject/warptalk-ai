@@ -14,11 +14,10 @@ from __future__ import annotations
 
 import time
 
-from shared.base_worker import BaseWorker
-from shared.config import AssistantSettings
-from shared.schemas import STTResultMessage
-
 from ai_assistant_worker.assistant import MeetingAssistant
+from shared.base_worker import BaseWorker
+from shared.config import AssistantSettings, resolve_openai_api_key
+from shared.schemas import STTResultMessage
 
 
 class AIAssistantWorker(BaseWorker):
@@ -42,7 +41,7 @@ class AIAssistantWorker(BaseWorker):
     async def load_model(self) -> None:
         """Initialize OpenAI client."""
         self.assistant = MeetingAssistant(
-            api_key=self.assistant_settings.api_key,
+            api_key=resolve_openai_api_key(self.assistant_settings.api_key),
             model=self.assistant_settings.model,
             max_tokens=self.assistant_settings.max_tokens,
             temperature=self.assistant_settings.temperature,
@@ -113,7 +112,10 @@ class AIAssistantWorker(BaseWorker):
         })
 
         # Generate action items
-        action_items = await self.assistant.extract_action_items(transcript_text, context_snapshot=context_snapshot)
+        action_items = await self.assistant.extract_action_items(
+            transcript_text,
+            context_snapshot=context_snapshot,
+        )
         await self.redis.hset(
             f"meeting:{meeting_id}:summary",
             "action_items",

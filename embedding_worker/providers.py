@@ -6,11 +6,10 @@ This module only handles text/RAG embeddings for Qdrant-backed retrieval.
 
 from __future__ import annotations
 
-import os
 from abc import ABC, abstractmethod
 from typing import Any
 
-from shared.config import EmbeddingSettings
+from shared.config import EmbeddingSettings, resolve_openai_api_key
 
 
 class EmbeddingProvider(ABC):
@@ -33,7 +32,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         self._client = client
 
     async def _get_client(self) -> Any:
-        api_key = self.settings.api_key or os.getenv("OPENAI_API_KEY", "")
+        api_key = resolve_openai_api_key(self.settings.api_key)
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is required for OpenAI embeddings")
 

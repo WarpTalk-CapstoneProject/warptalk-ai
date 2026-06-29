@@ -1,27 +1,20 @@
-"""Whisper STT model wrapper for mlx-whisper.
+"""OpenAI gpt-4o-mini-transcribe STT wrapper.
 
-Uses mlx-whisper because it provides the most reliable Vietnamese accuracy on
-Apple Silicon for the current local realtime transcript pipeline.
-
-Provides a synchronous `transcribe()` method designed to be called
-via `asyncio.to_thread()` from the async worker.
+Replaces mlx-whisper: zero GPU infra, Linux-deployable, demo cost < $10.
+Latency vs self-host: +100–200ms/utterance — not perceptible in meeting context.
 """
 
 from __future__ import annotations
 
-import os
+import io
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from shared.logger import get_logger
 
-if TYPE_CHECKING:
-    import numpy as np
-
 logger = get_logger(__name__)
 
-# Common Whisper Vietnamese misspelling corrections (diacritical errors)
+# Vietnamese diacritical corrections — gpt-4o-mini-transcribe also makes these
 _VI_CORRECTIONS: dict[str, str] = {
     "lu trữ": "lưu trữ",
     "luu trữ": "lưu trữ",
@@ -52,7 +45,6 @@ _VI_CORRECTIONS: dict[str, str] = {
 
 
 def _fix_vietnamese(text: str) -> str:
-    """Apply common Vietnamese spelling corrections."""
     result = text
     for wrong, right in _VI_CORRECTIONS.items():
         lower = result.lower()
@@ -66,8 +58,6 @@ def _fix_vietnamese(text: str) -> str:
 
 @dataclass(slots=True)
 class TranscribedSegment:
-    """A single transcribed text segment."""
-
     text: str
     language: str
     confidence: float
@@ -75,17 +65,27 @@ class TranscribedSegment:
     end_ms: int
 
 
-# MLX-Whisper model repo mapping
-_MLX_REPOS = {
-    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
-    "medium": "mlx-community/whisper-medium-mlx",
-    "small": "mlx-community/whisper-small-mlx",
-    "base": "mlx-community/whisper-base-mlx",
-    "tiny": "mlx-community/whisper-tiny-mlx",
+# OpenAI full-language-name → ISO 639-1 code (returned when language=None)
+_LANG_NAME_TO_CODE: dict[str, str] = {
+    "english": "en",
+    "vietnamese": "vi",
+    "chinese": "zh",
+    "japanese": "ja",
+    "korean": "ko",
+    "french": "fr",
+    "german": "de",
+    "spanish": "es",
+    "thai": "th",
+    "indonesian": "id",
+    "russian": "ru",
+    "arabic": "ar",
+    "portuguese": "pt",
+    "italian": "it",
+    "malay": "ms",
 }
 
+_ALLOWED_LANGUAGES = {"vi", "en"}
 
-# Known Whisper hallucination patterns
 _HALLUCINATIONS = {
     "thank you", "thanks for watching", "bye", "bye bye",
     "good night", "oh", "you", "yeah", "okay",
@@ -94,18 +94,14 @@ _HALLUCINATIONS = {
     "fuck", "fuck.", "hmm", "hmm.", "i'm",
     "subscribe", "like and subscribe",
     "see you all later", "see you all later.",
-    # Vietnamese hallucinations
     "cảm ơn mọi người", "cảm ơn các bạn đã theo dõi",
     "hãy subscribe cho kênh", "xin chào",
     "cảm ơn các bạn đã xem video",
     "đăng ký kênh", "nhấn nút đăng ký",
-    # Initial prompt leakage
     "cuộc họp tiếng việt, có thể xen tiếng anh",
     "cuộc họp tiếng anh",
     "đây là cuộc họp bằng tiếng việt",
-    # Short noise transcripts
     "nói", "ừ", "à", "ađe", "ade",
-    # Lone punctuation
     ".", "..", "...",
 }
 
@@ -113,9 +109,14 @@ _HALLUCINATION_SUBSTRINGS = [
     "subscribe", "đăng ký kênh", "theo dõi kênh",
     "la la school", "xem video", "bỏ lỡ",
     "ủng hộ kênh", "hẹn gặp lại", "chào mừng",
-    "ghiền mì gõ", "video tiếp theo",
-    "video hấp dẫn",
+    "ghiền mì gõ", "video tiếp theo", "video hấp dẫn",
 ]
+
+
+def _normalize_language(lang: str) -> str:
+    """Normalize OpenAI language output to ISO 639-1 code."""
+    lower = lang.lower()
+    return _LANG_NAME_TO_CODE.get(lower, lower[:2] if len(lower) > 2 else lower)
 
 
 def _filter_segments(
@@ -123,12 +124,10 @@ def _filter_segments(
     detected_language: str,
     chunk_offset_ms: int,
 ) -> list[TranscribedSegment]:
-    """Filter and post-process raw Whisper segments."""
+    lang_code = _normalize_language(detected_language)
 
-    # Filter out unlikely languages
-    _ALLOWED_LANGUAGES = {"vi", "en"}
-    if detected_language not in _ALLOWED_LANGUAGES:
-        logger.debug("filtered_wrong_language", detected=detected_language)
+    if lang_code not in _ALLOWED_LANGUAGES:
+        logger.debug("filtered_wrong_language", detected=detected_language, code=lang_code)
         return []
 
     results: list[TranscribedSegment] = []
@@ -139,150 +138,131 @@ def _filter_segments(
         if not text:
             continue
 
-        avg_logprob = seg.get("avg_logprob", -1.0)
-        no_speech = seg.get("no_speech_prob", 0.0)
+        avg_logprob = seg.get("avg_logprob", -1.0) or -1.0
+        no_speech = seg.get("no_speech_prob", 0.0) or 0.0
         text_lower = text.lower().rstrip('.!,')
 
-        # no_speech_prob filter
         if no_speech > 0.6:
             logger.debug("filtered_no_speech", text=text, no_speech_prob=round(no_speech, 2))
             continue
 
-        # Confidence filter: logprob < -1.0 usually means garbled output
         if avg_logprob < -1.0:
             logger.debug("filtered_low_confidence", text=text, logprob=round(avg_logprob, 2))
             continue
 
-        # Exact hallucination filter
         if text_lower in _HALLUCINATIONS:
             logger.debug("filtered_hallucination", text=text)
             continue
 
-        # Substring hallucination filter
         if any(sub in text_lower for sub in _HALLUCINATION_SUBSTRINGS):
             logger.debug("filtered_hallucination_substring", text=text)
             continue
 
-        # Repetition filter: "rô, rô, rô, rô" etc.
         words = text_lower.replace(",", "").split()
-        if len(words) >= 4:
-            unique_words = set(words)
-            if len(unique_words) <= 2:
-                logger.debug("filtered_repetition", text=text[:50])
-                continue
+        if len(words) >= 4 and len(set(words)) <= 2:
+            logger.debug("filtered_repetition", text=text[:50])
+            continue
 
-        # Character repetition: "hìììì..." or "aaaa..."
         if re.search(r'(.)\1{3,}', text_lower):
             logger.debug("filtered_char_repetition", text=text[:50])
             continue
 
-        # Dedup
         if text_lower in seen_texts:
             logger.debug("filtered_duplicate", text=text)
             continue
         seen_texts.add(text_lower)
 
-        start_s = seg.get("start", 0.0)
-        end_s = seg.get("end", 0.0)
-
-        logger.info(
-            "segment_accepted",
-            text=text,
-            logprob=round(avg_logprob, 2),
-            no_speech=round(no_speech, 2),
-        )
-        # Apply Vietnamese spelling corrections
-        corrected = _fix_vietnamese(text) if detected_language == "vi" else text
+        corrected = _fix_vietnamese(text) if lang_code == "vi" else text
         if corrected != text:
             logger.info("spelling_corrected", original=text, corrected=corrected)
 
         results.append(
             TranscribedSegment(
                 text=corrected,
-                language=detected_language,
+                language=lang_code,
                 confidence=round(avg_logprob, 4),
-                start_ms=chunk_offset_ms + int(start_s * 1000),
-                end_ms=chunk_offset_ms + int(end_s * 1000),
+                start_ms=chunk_offset_ms + int(seg.get("start", 0.0) * 1000),
+                end_ms=chunk_offset_ms + int(seg.get("end", 0.0) * 1000),
             )
         )
 
     return results
 
 
-class WhisperSTT:
-    """MLX-Whisper model wrapper for Apple Silicon accelerated STT.
+class OpenAISTT:
+    """OpenAI gpt-4o-mini-transcribe wrapper.
 
-    Uses Apple GPU (Metal) via the MLX framework for fast inference
-    on M-series chips. Falls back gracefully on non-Apple hardware.
+    Fully async — call `await transcribe()` directly, no asyncio.to_thread needed.
     """
 
-    def __init__(
+    def __init__(self, api_key: str = "", model: str = "gpt-4o-mini-transcribe") -> None:
+        self.api_key = api_key
+        self.model = model
+        self._client = None
+
+    async def load(self) -> None:
+        if not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY is required for OpenAI STT")
+
+        from openai import AsyncOpenAI
+
+        self._client = AsyncOpenAI(api_key=self.api_key)
+        logger.info("openai_stt_ready", model=self.model)
+
+    async def transcribe(
         self,
-        model_size: str = "large-v3-turbo",
-        device: str = "cpu",  # Ignored — MLX auto-selects GPU
-        compute_type: str = "int8",  # Ignored — MLX uses its own quantization
-        beam_size: int = 1,
-        vad_filter: bool = False,
-    ) -> None:
-        self.model_size = model_size
-        self.beam_size = beam_size
-        self._repo = _MLX_REPOS.get(model_size, model_size)
-        self._loaded = False
-
-    def load(self) -> None:
-        """Pre-download the MLX model weights."""
-        import mlx_whisper
-
-        logger.info(
-            "loading_whisper_model",
-            model_size=self.model_size,
-            engine="mlx",
-            repo=self._repo,
-        )
-        # Warmup: run a short transcription to trigger model download + JIT
-        import numpy as np
-        dummy = np.zeros(16000, dtype=np.float32)  # 1s silence
-        mlx_whisper.transcribe(dummy, path_or_hf_repo=self._repo)
-        self._loaded = True
-        logger.info("whisper_model_loaded")
-
-    def transcribe(
-        self,
-        audio: np.ndarray,
+        audio_bytes: bytes,
+        sample_rate: int = 16000,
         language: str | None = None,
         chunk_offset_ms: int = 0,
     ) -> list[TranscribedSegment]:
-        """Transcribe audio array to text segments.
-
-        This is a BLOCKING call — must be run via asyncio.to_thread().
+        """Transcribe raw audio bytes via OpenAI API.
 
         Args:
-            audio: NumPy float32 array at 16kHz
-            language: Source language hint, None for auto-detect
-            chunk_offset_ms: Offset to add to segment timestamps
+            audio_bytes: Raw audio bytes (WAV/PCM from Redis stream)
+            sample_rate: Sample rate of the audio
+            language: ISO 639-1 hint or None for auto-detect
+            chunk_offset_ms: Timestamp offset to add to segment times
 
         Returns:
-            List of transcribed segments
+            Filtered list of transcribed segments
         """
-        if not self._loaded:
-            raise RuntimeError("Model not loaded. Call load() first.")
+        if not audio_bytes:
+            return []
 
-        import mlx_whisper
+        audio_io = io.BytesIO(audio_bytes)
+        audio_io.name = "audio.wav"
 
         lang_arg = language if language and language != "auto" else None
 
-        result = mlx_whisper.transcribe(
-            audio,
-            path_or_hf_repo=self._repo,
-            language=lang_arg,
-            condition_on_previous_text=False,  # Prevents hallucination chaining
-            temperature=0.0,  # Deterministic output
-            initial_prompt="Đây là cuộc họp bằng tiếng Việt.",
-            no_speech_threshold=0.6,
-            word_timestamps=False,
-        )
+        try:
+            result = await self._client.audio.transcriptions.create(
+                model=self.model,
+                file=audio_io,
+                response_format="verbose_json",
+                language=lang_arg,
+                temperature=0.0,
+            )
+        except Exception as e:
+            logger.error("openai_stt_error", error=str(e))
+            raise
 
-        detected_language = result.get("language", "unknown")
-        segments_raw = result.get("segments", [])
+        detected_language = getattr(result, "language", "unknown") or "unknown"
+        raw_segments = getattr(result, "segments", None) or []
 
-        return _filter_segments(segments_raw, detected_language, chunk_offset_ms)
+        # Normalize SDK segment objects to plain dicts
+        segments_dicts: list[dict] = []
+        for seg in raw_segments:
+            try:
+                d = seg.model_dump() if hasattr(seg, "model_dump") else dict(seg)
+            except Exception:
+                d = {
+                    "text": getattr(seg, "text", ""),
+                    "start": getattr(seg, "start", 0.0),
+                    "end": getattr(seg, "end", 0.0),
+                    "avg_logprob": getattr(seg, "avg_logprob", -1.0),
+                    "no_speech_prob": getattr(seg, "no_speech_prob", 0.0),
+                }
+            segments_dicts.append(d)
+
+        return _filter_segments(segments_dicts, detected_language, chunk_offset_ms)

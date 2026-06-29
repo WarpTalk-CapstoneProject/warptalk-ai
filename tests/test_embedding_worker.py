@@ -23,7 +23,10 @@ class FakeEmbeddingProvider(EmbeddingProvider):
 
 class FakeVectorStore(VectorStore):
     def __init__(self) -> None:
-        self.upsert = AsyncMock()
+        self.upsert_mock = AsyncMock()
+
+    async def upsert(self, *args, **kwargs) -> None:
+        await self.upsert_mock(*args, **kwargs)
 
 
 def _request(**overrides) -> EmbeddingIndexRequest:
@@ -49,7 +52,10 @@ class TestEmbeddingWorker:
             api_key="test-key",
             dimensions=2,
         )
-        worker.provider = OpenAIEmbeddingProvider(settings=worker.embedding_settings, client=object())
+        worker.provider = OpenAIEmbeddingProvider(
+            settings=worker.embedding_settings,
+            client=object(),
+        )
         worker.vector_store = FakeVectorStore()
         worker.publish = AsyncMock()
 
@@ -58,7 +64,7 @@ class TestEmbeddingWorker:
             _request(external_llm_allowed=False).to_redis(),
         )
 
-        worker.vector_store.upsert.assert_not_awaited()
+        worker.vector_store.upsert_mock.assert_not_awaited()
         result = worker.publish.call_args.args[2]
         assert result["status"] == "blocked"
         assert result["reason"] == "external_llm_disabled_without_local_embedding_provider"
@@ -77,7 +83,7 @@ class TestEmbeddingWorker:
 
         await worker.process(b"msg-1", _request().to_redis())
 
-        worker.vector_store.upsert.assert_not_awaited()
+        worker.vector_store.upsert_mock.assert_not_awaited()
         result = worker.publish.call_args.args[2]
         assert result["status"] == "failed"
         assert "Embedding dimension mismatch" in result["reason"]
@@ -96,8 +102,8 @@ class TestEmbeddingWorker:
 
         await worker.process(b"msg-1", _request().to_redis())
 
-        worker.vector_store.upsert.assert_awaited_once()
-        kwargs = worker.vector_store.upsert.await_args.kwargs
+        worker.vector_store.upsert_mock.assert_awaited_once()
+        kwargs = worker.vector_store.upsert_mock.await_args.kwargs
         assert kwargs["collection"] == "workspace-1-rag"
         assert kwargs["ids"] == ["chunk-1"]
         assert kwargs["vectors"] == [[0.1, 0.2]]

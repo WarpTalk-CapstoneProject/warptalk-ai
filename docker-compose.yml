@@ -7,9 +7,6 @@
 #
 # IMPORTANT: Requires warptalk-backend stack running first.
 # AI workers connect to the backend's Redis via external network.
-#
-# GPU workers require NVIDIA Container Toolkit:
-#   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
 
 services:
   # ---- STT Worker ----
@@ -22,13 +19,6 @@ services:
       - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     restart: unless-stopped
 
   # ---- Translation Worker ----
@@ -41,13 +31,6 @@ services:
       - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     restart: unless-stopped
 
   # ---- TTS Worker ----
@@ -60,13 +43,6 @@ services:
       - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     restart: unless-stopped
 
   # ---- AI Assistant Worker ----
@@ -79,6 +55,21 @@ services:
       - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
+    restart: unless-stopped
+
+  # ---- Embedding Worker ----
+  embedding:
+    build:
+      context: .
+      target: embedding
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - VECTOR_DB_URL=http://qdrant:6333
+    networks:
+      - warptalk-infrastructure_warptalk-net
+    depends_on:
+      - qdrant
     restart: unless-stopped
 
   # ---- Qdrant Vector DB ----

@@ -15,18 +15,16 @@ license = { text = "MIT" }
 dependencies = [
     # Redis
     "redis>=5.0",
-    # Audio processing
+    # Lightweight audio helpers
     "numpy>=1.26",
     "soundfile>=0.12",
-    "librosa>=0.10",
-    # AI/ML base
-    "torch>=2.1",
-    "transformers>=4.36",
     # Utilities
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
     "structlog>=24.1",
     "python-dotenv>=1.0",
+    # OpenAI SDK backs STT, translation, assistant, and embeddings per DECISIONS.md
+    "openai>=1.6",
     # LiveKit
     "livekit>=0.11",
     "livekit-api>=0.11",
@@ -34,22 +32,20 @@ dependencies = [
 
 [project.optional-dependencies]
 stt = [
-    "faster-whisper>=1.0",
 ]
 translation = [
-    "sentencepiece>=0.1.99",
-    "deep-translator>=1.11.4",
 ]
 tts = [
-    "TTS>=0.22",
-    "edge-tts>=6.1",
+    "cartesia>=3.2.0",
 ]
 assistant = [
-    "openai>=1.6",
 ]
 embeddings = [
-    "openai>=1.6",
     "qdrant-client>=1.9",
+]
+ingress = [
+    # Optional local VAD path for livekit_ingress_worker; not installed in API-backed Docker workers.
+    "torch>=2.1",
 ]
 dev = [
     "pytest>=7.4",

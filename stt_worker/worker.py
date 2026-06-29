@@ -2,25 +2,22 @@
 
 Pipeline:
     Redis Stream (audio:chunks:{meetingId})
-    → Whisper STT (asyncio.to_thread)
+    → OpenAI gpt-4o-mini-transcribe (async API call)
     → Redis Stream (stt:results:{meetingId})
 """
 
 from __future__ import annotations
 
-import asyncio
 import time
 
-from shared.audio_utils import bytes_to_numpy
 from shared.base_worker import BaseWorker
-from shared.config import STTSettings
+from shared.config import STTSettings, resolve_openai_api_key
 from shared.schemas import AudioChunkMessage, STTResultMessage
-
-from stt_worker.model import WhisperSTT
+from stt_worker.model import OpenAISTT
 
 
 class STTWorker(BaseWorker):
-    """Speech-to-Text worker using mlx-whisper."""
+    """Speech-to-Text worker using OpenAI gpt-4o-mini-transcribe."""
 
     worker_name = "stt"
     input_stream = "audio:chunks"
@@ -29,18 +26,14 @@ class STTWorker(BaseWorker):
     def __init__(self, stt_settings: STTSettings | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.stt_settings = stt_settings or STTSettings()
-        self.model: WhisperSTT | None = None
+        self.model: OpenAISTT | None = None
 
     async def load_model(self) -> None:
-        """Load Whisper model in a thread to avoid blocking the event loop."""
-        self.model = WhisperSTT(
-            model_size=self.stt_settings.model,
-            device=self.stt_settings.device,
-            compute_type=self.stt_settings.compute_type,
-            beam_size=self.stt_settings.beam_size,
-            vad_filter=self.stt_settings.vad_filter,
+        self.model = OpenAISTT(
+            api_key=resolve_openai_api_key(self.stt_settings.api_key),
+            model=self.stt_settings.model,
         )
-        await asyncio.to_thread(self.model.load)
+        await self.model.load()
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Process one audio chunk: transcribe and publish results."""
@@ -62,34 +55,45 @@ class STTWorker(BaseWorker):
             is_final=chunk.is_final_chunk,
         )
 
-        # Convert audio bytes to numpy array
-        audio_array = bytes_to_numpy(chunk.audio_data, sample_rate=chunk.sample_rate)
-
-        # Calculate time offset for this chunk
         chunk_offset_ms = chunk.chunk_index * self.settings.chunk_duration_ms
-
-        # Auto-detect language — works well with VAD-gated audio (no silence)
         language_hint = chunk.language if chunk.language != "auto" else None
 
         t0 = time.monotonic()
-        segments = await asyncio.to_thread(
-            self.model.transcribe,
-            audio_array,
-            language=language_hint,
-            chunk_offset_ms=chunk_offset_ms,
-        )
+        try:
+            segments = await self.model.transcribe(
+                chunk.audio_data,
+                sample_rate=chunk.sample_rate,
+                language=language_hint,
+                chunk_offset_ms=chunk_offset_ms,
+            )
+        except Exception as exc:
+            await self.redis.publish_system_event(
+                room_id=chunk.meeting_id,
+                event_type="stt_unavailable",
+                payload={
+                    "speakerId": chunk.speaker_id,
+                    "chunkIndex": chunk.chunk_index,
+                    "model": self.stt_settings.model,
+                    "error": str(exc),
+                },
+            )
+            self.logger.error(
+                "stt_unavailable",
+                meeting_id=chunk.meeting_id,
+                speaker_id=chunk.speaker_id,
+                chunk_index=chunk.chunk_index,
+                error=str(exc),
+            )
+            segments = []
         inference_ms = int((time.monotonic() - t0) * 1000)
-        audio_ms = int(len(audio_array) / 16000 * 1000)
 
         self.logger.info(
             "inference_complete",
             inference_ms=inference_ms,
-            audio_ms=audio_ms,
-            rtf=round(inference_ms / max(audio_ms, 1), 2),
             segments=len(segments),
+            chunk_index=chunk.chunk_index,
         )
 
-        # Publish each transcribed segment
         for segment in segments:
             result = STTResultMessage(
                 meeting_id=chunk.meeting_id,
@@ -116,7 +120,6 @@ class STTWorker(BaseWorker):
             )
 
         if not segments and chunk.is_final_chunk:
-            # Emit empty result just to propagate the final chunk flag
             result = STTResultMessage(
                 meeting_id=chunk.meeting_id,
                 speaker_id=chunk.speaker_id,
@@ -126,4 +129,3 @@ class STTWorker(BaseWorker):
                 timestamp_ms=chunk.timestamp_ms,
             )
             await self.publish("stt:results", chunk.meeting_id, result.to_redis())
-

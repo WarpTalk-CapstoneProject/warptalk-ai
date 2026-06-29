@@ -1,226 +1,248 @@
-"""Tests for TTS Worker — verify progressive voice cloning logic."""
+"""Tests for TTS Worker — Cartesia voice cloning and synthesis."""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-import numpy as np
 import pytest
 
 from shared.config import TTSSettings, WorkerSettings
 from shared.schemas import TranslationResultMessage
-
-from tts_worker.embedding_extractor import EmbeddingExtractor, SpeakerAudioBuffer
 from tts_worker.worker import TTSWorker
 
 
-class TestSpeakerAudioBuffer:
-    """SpeakerAudioBuffer accumulation tests."""
-
-    def test_add_tracks_seconds(self) -> None:
-        buf = SpeakerAudioBuffer()
-        audio = np.zeros(16000, dtype=np.float32)  # 1 second
-        buf.add(audio, sample_rate=16000)
-
-        assert buf.total_seconds == pytest.approx(1.0)
-        assert len(buf.samples) == 1
-
-    def test_multiple_adds_accumulate(self) -> None:
-        buf = SpeakerAudioBuffer()
-        for _ in range(5):
-            buf.add(np.zeros(16000, dtype=np.float32), 16000)
-
-        assert buf.total_seconds == pytest.approx(5.0)
-        assert len(buf.samples) == 5
-
-    def test_get_combined(self) -> None:
-        buf = SpeakerAudioBuffer()
-        buf.add(np.ones(8000, dtype=np.float32), 16000)
-        buf.add(np.ones(8000, dtype=np.float32) * 2, 16000)
-
-        combined = buf.get_combined()
-        assert len(combined) == 16000
-        assert combined[0] == 1.0
-        assert combined[8000] == 2.0
+def _make_worker(mock_redis_client, worker_settings, tts_settings=None):
+    worker = TTSWorker.__new__(TTSWorker)
+    worker.settings = worker_settings
+    worker.redis = mock_redis_client
+    worker.logger = MagicMock()
+    worker.tts_settings = tts_settings or TTSSettings()
+    worker._route_states = {}
+    worker._consumer_name = "test-consumer"
+    worker.worker_name = "tts"
+    worker.cartesia = MagicMock()
+    worker.cartesia.synthesize = AsyncMock(return_value=(b"audio_bytes", 1000))
+    worker.cartesia.clone_voice = AsyncMock(return_value="test-voice-id")
+    return worker
 
 
-class TestEmbeddingExtractor:
-    """EmbeddingExtractor progressive cloning tests."""
-
-    async def test_no_extraction_before_min_seconds(self) -> None:
-        """Should not extract embedding before min_seconds reached."""
-        redis = MagicMock()
-        redis.hset = AsyncMock()
-
-        extractor = EmbeddingExtractor(
-            redis=redis,
-            min_seconds=5.0,
-            refine_seconds=15.0,
-        )
-
-        # Add 3s of audio (less than min 5s)
-        audio = np.zeros(16000 * 3, dtype=np.float32)
-        await extractor.add_audio("m1", "s1", audio, 16000)
-
-        # No embedding should be cached
-        redis.hset.assert_not_called()
-
-    def test_buffer_key_format(self) -> None:
-        extractor = EmbeddingExtractor.__new__(EmbeddingExtractor)
-        assert extractor._buffer_key("meeting-1", "speaker-1") == "meeting-1:speaker-1"
+def _make_msg(text="Xin chào bạn", target_lang="vi", is_final=False):
+    return TranslationResultMessage(
+        segment_id="seg-1",
+        meeting_id="m1",
+        speaker_id="s1",
+        original_text="Hello",
+        translated_text=text,
+        source_lang="en",
+        target_lang=target_lang,
+        is_final_chunk=is_final,
+    )
 
 
 class TestTTSWorker:
-    """TTS Worker process() tests."""
+    """TTSWorker process() tests with CartesiaSynthesizer."""
 
-    async def test_uses_edge_tts_when_no_embedding(
+    async def test_uses_default_voice_when_no_voice_id(
         self, mock_redis_client, worker_settings: WorkerSettings
     ) -> None:
-        """Should use Edge-TTS when no voice embedding is cached."""
-        worker = TTSWorker.__new__(TTSWorker)
-        worker.settings = worker_settings
-        worker.redis = mock_redis_client
-        worker.logger = MagicMock()
-        worker.tts_settings = TTSSettings()
+        """synthesize() called with voice_id=None when no clone cached."""
+        worker = _make_worker(mock_redis_client, worker_settings)
 
-        # No embedding in Redis
-        mock_redis_client._redis.hget = AsyncMock(return_value=None)
+        # No voice_id, no cache
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
 
-        # Mock Edge-TTS
-        worker.edge_tts = MagicMock()
-        worker.edge_tts.synthesize = AsyncMock(return_value=(b"audio", 1000))
-        worker.xtts = MagicMock()
-        worker.xtts.synthesize = AsyncMock()
+        await worker.process(b"msg-1", _make_msg().to_redis())
 
-        msg = TranslationResultMessage(
-            segment_id="seg-1",
-            meeting_id="m1",
-            speaker_id="s1",
-            original_text="Hello",
-            translated_text="Xin chào",
-            source_lang="en",
-            target_lang="vi",
-        )
+        worker.cartesia.synthesize.assert_called_once()
+        _, kwargs = worker.cartesia.synthesize.call_args
+        assert kwargs.get("voice_id") is None
 
-        await worker.process(b"msg-1", msg.to_redis())
-
-        # Edge-TTS should be called, not XTTS
-        worker.edge_tts.synthesize.assert_called_once()
-        worker.xtts.synthesize.assert_not_called()
-
-    async def test_uses_xtts_when_embedding_exists(
+    async def test_uses_cloned_voice_when_voice_id_cached(
         self, mock_redis_client, worker_settings: WorkerSettings
     ) -> None:
-        """Should use XTTS v2 when voice embedding is cached."""
-        worker = TTSWorker.__new__(TTSWorker)
-        worker.settings = worker_settings
-        worker.redis = mock_redis_client
-        worker.logger = MagicMock()
-        worker.tts_settings = TTSSettings()
+        """synthesize() called with voice_id when clone is cached in Redis."""
+        worker = _make_worker(mock_redis_client, worker_settings)
 
-        # Embedding exists in Redis
-        fake_embedding = np.zeros(256, dtype=np.float32).tobytes()
-        mock_redis_client._redis.hget = AsyncMock(return_value=fake_embedding)
+        mock_redis_client._redis.hget.return_value = b"cached-voice-id"
+        mock_redis_client._redis.get.return_value = None
 
-        # Mock synthesizers
-        worker.edge_tts = MagicMock()
-        worker.edge_tts.synthesize = AsyncMock()
-        worker.xtts = MagicMock()
-        worker.xtts.synthesize = AsyncMock(return_value=(b"cloned-audio", 1500))
+        await worker.process(b"msg-1", _make_msg().to_redis())
 
-        msg = TranslationResultMessage(
-            segment_id="seg-1",
-            meeting_id="m1",
-            speaker_id="s1",
-            original_text="Hello",
-            translated_text="Xin chào",
-            source_lang="en",
-            target_lang="vi",
-        )
+        worker.cartesia.synthesize.assert_called_once()
+        _, kwargs = worker.cartesia.synthesize.call_args
+        assert kwargs.get("voice_id") == "cached-voice-id"
 
-        await worker.process(b"msg-1", msg.to_redis())
-
-        # XTTS should be called with embedding, not Edge-TTS
-        worker.xtts.synthesize.assert_called_once()
-        worker.edge_tts.synthesize.assert_not_called()
-        call_kwargs = worker.xtts.synthesize.call_args
-        assert call_kwargs[1].get("speaker_embedding") == fake_embedding or \
-               call_kwargs.kwargs.get("speaker_embedding") == fake_embedding
-
-    async def test_uses_standard_voice_for_short_utterance_even_with_embedding(
+    async def test_publishes_cloned_voice_metadata(
         self, mock_redis_client, worker_settings: WorkerSettings
     ) -> None:
-        """Short phrases should stay on anchor voice to protect latency and continuity."""
-        worker = TTSWorker.__new__(TTSWorker)
-        worker.settings = worker_settings
-        worker.redis = mock_redis_client
-        worker.logger = MagicMock()
-        worker.tts_settings = TTSSettings(min_clone_chars=8)
+        """Published TTSResultMessage should reflect cloned voice fields."""
+        worker = _make_worker(mock_redis_client, worker_settings)
 
-        fake_embedding = np.zeros(256, dtype=np.float32).tobytes()
-        mock_redis_client._redis.hget = AsyncMock(return_value=fake_embedding)
+        mock_redis_client._redis.hget.return_value = b"voice-abc"
+        mock_redis_client._redis.get.return_value = None
 
-        worker.edge_tts = MagicMock(provider_name="edge")
-        worker.edge_tts.synthesize = AsyncMock(return_value=(b"ok-audio", 300))
-        worker.xtts = MagicMock(provider_name="xtts")
-        worker.xtts.synthesize = AsyncMock()
+        await worker.process(b"msg-1", _make_msg().to_redis())
 
-        msg = TranslationResultMessage(
-            segment_id="seg-1",
-            meeting_id="m1",
-            speaker_id="s1",
-            original_text="Ok",
-            translated_text="Ok",
-            source_lang="en",
-            target_lang="vi",
+        mock_redis_client._redis.xadd.assert_called()
+        # Find the tts:results publish (first call is room-specific stream)
+        tts_call = next(
+            c for c in mock_redis_client._redis.xadd.call_args_list
+            if "tts:results" in str(c.args[0])
         )
-
-        await worker.process(b"msg-1", msg.to_redis())
-
-        worker.edge_tts.synthesize.assert_called_once()
-        worker.xtts.synthesize.assert_not_called()
-        published = mock_redis_client._redis.xadd.call_args.args[1]
-        assert published["voice_type"] == "default"
-        assert published["voice_mode"] == "standard"
-        assert published["clone_strength"] == "0.0"
-        assert published["fallback_reason"] == "short_utterance"
-
-    async def test_publishes_blended_metadata_when_embedding_exists(
-        self, mock_redis_client, worker_settings: WorkerSettings
-    ) -> None:
-        """Available clone path should publish blended voice metadata for clients."""
-        worker = TTSWorker.__new__(TTSWorker)
-        worker.settings = worker_settings
-        worker.redis = mock_redis_client
-        worker.logger = MagicMock()
-        worker.tts_settings = TTSSettings(min_clone_chars=4, default_clone_strength=0.6)
-
-        fake_embedding = np.zeros(256, dtype=np.float32).tobytes()
-        mock_redis_client._redis.hget = AsyncMock(return_value=fake_embedding)
-
-        worker.edge_tts = MagicMock(provider_name="edge")
-        worker.edge_tts.synthesize = AsyncMock()
-        worker.xtts = MagicMock(provider_name="xtts")
-        worker.xtts.synthesize = AsyncMock(return_value=(b"cloned-audio", 1500))
-
-        msg = TranslationResultMessage(
-            segment_id="seg-1",
-            meeting_id="m1",
-            speaker_id="s1",
-            original_text="Hello there",
-            translated_text="Xin chào bạn",
-            source_lang="en",
-            target_lang="vi",
-        )
-
-        await worker.process(b"msg-1", msg.to_redis())
-
-        published = mock_redis_client._redis.xadd.call_args.args[1]
-        assert published["voice_type"] == "blended"
-        assert published["voice_mode"] == "blended"
-        assert published["clone_strength"] == "0.6"
-        assert published["anchor_provider"] == "edge"
-        assert published["clone_provider"] == "xtts"
-        assert published["render_location"] == "server"
-        assert published["cache_key"]
+        published = tts_call.args[1]
+        assert published["voice_type"] == "cloned"
+        assert published["voice_mode"] == "cloned"
+        assert published["clone_strength"] == "1.0"
+        assert published["anchor_provider"] == "cartesia"
+        assert published["clone_provider"] == "cartesia"
         assert published["cache_hit"] == "false"
+
+    async def test_publishes_default_voice_metadata_when_no_clone(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """Published result should reflect voice_type=default when no voice_id."""
+        worker = _make_worker(mock_redis_client, worker_settings)
+
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
+
+        await worker.process(b"msg-1", _make_msg().to_redis())
+
+        tts_call = next(
+            c for c in mock_redis_client._redis.xadd.call_args_list
+            if "tts:results" in str(c.args[0])
+        )
+        published = tts_call.args[1]
+        assert published["voice_type"] == "default"
+        assert published["clone_strength"] == "0.0"
+        assert published["fallback_reason"] == "voice_profile_not_ready"
+
+    async def test_skips_empty_text(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """process() should not call synthesize for empty translated_text."""
+        worker = _make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hget.return_value = None
+
+        await worker.process(b"msg-1", _make_msg(text="   ").to_redis())
+
+        worker.cartesia.synthesize.assert_not_called()
+
+    async def test_cache_hit_skips_synthesis(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """Cache hit should publish immediately without calling synthesize."""
+        worker = _make_worker(mock_redis_client, worker_settings)
+
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = b"cached-audio"
+
+        await worker.process(b"msg-1", _make_msg().to_redis())
+
+        worker.cartesia.synthesize.assert_not_called()
+        mock_redis_client._redis.xadd.assert_called()
+        tts_call = next(
+            c for c in mock_redis_client._redis.xadd.call_args_list
+            if "tts:results" in str(c.args[0])
+        )
+        assert tts_call.args[1]["cache_hit"] == "true"
+
+    async def test_synthesis_error_does_not_publish_audio(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """On synthesis failure, no TTSResultMessage should be published."""
+        worker = _make_worker(mock_redis_client, worker_settings)
+        worker.cartesia.synthesize = AsyncMock(side_effect=Exception("API down"))
+
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
+
+        await worker.process(b"msg-1", _make_msg().to_redis())
+
+        # xadd may be called for system event (via publish_system_event → xadd)
+        # but the audio publish should NOT have been called with audio_data
+        for call in mock_redis_client._redis.xadd.call_args_list:
+            stream = call.args[0] if call.args else ""
+            if "tts:results" in stream:
+                pytest.fail("TTSResultMessage should not be published on synthesis error")
+
+    async def test_paused_route_skips_synthesis(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """PAUSED route should return immediately without synthesis."""
+        worker = _make_worker(mock_redis_client, worker_settings)
+        worker._route_states = {"m1": "PAUSED"}
+        mock_redis_client._redis.hget.return_value = None
+
+        await worker.process(b"msg-1", _make_msg().to_redis())
+
+        worker.cartesia.synthesize.assert_not_called()
+
+    async def test_final_chunk_publishes_final_chunk_processed_event(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """is_final_chunk=True should trigger final_chunk_processed system event."""
+        worker = _make_worker(mock_redis_client, worker_settings)
+
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
+
+        await worker.process(b"msg-1", _make_msg(is_final=True).to_redis())
+
+        # final_chunk_processed is published via publish_system_event → xadd to system_events
+        xadd_calls = mock_redis_client._redis.xadd.call_args_list
+        system_event_calls = [
+            c for c in xadd_calls if "system_events" in str(c.args[0])
+        ]
+        assert len(system_event_calls) > 0
+
+
+class TestGetVoiceId:
+    """_get_voice_id Redis lookup tests."""
+
+    async def test_returns_none_when_not_cached(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        worker = TTSWorker.__new__(TTSWorker)
+        worker.redis = mock_redis_client
+        mock_redis_client._redis.hget.return_value = None
+
+        result = await worker._get_voice_id("m1", "s1")
+        assert result is None
+
+    async def test_returns_decoded_string(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        worker = TTSWorker.__new__(TTSWorker)
+        worker.redis = mock_redis_client
+        mock_redis_client._redis.hget.return_value = b"voice-xyz"
+
+        result = await worker._get_voice_id("m1", "s1")
+        assert result == "voice-xyz"
+
+
+class TestCacheKey:
+    def test_deterministic(self) -> None:
+        k1 = TTSWorker._cache_key("s1", "vi", "Xin chào", "cloned")
+        k2 = TTSWorker._cache_key("s1", "vi", "Xin chào", "cloned")
+        assert k1 == k2
+
+    def test_different_text_different_key(self) -> None:
+        k1 = TTSWorker._cache_key("s1", "vi", "Hello", "default")
+        k2 = TTSWorker._cache_key("s1", "vi", "Goodbye", "default")
+        assert k1 != k2
+
+    def test_different_voice_mode_different_key(self) -> None:
+        k1 = TTSWorker._cache_key("s1", "vi", "Hello", "default")
+        k2 = TTSWorker._cache_key("s1", "vi", "Hello", "cloned")
+        assert k1 != k2
+
+    def test_case_insensitive(self) -> None:
+        k1 = TTSWorker._cache_key("s1", "vi", "hello world", "default")
+        k2 = TTSWorker._cache_key("s1", "vi", "HELLO WORLD", "default")
+        assert k1 == k2
+
+    def test_starts_with_prefix(self) -> None:
+        k = TTSWorker._cache_key("s1", "vi", "Hello", "default")
+        assert k.startswith("tts:cache:")

@@ -1,6 +1,6 @@
 """Self-contained E2E latency test: Translation → TTS pipeline.
 
-Directly calls NLLB Translator + Edge-TTS Synthesizer to measure
+Directly calls OpenAI Translator + Cartesia Synthesizer to measure
 real-world latency without Redis worker infrastructure.
 
 Usage:
@@ -16,9 +16,9 @@ import time
 # Add project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from translation_worker.translator import NLLBTranslator, GoogleTranslator, TranslatorWithFallback
-from tts_worker.synthesizer import EdgeTTSSynthesizer
 from shared.text_utils import split_into_sentences
+from translation_worker.translator import OpenAITranslator
+from tts_worker.synthesizer import CartesiaSynthesizer
 
 # ── Test sentences ───────────────────────────────────────────
 TEST_CASES = [
@@ -35,7 +35,10 @@ TEST_CASES = [
         "description": "Medium (EN→VI)",
     },
     {
-        "text": "The new feature implementation is going well. We expect to finish by the end of the week and start user testing next Monday.",
+        "text": (
+            "The new feature implementation is going well. We expect to finish by "
+            "the end of the week and start user testing next Monday."
+        ),
         "language": "en",
         "target": "vi",
         "description": "Long (EN→VI)",
@@ -58,32 +61,41 @@ TEST_CASES = [
 async def main():
     print("=" * 72)
     print("WarpTalk E2E Latency Test — Translation + TTS Pipeline")
-    print("  Translator: NLLB-200-distilled-600M (cpu) + Google fallback")
-    print("  TTS Engine: Edge-TTS (Microsoft Neural Voices)")
+    print("  Translator: OpenAI gpt-4.1-mini")
+    print("  TTS Engine: Cartesia Sonic Turbo")
     print("=" * 72)
     print()
 
     # ── 1. Load models ────────────────────────────────────────
-    print("📦 Loading translation model (first run downloads ~1.2GB)...")
+    openai_api_key = os.getenv("TRANSLATION_API_KEY") or os.getenv("OPENAI_API_KEY")
+    cartesia_api_key = os.getenv("TTS_API_KEY") or os.getenv("CARTESIA_API_KEY")
+    if not openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY or TRANSLATION_API_KEY is required")
+    if not cartesia_api_key:
+        raise RuntimeError("TTS_API_KEY or CARTESIA_API_KEY is required")
+
+    print("📦 Initializing OpenAI translator...")
     t0 = time.perf_counter()
 
-    translator = TranslatorWithFallback(
-        primary=NLLBTranslator(
-            model_name="facebook/nllb-200-distilled-600M",
-            device="cpu",
-            max_length=256,
-        ),
-        fallback=GoogleTranslator(),
+    translator = OpenAITranslator(
+        api_key=openai_api_key,
+        model="gpt-4.1-mini",
+        max_tokens=512,
+        temperature=0.1,
     )
     await translator.load()
     load_time = time.perf_counter() - t0
-    print(f"   ✅ Models loaded in {load_time:.1f}s")
+    print(f"   ✅ Translator ready in {load_time:.1f}s")
     print()
 
-    print("🔊 Initializing Edge-TTS...")
-    synthesizer = EdgeTTSSynthesizer(default_voice="vi-VN-HoaiMyNeural")
+    print("🔊 Initializing Cartesia...")
+    synthesizer = CartesiaSynthesizer(
+        api_key=cartesia_api_key,
+        model="sonic-turbo",
+        sample_rate=44100,
+    )
     await synthesizer.load()
-    print("   ✅ Edge-TTS ready")
+    print("   ✅ Cartesia ready")
     print()
 
     # ── 2. Run test cases ─────────────────────────────────────
@@ -97,9 +109,9 @@ async def main():
 
         # ── 1. Text Chunking (Simulate STT -> Translation Pipelining) ──
         sentences = split_into_sentences(case["text"])
-        
+
         t_start = time.perf_counter()
-        
+
         # Only measure latency to the FIRST chunk (Time To First Byte)
         # In a real pipelined system, subsequent chunks process in background
         first_sentence = sentences[0] if sentences else ""
@@ -123,7 +135,7 @@ async def main():
         t_tts = time.perf_counter()
         tts_ms = (t_tts - t_translate) * 1000
         total_ms = (t_tts - t_start) * 1000
-        
+
         # Note: in real pipeline, other chunks are being generated simultaneously.
         # But E2E latency is defined by TTFB for conversational responsiveness.
 
@@ -188,9 +200,9 @@ async def main():
         print(f"⚠️  Average total {avg_total:.0f}ms EXCEEDS the {target}ms target!")
         print(f"   Breakdown: Translation={avg_translate:.0f}ms, TTS={avg_tts:.0f}ms")
         if avg_translate > avg_tts:
-            print("   💡 Bottleneck: Translation (consider GPU or Google Translate)")
+            print("   💡 Bottleneck: Translation (check prompt/model latency)")
         else:
-            print("   💡 Bottleneck: TTS (Edge-TTS network latency)")
+            print("   💡 Bottleneck: TTS (check Cartesia network latency)")
 
     print()
     print(f"Audio files saved in: {output_dir}/")

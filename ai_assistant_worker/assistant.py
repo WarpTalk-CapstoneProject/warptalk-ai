@@ -1,4 +1,4 @@
-"""AI Assistant — GPT-4o meeting summarization and action items.
+"""AI Assistant — OpenAI meeting summarization and action items.
 
 Provides async methods for generating meeting summaries,
 extracting action items, and answering questions about the meeting.
@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 
 
 class MeetingAssistant:
-    """GPT-4o powered meeting assistant.
+    """OpenAI-powered meeting assistant.
 
     Accumulates transcript segments and generates summaries on demand.
     """
@@ -34,7 +34,7 @@ When extracting action items:
     def __init__(
         self,
         api_key: str,
-        model: str = "gpt-4o",
+        model: str = "gpt-4.1",
         max_tokens: int = 2048,
         temperature: float = 0.3,
     ) -> None:

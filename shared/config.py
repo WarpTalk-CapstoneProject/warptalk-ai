@@ -1,12 +1,22 @@
 """Shared configuration loader using pydantic-settings.
 
 Each worker has its own settings class loaded from environment variables
-with a unique prefix (STT_, TRANSLATION_, TTS_, OPENAI_).
+with a unique prefix (STT_, TRANSLATION_, TTS_, ASSISTANT_, EMBEDDING_).
 """
 
 from __future__ import annotations
 
+import os
+
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
+
+load_dotenv()
+
+
+def resolve_openai_api_key(stage_api_key: str = "") -> str:
+    """Prefer a stage-specific key, then fall back to shared OPENAI_API_KEY."""
+    return stage_api_key or os.getenv("OPENAI_API_KEY", "")
 
 
 class RedisSettings(BaseSettings):
@@ -40,7 +50,7 @@ class WorkerSettings(BaseSettings):
     model_config = {"env_prefix": ""}
 
     log_level: str = "INFO"
-    chunk_duration_ms: int = 3000  # 3s chunk — mlx-whisper has ~4s fixed overhead, longer=better RTF
+    chunk_duration_ms: int = 3000  # 3s chunk — balance between latency and STT context
     redis: RedisSettings = RedisSettings()
     livekit: LiveKitSettings = LiveKitSettings()
 
@@ -56,12 +66,10 @@ class STTSettings(BaseSettings):
 
     model_config = {"env_prefix": "STT_"}
 
-    model: str = "large-v3-turbo"  # MLX: best Vietnamese accuracy
-    device: str = "cpu"  # Ignored by MLX — auto-selects Apple GPU
-    compute_type: str = "int8"  # Ignored by MLX — uses own quantization
+    provider: str = "openai"
+    api_key: str = ""
+    model: str = "gpt-4o-mini-transcribe"
     language: str = "auto"  # Auto-detect for code-switching (Vi + En)
-    beam_size: int = 1  # Greedy for lowest latency
-    vad_filter: bool = False  # VAD handled by ingress worker, not Whisper
 
 
 class TranslationSettings(BaseSettings):
@@ -69,10 +77,11 @@ class TranslationSettings(BaseSettings):
 
     model_config = {"env_prefix": "TRANSLATION_"}
 
-    model: str = "facebook/nllb-200-distilled-600M"
-    device: str = "cuda"
-    fallback_provider: str = "google"  # 'google' or 'none'
-    max_length: int = 512
+    provider: str = "openai"  # 'openai' only — no fallback
+    api_key: str = ""
+    model: str = "gpt-4.1-mini"  # Best cost/quality for short-text translation
+    max_tokens: int = 512
+    temperature: float = 0.1  # Near-deterministic for translation accuracy
 
 
 class TTSSettings(BaseSettings):
@@ -80,29 +89,23 @@ class TTSSettings(BaseSettings):
 
     model_config = {"env_prefix": "TTS_"}
 
-    anchor_provider: str = "edge"
-    clone_provider: str = "xtts"
-    xtts_model: str = "tts_models/multilingual/multi-dataset/xtts_v2"
-    device: str = "cuda"
-    embedding_min_seconds: float = 5.0  # Min audio for first voice embedding
-    embedding_refine_seconds: float = 15.0  # Audio threshold for refined embedding
-    default_voice: str = "en-US-AriaNeural"  # Edge-TTS default voice
-    sample_rate: int = 24000  # XTTS v2 output sample rate
-    blend_enabled: bool = True
+    provider: str = "cartesia"
+    api_key: str = ""
+    model: str = "sonic-turbo"
+    sample_rate: int = 44100
+    voice_clone_min_seconds: float = 10.0  # Buffer threshold before calling /voices/clone
     min_clone_chars: int = 8
-    default_clone_strength: float = 0.6
     cache_enabled: bool = True
-    cache_ttl_seconds: int = 900
-    max_synthesis_ms: int = 6000
+    cache_ttl_seconds: int = 3600
 
 
 class AssistantSettings(BaseSettings):
     """AI Assistant worker settings."""
 
-    model_config = {"env_prefix": "OPENAI_"}
+    model_config = {"env_prefix": "ASSISTANT_"}
 
     api_key: str = ""
-    model: str = "gpt-4o"
+    model: str = "gpt-4.1"
     max_tokens: int = 2048
     temperature: float = 0.3
 

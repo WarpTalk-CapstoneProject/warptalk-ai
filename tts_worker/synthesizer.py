@@ -1,190 +1,116 @@
-"""TTS synthesis backends — XTTS v2 (voice cloning) and Edge-TTS (default).
+"""Cartesia TTS synthesizer — voice cloning + synthesis via Cartesia API.
 
-All synthesizers expose an async `synthesize()` method.
+Replaces XTTS v2 (CPML non-commercial license) and Edge-TTS (no voice cloning).
+TTFA: 40ms (Sonic Turbo). Voice cloning: 10-15s audio sample → voice_id via API.
 """
 
 from __future__ import annotations
 
-import asyncio
 import io
-from abc import ABC, abstractmethod
 
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
 
 
-class Synthesizer(ABC):
-    """Abstract TTS synthesis backend."""
+class CartesiaSynthesizer:
+    """Cartesia Sonic Turbo synthesizer with voice cloning.
 
-    @abstractmethod
+    Voice cloning workflow:
+        1. Buffer 10-15s of raw speaker audio (handled by TTSWorker)
+        2. Call clone_voice() → returns voice_id (cached in Redis)
+        3. All subsequent synthesize() calls use that voice_id
+    """
+
+    provider_name = "cartesia"
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "sonic-turbo",
+        sample_rate: int = 44100,
+    ) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.sample_rate = sample_rate
+        self._client = None
+
+    async def load(self) -> None:
+        from cartesia import AsyncCartesia
+
+        self._client = AsyncCartesia(api_key=self.api_key)
+        logger.info("cartesia_ready", model=self.model, sample_rate=self.sample_rate)
+
+    async def clone_voice(self, audio_bytes: bytes, speaker_label: str) -> str:
+        """Clone a speaker's voice from raw audio.
+
+        Args:
+            audio_bytes: Raw audio bytes (WAV/PCM), minimum ~10s
+            speaker_label: Human-readable label for the cloned voice
+
+        Returns:
+            Cartesia voice_id to use in subsequent synthesize() calls
+        """
+        audio_io = io.BytesIO(audio_bytes)
+
+        voice = await self._client.voices.clone(
+            clip=audio_io,
+            name=speaker_label,
+            enhance=True,
+        )
+        voice_id: str = voice.id
+        logger.info("voice_cloned", label=speaker_label, voice_id=voice_id)
+        return voice_id
+
     async def synthesize(
         self,
         text: str,
         language: str,
-        speaker_embedding: bytes | None = None,
+        voice_id: str | None = None,
     ) -> tuple[bytes, int]:
         """Synthesize text to speech.
 
         Args:
             text: Text to synthesize
-            language: Target language code
-            speaker_embedding: Optional XTTS speaker embedding for voice cloning
+            language: ISO 639-1 language code (e.g. "en", "vi")
+            voice_id: Cartesia voice_id from clone_voice(); None uses Cartesia default
 
         Returns:
-            Tuple of (audio_bytes, duration_ms)
+            Tuple of (wav_bytes, duration_ms)
         """
-
-    @abstractmethod
-    async def load(self) -> None:
-        """Load model or initialize client."""
-
-
-# ---------------------------------------------------------------------------
-# XTTS v2 — GPU voice cloning with streaming support
-# ---------------------------------------------------------------------------
-
-
-class XTTSSynthesizer(Synthesizer):
-    """Coqui XTTS v2 synthesizer with streaming inference.
-
-    Uses `inference_stream()` for low time-to-first-byte,
-    runs in asyncio.to_thread for non-blocking audio generation.
-    """
-
-    def __init__(
-        self,
-        model_name: str = "tts_models/multilingual/multi-dataset/xtts_v2",
-        device: str = "cuda",
-        sample_rate: int = 24000,
-    ) -> None:
-        self.provider_name = "xtts"
-        self.model_name = model_name
-        self.device = device
-        self.sample_rate = sample_rate
-        self._tts = None
-
-    async def load(self) -> None:
-        """Load XTTS v2 model in a thread."""
-        await asyncio.to_thread(self._load_sync)
-
-    def _load_sync(self) -> None:
-        from TTS.api import TTS
-
-        logger.info("loading_xtts_model", model=self.model_name, device=self.device)
-        self._tts = TTS(model_name=self.model_name).to(self.device)
-        logger.info("xtts_model_loaded")
-
-    async def synthesize(
-        self,
-        text: str,
-        language: str,
-        speaker_embedding: bytes | None = None,
-    ) -> tuple[bytes, int]:
-        """Synthesize text with optional voice cloning."""
         if not text.strip():
             return b"", 0
 
-        return await asyncio.to_thread(
-            self._synthesize_sync, text, language, speaker_embedding
+        voice: dict
+        if voice_id:
+            voice = {"id": voice_id}
+        else:
+            # Cartesia auto-selects a built-in voice when no id is specified
+            voice = {"mode": "id", "id": self._default_voice_id(language)}
+
+        audio_bytes: bytes = await self._client.tts.bytes(
+            model_id=self.model,
+            transcript=text,
+            voice=voice,
+            output_format={
+                "container": "wav",
+                "sample_rate": self.sample_rate,
+                "encoding": "pcm_s16le",
+            },
+            language=language,
         )
 
-    def _synthesize_sync(
-        self,
-        text: str,
-        language: str,
-        speaker_embedding: bytes | None,
-    ) -> tuple[bytes, int]:
-        import numpy as np
-        import soundfile as sf
-
-        if speaker_embedding is not None:
-            # Voice cloning with pre-extracted embedding
-            embedding = np.frombuffer(speaker_embedding, dtype=np.float32)
-            wav = self._tts.tts(
-                text=text,
-                language=language,
-                speaker_embedding=embedding,
-            )
-        else:
-            # Use default speaker
-            wav = self._tts.tts(text=text, language=language)
-
-        # Convert numpy array to WAV bytes
-        audio_array = np.array(wav, dtype=np.float32)
-        buffer = io.BytesIO()
-        sf.write(buffer, audio_array, self.sample_rate, format="WAV")
-        buffer.seek(0)
-        audio_bytes = buffer.read()
-
-        duration_ms = int(len(audio_array) / self.sample_rate * 1000)
-        return audio_bytes, duration_ms
-
-
-# ---------------------------------------------------------------------------
-# Edge-TTS — fast, no GPU, default voice (used before voice embedding ready)
-# ---------------------------------------------------------------------------
-
-
-class EdgeTTSSynthesizer(Synthesizer):
-    """Microsoft Edge-TTS synthesizer (no GPU required).
-
-    Used as the default voice during the first 5 seconds before
-    the speaker's voice embedding is extracted.
-    """
-
-    def __init__(self, default_voice: str = "en-US-AriaNeural") -> None:
-        self.provider_name = "edge"
-        self.default_voice = default_voice
-
-    async def load(self) -> None:
-        """Edge-TTS is API-based, no model to load."""
-        logger.info("edge_tts_ready", default_voice=self.default_voice)
-
-    # Language → Edge-TTS voice mapping
-    VOICE_MAP: dict[str, str] = {
-        "en": "en-US-AriaNeural",
-        "vi": "vi-VN-HoaiMyNeural",
-        "zh": "zh-CN-XiaoxiaoNeural",
-        "ja": "ja-JP-NanamiNeural",
-        "ko": "ko-KR-SunHiNeural",
-        "fr": "fr-FR-DeniseNeural",
-        "de": "de-DE-KatjaNeural",
-        "es": "es-ES-ElviraNeural",
-        "th": "th-TH-PremwadeeNeural",
-        "id": "id-ID-GadisNeural",
-        "ru": "ru-RU-SvetlanaNeural",
-        "ar": "ar-SA-ZariyahNeural",
-        "pt": "pt-BR-FranciscaNeural",
-        "it": "it-IT-ElsaNeural",
-    }
-
-    async def synthesize(
-        self,
-        text: str,
-        language: str,
-        speaker_embedding: bytes | None = None,
-    ) -> tuple[bytes, int]:
-        """Synthesize text using Edge-TTS API.
-
-        speaker_embedding is ignored — Edge-TTS uses preset voices.
-        """
-        if not text.strip():
-            return b"", 0
-
-        import edge_tts
-
-        voice = self.VOICE_MAP.get(language, self.default_voice)
-        communicate = edge_tts.Communicate(text, voice)
-
-        audio_chunks: list[bytes] = []
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio_chunks.append(chunk["data"])
-
-        audio_bytes = b"".join(audio_chunks)
-
-        # Estimate duration from audio size (rough: 24kHz 16-bit mono)
-        duration_ms = int(len(audio_bytes) / (24000 * 2) * 1000) if audio_bytes else 0
+        # WAV header is 44 bytes; remaining = PCM samples (16-bit mono)
+        pcm_bytes = max(0, len(audio_bytes) - 44)
+        duration_ms = int(pcm_bytes / 2 / self.sample_rate * 1000)
 
         return audio_bytes, duration_ms
+
+    @staticmethod
+    def _default_voice_id(language: str) -> str:
+        """Built-in Cartesia voice IDs per language (fallback before cloning)."""
+        defaults = {
+            "en": "694f9389-aac1-45b6-b726-9d9369183238",  # Cartesia "Barbershop Man"
+            "vi": "5619d38c-cf51-4d8e-9575-48f61a280413",  # Cartesia Vietnamese voice
+        }
+        return defaults.get(language, defaults["en"])

@@ -1,104 +1,163 @@
-"""Tests for Translation Worker — mock translator, verify passthrough logic."""
+"""Tests for Translation Worker — mock translator, verify passthrough and routing logic."""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-
 from shared.config import TranslationSettings, WorkerSettings
 from shared.schemas import STTResultMessage
-
-from translation_worker.translator import (
-    LANG_CODE_MAP,
-    NLLBTranslator,
-    TranslatorWithFallback,
-    to_flores_code,
-)
+from translation_worker.translator import OpenAITranslator, _lang_name
 from translation_worker.worker import TranslationWorker
 
 
-class TestLangCodeMapping:
-    """Language code conversion tests."""
+class TestLangName:
+    """_lang_name helper tests."""
 
-    @pytest.mark.parametrize(
-        "iso,flores",
-        [
-            ("en", "eng_Latn"),
-            ("vi", "vie_Latn"),
-            ("zh", "zho_Hans"),
-            ("ja", "jpn_Jpan"),
-        ],
-    )
-    def test_known_codes(self, iso: str, flores: str) -> None:
-        assert to_flores_code(iso) == flores
+    def test_known_codes(self) -> None:
+        assert _lang_name("en") == "English"
+        assert _lang_name("vi") == "Vietnamese"
+        assert _lang_name("zh") == "Chinese (Simplified)"
+        assert _lang_name("ja") == "Japanese"
 
-    def test_unknown_code_passes_through(self) -> None:
-        assert to_flores_code("xxx_Yyyy") == "xxx_Yyyy"
+    def test_unknown_code_returns_code(self) -> None:
+        assert _lang_name("xx") == "xx"
+
+    def test_hyphenated_code_uses_base(self) -> None:
+        # "en-US" → "en" → "English"
+        assert _lang_name("en-US") == "English"
 
 
-class TestTranslatorWithFallback:
-    """TranslatorWithFallback tests."""
+class TestOpenAITranslator:
+    """OpenAITranslator unit tests."""
 
-    async def test_uses_primary_on_success(self) -> None:
-        primary = MagicMock()
-        primary.translate = AsyncMock(return_value="translated")
-        primary.load = AsyncMock()
+    async def test_translate_calls_openai(self) -> None:
+        translator = OpenAITranslator.__new__(OpenAITranslator)
+        translator.model = "gpt-4.1-mini"
+        translator.max_tokens = 512
+        translator.temperature = 0.1
 
-        translator = TranslatorWithFallback(primary, fallback=None)
-        result = await translator.translate("hello", "en", "vi")
+        mock_response = MagicMock()
+        mock_response.choices[0].message.content = "Xin chào"
 
-        assert result == "translated"
-        primary.translate.assert_called_once()
+        translator._client = MagicMock()
+        translator._client.chat.completions.create = AsyncMock(return_value=mock_response)
 
-    async def test_falls_back_on_primary_error(self) -> None:
-        primary = MagicMock()
-        primary.translate = AsyncMock(side_effect=RuntimeError("GPU OOM"))
-        primary.load = AsyncMock()
+        result = await translator.translate("Hello", "en", "vi")
 
-        fallback = MagicMock()
-        fallback.translate = AsyncMock(return_value="fallback_result")
-        fallback.load = AsyncMock()
+        assert result == "Xin chào"
+        translator._client.chat.completions.create.assert_called_once()
 
-        translator = TranslatorWithFallback(primary, fallback)
-        result = await translator.translate("hello", "en", "vi")
+    async def test_translate_empty_returns_empty(self) -> None:
+        translator = OpenAITranslator.__new__(OpenAITranslator)
+        translator._client = MagicMock()
 
-        assert result == "fallback_result"
-        fallback.translate.assert_called_once()
+        result = await translator.translate("   ", "en", "vi")
+        assert result == ""
+        translator._client.chat.completions.create.assert_not_called()
+
+    async def test_translate_same_language_passthrough(self) -> None:
+        translator = OpenAITranslator.__new__(OpenAITranslator)
+        translator._client = MagicMock()
+
+        result = await translator.translate("Hello", "en", "en")
+        assert result == "Hello"
+        translator._client.chat.completions.create.assert_not_called()
 
 
 class TestTranslationWorker:
-    """Translation Worker process() tests."""
+    """TranslationWorker process() tests."""
 
-    async def test_passthrough_same_language(
-        self, mock_redis_client, worker_settings: WorkerSettings
-    ) -> None:
-        """Should forward text unchanged if source == target language."""
+    def _make_worker(self, mock_redis_client, worker_settings):
         worker = TranslationWorker.__new__(TranslationWorker)
         worker.settings = worker_settings
         worker.redis = mock_redis_client
         worker.logger = MagicMock()
         worker.translation_settings = TranslationSettings()
-
+        worker._paused_rooms = set()
+        worker.worker_name = "translation"
         mock_translator = MagicMock()
-        mock_translator.translate = AsyncMock()
+        mock_translator.translate = AsyncMock(return_value="Xin chào")
         worker.translator = mock_translator
+        return worker
 
-        # Mock target language = same as source
-        mock_redis_client._redis.hget = AsyncMock(return_value=b"en")
-
-        stt_result = STTResultMessage(
+    def _make_stt_msg(self, language="en", text="Hello world"):
+        return STTResultMessage(
             meeting_id="m1",
             speaker_id="s1",
-            text="Hello world",
-            language="en",
+            text=text,
+            language=language,
             confidence=0.95,
         )
 
-        await worker.process(b"msg-1", stt_result.to_redis())
+    async def test_passthrough_same_language(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """Should forward text unchanged if source == target language."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
 
-        # Translator should NOT be called
-        mock_translator.translate.assert_not_called()
+        # Target lang = source lang (both "en")
+        mock_redis_client._redis.hget.return_value = b"en"
 
-        # But publish should still be called (passthrough)
-        mock_redis_client._redis.xadd.assert_called_once()
+        await worker.process(b"msg-1", self._make_stt_msg().to_redis())
+
+        # Translator should NOT be called (passthrough)
+        worker.translator.translate.assert_not_called()
+        # Result should still be published (BaseWorker.publish calls xadd twice)
+        mock_redis_client._redis.xadd.assert_called()
+
+    async def test_calls_translator_for_different_language(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """Should call translator when source != target language."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+
+        # Target lang = "vi", source lang = "en"
+        mock_redis_client._redis.hget.return_value = b"vi"
+
+        await worker.process(b"msg-1", self._make_stt_msg(language="en").to_redis())
+
+        worker.translator.translate.assert_called()
+
+    async def test_default_fallback_language_is_en(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """When no per-speaker language set, fallback should be 'en' not 'vi'."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+
+        # No language configured for this speaker
+        mock_redis_client._redis.hget.return_value = None
+
+        await worker.process(b"msg-1", self._make_stt_msg(language="vi").to_redis())
+
+        # Translator called with target_lang="en"
+        call_kwargs = worker.translator.translate.call_args
+        target = call_kwargs.kwargs.get("target_lang") or call_kwargs[1].get("target_lang")
+        assert target == "en"
+
+    async def test_publishes_translation_result(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """process() should publish TranslationResultMessage to translate:results."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+
+        mock_redis_client._redis.hget.return_value = b"vi"
+
+        await worker.process(b"msg-1", self._make_stt_msg().to_redis())
+
+        # Verify publish to translate:results stream
+        streams_published = [
+            str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list
+        ]
+        assert any("translate:results" in s for s in streams_published)
+
+    async def test_skips_paused_room(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """process() should skip messages for paused rooms."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        worker._paused_rooms = {"m1"}
+
+        await worker.process(b"msg-1", self._make_stt_msg().to_redis())
+
+        worker.translator.translate.assert_not_called()
+        mock_redis_client._redis.xadd.assert_not_called()
