@@ -35,10 +35,11 @@ COPY translation_worker/ translation_worker/
 COPY tts_worker/ tts_worker/
 COPY ai_assistant_worker/ ai_assistant_worker/
 COPY embedding_worker/ embedding_worker/
+COPY billing_worker/ billing_worker/
 RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Install OpenAI-backed workers plus Cartesia TTS and Qdrant embedding extras.
-RUN python -m pip install --no-cache-dir -e ".[tts,embeddings]"
+# Install OpenAI-backed workers plus Cartesia TTS, Qdrant embedding, and asyncpg billing extras.
+RUN python -m pip install --no-cache-dir -e ".[tts,embeddings,billing]"
 
 # ---- STT Worker ----
 FROM builder AS stt
@@ -85,3 +86,12 @@ USER worker
 
 ENV PYTHONPATH=/app
 CMD ["python", "-m", "embedding_worker"]
+
+# ---- Billing Settlement Worker ----
+FROM builder AS billing
+
+RUN groupadd -r worker && useradd -r -g worker -d /app worker
+USER worker
+
+ENV PYTHONPATH=/app
+CMD ["python", "-m", "billing_worker"]

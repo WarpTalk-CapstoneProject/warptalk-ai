@@ -67,7 +67,7 @@ class CartesiaSynthesizer:
         text: str,
         language: str,
         voice_id: str | None = None,
-    ) -> tuple[bytes, int]:
+    ) -> tuple[bytes, int, str]:
         """Synthesize text to speech.
 
         Args:
@@ -76,17 +76,19 @@ class CartesiaSynthesizer:
             voice_id: Cartesia voice_id from clone_voice(); None uses Cartesia default
 
         Returns:
-            Tuple of (wav_bytes, duration_ms)
+            Tuple of (wav_bytes, duration_ms, resolved_voice_id). resolved_voice_id is
+            always a real Cartesia voice id — the cloned one if `voice_id` was given,
+            otherwise whichever built-in default this call actually used. Callers need
+            this even in the default case: it's the only place that knows which id was
+            used, and it's required to record which voice actually produced a given
+            audio_dubbings row (see transcript.audio_dubbings.provider_voice_id).
         """
-        if not text.strip():
-            return b"", 0
+        resolved_voice_id = voice_id or self._default_voice_id(language)
 
-        voice: dict
-        if voice_id:
-            voice = {"id": voice_id}
-        else:
-            # Cartesia auto-selects a built-in voice when no id is specified
-            voice = {"mode": "id", "id": self._default_voice_id(language)}
+        if not text.strip():
+            return b"", 0, resolved_voice_id
+
+        voice: dict = {"id": resolved_voice_id}
 
         audio_bytes: bytes = await self._client.tts.bytes(
             model_id=self.model,
@@ -104,7 +106,7 @@ class CartesiaSynthesizer:
         pcm_bytes = max(0, len(audio_bytes) - 44)
         duration_ms = int(pcm_bytes / 2 / self.sample_rate * 1000)
 
-        return audio_bytes, duration_ms
+        return audio_bytes, duration_ms, resolved_voice_id
 
     @staticmethod
     def _default_voice_id(language: str) -> str:

@@ -87,12 +87,19 @@ class TTSWorker(BaseWorker):
         if self.tts_settings.cache_enabled:
             cached_audio = await self.redis.get(cache_key)
             if cached_audio:
+                # synthesize() wasn't called (that's the point of the cache), so it never
+                # told us which Cartesia voice a fresh call would resolve to — recompute
+                # the same way it would, without an API call.
+                resolved_voice_id = voice_id or CartesiaSynthesizer._default_voice_id(
+                    translation.target_lang
+                )
                 await self._publish_result(
                     translation=translation,
                     audio_bytes=cached_audio,
                     duration_ms=0,
                     voice_type=voice_type,
                     voice_id=voice_id,
+                    provider_voice_id=resolved_voice_id,
                     cache_key=cache_key,
                     cache_hit=True,
                     synthesis_latency_ms=0,
@@ -101,7 +108,7 @@ class TTSWorker(BaseWorker):
 
         t0 = time.monotonic()
         try:
-            audio_bytes, duration_ms = await self.cartesia.synthesize(
+            audio_bytes, duration_ms, resolved_voice_id = await self.cartesia.synthesize(
                 text=text,
                 language=translation.target_lang,
                 voice_id=voice_id,
@@ -130,6 +137,7 @@ class TTSWorker(BaseWorker):
                 duration_ms=duration_ms,
                 voice_type=voice_type,
                 voice_id=voice_id,
+                provider_voice_id=resolved_voice_id,
                 cache_key=cache_key,
                 cache_hit=False,
                 synthesis_latency_ms=synthesis_latency_ms,
@@ -164,6 +172,7 @@ class TTSWorker(BaseWorker):
         duration_ms: int,
         voice_type: str,
         voice_id: str | None,
+        provider_voice_id: str,
         cache_key: str,
         cache_hit: bool,
         synthesis_latency_ms: int,
@@ -179,6 +188,7 @@ class TTSWorker(BaseWorker):
             clone_strength=1.0 if voice_id else 0.0,
             anchor_provider="cartesia",
             clone_provider="cartesia" if voice_id else "",
+            provider_voice_id=provider_voice_id,
             render_location="server",
             cache_key=cache_key,
             cache_hit=cache_hit,
@@ -191,7 +201,14 @@ class TTSWorker(BaseWorker):
         await self.publish("tts:results", translation.meeting_id, result.to_redis())
 
     async def _get_voice_id(self, meeting_id: str, speaker_id: str) -> str | None:
-        """Return cached Cartesia voice_id for this speaker, or None."""
+        """Return cached Cartesia voice_id for this speaker, or None.
+
+        Re-checks consent on every call (not just before cloning) — if the speaker
+        revokes voice clone consent mid-session, synthesis must fall back to the
+        default voice immediately, even though a voice_id is still cached.
+        """
+        if not self.is_voice_clone_consented(meeting_id, speaker_id):
+            return None
         cached = await self.redis.hget(f"voice:{meeting_id}:{speaker_id}", "voice_id")
         if cached:
             return cached.decode() if isinstance(cached, bytes) else cached
@@ -215,6 +232,14 @@ class TTSWorker(BaseWorker):
                     try:
                         chunk = AudioChunkMessage.from_redis(data)
                         key = (chunk.meeting_id, chunk.speaker_id)
+
+                        # Consent gate: never buffer/clone a speaker's voice (biometric
+                        # data) unless they have at least one current outgoing route with
+                        # VoiceCloneEnabled = true. See base_worker.is_voice_clone_consented.
+                        if not self.is_voice_clone_consented(chunk.meeting_id, chunk.speaker_id):
+                            buffers.pop(key, None)
+                            buffer_seconds.pop(key, None)
+                            continue
 
                         # Skip if voice already cloned for this speaker
                         if await self._get_voice_id(chunk.meeting_id, chunk.speaker_id):
@@ -248,9 +273,10 @@ class TTSWorker(BaseWorker):
         label = f"speaker-{speaker_id[:8]}-{meeting_id[:8]}"
         try:
             voice_id = await self.cartesia.clone_voice(audio_bytes, label)
-            await self.redis.hset(
-                f"voice:{meeting_id}:{speaker_id}", "voice_id", voice_id
-            )
+            cache_key = f"voice:{meeting_id}:{speaker_id}"
+            await self.redis.hset(cache_key, "voice_id", voice_id)
+            # hset has no TTL of its own — without this the key lives in Redis forever.
+            await self.redis.expire(cache_key, self.tts_settings.voice_clone_key_ttl_seconds)
             self.logger.info(
                 "voice_cached",
                 meeting_id=meeting_id,

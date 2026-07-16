@@ -186,6 +186,10 @@ class RedisStreamClient:
         """Set a hash field value."""
         await self.redis.hset(key, field, value)
 
+    async def expire(self, key: str, ttl_seconds: int) -> None:
+        """Set/refresh a TTL on an existing key (e.g. after hset, which has no TTL param)."""
+        await self.redis.expire(key, ttl_seconds)
+
     async def hget(self, key: str, field: str) -> bytes | None:
         """Get a hash field value."""
         return await self.redis.hget(key, field)

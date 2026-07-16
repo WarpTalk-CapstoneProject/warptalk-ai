@@ -130,9 +130,17 @@ class TranslationWorker(BaseWorker):
 
         Reads from a Redis hash set by the backend when a user joins
         and selects their preferred output language.
+
+        NOTE: `meeting_id` here is actually the translation_room_id (see
+        AudioChunkMessage.from_redis / RedisStreamService.PublishAudioChunkAsync).
+        The hash key MUST match TranslationRoomHub.JoinTranslationRoom, which writes
+        to `translationRoom:{translationRoomId}:languages` — this used to read
+        `meeting:{meeting_id}:languages` instead, a key nothing ever wrote to, so
+        every listener's chosen language was silently ignored and this always fell
+        through to the hardcoded "en" fallback below.
         """
         cached = await self.redis.hget(
-            f"meeting:{meeting_id}:languages", speaker_id
+            f"translationRoom:{meeting_id}:languages", speaker_id
         )
         if cached:
             return cached.decode() if isinstance(cached, bytes) else cached

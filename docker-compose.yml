@@ -72,6 +72,21 @@ services:
       - qdrant
     restart: unless-stopped
 
+  # ---- Billing Settlement Worker ----
+  # Only AI worker that talks to Postgres — settles STT/TRANSLATION/AUDIO_DUBBING usage
+  # into subscription.usage_records + subscription.credit_transactions after the fact.
+  billing:
+    build:
+      context: .
+      target: billing
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - BILLING_DB_DSN=${BILLING_DB_DSN}
+    networks:
+      - warptalk-infrastructure_warptalk-net
+    restart: unless-stopped
+
   # ---- Qdrant Vector DB ----
   qdrant:
     image: qdrant/qdrant:latest

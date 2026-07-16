@@ -11,17 +11,25 @@ from shared.schemas import TranslationResultMessage
 from tts_worker.worker import TTSWorker
 
 
-def _make_worker(mock_redis_client, worker_settings, tts_settings=None):
+def _make_worker(mock_redis_client, worker_settings, tts_settings=None, consented=True):
     worker = TTSWorker.__new__(TTSWorker)
     worker.settings = worker_settings
     worker.redis = mock_redis_client
     worker.logger = MagicMock()
     worker.tts_settings = tts_settings or TTSSettings()
     worker._route_states = {}
+    # Voice-clone consent gate reads _room_routes (populated in real usage by
+    # AudioRouteCacheService's AUDIO_ROUTES_UPDATED broadcast — see
+    # shared.base_worker.is_voice_clone_consented). Default the standard test
+    # speaker/room pair ("s1" in "m1") to consented so existing cloned-voice
+    # assertions keep testing what they say they test.
+    worker._room_routes = (
+        {"m1": [{"SourceUserId": "s1", "VoiceCloneEnabled": True}]} if consented else {}
+    )
     worker._consumer_name = "test-consumer"
     worker.worker_name = "tts"
     worker.cartesia = MagicMock()
-    worker.cartesia.synthesize = AsyncMock(return_value=(b"audio_bytes", 1000))
+    worker.cartesia.synthesize = AsyncMock(return_value=(b"audio_bytes", 1000, "resolved-voice-id"))
     worker.cartesia.clone_voice = AsyncMock(return_value="test-voice-id")
     return worker
 
@@ -206,6 +214,7 @@ class TestGetVoiceId:
     ) -> None:
         worker = TTSWorker.__new__(TTSWorker)
         worker.redis = mock_redis_client
+        worker._room_routes = {"m1": [{"SourceUserId": "s1", "VoiceCloneEnabled": True}]}
         mock_redis_client._redis.hget.return_value = None
 
         result = await worker._get_voice_id("m1", "s1")
@@ -216,10 +225,36 @@ class TestGetVoiceId:
     ) -> None:
         worker = TTSWorker.__new__(TTSWorker)
         worker.redis = mock_redis_client
+        worker._room_routes = {"m1": [{"SourceUserId": "s1", "VoiceCloneEnabled": True}]}
         mock_redis_client._redis.hget.return_value = b"voice-xyz"
 
         result = await worker._get_voice_id("m1", "s1")
         assert result == "voice-xyz"
+
+    async def test_returns_none_when_not_consented_even_if_cached(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        """Consent gate wins even when a voice_id is already cached from before
+        the speaker revoked consent — see base_worker.is_voice_clone_consented."""
+        worker = TTSWorker.__new__(TTSWorker)
+        worker.redis = mock_redis_client
+        worker._room_routes = {"m1": [{"SourceUserId": "s1", "VoiceCloneEnabled": False}]}
+        mock_redis_client._redis.hget.return_value = b"voice-xyz"
+
+        result = await worker._get_voice_id("m1", "s1")
+        assert result is None
+
+    async def test_returns_none_when_room_routes_unknown(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        """Fail closed: no route data received yet for this room means no consent."""
+        worker = TTSWorker.__new__(TTSWorker)
+        worker.redis = mock_redis_client
+        worker._room_routes = {}
+        mock_redis_client._redis.hget.return_value = b"voice-xyz"
+
+        result = await worker._get_voice_id("m1", "s1")
+        assert result is None
 
 
 class TestCacheKey:

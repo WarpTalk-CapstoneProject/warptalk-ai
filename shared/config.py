@@ -97,6 +97,7 @@ class TTSSettings(BaseSettings):
     min_clone_chars: int = 8
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
+    voice_clone_key_ttl_seconds: int = 43200  # 12h — unbounded before this; matches AudioRouteCacheService's own Redis TTL
 
 
 class AssistantSettings(BaseSettings):
@@ -121,6 +122,34 @@ class EmbeddingSettings(BaseSettings):
     dimensions: int = 1536
     batch_size: int = 64
     timeout_ms: int = 30000
+
+
+class DatabaseSettings(BaseSettings):
+    """Postgres connection settings for the billing settlement worker.
+
+    No AI worker wrote to Postgres before billing_worker — everything else in
+    warptalk-ai is Redis-only. Keep this settings class scoped to billing_worker
+    only; do not reach for it from stt/translation/tts workers, which must stay
+    on the real-time Redis Streams path.
+    """
+
+    model_config = {"env_prefix": "BILLING_DB_"}
+
+    dsn: str = "postgresql://postgres:postgres@localhost:5432/warptalk"
+    min_pool_size: int = 1
+    max_pool_size: int = 5
+
+
+class BillingSettings(BaseSettings):
+    """Billing settlement worker settings."""
+
+    model_config = {"env_prefix": "BILLING_"}
+
+    database: DatabaseSettings = DatabaseSettings()
+    # Subscription lookups (translation_room_id -> subscription_id) are cached for the
+    # room's lifetime — refresh periodically in case a workspace's active subscription
+    # changes mid-room (plan upgrade/downgrade).
+    subscription_cache_ttl_seconds: int = 300
 
 
 class VectorDbSettings(BaseSettings):

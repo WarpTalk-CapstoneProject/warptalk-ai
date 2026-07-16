@@ -64,6 +64,7 @@ class BaseWorker(ABC):
         self._consumer_name = f"{self.worker_name}-{socket.gethostname()}"
         self._route_states: dict[str, str] = {}
         self._paused_rooms: set[str] = set()
+        self._room_routes: dict[str, list[dict]] = {}
         self._pubsub = None
         self._listener_task = None
 
@@ -138,13 +139,18 @@ class BaseWorker(ABC):
                                 channel = channel.decode("utf-8")
                             parts = channel.split(":")
                             room_id = parts[1] if len(parts) > 1 else data.get("roomId")
-                            
+
+                            inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+
                             # Extract status from room_status nested inside data payload, or top-level status
-                            status = data.get("status")
-                            if not status and "data" in data and isinstance(data["data"], dict):
-                                status = data["data"].get("room_status")
-                            if not status:
-                                status = data.get("room_status")
+                            status = data.get("status") or inner.get("room_status") or data.get("room_status")
+
+                            # Cache the full route list (source/target participant + language +
+                            # VoiceCloneEnabled per route) so workers can gate per-speaker behavior
+                            # (e.g. tts_worker's voice-clone consent check) without a second round
+                            # trip. Published by AudioRouteCacheService.PublishRoutesUpdateAsync.
+                            if room_id and isinstance(inner.get("routes"), list):
+                                self._room_routes[room_id] = inner["routes"]
 
                             if room_id and status:
                                 self._route_states[room_id] = status
@@ -172,6 +178,25 @@ class BaseWorker(ABC):
         """Override in subclasses to perform room-specific cleanup."""
         self._route_states.pop(room_id, None)
         self._paused_rooms.discard(room_id)
+        self._room_routes.pop(room_id, None)
+
+    def is_voice_clone_consented(self, room_id: str, speaker_user_id: str) -> bool:
+        """True if `speaker_user_id` has at least one current outgoing route (they are the
+        source/speaker) with VoiceCloneEnabled = true.
+
+        Voice cloning captures biometric data — this is the consent gate. Routes are keyed
+        by translation_room_participants.id in Postgres, but the AI pipeline identifies
+        speakers by auth user id, so this matches on the denormalized SourceUserId field
+        (see TranslationRoomAudioRouteMapper.ToDto). Returns False (no consent) if routes
+        haven't been received yet for this room — fail closed, never clone without a
+        confirmed opt-in.
+        """
+        routes = self._room_routes.get(room_id, [])
+        return any(
+            str(route.get("SourceUserId") or "").lower() == speaker_user_id.lower()
+            and bool(route.get("VoiceCloneEnabled"))
+            for route in routes
+        )
 
     # ------------------------------------------------------------------
     # Abstract interface

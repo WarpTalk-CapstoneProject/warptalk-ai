@@ -208,6 +208,7 @@ class TTSResultMessage(BaseModel):
     clone_strength: float = 0.0
     anchor_provider: str = ""
     clone_provider: str = ""
+    provider_voice_id: str = ""  # Cartesia voice id actually used — set even for voice_type='default'
     render_location: str = "server"
     cache_key: str = ""
     cache_hit: bool = False
@@ -232,6 +233,7 @@ class TTSResultMessage(BaseModel):
             "clone_strength": str(self.clone_strength),
             "anchor_provider": self.anchor_provider,
             "clone_provider": self.clone_provider,
+            "provider_voice_id": self.provider_voice_id,
             "render_location": self.render_location,
             "cache_key": self.cache_key,
             "cache_hit": _bool_to_redis(self.cache_hit),
@@ -257,6 +259,7 @@ class TTSResultMessage(BaseModel):
             clone_strength=float(d.get("clone_strength", "0.0")),
             anchor_provider=d.get("anchor_provider", ""),
             clone_provider=d.get("clone_provider", ""),
+            provider_voice_id=d.get("provider_voice_id", ""),
             render_location=d.get("render_location", "server"),
             cache_key=d.get("cache_key", ""),
             cache_hit=_redis_to_bool(d.get("cache_hit", "false")),
