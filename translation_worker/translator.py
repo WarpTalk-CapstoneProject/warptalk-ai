@@ -1,9 +1,12 @@
 """Translation backend — OpenAI gpt-4.1-mini.
 
-Single provider, no fallback. Exposes async `translate()`.
+Single provider, no fallback. Exposes async `translate()` and `translate_batch()`.
 """
 
 from __future__ import annotations
+
+import asyncio
+import re
 
 from shared.logger import get_logger
 
@@ -35,6 +38,17 @@ _SYSTEM_PROMPT = (
     "Preserve tone, technical terms, and speaker intent. "
     "Output ONLY the translation — no explanations, no notes, no alternatives."
 )
+
+_BATCH_SYSTEM_PROMPT = (
+    "You are a professional real-time interpreter in a multilingual business meeting. "
+    "You will receive several numbered sentences, one per line, in the form '[n] text'. "
+    "Translate each sentence accurately and naturally, preserving tone, technical terms, "
+    "and speaker intent. Reply with exactly one line per input sentence, in the same "
+    "order, each formatted as '[n] translation' using the same number n as the input. "
+    "Output ONLY those numbered lines — no explanations, no notes, no alternatives."
+)
+
+_BATCH_LINE_RE = re.compile(r"^\s*\[(\d+)\]\s*(.*)$")
 
 
 def _lang_name(iso_code: str) -> str:
@@ -115,3 +129,76 @@ class OpenAITranslator:
             output_chars=len(result),
         )
         return result
+
+    async def translate_batch(
+        self, texts: list[str], source_lang: str, target_lang: str
+    ) -> list[str]:
+        """Translate several sentences in a single OpenAI call.
+
+        Cuts N sequential API round-trips down to 1, which is where most of the
+        per-sentence latency in translation_worker.process() came from (each call is
+        a real network round-trip, not just model inference time). Falls back to
+        concurrent per-sentence translate() calls — never to a sequential loop — if the
+        model's numbered-line response can't be parsed back into exactly len(texts)
+        entries, so a billing_worker charge (computed per translated_text length) is
+        never silently mismatched to the wrong sentence.
+
+        Returns a list the same length and order as `texts`.
+        """
+        if not texts:
+            return []
+
+        src = source_lang.split("-")[0]
+        tgt = target_lang.split("-")[0]
+        if src == tgt:
+            return list(texts)
+
+        src_name = _lang_name(src)
+        tgt_name = _lang_name(tgt)
+        numbered_input = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(texts))
+        user_message = f"Translate from {src_name} to {tgt_name}:\n{numbered_input}"
+
+        response = await self._client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": _BATCH_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=self.max_tokens * len(texts),
+            temperature=self.temperature,
+        )
+
+        raw = (response.choices[0].message.content or "").strip()
+        parsed: dict[int, str] = {}
+        for line in raw.splitlines():
+            m = _BATCH_LINE_RE.match(line)
+            if not m:
+                continue
+            idx = int(m.group(1))
+            if 1 <= idx <= len(texts):
+                parsed[idx] = m.group(2).strip()
+
+        if len(parsed) != len(texts):
+            logger.warning(
+                "batch_translation_parse_mismatch",
+                expected=len(texts),
+                parsed=len(parsed),
+                src=src_name,
+                tgt=tgt_name,
+            )
+            return list(
+                await asyncio.gather(
+                    *(self.translate(t, source_lang, target_lang) for t in texts)
+                )
+            )
+
+        results = [parsed[i + 1] for i in range(len(texts))]
+        logger.debug(
+            "batch_translation_complete",
+            src=src_name,
+            tgt=tgt_name,
+            count=len(texts),
+            total_input_chars=sum(len(t) for t in texts),
+            total_output_chars=sum(len(t) for t in results),
+        )
+        return results

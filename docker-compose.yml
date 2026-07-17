@@ -87,6 +87,25 @@ services:
       - warptalk-infrastructure_warptalk-net
     restart: unless-stopped
 
+  # ---- LiveKit Ingress Worker ----
+  # Joins the LiveKit room paired 1:1 with a translation room (MeetingRoom.ProviderRoomName
+  # == translationRoomId), gates audio with Silero VAD, publishes only real speech chunks
+  # to audio:chunks — VAD-triggered chunk boundaries instead of the fixed chunk_duration_ms
+  # window the SignalR audio path uses.
+  livekit-ingress:
+    build:
+      context: .
+      target: livekit-ingress
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - LIVEKIT_URL=${LIVEKIT_URL}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+    networks:
+      - warptalk-infrastructure_warptalk-net
+    restart: unless-stopped
+
   # ---- Qdrant Vector DB ----
   qdrant:
     image: qdrant/qdrant:latest

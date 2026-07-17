@@ -68,7 +68,7 @@ class STTSettings(BaseSettings):
 
     provider: str = "openai"
     api_key: str = ""
-    model: str = "gpt-4o-mini-transcribe"
+    model: str = "gpt-realtime-whisper"  # Realtime API streaming transcription model
     language: str = "auto"  # Auto-detect for code-switching (Vi + En)
 
 
@@ -91,7 +91,11 @@ class TTSSettings(BaseSettings):
 
     provider: str = "cartesia"
     api_key: str = ""
-    model: str = "sonic-turbo"
+    # sonic-turbo does not support Vietnamese (confirmed via a live 400 "language_not_supported"
+    # response) — sonic-3.5 is Cartesia's current model with Vietnamese in its language table.
+    # This product's whole premise is cross-language dubbing, so the default must support the
+    # target languages it actually needs, not just English.
+    model: str = "sonic-3.5"
     sample_rate: int = 44100
     voice_clone_min_seconds: float = 10.0  # Buffer threshold before calling /voices/clone
     min_clone_chars: int = 8

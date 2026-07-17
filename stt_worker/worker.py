@@ -13,7 +13,7 @@ import time
 from shared.base_worker import BaseWorker
 from shared.config import STTSettings, resolve_openai_api_key
 from shared.schemas import AudioChunkMessage, STTResultMessage
-from stt_worker.model import OpenAISTT
+from stt_worker.model import OpenAISTT, TranscribedSegment
 
 
 class STTWorker(BaseWorker):
@@ -58,6 +58,32 @@ class STTWorker(BaseWorker):
         chunk_offset_ms = chunk.chunk_index * self.settings.chunk_duration_ms
         language_hint = chunk.language if chunk.language != "auto" else None
 
+        async def publish_early(segment: TranscribedSegment) -> None:
+            # Never final — the chunk's real is_final_chunk flag belongs to whichever
+            # trailing segment(s) come back from transcribe() below, once the whole
+            # chunk is done. This is published the moment a complete sentence shows up
+            # in the Realtime API's incremental delta stream, so translation/TTS can
+            # start on it without waiting for the rest of the chunk to transcribe.
+            result = STTResultMessage(
+                meeting_id=chunk.meeting_id,
+                speaker_id=chunk.speaker_id,
+                text=segment.text,
+                language=segment.language,
+                confidence=segment.confidence,
+                start_ms=segment.start_ms,
+                end_ms=segment.end_ms,
+                chunk_index=chunk.chunk_index,
+                is_final_chunk=False,
+                timestamp_ms=chunk.timestamp_ms,
+            )
+            await self.publish("stt:results", chunk.meeting_id, result.to_redis())
+            self.logger.info(
+                "segment_transcribed_early",
+                meeting_id=chunk.meeting_id,
+                text=segment.text[:80],
+                language=segment.language,
+            )
+
         t0 = time.monotonic()
         try:
             segments = await self.model.transcribe(
@@ -65,6 +91,9 @@ class STTWorker(BaseWorker):
                 sample_rate=chunk.sample_rate,
                 language=language_hint,
                 chunk_offset_ms=chunk_offset_ms,
+                meeting_id=chunk.meeting_id,
+                speaker_id=chunk.speaker_id,
+                on_early_segment=publish_early,
             )
         except Exception as exc:
             await self.redis.publish_system_event(

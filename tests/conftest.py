@@ -53,6 +53,7 @@ def mock_redis_client(redis_settings: RedisSettings) -> RedisStreamClient:
     client._redis.xadd.return_value = b"1234567890-0"
     client._redis.xreadgroup.return_value = []
     client._redis.hget.return_value = None
+    client._redis.hgetall.return_value = {}
     client._redis.get.return_value = None
 
     return client

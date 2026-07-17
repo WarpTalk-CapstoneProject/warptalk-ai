@@ -154,6 +154,7 @@ class TranslationResultMessage(BaseModel):
     end_ms: int = 0
     is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    translator_model: str = ""  # OpenAITranslator.model — needed by TranscriptService to populate transcript.translation_contents.translator_model (NOT NULL)
 
     def to_redis(self) -> dict[str, str]:
         return {
@@ -169,6 +170,7 @@ class TranslationResultMessage(BaseModel):
             "end_ms": str(self.end_ms),
             "is_final_chunk": "1" if self.is_final_chunk else "0",
             "timestamp_ms": str(self.timestamp_ms),
+            "translator_model": self.translator_model,
         }
 
     @classmethod
@@ -187,6 +189,7 @@ class TranslationResultMessage(BaseModel):
             end_ms=int(d.get("end_ms", "0")),
             is_final_chunk=d.get("is_final_chunk") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
+            translator_model=d.get("translator_model", ""),
         )
 
 

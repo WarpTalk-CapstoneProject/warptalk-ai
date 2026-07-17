@@ -1,7 +1,8 @@
-"""Tests for STT Worker — mock OpenAI STT, verify output schema."""
+"""Tests for STT Worker — mock OpenAI Realtime STT session, verify output schema."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -10,6 +11,49 @@ from shared.config import STTSettings, WorkerSettings
 from shared.schemas import AudioChunkMessage
 from stt_worker.model import OpenAISTT, TranscribedSegment, _filter_segments, _normalize_language
 from stt_worker.worker import STTWorker
+
+
+class FakeRealtimeConn:
+    """Minimal stand-in for openai's AsyncRealtimeConnection: an async iterator of
+    events, plus the session/input_audio_buffer sub-resources actually called."""
+
+    def __init__(self, events: list) -> None:
+        self._events = events
+        self.session = MagicMock()
+        self.session.update = AsyncMock()
+        self.input_audio_buffer = MagicMock()
+        self.input_audio_buffer.append = AsyncMock()
+        self.input_audio_buffer.commit = AsyncMock()
+
+    def __aiter__(self):
+        async def gen():
+            for event in self._events:
+                yield event
+        return gen()
+
+
+class FakeRealtimeManager:
+    """Minimal stand-in for AsyncRealtimeConnectionManager (`async with client.realtime.connect(...) as conn`)."""
+
+    def __init__(self, conn: FakeRealtimeConn) -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> FakeRealtimeConn:
+        return self._conn
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
+def _make_stt_with_conn(events: list) -> tuple[OpenAISTT, FakeRealtimeConn]:
+    stt = OpenAISTT.__new__(OpenAISTT)
+    stt.api_key = ""
+    stt.model = "gpt-realtime-whisper"
+    stt._sessions = {}
+    conn = FakeRealtimeConn(events)
+    stt._client = MagicMock()
+    stt._client.realtime.connect = MagicMock(return_value=FakeRealtimeManager(conn))
+    return stt, conn
 
 
 def _segment(text: str, avg_logprob: float = -0.3, no_speech_prob: float = 0.01) -> dict:
@@ -23,37 +67,32 @@ def _segment(text: str, avg_logprob: float = -0.3, no_speech_prob: float = 0.01)
 
 
 class TestOpenAISTT:
-    """OpenAISTT wrapper tests."""
+    """OpenAISTT wrapper tests — mocks the Realtime API's WebSocket session."""
 
-    async def test_transcribe_returns_segments(self) -> None:
-        """transcribe() should return filtered list of TranscribedSegment."""
-        stt = OpenAISTT.__new__(OpenAISTT)
-        stt.api_key = ""
-        stt.model = "gpt-4o-mini-transcribe"
+    async def test_transcribe_returns_segments(self, sample_audio_bytes: bytes) -> None:
+        """transcribe() should return a filtered list of TranscribedSegment.
 
-        mock_segment = MagicMock()
-        mock_segment.model_dump.return_value = {
-            "text": " Hello, world!",
-            "start": 0.0,
-            "end": 1.5,
-            "avg_logprob": -0.25,
-            "no_speech_prob": 0.01,
-        }
+        The Realtime API's completed event carries just a flat `transcript` field (no
+        per-segment timing/confidence/language), same shape gap as the old REST
+        response — a language hint must still be passed in since the API doesn't echo
+        one back.
+        """
+        events = [SimpleNamespace(
+            type="conversation.item.input_audio_transcription.completed",
+            transcript=" Hello, world!",
+        )]
+        stt, conn = _make_stt_with_conn(events)
 
-        mock_result = MagicMock()
-        mock_result.language = "en"
-        mock_result.segments = [mock_segment]
-
-        stt._client = MagicMock()
-        stt._client.audio.transcriptions.create = AsyncMock(return_value=mock_result)
-
-        result = await stt.transcribe(b"fake_audio", sample_rate=16000)
+        result = await stt.transcribe(
+            sample_audio_bytes, sample_rate=16000, language="en",
+            meeting_id="m1", speaker_id="s1",
+        )
 
         assert len(result) == 1
         assert result[0].text == "Hello, world!"
         assert result[0].language == "en"
         assert result[0].start_ms == 0
-        assert result[0].end_ms == 1500
+        conn.input_audio_buffer.commit.assert_awaited_once()
 
     async def test_transcribe_empty_bytes_returns_empty(self) -> None:
         stt = OpenAISTT.__new__(OpenAISTT)
@@ -61,17 +100,146 @@ class TestOpenAISTT:
         result = await stt.transcribe(b"")
         assert result == []
 
-    async def test_transcribe_api_error_raises_for_worker_degrade_signal(self) -> None:
+    async def test_transcribe_api_error_raises_for_worker_degrade_signal(
+        self, sample_audio_bytes: bytes
+    ) -> None:
         stt = OpenAISTT.__new__(OpenAISTT)
         stt.api_key = ""
-        stt.model = "gpt-4o-mini-transcribe"
+        stt.model = "gpt-realtime-whisper"
+        stt._sessions = {}
         stt._client = MagicMock()
-        stt._client.audio.transcriptions.create = AsyncMock(
-            side_effect=Exception("API error")
-        )
+        stt._client.realtime.connect = MagicMock(side_effect=Exception("API error"))
 
         with pytest.raises(Exception, match="API error"):
-            await stt.transcribe(b"audio_bytes", sample_rate=16000)
+            await stt.transcribe(
+                sample_audio_bytes, sample_rate=16000, meeting_id="m1", speaker_id="s1"
+            )
+
+    async def test_transcribe_emits_complete_sentences_early_from_deltas(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """A complete sentence appearing mid-stream in delta events should be handed
+        to on_early_segment immediately, without waiting for .completed — that's the
+        whole point of pipelining translation/TTS against a still-in-progress chunk.
+        The trailing fragment ("How are you?") is a second complete sentence that
+        arrives via delta too, so nothing is left over for the return value.
+        """
+        events = [
+            SimpleNamespace(type="conversation.item.input_audio_transcription.delta", delta="Hello there."),
+            SimpleNamespace(type="conversation.item.input_audio_transcription.delta", delta=" How are you?"),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Hello there. How are you?",
+            ),
+        ]
+        stt, conn = _make_stt_with_conn(events)
+        early_segments: list[TranscribedSegment] = []
+
+        async def on_early(seg: TranscribedSegment) -> None:
+            early_segments.append(seg)
+
+        result = await stt.transcribe(
+            sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1",
+            on_early_segment=on_early,
+        )
+
+        assert [s.text for s in early_segments] == ["Hello there.", "How are you?"]
+        assert result == []
+
+    async def test_transcribe_returns_trailing_fragment_not_flushed_early(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """An incomplete trailing fragment must NOT be flushed early (no punctuation
+        yet to confirm a sentence boundary) — it comes back in the normal return value
+        once .completed supplies the authoritative final transcript.
+        """
+        events = [
+            SimpleNamespace(type="conversation.item.input_audio_transcription.delta", delta="Hello there."),
+            SimpleNamespace(type="conversation.item.input_audio_transcription.delta", delta=" How are"),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Hello there. How are you today?",
+            ),
+        ]
+        stt, conn = _make_stt_with_conn(events)
+        early_segments: list[TranscribedSegment] = []
+
+        async def on_early(seg: TranscribedSegment) -> None:
+            early_segments.append(seg)
+
+        result = await stt.transcribe(
+            sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1",
+            on_early_segment=on_early,
+        )
+
+        assert [s.text for s in early_segments] == ["Hello there."]
+        assert len(result) == 1
+        assert result[0].text == "How are you today?"
+
+    async def test_transcribe_without_on_early_segment_ignores_deltas(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """Callers that don't pass on_early_segment (e.g. a future non-pipelined path)
+        get the old all-at-once behavior — deltas are ignored, only .completed matters.
+        """
+        events = [
+            SimpleNamespace(type="conversation.item.input_audio_transcription.delta", delta="Hello there."),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Hello there.",
+            ),
+        ]
+        stt, conn = _make_stt_with_conn(events)
+
+        result = await stt.transcribe(sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1")
+
+        assert len(result) == 1
+        assert result[0].text == "Hello there."
+
+    async def test_transcribe_delta_final_mismatch_drops_trailing_safely(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """If the final transcript doesn't start with what was already flushed (model
+        revised the flushed prefix), don't guess at a diff — drop the trailing part
+        rather than risk re-publishing/double-billing already-flushed text.
+        """
+        events = [
+            SimpleNamespace(type="conversation.item.input_audio_transcription.delta", delta="Helo there."),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Hello there, how are you?",
+            ),
+        ]
+        stt, conn = _make_stt_with_conn(events)
+        early_segments: list[TranscribedSegment] = []
+
+        async def on_early(seg: TranscribedSegment) -> None:
+            early_segments.append(seg)
+
+        result = await stt.transcribe(
+            sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1",
+            on_early_segment=on_early,
+        )
+
+        assert len(early_segments) == 1
+        assert result == []
+
+    async def test_transcribe_reuses_session_across_calls(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """A second chunk from the same (meeting, speaker) must NOT reconnect —
+        that's the whole point of session reuse (pay the handshake once, not per chunk).
+        """
+        events = [SimpleNamespace(
+            type="conversation.item.input_audio_transcription.completed",
+            transcript="Hi",
+        )]
+        stt, conn = _make_stt_with_conn(events)
+
+        await stt.transcribe(sample_audio_bytes, meeting_id="m1", speaker_id="s1")
+        await stt.transcribe(sample_audio_bytes, meeting_id="m1", speaker_id="s1")
+
+        stt._client.realtime.connect.assert_called_once()
 
 
 class TestFilterSegments:
@@ -187,6 +355,54 @@ class TestSTTWorker:
             str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list
         ]
         assert any("stt:results" in s for s in streams_published)
+
+    async def test_process_publishes_early_segments_as_non_final(
+        self,
+        mock_redis_client,
+        worker_settings: WorkerSettings,
+        sample_audio_bytes: bytes,
+    ) -> None:
+        """Early (mid-chunk) segments must always publish is_final_chunk=False —
+        only the trailing segment(s) returned from transcribe() carry the chunk's
+        real is_final_chunk flag, once the whole chunk is actually done.
+        """
+        worker = STTWorker.__new__(STTWorker)
+        worker.settings = worker_settings
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker.stt_settings = STTSettings()
+        worker._paused_rooms = set()
+
+        async def fake_transcribe(*args, **kwargs):
+            on_early_segment = kwargs["on_early_segment"]
+            await on_early_segment(
+                TranscribedSegment(text="Hello there.", language="en", confidence=0.0, start_ms=0, end_ms=0)
+            )
+            return [
+                TranscribedSegment(text="How are you?", language="en", confidence=0.0, start_ms=0, end_ms=1000)
+            ]
+
+        worker.model = MagicMock()
+        worker.model.transcribe = AsyncMock(side_effect=fake_transcribe)
+
+        chunk = AudioChunkMessage(
+            meeting_id="meeting-1",
+            speaker_id="speaker-1",
+            chunk_index=0,
+            audio_data=sample_audio_bytes,
+            is_final_chunk=True,
+        )
+
+        await worker.process(b"msg-1", chunk.to_redis())
+
+        published = [
+            data for stream, data in
+            (c.args for c in mock_redis_client._redis.xadd.call_args_list)
+            if "stt:results" in str(stream)
+        ]
+        by_text = {data["text"]: data["is_final_chunk"] for data in published}
+        assert by_text["Hello there."] == "0"
+        assert by_text["How are you?"] == "1"
 
     async def test_process_skips_paused_room(
         self,

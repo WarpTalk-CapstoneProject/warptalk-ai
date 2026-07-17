@@ -23,8 +23,11 @@ dependencies = [
     "pydantic-settings>=2.1",
     "structlog>=24.1",
     "python-dotenv>=1.0",
-    # OpenAI SDK backs STT, translation, assistant, and embeddings per DECISIONS.md
-    "openai>=1.6",
+    # OpenAI SDK backs STT, translation, assistant, and embeddings per DECISIONS.md.
+    # STT uses the Realtime API (gpt-realtime-whisper over WebSocket) — needs the
+    # openai[realtime] extra's websockets dependency.
+    "openai>=2.45",
+    "websockets>=13",
     # LiveKit
     "livekit>=0.11",
     "livekit-api>=0.11",
@@ -48,7 +51,10 @@ embeddings = [
 ]
 ingress = [
     # Optional local VAD path for livekit_ingress_worker; not installed in API-backed Docker workers.
+    # torchaudio is a transitive runtime import inside silero-vad's hubconf (utils_vad.py),
+    # not declared by torch.hub.load() itself — omitting it fails at model-load time, not install time.
     "torch>=2.1",
+    "torchaudio>=2.1",
 ]
 dev = [
     "pytest>=7.4",

@@ -90,7 +90,14 @@ class CartesiaSynthesizer:
 
         voice: dict = {"id": resolved_voice_id}
 
-        audio_bytes: bytes = await self._client.tts.bytes(
+        # cartesia-py 3.x's tts.bytes() is an async method whose awaited result is itself an
+        # AsyncIterator[bytes] (it streams chunks) — never a plain bytes object, despite this
+        # code's prior assumption. Needs BOTH the await (to get the stream) AND an async-for
+        # (to drain it) — awaiting alone previously raised "object of type 'async_generator'
+        # has no len()"; async-for alone (without the await) raises "'async for' requires an
+        # object with __aiter__ method, got coroutine". Cartesia was unreachable/misconfigured
+        # before now, so neither mistake had ever been exercised end-to-end.
+        stream = await self._client.tts.bytes(
             model_id=self.model,
             transcript=text,
             voice=voice,
@@ -101,6 +108,8 @@ class CartesiaSynthesizer:
             },
             language=language,
         )
+        chunks: list[bytes] = [chunk async for chunk in stream]
+        audio_bytes: bytes = b"".join(chunks)
 
         # WAV header is 44 bytes; remaining = PCM samples (16-bit mono)
         pcm_bytes = max(0, len(audio_bytes) - 44)

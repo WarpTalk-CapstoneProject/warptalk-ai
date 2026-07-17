@@ -194,6 +194,10 @@ class RedisStreamClient:
         """Get a hash field value."""
         return await self.redis.hget(key, field)
 
+    async def hgetall(self, key: str) -> dict[bytes, bytes]:
+        """Get all fields/values of a hash."""
+        return await self.redis.hgetall(key)
+
     async def set_with_ttl(self, key: str, value: bytes | str, ttl_seconds: int) -> None:
         """Set a key with expiration."""
         await self.redis.setex(key, ttl_seconds, value)
