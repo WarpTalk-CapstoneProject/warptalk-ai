@@ -21,7 +21,13 @@ import time
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
+from tts_worker.livekit_publisher import LiveKitTTSPublisher
 from tts_worker.synthesizer import CartesiaSynthesizer
+
+# Standard WAV header size for the pcm_s16le format CartesiaSynthesizer requests —
+# used to strip the header before feeding audio into the LiveKit track (which wants
+# raw PCM frames, not a WAV container).
+_WAV_HEADER_BYTES = 44
 
 
 class TTSWorker(BaseWorker):
@@ -41,6 +47,7 @@ class TTSWorker(BaseWorker):
         super().__init__(**kwargs)
         self.tts_settings = tts_settings or TTSSettings()
         self.cartesia: CartesiaSynthesizer | None = None
+        self.livekit_publisher: LiveKitTTSPublisher | None = None
 
     async def load_model(self) -> None:
         self.cartesia = CartesiaSynthesizer(
@@ -49,6 +56,7 @@ class TTSWorker(BaseWorker):
             sample_rate=self.tts_settings.sample_rate,
         )
         await self.cartesia.load()
+        self.livekit_publisher = LiveKitTTSPublisher(self.settings.livekit)
         asyncio.create_task(self._consume_audio_for_cloning())
         self.logger.info("tts_worker_ready", model=self.tts_settings.model)
 
@@ -199,6 +207,19 @@ class TTSWorker(BaseWorker):
             timestamp_ms=translation.timestamp_ms,
         )
         await self.publish("tts:results", translation.meeting_id, result.to_redis())
+
+        # Also publish as a LiveKit audio track — see livekit_publisher.py for why:
+        # the room page's existing RoomAudioRenderer plays it automatically. Fire-and-
+        # forget: this must never block or fail the tts:results publish above, which
+        # billing_worker/TranscriptRedisConsumerService depend on regardless of whether
+        # the LiveKit side is reachable.
+        pcm = audio_bytes[_WAV_HEADER_BYTES:] if len(audio_bytes) > _WAV_HEADER_BYTES else b""
+        if pcm and self.livekit_publisher is not None:
+            asyncio.create_task(
+                self.livekit_publisher.publish_pcm(
+                    translation.meeting_id, translation.target_lang, pcm, self.tts_settings.sample_rate
+                )
+            )
 
     async def _get_voice_id(self, meeting_id: str, speaker_id: str) -> str | None:
         """Return cached Cartesia voice_id for this speaker, or None.

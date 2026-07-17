@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -31,6 +32,8 @@ def _make_worker(mock_redis_client, worker_settings, tts_settings=None, consente
     worker.cartesia = MagicMock()
     worker.cartesia.synthesize = AsyncMock(return_value=(b"audio_bytes", 1000, "resolved-voice-id"))
     worker.cartesia.clone_voice = AsyncMock(return_value="test-voice-id")
+    worker.livekit_publisher = MagicMock()
+    worker.livekit_publisher.publish_pcm = AsyncMock()
     return worker
 
 
@@ -204,6 +207,48 @@ class TestTTSWorker:
             c for c in xadd_calls if "system_events" in str(c.args[0])
         ]
         assert len(system_event_calls) > 0
+
+    async def test_publishes_to_livekit_with_wav_header_stripped(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """Synthesized audio must reach the LiveKit publisher as raw PCM (WAV header
+        stripped), targeting the room via meeting_id/target_lang — this is what lets
+        the frontend's existing RoomAudioRenderer play it with no new playback code.
+        """
+        worker = _make_worker(mock_redis_client, worker_settings)
+        header = b"R" * 44
+        pcm_body = b"\x01\x02" * 100
+        worker.cartesia.synthesize = AsyncMock(return_value=(header + pcm_body, 1000, "resolved-voice-id"))
+
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
+
+        await worker.process(b"msg-1", _make_msg(target_lang="vi").to_redis())
+        await asyncio.sleep(0)  # let the fire-and-forget create_task run
+
+        worker.livekit_publisher.publish_pcm.assert_awaited_once()
+        args, kwargs = worker.livekit_publisher.publish_pcm.call_args
+        call_args = kwargs or dict(zip(["meeting_id", "target_lang", "pcm_s16le", "sample_rate"], args))
+        assert call_args["meeting_id"] == "m1"
+        assert call_args["target_lang"] == "vi"
+        assert call_args["pcm_s16le"] == pcm_body
+
+    async def test_cache_hit_still_publishes_to_livekit(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """A cache hit skips Cartesia entirely but must still reach LiveKit — cached
+        audio is just as real/playable as a fresh synthesis.
+        """
+        worker = _make_worker(mock_redis_client, worker_settings)
+        cached_audio = (b"R" * 44) + (b"\x03\x04" * 50)
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = cached_audio
+
+        await worker.process(b"msg-1", _make_msg().to_redis())
+        await asyncio.sleep(0)
+
+        worker.cartesia.synthesize.assert_not_called()
+        worker.livekit_publisher.publish_pcm.assert_awaited_once()
 
 
 class TestGetVoiceId:
