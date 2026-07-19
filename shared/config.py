@@ -81,7 +81,12 @@ class TranslationSettings(BaseSettings):
     api_key: str = ""
     model: str = "gpt-4.1-mini"  # Best cost/quality for short-text translation
     max_tokens: int = 512
-    temperature: float = 0.1  # Near-deterministic for translation accuracy
+    # Fully deterministic, not just "near" — measured via the real pipeline benchmark
+    # that 0.1 let identical repeated sentences translate to different (equally valid)
+    # phrasings across separate calls, breaking tts_worker's text-based synthesis
+    # cache: a real repeated meeting phrase missed the cache and paid a full ~1s
+    # Cartesia call instead of a ~2ms cache hit. See translation_worker/translator.py.
+    temperature: float = 0.0
 
 
 class TTSSettings(BaseSettings):

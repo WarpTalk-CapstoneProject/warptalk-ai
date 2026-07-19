@@ -29,6 +29,19 @@ from tts_worker.synthesizer import CartesiaSynthesizer
 # raw PCM frames, not a WAV container).
 _WAV_HEADER_BYTES = 44
 
+# Cartesia's voices.clone() requires a concrete `language`, but AudioChunkMessage.language
+# defaults to "auto" (STT does language auto-detection, not the audio-chunk producer) — so
+# fall back to "en" for anything Cartesia's SDK wouldn't accept as a real language code.
+_CARTESIA_SUPPORTED_LANGUAGES = {
+    "en", "fr", "de", "es", "pt", "zh", "ja", "hi", "it", "ko", "nl", "pl", "ru", "sv",
+    "tr", "tl", "bg", "ro", "ar", "cs", "el", "fi", "hr", "ms", "sk", "da", "ta", "uk",
+    "hu", "no", "vi", "bn", "th", "he", "ka", "id", "te", "gu", "kn", "ml", "mr", "pa",
+}
+
+
+def _clone_language(hint: str) -> str:
+    return hint if hint in _CARTESIA_SUPPORTED_LANGUAGES else "en"
+
 
 class TTSWorker(BaseWorker):
     """Text-to-Speech worker using Cartesia Sonic Turbo."""
@@ -240,11 +253,12 @@ class TTSWorker(BaseWorker):
         # {(meeting_id, speaker_id): accumulated_audio_bytes}
         buffers: dict[tuple[str, str], bytearray] = {}
         buffer_seconds: dict[tuple[str, str], float] = {}
+        buffer_lang: dict[tuple[str, str], str] = {}
 
         while self._running:
             try:
                 async for _msg_id, data in self.redis.consume(
-                    stream="audio:chunks:*",
+                    stream="audio:chunks",
                     group=self._audio_consumer_group,
                     consumer=self._consumer_name,
                     block_ms=2000,
@@ -260,6 +274,7 @@ class TTSWorker(BaseWorker):
                         if not self.is_voice_clone_consented(chunk.meeting_id, chunk.speaker_id):
                             buffers.pop(key, None)
                             buffer_seconds.pop(key, None)
+                            buffer_lang.pop(key, None)
                             continue
 
                         # Skip if voice already cloned for this speaker
@@ -270,13 +285,15 @@ class TTSWorker(BaseWorker):
                         # PCM 16-bit mono: 2 bytes per sample
                         duration_s = len(chunk.audio_data) / 2 / max(chunk.sample_rate, 1)
                         buffer_seconds[key] = buffer_seconds.get(key, 0.0) + duration_s
+                        buffer_lang[key] = chunk.language
 
                         if buffer_seconds[key] >= self.tts_settings.voice_clone_min_seconds:
                             audio_snapshot = bytes(buffers.pop(key))
                             del buffer_seconds[key]
+                            clone_lang = _clone_language(buffer_lang.pop(key, "en"))
                             asyncio.create_task(
                                 self._clone_and_cache(
-                                    chunk.meeting_id, chunk.speaker_id, audio_snapshot
+                                    chunk.meeting_id, chunk.speaker_id, audio_snapshot, clone_lang
                                 )
                             )
                     except Exception:
@@ -288,12 +305,12 @@ class TTSWorker(BaseWorker):
                 await asyncio.sleep(2)
 
     async def _clone_and_cache(
-        self, meeting_id: str, speaker_id: str, audio_bytes: bytes
+        self, meeting_id: str, speaker_id: str, audio_bytes: bytes, language: str = "en"
     ) -> None:
         """Clone voice via Cartesia and cache voice_id in Redis."""
         label = f"speaker-{speaker_id[:8]}-{meeting_id[:8]}"
         try:
-            voice_id = await self.cartesia.clone_voice(audio_bytes, label)
+            voice_id = await self.cartesia.clone_voice(audio_bytes, label, language)
             cache_key = f"voice:{meeting_id}:{speaker_id}"
             await self.redis.hset(cache_key, "voice_id", voice_id)
             # hset has no TTL of its own — without this the key lives in Redis forever.

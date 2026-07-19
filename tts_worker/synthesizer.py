@@ -41,22 +41,27 @@ class CartesiaSynthesizer:
         self._client = AsyncCartesia(api_key=self.api_key)
         logger.info("cartesia_ready", model=self.model, sample_rate=self.sample_rate)
 
-    async def clone_voice(self, audio_bytes: bytes, speaker_label: str) -> str:
+    async def clone_voice(self, audio_bytes: bytes, speaker_label: str, language: str = "en") -> str:
         """Clone a speaker's voice from raw audio.
 
         Args:
             audio_bytes: Raw audio bytes (WAV/PCM), minimum ~10s
             speaker_label: Human-readable label for the cloned voice
+            language: Speaker's source language (Cartesia's `language` param is
+                required by the installed SDK; "auto"/unsupported hints are the
+                caller's job to normalize before calling this)
 
         Returns:
             Cartesia voice_id to use in subsequent synthesize() calls
         """
         audio_io = io.BytesIO(audio_bytes)
 
+        # cartesia==3.3.0's AsyncVoicesResource.clone() has no `enhance` kwarg
+        # (that was a stale/pre-GA param name) and requires `language`.
         voice = await self._client.voices.clone(
             clip=audio_io,
             name=speaker_label,
-            enhance=True,
+            language=language,
         )
         voice_id: str = voice.id
         logger.info("voice_cloned", label=speaker_label, voice_id=voice_id)

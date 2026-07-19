@@ -66,7 +66,14 @@ class OpenAITranslator:
         api_key: str,
         model: str = "gpt-4.1-mini",
         max_tokens: int = 512,
-        temperature: float = 0.1,
+        # 0.0, not 0.1: measured via real pipeline benchmark that temperature=0.1 let
+        # identical repeated input sentences translate to different (equally valid)
+        # phrasings across separate calls (e.g. "15%" vs "mười lăm phần trăm"), which
+        # breaks tts_worker's text-based synthesis cache — a real repeated meeting
+        # phrase misses the cache and pays a full ~1s Cartesia call instead of a ~2ms
+        # cache hit. Determinism isn't perfectly guaranteed even at 0.0 (OpenAI's own
+        # infra has some residual nondeterminism), but it meaningfully raises the hit rate.
+        temperature: float = 0.0,
     ) -> None:
         self.api_key = api_key
         self.model = model
