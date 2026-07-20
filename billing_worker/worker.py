@@ -27,6 +27,7 @@ import asyncio
 import signal
 import socket
 import time
+import uuid
 
 from shared.config import BillingSettings, RedisSettings, WorkerSettings
 from shared.logger import get_logger
@@ -39,6 +40,27 @@ logger = get_logger("worker.billing")
 
 STT_CHARGE_TYPE = "STT"
 TRANSLATION_CHARGE_TYPE = "TRANSLATION"
+
+
+def _extract_underlying_segment_id(raw_segment_id: str) -> str | None:
+    """Port of TranscriptRedisConsumerService.ExtractUnderlyingSegmentId (C#), byte-for-byte:
+    translation_worker mints segment_id as f"{stt_segment_guid}-c{idx}"; tts_worker carries
+    that composite string through unchanged. Recover the real TranscriptSegment.Id GUID.
+
+    Returns None if the string isn't a valid GUID even after stripping the suffix — callers
+    must treat that as "cannot attribute this charge to a segment", not crash.
+    """
+    if not raw_segment_id:
+        return None
+    guid_part = (
+        raw_segment_id[:36]
+        if len(raw_segment_id) > 36 and raw_segment_id[36] == "-"
+        else raw_segment_id
+    )
+    try:
+        return str(uuid.UUID(guid_part))
+    except ValueError:
+        return None
 
 
 class BillingSettlementWorker:
@@ -157,6 +179,10 @@ class BillingSettlementWorker:
             quantity=quantity_s,
             unit="second",
             credits_consumed=max(1, round(quantity_s)),
+            # msg.segment_id IS the real TranscriptSegment.Id for STT events (unlike
+            # translation/TTS, which carry a composite "{guid}-c{idx}" string) — no
+            # extraction needed here.
+            transcript_segment_id=msg.segment_id,
             # NOTE: msg.segment_id is randomly generated per STTResultMessage
             # (Field(default_factory=uuid4) in shared/schemas.py) — it is NOT stable
             # across a Redis Streams redelivery of the *upstream* audio chunk, since
@@ -177,6 +203,17 @@ class BillingSettlementWorker:
             return
         subscription_id, workspace_id = resolved
 
+        # msg.segment_id here is a composite string "{stt_segment_guid}-c{idx}" (minted in
+        # translation_worker/worker.py), not a valid GUID on its own — recover the real
+        # TranscriptSegment.Id before using it as a UUID column value. Previously the raw
+        # composite string was passed straight into reference_id (a UUID column), which
+        # silently failed to bind and dropped the charge.
+        underlying_segment_id = _extract_underlying_segment_id(msg.segment_id)
+        if underlying_segment_id is None:
+            self.logger.warning(
+                "segment_id_extraction_failed", raw_segment_id=msg.segment_id
+            )
+
         quantity_chars = float(len(msg.translated_text))
         await self.db.record_usage_and_charge(
             subscription_id=subscription_id,
@@ -185,13 +222,17 @@ class BillingSettlementWorker:
             translation_room_id=msg.meeting_id,
             usage_type=TRANSLATION_CHARGE_TYPE,
             charge_type=TRANSLATION_CHARGE_TYPE,
-            reference_id=msg.segment_id,
+            reference_id=underlying_segment_id,
             reference_type="translation_content",
             quantity=quantity_chars,
             unit="character",
             credits_consumed=max(1, round(quantity_chars / 100)),
+            transcript_segment_id=underlying_segment_id,
             # msg.segment_id here IS deterministic (translation_worker builds it as
-            # f"{stt_result.segment_id}-c{idx}"), so this key is redelivery-safe.
+            # f"{stt_result.segment_id}-c{idx}"), so this key is redelivery-safe. The
+            # idempotency key keeps using the raw composite msg.segment_id, unaffected by
+            # the extraction above (which only changes what's stored in reference_id /
+            # transcript_segment_id).
             idempotency_key=f"{TRANSLATION_CHARGE_TYPE}:{msg.segment_id}:{msg.target_lang}",
         )
 
@@ -211,6 +252,15 @@ class BillingSettlementWorker:
         charge_type = (
             "AUDIO_DUBBING_VOICE_CLONE" if msg.voice_type == "cloned" else "AUDIO_DUBBING_STANDARD"
         )
+
+        # Same composite-segment-id situation as _handle_translation above — extract the
+        # real TranscriptSegment.Id before using it as a UUID column value.
+        underlying_segment_id = _extract_underlying_segment_id(msg.segment_id)
+        if underlying_segment_id is None:
+            self.logger.warning(
+                "segment_id_extraction_failed", raw_segment_id=msg.segment_id
+            )
+
         quantity_s = max(msg.duration_ms / 1000.0, 0.1)
         await self.db.record_usage_and_charge(
             subscription_id=subscription_id,
@@ -219,11 +269,12 @@ class BillingSettlementWorker:
             translation_room_id=msg.meeting_id,
             usage_type=charge_type,
             charge_type=charge_type,
-            reference_id=msg.segment_id,
+            reference_id=underlying_segment_id,
             reference_type="audio_dubbing",
             quantity=quantity_s,
             unit="second",
             credits_consumed=max(1, round(quantity_s)),
+            transcript_segment_id=underlying_segment_id,
             idempotency_key=f"{charge_type}:{msg.segment_id}:{msg.target_lang}",
             details={"clone_provider": msg.clone_provider, "voice_mode": msg.voice_mode},
         )

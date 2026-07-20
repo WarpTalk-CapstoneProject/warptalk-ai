@@ -84,12 +84,13 @@ class BillingRepository:
         translation_room_id: str,
         usage_type: str,
         charge_type: str,
-        reference_id: str,
+        reference_id: str | None,
         reference_type: str,
         quantity: float,
         unit: str,
         credits_consumed: int,
         idempotency_key: str,
+        transcript_segment_id: str | uuid.UUID | None = None,
         details: dict[str, Any] | None = None,
     ) -> bool:
         """Insert usage_records + credit_transactions, idempotent on idempotency_key.
@@ -101,10 +102,26 @@ class BillingRepository:
         usage_rate_card lookup design (source/target language + currency tiers) from
         warptalk-v4-final.dbml — wiring that up is real pricing work, not schema work,
         and deliberately out of scope here so this doesn't ship guessed prices.
+
+        transcript_segment_id should be the real transcript.transcript_segments.id GUID —
+        callers must extract it from any composite segment_id (translation_worker mints
+        "{stt-segment-guid}-c{idx}") before passing it in; this function does not do that
+        extraction itself, it only converts a valid GUID string/UUID for binding.
+
+        reference_id is also converted to a UUID before binding: previously it was passed
+        straight through as a raw string, which silently failed (and dropped the charge)
+        for translation/TTS events whose segment_id is the composite string above, not a
+        bare GUID. Callers must pass an already-extracted, valid GUID string here too.
         """
         assert self._pool is not None, "call connect() first"
         user_uuid = _as_uuid(user_id) if user_id else None
         room_uuid = _as_uuid(translation_room_id)
+        reference_uuid = _as_uuid(reference_id) if reference_id else None
+        segment_uuid = (
+            transcript_segment_id
+            if isinstance(transcript_segment_id, uuid.UUID)
+            else _as_uuid(transcript_segment_id) if transcript_segment_id else None
+        )
 
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -119,8 +136,8 @@ class BillingRepository:
                     """
                     INSERT INTO subscription.usage_records
                         (subscription_id, user_id, workspace_id, translation_room_id,
-                         usage_type, unit, quantity, credits_consumed, details)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+                         usage_type, unit, quantity, credits_consumed, segment_id, details)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
                     RETURNING id
                     """,
                     subscription_id,
@@ -131,6 +148,7 @@ class BillingRepository:
                     unit,
                     quantity,
                     credits_consumed,
+                    segment_uuid,
                     _to_jsonb(details or {}),
                 )
 
@@ -150,25 +168,28 @@ class BillingRepository:
                     """
                     INSERT INTO subscription.credit_transactions
                         (subscription_id, user_id, amount, type, reference_id, reference_type,
-                         balance_after, charge_type, usage_record_id, idempotency_key)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                         balance_after, charge_type, usage_record_id, idempotency_key,
+                         transcript_segment_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     """,
                     subscription_id,
                     user_uuid,
                     -credits_consumed,
                     charge_type,
-                    reference_id,
+                    reference_uuid,
                     reference_type,
                     new_balance if new_balance is not None else 0,
                     charge_type,
                     usage_record_id,
                     idempotency_key,
+                    segment_uuid,
                 )
 
         logger.info(
             "usage_charged",
             charge_type=charge_type,
-            reference_id=reference_id,
+            reference_id=str(reference_uuid) if reference_uuid else None,
+            transcript_segment_id=str(segment_uuid) if segment_uuid else None,
             credits_consumed=credits_consumed,
         )
         return True
