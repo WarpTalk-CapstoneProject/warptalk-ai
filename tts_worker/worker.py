@@ -230,7 +230,11 @@ class TTSWorker(BaseWorker):
         if pcm and self.livekit_publisher is not None:
             asyncio.create_task(
                 self.livekit_publisher.publish_pcm(
-                    translation.meeting_id, translation.target_lang, pcm, self.tts_settings.sample_rate
+                    translation.meeting_id,
+                    translation.speaker_id,
+                    translation.target_lang,
+                    pcm,
+                    self.tts_settings.sample_rate,
                 )
             )
 

@@ -103,7 +103,15 @@ class TranslationWorker(BaseWorker):
                 await asyncio.sleep(1.0)
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
-        """Translate one STT result segment by chunking into sentences."""
+        """Translate one STT result segment by chunking into sentences.
+
+        Every participant is simultaneously a translation source (when they speak) and a
+        target (their own listen language) — a meeting is not one fixed source->target
+        pair. Fan out to every DISTINCT listen-language among the OTHER participants (not
+        per-listener: two listeners both wanting Vietnamese share one translated+dubbed
+        track, matching how tts_worker's LiveKitTTSPublisher already keys its bots by
+        (meeting_id, target_lang)).
+        """
         stt_result = STTResultMessage.from_redis(data)
 
         if stt_result.meeting_id in self._paused_rooms:
@@ -113,8 +121,7 @@ class TranslationWorker(BaseWorker):
         e2e_latency_ms = current_timestamp_ms - stt_result.timestamp_ms
         await self.redis.publish_telemetry(stt_result.meeting_id, self.worker_name, e2e_latency_ms)
 
-        # Get target language for this meeting/speaker
-        target_lang = await self._get_target_language(
+        target_langs = await self._get_target_languages(
             stt_result.meeting_id, stt_result.speaker_id
         )
 
@@ -123,21 +130,30 @@ class TranslationWorker(BaseWorker):
 
         if not sentences:
             if stt_result.is_final_chunk:
-                result = TranslationResultMessage(
-                    segment_id=stt_result.segment_id,
-                    meeting_id=stt_result.meeting_id,
-                    speaker_id=stt_result.speaker_id,
-                    original_text="",
-                    translated_text="",
-                    source_lang=stt_result.language,
-                    target_lang=target_lang,
-                    is_final_chunk=True,
-                    timestamp_ms=stt_result.timestamp_ms,
-                    translator_model=self.translator.model,
-                )
-                await self.publish("translate:results", stt_result.meeting_id, result.to_redis())
+                for target_lang in target_langs:
+                    result = TranslationResultMessage(
+                        segment_id=f"{stt_result.segment_id}-{target_lang}",
+                        meeting_id=stt_result.meeting_id,
+                        speaker_id=stt_result.speaker_id,
+                        original_text="",
+                        translated_text="",
+                        source_lang=stt_result.language,
+                        target_lang=target_lang,
+                        is_final_chunk=True,
+                        timestamp_ms=stt_result.timestamp_ms,
+                        translator_model=self.translator.model,
+                    )
+                    await self.publish("translate:results", stt_result.meeting_id, result.to_redis())
             return
 
+        await asyncio.gather(*(
+            self._translate_and_publish(stt_result, sentences, target_lang)
+            for target_lang in target_langs
+        ))
+
+    async def _translate_and_publish(
+        self, stt_result: STTResultMessage, sentences: list[str], target_lang: str
+    ) -> None:
         # Fire off translation for all sentences UP FRONT so they run concurrently instead
         # of one-sentence-at-a-time (each translate() call is a real OpenAI network
         # round-trip — awaiting them sequentially in the publish loop below used to add a
@@ -166,8 +182,10 @@ class TranslationWorker(BaseWorker):
                 )
 
         for idx, sentence in enumerate(sentences):
-            # Sequence the segment ID so frontend gets consecutive speech segments
-            chunk_segment_id = f"{stt_result.segment_id}-c{idx}"
+            # Sequence the segment ID (per target language, so different listeners'
+            # translations of the same STT segment don't collide) so the frontend gets
+            # consecutive speech segments.
+            chunk_segment_id = f"{stt_result.segment_id}-{target_lang}-c{idx}"
 
             if passthrough:
                 translated_text = sentence
@@ -209,8 +227,8 @@ class TranslationWorker(BaseWorker):
                 translated=translated_text[:60],
             )
 
-    async def _get_target_language(self, meeting_id: str, speaker_id: str) -> str:
-        """Get the target translation language for a speaker's audience.
+    async def _get_target_languages(self, meeting_id: str, speaker_id: str) -> set[str]:
+        """Every DISTINCT listen-language among the OTHER participants in this meeting.
 
         Reads from a Redis hash set by the backend when a user joins and selects their
         preferred output language: `translationRoom:{translationRoomId}:languages`,
@@ -220,27 +238,20 @@ class TranslationWorker(BaseWorker):
         NOTE: `meeting_id` here is actually the translation_room_id (see
         AudioChunkMessage.from_redis / RedisStreamService.PublishAudioChunkAsync).
 
-        Previously this looked up `hget(hash, speaker_id)` — i.e. it read the SPEAKER's
-        own listen-language entry, not any listener's. That is wrong: the host's own
-        ListenLanguage is hardcoded to the room's source language at creation
-        (TranslationRoomService.CreateTranslationRoomAsync sets
-        hostParticipant.ListenLanguage = sourceLang), so when the host spoke, this
-        always resolved target_lang == source_lang, short-circuited
-        OpenAITranslator.translate()'s same-language passthrough, and silently
-        produced zero real translations for the single most common case (host speaks,
-        guest listens). Fixed to look at every OTHER participant's entry instead.
-
-        Still a simplification: with >1 listener configured for different languages,
-        this returns only the first one found (single target_lang per
-        TranslationResultMessage) — true multi-listener fan-out (one message per
-        distinct target language) is a separate, larger change, not attempted here.
+        Previously this returned only the FIRST other participant's entry found — with
+        >1 listener wanting different languages, everyone but the first got nothing
+        (single target_lang per TranslationResultMessage). Fixed to fan out to every
+        distinct language present instead of picking one.
         """
         all_languages = await self.redis.hgetall(f"translationRoom:{meeting_id}:languages")
+        targets: set[str] = set()
         for raw_user_id, raw_lang in all_languages.items():
             user_id = raw_user_id.decode() if isinstance(raw_user_id, bytes) else raw_user_id
             if user_id == speaker_id:
                 continue
-            return raw_lang.decode() if isinstance(raw_lang, bytes) else raw_lang
+            lang = raw_lang.decode() if isinstance(raw_lang, bytes) else raw_lang
+            if lang:
+                targets.add(lang)
 
         # No other participant registered yet — avoid assuming Vietnamese for all users.
-        return "en"
+        return targets or {"en"}

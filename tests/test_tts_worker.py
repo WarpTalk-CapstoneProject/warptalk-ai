@@ -228,8 +228,11 @@ class TestTTSWorker:
 
         worker.livekit_publisher.publish_pcm.assert_awaited_once()
         args, kwargs = worker.livekit_publisher.publish_pcm.call_args
-        call_args = kwargs or dict(zip(["meeting_id", "target_lang", "pcm_s16le", "sample_rate"], args))
+        call_args = kwargs or dict(
+            zip(["meeting_id", "speaker_id", "target_lang", "pcm_s16le", "sample_rate"], args)
+        )
         assert call_args["meeting_id"] == "m1"
+        assert call_args["speaker_id"] == "s1"
         assert call_args["target_lang"] == "vi"
         assert call_args["pcm_s16le"] == pcm_body
 
