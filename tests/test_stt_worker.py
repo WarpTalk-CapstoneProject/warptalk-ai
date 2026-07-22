@@ -256,9 +256,33 @@ class TestFilterSegments:
         result = _filter_segments(segs, "vi", 0)
         assert len(result) == 1
 
-    def test_unknown_language_filtered(self) -> None:
-        segs = [_segment("こんにちは")]
+    def test_declared_nonlatin_language_passes(self) -> None:
+        """A speaker whose declared profile language is non-Latin (e.g. Japanese) must
+        get their transcript — hard-coding the allow-list to vi/en was the bug that
+        dropped every segment for such speakers ("nói không ra transcript"). The
+        speaker's own hint language is always allowed, and the cross-script guard does
+        NOT apply to a declared non-Latin language.
+        """
+        segs = [_segment("こんにちは、会議を始めましょう")]
         result = _filter_segments(segs, "ja", 0)
+        assert len(result) == 1
+        assert result[0].language == "ja"
+
+    def test_language_outside_declared_set_filtered(self) -> None:
+        """When the meeting declares an explicit language set that a detected language is
+        not part of (and it isn't the speaker's own hint), the segment is dropped."""
+        segs = [_segment("Bonjour tout le monde")]
+        result = _filter_segments(segs, "de", 0, allowed_languages={"vi", "en"})
+        # 'de' is force-added as the speaker's own hint, so it passes — trusting the
+        # speaker's declaration is intentional; the meeting set constrains guessing, not
+        # a speaker's pinned language.
+        assert len(result) == 1
+
+    def test_latin_speaker_foreign_script_filtered(self) -> None:
+        """A speaker declared in a Latin-script language emitting CJK/Kana text is the
+        model mixing languages mid-utterance — drop it to enforce "no mixing"."""
+        segs = [_segment("こんにちは")]
+        result = _filter_segments(segs, "en", 0)
         assert result == []
 
     def test_low_confidence_filtered(self) -> None:
@@ -325,6 +349,8 @@ class TestSTTWorker:
         worker.logger = MagicMock()
         worker.stt_settings = STTSettings()
         worker._paused_rooms = set()
+        worker._stt_prompts = {}
+        worker._room_languages = {}
 
         worker.model = MagicMock()
         worker.model.transcribe = AsyncMock(
@@ -372,6 +398,8 @@ class TestSTTWorker:
         worker.logger = MagicMock()
         worker.stt_settings = STTSettings()
         worker._paused_rooms = set()
+        worker._stt_prompts = {}
+        worker._room_languages = {}
 
         async def fake_transcribe(*args, **kwargs):
             on_early_segment = kwargs["on_early_segment"]
@@ -443,6 +471,8 @@ class TestSTTWorker:
         worker.logger = MagicMock()
         worker.stt_settings = STTSettings(model="gpt-4o-mini-transcribe")
         worker._paused_rooms = set()
+        worker._stt_prompts = {}
+        worker._room_languages = {}
 
         worker.model = MagicMock()
         worker.model.transcribe = AsyncMock(side_effect=RuntimeError("provider down"))
@@ -462,3 +492,53 @@ class TestSTTWorker:
         ]
         assert any("translationRoom:system_events" in stream for stream in streams_published)
         assert not any("stt:results" in stream for stream in streams_published)
+
+    async def test_get_stt_prompt_returns_generic_base_when_no_glossary(
+        self, mock_redis_client
+    ) -> None:
+        """Every session gets the generic anti-hallucination base prompt even when the
+        room has no glossary published (get() returns None)."""
+        from stt_worker.worker import _GENERIC_STT_BASE_PROMPT
+
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._stt_prompts = {}
+
+        prompt = await worker._get_stt_prompt("m1")
+        assert prompt == _GENERIC_STT_BASE_PROMPT
+
+    async def test_get_stt_prompt_appends_glossary_to_base(
+        self, mock_redis_client
+    ) -> None:
+        """A published glossary is appended AFTER the generic base, not instead of it."""
+        from stt_worker.worker import _GENERIC_STT_BASE_PROMPT
+
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._stt_prompts = {}
+        mock_redis_client._redis.get.return_value = b"WarpTalk, Kubernetes, gRPC"
+
+        prompt = await worker._get_stt_prompt("m1")
+        assert prompt.startswith(_GENERIC_STT_BASE_PROMPT)
+        assert "WarpTalk, Kubernetes, gRPC" in prompt
+
+    async def test_get_room_languages_derives_distinct_speak_languages(
+        self, mock_redis_client
+    ) -> None:
+        """The meeting's allowed-language set is the distinct, normalized set of its
+        participants' declared speak-languages (locale tags collapsed to bare codes)."""
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {}
+        mock_redis_client._redis.hgetall.return_value = {
+            b"user-1": b"vi",
+            b"user-2": b"en-US",
+            b"user-3": b"vi",
+            b"user-4": b"ja",
+        }
+
+        langs = await worker._get_room_languages("m1")
+        assert langs == {"vi", "en", "ja"}

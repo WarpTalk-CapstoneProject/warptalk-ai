@@ -26,7 +26,12 @@ class RedisSettings(BaseSettings):
 
     url: str = "redis://localhost:6379"
     password: str = ""
-    max_connections: int = 10
+    # livekit_ingress alone holds 1 connection per concurrent room (pubsub listener)
+    # plus one per in-flight XADD from VAD-triggered chunk publishes — 10 was only
+    # enough for a single active room at a time; opening a second meeting while one
+    # is still live exhausted the pool ("MaxConnectionsError: Too many connections"),
+    # which read as the whole AI pipeline going unresponsive.
+    max_connections: int = 50
     socket_timeout: float = 5.0
     socket_connect_timeout: float = 5.0
     stream_maxlen: int = 1000  # MAXLEN ~ for XADD trimming
@@ -68,7 +73,13 @@ class STTSettings(BaseSettings):
 
     provider: str = "openai"
     api_key: str = ""
-    model: str = "gpt-realtime-whisper"  # Realtime API streaming transcription model
+    # gpt-4o-transcribe (not gpt-realtime-whisper): the realtime-whisper model is
+    # dialogue-optimized (forced min temperature 0.6) and supports neither a `prompt`
+    # field nor confidence signals, so it hallucinates more and can't be steered.
+    # gpt-4o-transcribe runs over the same realtime transcription session but accepts a
+    # free-text `prompt` for contextual biasing (glossary/key terms) — the research-
+    # backed way to cut hallucination (arXiv 2410.18363). See model.py.
+    model: str = "gpt-4o-transcribe"
     language: str = "auto"  # Auto-detect for code-switching (Vi + En)
 
 

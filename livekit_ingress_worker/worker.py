@@ -17,6 +17,17 @@ from livekit import api
 from shared.base_worker import BaseWorker
 from shared.schemas import AudioChunkMessage
 
+# Bot participant identities used elsewhere in this pipeline — this worker's own
+# "AIBot_{room}" (join_room, below) and the TTS publisher's "ai-interpreter-{lang}"
+# (tts_worker/livekit_publisher.py). Without this filter, subscribing to the AI
+# interpreter's own synthesized-speech track feeds it straight back into STT ->
+# translation -> TTS, a feedback loop that compounds hallucination/repetition.
+_AI_BOT_IDENTITY_PREFIXES = ("AIBot_", "ai-interpreter-")
+
+
+def _is_ai_bot_identity(identity: str) -> bool:
+    return identity.startswith(_AI_BOT_IDENTITY_PREFIXES)
+
 
 class LiveKitIngressWorker(BaseWorker):
     """Worker that joins LiveKit rooms and pushes audio to Redis Streams."""
@@ -112,7 +123,7 @@ class LiveKitIngressWorker(BaseWorker):
 
         @room.on("track_subscribed")
         def on_track_subscribed(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
-            if track.kind == rtc.TrackKind.KIND_AUDIO:
+            if track.kind == rtc.TrackKind.KIND_AUDIO and not _is_ai_bot_identity(participant.identity):
                 self.logger.info("audio_track_subscribed", participant=participant.identity, track=track.sid)
                 task = asyncio.create_task(self.process_audio_track(room_name, participant.identity, track))
                 self.audio_tasks[track.sid] = task
@@ -123,6 +134,8 @@ class LiveKitIngressWorker(BaseWorker):
 
             # Subscribe to already-published audio tracks from existing participants
             for participant in room.remote_participants.values():
+                if _is_ai_bot_identity(participant.identity):
+                    continue
                 for pub in participant.track_publications.values():
                     if pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
                         self.logger.info(
@@ -345,12 +358,24 @@ class LiveKitIngressWorker(BaseWorker):
             raw_peak=round(float(raw_peak), 6),
         )
 
+        # This speaker's own chosen speak-language — TranslationRoomHub.JoinTranslationRoom
+        # persists it (see NormalizeLanguageCode there) keyed by userId, which is the same
+        # value LiveKit uses as participant.identity/speaker_id here. Falls back to "auto"
+        # (STT's own guess) only if the speaker somehow isn't registered yet.
+        language = "auto"
+        raw_language = await self.redis.hget(
+            f"translationRoom:{room_name}:speak_languages", speaker_id
+        )
+        if raw_language:
+            language = raw_language.decode() if isinstance(raw_language, bytes) else raw_language
+
         msg = AudioChunkMessage(
             meeting_id=room_name,
             speaker_id=speaker_id,
             chunk_index=chunk_index,
             audio_data=bytes(pcm),
             sample_rate=sample_rate,
+            language=language,
             timestamp_ms=int(time.time() * 1000),
         )
 

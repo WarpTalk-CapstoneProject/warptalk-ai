@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 
+import numpy as np
 from livekit import api, rtc
 
 from shared.config import LiveKitSettings
@@ -30,28 +31,68 @@ FRAME_MS = 20
 # without this delay, but it's cheap insurance against a slow WebRTC negotiation.
 _PUBLISH_SETTLE_S = 0.2
 
+# Each STT chunk's translated text is synthesized as its own independent Cartesia call,
+# so every clip starts/ends at whatever sample amplitude Cartesia happened to render —
+# rarely zero. Splicing those hard-cut edges back-to-back on one continuous LiveKit
+# track produces an audible click/pop at the start of every chunk. A short linear
+# ramp in/out removes the discontinuity.
+_FADE_MS = 8
+
+
+def _apply_fade(pcm_s16le: bytes, sample_rate: int) -> bytes:
+    if not pcm_s16le:
+        return pcm_s16le
+
+    # Drop a stray trailing byte so the buffer is a whole number of 16-bit samples —
+    # np.frombuffer(int16) rejects an odd-length buffer, and a lone half-sample carries
+    # no usable audio anyway (the matching partial-frame drop happens in _capture_all).
+    if len(pcm_s16le) % 2:
+        pcm_s16le = pcm_s16le[:-1]
+
+    samples = np.frombuffer(pcm_s16le, dtype=np.int16).astype(np.float32)
+    fade_len = min(len(samples) // 2, int(sample_rate * _FADE_MS / 1000))
+    if fade_len <= 0:
+        return pcm_s16le
+
+    ramp = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+    samples[:fade_len] *= ramp
+    samples[-fade_len:] *= ramp[::-1]
+    return samples.astype(np.int16).tobytes()
+
 
 class LiveKitTTSPublisher:
-    """One bot participant + audio track per (meeting_id, target_lang), reused
-    across every synthesized sentence for that pair — same session-reuse pattern as
-    stt_worker's realtime sessions, so only the first sentence in a target language
-    pays the room-join handshake.
+    """One bot participant + audio track per (meeting_id, speaker_id, target_lang),
+    reused across every synthesized sentence for that triple — same session-reuse
+    pattern as stt_worker's realtime sessions, so only the first sentence for a given
+    speaker+language pays the room-join handshake.
+
+    Keying by speaker (not just language) is what lets concurrent speakers be dubbed in
+    PARALLEL: each speaker's interpreted audio is its own independent WebRTC track that
+    the client mixes natively, instead of every speaker's dub being serialized onto a
+    single shared "ai-interpreter-{lang}" track. It also lines up one interpreter track
+    per human speaker, so a listener can attribute (and a cloned voice can match) the dub
+    to the person who actually spoke.
     """
 
     def __init__(self, settings: LiveKitSettings) -> None:
         self.settings = settings
-        self._bots: dict[tuple[str, str], dict] = {}
+        self._bots: dict[tuple[str, str, str], dict] = {}
         # publish_pcm() is called fire-and-forget (asyncio.create_task) from
         # tts_worker, so two sentences translated close together can both reach
         # _get_or_create_bot() before either has finished connecting — without this
         # lock, both create a room connection under the SAME bot identity, and
         # LiveKit kicks one with "DuplicateIdentity" (observed live).
-        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._locks: dict[tuple[str, str, str], asyncio.Lock] = {}
 
     async def publish_pcm(
-        self, meeting_id: str, target_lang: str, pcm_s16le: bytes, sample_rate: int
+        self,
+        meeting_id: str,
+        speaker_id: str,
+        target_lang: str,
+        pcm_s16le: bytes,
+        sample_rate: int,
     ) -> None:
-        """Feed raw 16-bit mono PCM (no WAV header) into the bot's audio track.
+        """Feed raw 16-bit mono PCM (no WAV header) into this speaker's interpreter track.
 
         capture_frame() fails intermittently with "InvalidState" — a known, sporadic,
         upstream LiveKit issue (livekit/rust-sdks#497, livekit/agents-js#270), not tied
@@ -62,12 +103,16 @@ class LiveKitTTSPublisher:
         if not pcm_s16le:
             return
 
+        key = (meeting_id, speaker_id, target_lang)
         for attempt in range(2):
             try:
-                bot = await self._get_or_create_bot(meeting_id, target_lang, sample_rate)
+                bot = await self._get_or_create_bot(meeting_id, speaker_id, target_lang, sample_rate)
             except Exception:
                 logger.exception(
-                    "livekit_tts_bot_connect_error", meeting_id=meeting_id, target_lang=target_lang
+                    "livekit_tts_bot_connect_error",
+                    meeting_id=meeting_id,
+                    speaker_id=speaker_id,
+                    target_lang=target_lang,
                 )
                 return
 
@@ -77,10 +122,11 @@ class LiveKitTTSPublisher:
             logger.warning(
                 "livekit_tts_publish_retry",
                 meeting_id=meeting_id,
+                speaker_id=speaker_id,
                 target_lang=target_lang,
                 attempt=attempt,
             )
-            self._bots.pop((meeting_id, target_lang), None)
+            self._bots.pop(key, None)
 
     async def _capture_all(self, source: rtc.AudioSource, pcm_s16le: bytes, sample_rate: int) -> bool:
         """Push all frames; returns False (and logs) on the first capture_frame failure."""
@@ -88,6 +134,7 @@ class LiveKitTTSPublisher:
         if frame_bytes <= 0:
             return True
 
+        pcm_s16le = _apply_fade(pcm_s16le, sample_rate)
         usable_len = len(pcm_s16le) - (len(pcm_s16le) % frame_bytes)
         try:
             for i in range(0, usable_len, frame_bytes):
@@ -105,9 +152,9 @@ class LiveKitTTSPublisher:
             return False
 
     async def _get_or_create_bot(
-        self, meeting_id: str, target_lang: str, sample_rate: int
+        self, meeting_id: str, speaker_id: str, target_lang: str, sample_rate: int
     ) -> dict:
-        key = (meeting_id, target_lang)
+        key = (meeting_id, speaker_id, target_lang)
         cached = self._bots.get(key)
         if cached is not None:
             return cached
@@ -119,7 +166,12 @@ class LiveKitTTSPublisher:
             if cached is not None:
                 return cached
 
-            identity = f"ai-interpreter-{target_lang}"
+            # Language first so the frontend can match by a stable prefix
+            # (`ai-interpreter-{lang}-`) — speaker_id is a GUID that contains its own
+            # hyphens, so putting it last keeps the language token unambiguous. The
+            # `ai-interpreter-` prefix still matches livekit_ingress_worker's
+            # _is_ai_bot_identity filter, so this bot's own track is never re-ingested.
+            identity = f"ai-interpreter-{target_lang}-{speaker_id}"
             token = (
                 api.AccessToken(self.settings.api_key, self.settings.api_secret)
                 .with_identity(identity)
@@ -143,6 +195,7 @@ class LiveKitTTSPublisher:
             logger.info(
                 "livekit_tts_bot_published",
                 meeting_id=meeting_id,
+                speaker_id=speaker_id,
                 target_lang=target_lang,
                 identity=identity,
             )
