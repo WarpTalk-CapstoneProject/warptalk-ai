@@ -104,6 +104,7 @@ COPY pyproject.toml ./
 COPY shared/ shared/
 COPY livekit_ingress_worker/ livekit_ingress_worker/
 RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && python -m pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu \
     && python -m pip install --no-cache-dir -e ".[ingress]"
 
 RUN groupadd -r worker && useradd -r -g worker -d /app worker
