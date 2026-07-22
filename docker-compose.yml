@@ -119,6 +119,18 @@ services:
       - warptalk-infrastructure_warptalk-net
     restart: unless-stopped
 
+  # ---- Security Worker ----
+  security:
+    build:
+      context: .
+      target: security
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+    networks:
+      - warptalk-infrastructure_warptalk-net
+    restart: unless-stopped
+
 volumes:
   qdrantdata:
 

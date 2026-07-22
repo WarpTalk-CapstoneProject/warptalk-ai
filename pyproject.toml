@@ -3,7 +3,8 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["shared*", "stt_worker*", "translation_worker*", "tts_worker*", "ai_assistant_worker*", "embedding_worker*", "billing_worker*"]
+include = ["shared*", "stt_worker*", "translation_worker*", "tts_worker*", "ai_assistant_worker*", "embedding_worker*", "billing_worker*", "security_worker*", "livekit_ingress_worker*"]
+
 
 [project]
 name = "warptalk-ai"
@@ -23,6 +24,8 @@ dependencies = [
     "pydantic-settings>=2.1",
     "structlog>=24.1",
     "python-dotenv>=1.0",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
     # OpenAI SDK backs STT, translation, assistant, and embeddings per DECISIONS.md.
     # STT uses the Realtime API (gpt-realtime-whisper over WebSocket) — needs the
     # openai[realtime] extra's websockets dependency.

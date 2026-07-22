@@ -37,6 +37,7 @@ COPY ai_assistant_worker/ ai_assistant_worker/
 COPY embedding_worker/ embedding_worker/
 COPY billing_worker/ billing_worker/
 COPY livekit_ingress_worker/ livekit_ingress_worker/
+COPY security_worker/ security_worker/
 RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
 # Install OpenAI-backed workers plus Cartesia TTS, Qdrant embedding, and asyncpg billing extras.
@@ -117,3 +118,12 @@ USER worker
 
 ENV PYTHONPATH=/app
 CMD ["python", "-m", "livekit_ingress_worker"]
+
+# ---- Security Worker ----
+FROM builder AS security
+
+RUN groupadd -r worker && useradd -r -g worker -d /app worker
+USER worker
+
+ENV PYTHONPATH=/app
+CMD ["python", "-m", "security_worker"]

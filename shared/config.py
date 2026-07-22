@@ -170,3 +170,11 @@ class VectorDbSettings(BaseSettings):
     url: str = "http://localhost:6333"
     api_key: str = ""
     distance_metric: str = "cosine"
+
+
+class SecuritySettings(BaseSettings):
+    """Security scanning worker settings."""
+
+    model_config = {"env_prefix": "SECURITY_"}
+
+    api_key: str = ""
