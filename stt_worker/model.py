@@ -22,10 +22,17 @@ from typing import Awaitable, Callable
 
 import numpy as np
 
+from shared.config import STTSettings
 from shared.logger import get_logger
 from shared.text_utils import split_into_sentences
 
 logger = get_logger(__name__)
+
+# Mirrors STTSettings.model — the value production code actually runs with
+# (stt_worker/worker.py always passes it explicitly). Sourcing the default from here
+# instead of a second hardcoded literal keeps direct/test instantiation in sync with
+# config.py without anyone having to remember to update both places.
+_DEFAULTS = STTSettings()
 
 # gpt-realtime-whisper rejects session.audio.input.format.rate below this.
 REALTIME_SAMPLE_RATE = 24000
@@ -348,7 +355,7 @@ class OpenAISTT:
     connection handshake.
     """
 
-    def __init__(self, api_key: str = "", model: str = "gpt-4o-transcribe") -> None:
+    def __init__(self, api_key: str = "", model: str = _DEFAULTS.model) -> None:
         self.api_key = api_key
         self.model = model
         self._client = None

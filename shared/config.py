@@ -131,6 +131,30 @@ class AssistantSettings(BaseSettings):
     temperature: float = 0.3
 
 
+class ChatAssistantSettings(BaseSettings):
+    """Global AI assistant (chat-with-tools) worker settings.
+
+    Distinct from AssistantSettings (per-meeting summarization) — this worker answers
+    free-form questions in the global "Ask WarpTalk" widget and can call tools that read
+    real workspace data from sibling .NET services.
+    """
+
+    model_config = {"env_prefix": "ASSISTANT_CHAT_"}
+
+    api_key: str = ""
+    model: str = "gpt-4o-mini"
+    max_tokens: int = 1024
+    temperature: float = 0.4
+    max_tool_iterations: int = 5
+    # Flush a streamed chunk to Redis every N characters rather than per-token — keeps
+    # Redis Stream / SignalR traffic bounded, matching the rest of the pipeline's coarse
+    # buffered-unit convention (STT/TTS/AI-assistant results are never per-token either).
+    chunk_flush_chars: int = 40
+    workspace_service_url: str = "http://localhost:5106"
+    transcript_service_url: str = "http://localhost:5103"
+    translation_room_service_url: str = "http://localhost:5102"
+
+
 class EmbeddingSettings(BaseSettings):
     """Knowledge embedding settings for WarpBot RAG."""
 

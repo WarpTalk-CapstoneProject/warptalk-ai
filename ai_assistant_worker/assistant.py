@@ -6,9 +6,17 @@ extracting action items, and answering questions about the meeting.
 
 from __future__ import annotations
 
+from shared.config import AssistantSettings
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Constructor defaults below mirror AssistantSettings — the values production code
+# actually runs with (ai_assistant_worker/worker.py always passes them explicitly).
+# Sourcing the defaults from here instead of a second hardcoded literal keeps
+# direct/test instantiation (e.g. tests/test_ai_assistant.py) in sync with config.py
+# without anyone having to remember to update both places.
+_DEFAULTS = AssistantSettings()
 
 
 class MeetingAssistant:
@@ -34,9 +42,9 @@ When extracting action items:
     def __init__(
         self,
         api_key: str,
-        model: str = "gpt-4.1",
-        max_tokens: int = 2048,
-        temperature: float = 0.3,
+        model: str = _DEFAULTS.model,
+        max_tokens: int = _DEFAULTS.max_tokens,
+        temperature: float = _DEFAULTS.temperature,
     ) -> None:
         self.api_key = api_key
         self.model = model

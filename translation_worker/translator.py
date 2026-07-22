@@ -8,9 +8,16 @@ from __future__ import annotations
 import asyncio
 import re
 
+from shared.config import TranslationSettings
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Constructor defaults below mirror TranslationSettings — the values production code
+# actually runs with (translation_worker/worker.py always passes them explicitly).
+# Sourcing the defaults from here instead of a second hardcoded literal keeps direct/test
+# instantiation in sync with config.py without anyone having to remember both places.
+_DEFAULTS = TranslationSettings()
 
 # ISO 639-1 → human-readable name for system prompt clarity
 _LANG_NAMES: dict[str, str] = {
@@ -64,8 +71,8 @@ class OpenAITranslator:
     def __init__(
         self,
         api_key: str,
-        model: str = "gpt-4.1-mini",
-        max_tokens: int = 512,
+        model: str = _DEFAULTS.model,
+        max_tokens: int = _DEFAULTS.max_tokens,
         # 0.0, not 0.1: measured via real pipeline benchmark that temperature=0.1 let
         # identical repeated input sentences translate to different (equally valid)
         # phrasings across separate calls (e.g. "15%" vs "mười lăm phần trăm"), which
@@ -73,7 +80,7 @@ class OpenAITranslator:
         # phrase misses the cache and pays a full ~1s Cartesia call instead of a ~2ms
         # cache hit. Determinism isn't perfectly guaranteed even at 0.0 (OpenAI's own
         # infra has some residual nondeterminism), but it meaningfully raises the hit rate.
-        temperature: float = 0.0,
+        temperature: float = _DEFAULTS.temperature,
     ) -> None:
         self.api_key = api_key
         self.model = model

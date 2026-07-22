@@ -104,6 +104,45 @@ class EmbeddingIndexResult(BaseModel):
         }
 
 
+class EmbeddingSearchRequest(BaseModel):
+    """Chat assistant → embedding worker semantic-search request.
+
+    Delivered over the `embedding:search_requests` stream; the reply is NOT a stream
+    (point-to-point, not broadcast) — it's a single JSON blob RPUSHed to a per-job
+    `embedding:search_result:{job_id}` list key, which the requester BLPOPs with a
+    timeout. That fits an RPC-shaped call better than a second consumer-group stream.
+    """
+
+    job_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    workspace_id: str
+    collection_id: str
+    query: str
+    top_k: int = 5
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_redis(self) -> dict[str, str]:
+        return {
+            "job_id": self.job_id,
+            "workspace_id": self.workspace_id,
+            "collection_id": self.collection_id,
+            "query": self.query,
+            "top_k": str(self.top_k),
+            "timestamp_ms": str(self.timestamp_ms),
+        }
+
+    @classmethod
+    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> EmbeddingSearchRequest:
+        d = _decode_dict(data)
+        return cls(
+            job_id=d.get("job_id", str(uuid.uuid4())),
+            workspace_id=d["workspace_id"],
+            collection_id=d["collection_id"],
+            query=d.get("query", ""),
+            top_k=int(d.get("top_k", "5")),
+            timestamp_ms=int(d.get("timestamp_ms", "0")),
+        )
+
+
 def _decode_dict(data: dict[bytes | str, bytes | str]) -> dict[str, str]:
     return {
         k.decode() if isinstance(k, bytes) else k: (

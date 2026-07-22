@@ -275,6 +275,100 @@ class TTSResultMessage(BaseModel):
         )
 
 
+class ChatRequestMessage(BaseModel):
+    """AssistantService (.NET) → ChatAssistantWorker.
+
+    One user turn to answer, with the prior conversation history needed for context.
+    bearer_token is the caller's own "Bearer eyJ..." header, forwarded so tool calls hit
+    sibling services' existing authenticated endpoints — never a privileged bypass.
+    """
+
+    __slots__ = ()
+
+    request_id: str
+    conversation_id: str
+    workspace_id: str
+    user_id: str
+    bearer_token: str = ""
+    history_json: str = "[]"  # JSON array of {"role": ..., "content": ...}
+    page_context_json: str = ""  # JSON {"pageType", "entityId", "workspaceId", "snapshot"} or "" if none
+    mentions_json: str = ""  # JSON array of {"entityType", "entityId", "label", "workspaceId"} or "" if none
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_redis(self) -> dict[str, str]:
+        return {
+            "request_id": self.request_id,
+            "conversation_id": self.conversation_id,
+            "workspace_id": self.workspace_id,
+            "user_id": self.user_id,
+            "bearer_token": self.bearer_token,
+            "history_json": self.history_json,
+            "page_context_json": self.page_context_json,
+            "mentions_json": self.mentions_json,
+            "timestamp_ms": str(self.timestamp_ms),
+        }
+
+    @classmethod
+    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> ChatRequestMessage:
+        d = _decode_dict(data)
+        return cls(
+            request_id=d["request_id"],
+            conversation_id=d["conversation_id"],
+            workspace_id=d["workspace_id"],
+            user_id=d["user_id"],
+            bearer_token=d.get("bearer_token", ""),
+            history_json=d.get("history_json", "[]"),
+            page_context_json=d.get("page_context_json", ""),
+            mentions_json=d.get("mentions_json", ""),
+            timestamp_ms=int(d.get("timestamp_ms", "0")),
+        )
+
+
+class ChatResultMessage(BaseModel):
+    """ChatAssistantWorker → AssistantService (.NET).
+
+    One event within a chat turn — a streamed text chunk, a tool-call lifecycle event, or
+    the final completed/failed outcome. `type` discriminates which other fields are meaningful.
+    """
+
+    __slots__ = ()
+
+    request_id: str
+    conversation_id: str
+    type: str  # "chunk" | "tool_call_started" | "tool_call_completed" | "completed" | "failed"
+    content: str = ""
+    tool_name: str = ""
+    tool_status: str = ""
+    tool_calls_json: str = ""
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_redis(self) -> dict[str, str]:
+        return {
+            "request_id": self.request_id,
+            "conversation_id": self.conversation_id,
+            "type": self.type,
+            "content": self.content,
+            "tool_name": self.tool_name,
+            "tool_status": self.tool_status,
+            "tool_calls_json": self.tool_calls_json,
+            "timestamp_ms": str(self.timestamp_ms),
+        }
+
+    @classmethod
+    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> ChatResultMessage:
+        d = _decode_dict(data)
+        return cls(
+            request_id=d["request_id"],
+            conversation_id=d["conversation_id"],
+            type=d["type"],
+            content=d.get("content", ""),
+            tool_name=d.get("tool_name", ""),
+            tool_status=d.get("tool_status", ""),
+            tool_calls_json=d.get("tool_calls_json", ""),
+            timestamp_ms=int(d.get("timestamp_ms", "0")),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
