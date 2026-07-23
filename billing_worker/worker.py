@@ -44,8 +44,11 @@ TRANSLATION_CHARGE_TYPE = "TRANSLATION"
 
 def _extract_underlying_segment_id(raw_segment_id: str) -> str | None:
     """Port of TranscriptRedisConsumerService.ExtractUnderlyingSegmentId (C#), byte-for-byte:
-    translation_worker mints segment_id as f"{stt_segment_guid}-c{idx}"; tts_worker carries
-    that composite string through unchanged. Recover the real TranscriptSegment.Id GUID.
+    translation_worker mints segment_id as f"{stt_segment_guid}-{target_lang}-c{idx}" (the
+    target_lang keeps concurrent per-listener-language translations of the same STT segment
+    from colliding on the same chunk id); tts_worker carries that composite string through
+    unchanged. Slicing on the first 36 chars recovers the real TranscriptSegment.Id GUID
+    regardless of what follows it.
 
     Returns None if the string isn't a valid GUID even after stripping the suffix — callers
     must treat that as "cannot attribute this charge to a segment", not crash.
@@ -203,8 +206,8 @@ class BillingSettlementWorker:
             return
         subscription_id, workspace_id = resolved
 
-        # msg.segment_id here is a composite string "{stt_segment_guid}-c{idx}" (minted in
-        # translation_worker/worker.py), not a valid GUID on its own — recover the real
+        # msg.segment_id here is a composite string "{stt_segment_guid}-{target_lang}-c{idx}"
+        # (minted in translation_worker/worker.py), not a valid GUID on its own — recover the real
         # TranscriptSegment.Id before using it as a UUID column value. Previously the raw
         # composite string was passed straight into reference_id (a UUID column), which
         # silently failed to bind and dropped the charge.
@@ -229,7 +232,7 @@ class BillingSettlementWorker:
             credits_consumed=max(1, round(quantity_chars / 100)),
             transcript_segment_id=underlying_segment_id,
             # msg.segment_id here IS deterministic (translation_worker builds it as
-            # f"{stt_result.segment_id}-c{idx}"), so this key is redelivery-safe. The
+            # f"{stt_result.segment_id}-{target_lang}-c{idx}"), so this key is redelivery-safe. The
             # idempotency key keeps using the raw composite msg.segment_id, unaffected by
             # the extraction above (which only changes what's stored in reference_id /
             # transcript_segment_id).
