@@ -12,6 +12,7 @@ independently of the translation worker.
 
 from __future__ import annotations
 
+import json
 import time
 
 from ai_assistant_worker.assistant import MeetingAssistant
@@ -94,6 +95,18 @@ class AIAssistantWorker(BaseWorker):
         context_snapshot_bytes = await self.redis.get(f"meeting:{meeting_id}:context_snapshot")
         context_snapshot = context_snapshot_bytes.decode("utf-8") if context_snapshot_bytes else ""
 
+        # Best-effort: the room's configured target language(s), written by
+        # MeetingService.EndMeetingAsync (WarpTalk.MeetingService) as a JSON array string.
+        # Missing/unparseable is fine — generate_structured_summary treats it as "no
+        # translation needed" and just skips the bilingual section.
+        target_languages: list[str] = []
+        try:
+            target_languages_bytes = await self.redis.get(f"meeting:{meeting_id}:target_languages")
+            if target_languages_bytes:
+                target_languages = json.loads(target_languages_bytes.decode("utf-8"))
+        except Exception:
+            self.logger.warning("failed_to_read_target_languages", meeting_id=meeting_id)
+
         # Generate summary
         summary = await self.assistant.summarize(transcript_text, context_snapshot=context_snapshot)
 
@@ -128,6 +141,21 @@ class AIAssistantWorker(BaseWorker):
             "content": action_items,
             "timestamp_ms": str(int(time.time() * 1000)),
         })
+
+        # WT-13: also generate the structured {summary, decisions[], actionItems[]} JSON
+        # that TranslationRoomService.ArtifactsFinalizer stores as the SUMMARY_EXPORT
+        # artifact's inline Content, so the frontend can render an overview, a decisions
+        # list, and an owner/task action-item checklist instead of parsing markdown.
+        structured = await self.assistant.generate_structured_summary(
+            transcript_text,
+            target_languages=target_languages,
+            context_snapshot=context_snapshot,
+        )
+        await self.redis.hset(
+            f"meeting:{meeting_id}:summary",
+            "structured_json",
+            json.dumps(structured),
+        )
 
         self.logger.info(
             "summary_generated",
