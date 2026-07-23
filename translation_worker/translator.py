@@ -120,7 +120,12 @@ class OpenAITranslator:
 
         src_name = _lang_name(src)
         tgt_name = _lang_name(tgt)
-        user_message = f"Translate from {src_name} to {tgt_name}:\n{text}"
+        user_message = (
+            f"Translate from {src_name} to {tgt_name}:\n{text}\n\n"
+            f"Respond entirely in {tgt_name} — never leave any word in {src_name} or "
+            "switch to a third language, except for proper nouns/brand names with no "
+            "natural translation."
+        )
 
         response = await self._client.chat.completions.create(
             model=self.model,
@@ -170,7 +175,12 @@ class OpenAITranslator:
         src_name = _lang_name(src)
         tgt_name = _lang_name(tgt)
         numbered_input = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(texts))
-        user_message = f"Translate from {src_name} to {tgt_name}:\n{numbered_input}"
+        user_message = (
+            f"Translate from {src_name} to {tgt_name}:\n{numbered_input}\n\n"
+            f"Respond entirely in {tgt_name} — never leave any word in {src_name} or "
+            "switch to a third language, except for proper nouns/brand names with no "
+            "natural translation."
+        )
 
         response = await self._client.chat.completions.create(
             model=self.model,

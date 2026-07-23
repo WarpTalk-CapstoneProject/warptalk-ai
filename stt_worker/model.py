@@ -169,6 +169,12 @@ _FOREIGN_SCRIPT_RE = re.compile(
     r'぀-ヿ]'   # Hiragana/Katakana
 )
 
+# Even the fastest human speech in any language doesn't clear ~30 chars/sec, so this
+# pair (< 0.5s of real audio, yet > 20 chars of text) only fires on the classic
+# Whisper-family hallucination pattern: a full phrase invented over near-silence/noise.
+_MIN_SPEECH_SECONDS_FOR_LONG_TEXT = 0.5
+_MAX_CHARS_FOR_SHORT_AUDIO = 20
+
 _HALLUCINATIONS = {
     "thank you", "thanks for watching", "bye", "bye bye",
     "good night", "oh", "you", "yeah", "okay",
@@ -234,6 +240,7 @@ def _filter_segments(
     detected_language: str,
     chunk_offset_ms: int,
     allowed_languages: set[str] | None = None,
+    real_duration_s: float | None = None,
 ) -> list[TranscribedSegment]:
     language_known = detected_language != "unknown"
     lang_code = _normalize_language(detected_language) if language_known else None
@@ -297,6 +304,24 @@ def _filter_segments(
 
         if avg_logprob < -1.0:
             logger.debug("filtered_low_confidence", text=text, logprob=round(avg_logprob, 2))
+            continue
+
+        # Unlike no_speech/avg_logprob above, this IS a real signal — only passed for the
+        # trailing fragment in transcribe() (the whole chunk's actual PCM duration via
+        # _pcm16_duration_seconds), never for early-emitted sentences (which have no real
+        # per-sentence timing to check against, see _emit_early). No human produces this
+        # many characters, in any language, in this little audio — the classic
+        # Whisper-family failure mode of a full sentence hallucinated onto near-silence.
+        if (
+            real_duration_s is not None
+            and real_duration_s < _MIN_SPEECH_SECONDS_FOR_LONG_TEXT
+            and len(text) > _MAX_CHARS_FOR_SHORT_AUDIO
+        ):
+            logger.debug(
+                "filtered_text_too_long_for_audio",
+                text=text[:60],
+                duration_s=round(real_duration_s, 2),
+            )
             continue
 
         if text_lower in _HALLUCINATIONS:
@@ -464,7 +489,15 @@ class OpenAISTT:
             "no_speech_prob": 0.0,
         }]
 
-        return _filter_segments(segments_dicts, detected_language, chunk_offset_ms, allowed_languages)
+        # duration_s is the WHOLE chunk's audio, while `text` here is only the trailing
+        # fragment not already flushed via on_early_segment — so this over-estimates the
+        # audio actually backing this specific text, making the check in _filter_segments
+        # more lenient than perfectly accurate. That's the safe direction: it only ever
+        # risks missing a hallucination, never dropping real trailing speech.
+        return _filter_segments(
+            segments_dicts, detected_language, chunk_offset_ms, allowed_languages,
+            real_duration_s=duration_s,
+        )
 
     async def _transcribe_via_session(
         self,

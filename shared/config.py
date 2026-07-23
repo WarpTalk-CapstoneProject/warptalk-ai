@@ -118,6 +118,13 @@ class TTSSettings(BaseSettings):
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
     voice_clone_key_ttl_seconds: int = 43200  # 12h — unbounded before this; matches AudioRouteCacheService's own Redis TTL
+    # How many public Cartesia voices to offer per language — both for the per-speaker
+    # hashed default (auto-diversity when nobody has cloned/chosen a voice) and for the
+    # control-bar voice picker's option list.
+    voice_catalog_size: int = 6
+    # Cartesia's public library doesn't churn often — cache the per-language catalog
+    # in Redis this long before re-fetching, to avoid a /voices call on every miss.
+    voice_catalog_cache_ttl_seconds: int = 21600  # 6h
 
 
 class AssistantSettings(BaseSettings):

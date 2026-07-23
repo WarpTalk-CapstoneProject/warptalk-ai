@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from shared.config import TTSSettings, WorkerSettings
 from shared.schemas import TranslationResultMessage
+from tts_worker.synthesizer import CartesiaSynthesizer
 from tts_worker.worker import TTSWorker
 
 
@@ -32,6 +34,10 @@ def _make_worker(mock_redis_client, worker_settings, tts_settings=None, consente
     worker.cartesia = MagicMock()
     worker.cartesia.synthesize = AsyncMock(return_value=(b"audio_bytes", 1000, "resolved-voice-id"))
     worker.cartesia.clone_voice = AsyncMock(return_value="test-voice-id")
+    # Empty catalog by default (no Cartesia list_voices call was made) — makes
+    # _hashed_default_voice_id() fall back to CartesiaSynthesizer._default_voice_id(),
+    # matching the pre-multi-voice single hardcoded default most tests still assume.
+    worker.cartesia.list_voices = AsyncMock(return_value=[])
     worker.livekit_publisher = MagicMock()
     worker.livekit_publisher.publish_pcm = AsyncMock()
     return worker
@@ -56,7 +62,10 @@ class TestTTSWorker:
     async def test_uses_default_voice_when_no_voice_id(
         self, mock_redis_client, worker_settings: WorkerSettings
     ) -> None:
-        """synthesize() called with voice_id=None when no clone cached."""
+        """synthesize() gets an explicit resolved voice_id when no clone is cached —
+        _resolve_voice_variants() always resolves a concrete default (catalog-hashed,
+        or the static fallback when the catalog is empty) before calling synthesize(),
+        so downstream code never has to special-case voice_id=None itself."""
         worker = _make_worker(mock_redis_client, worker_settings)
 
         # No voice_id, no cache
@@ -67,7 +76,7 @@ class TestTTSWorker:
 
         worker.cartesia.synthesize.assert_called_once()
         _, kwargs = worker.cartesia.synthesize.call_args
-        assert kwargs.get("voice_id") is None
+        assert kwargs.get("voice_id") == CartesiaSynthesizer._default_voice_id("vi")
 
     async def test_uses_cloned_voice_when_voice_id_cached(
         self, mock_redis_client, worker_settings: WorkerSettings
@@ -224,13 +233,13 @@ class TestTTSWorker:
         mock_redis_client._redis.get.return_value = None
 
         await worker.process(b"msg-1", _make_msg(target_lang="vi").to_redis())
-        await asyncio.sleep(0)  # let the fire-and-forget create_task run
 
         worker.livekit_publisher.publish_pcm.assert_awaited_once()
         args, kwargs = worker.livekit_publisher.publish_pcm.call_args
-        call_args = kwargs or dict(
-            zip(["meeting_id", "speaker_id", "target_lang", "pcm_s16le", "sample_rate"], args)
-        )
+        call_args = {
+            **dict(zip(["meeting_id", "speaker_id", "target_lang", "pcm_s16le", "sample_rate"], args)),
+            **kwargs,
+        }
         assert call_args["meeting_id"] == "m1"
         assert call_args["speaker_id"] == "s1"
         assert call_args["target_lang"] == "vi"
@@ -248,7 +257,6 @@ class TestTTSWorker:
         mock_redis_client._redis.get.return_value = cached_audio
 
         await worker.process(b"msg-1", _make_msg().to_redis())
-        await asyncio.sleep(0)
 
         worker.cartesia.synthesize.assert_not_called()
         worker.livekit_publisher.publish_pcm.assert_awaited_once()
@@ -329,3 +337,314 @@ class TestCacheKey:
     def test_starts_with_prefix(self) -> None:
         k = TTSWorker._cache_key("s1", "vi", "Hello", "default")
         assert k.startswith("tts:cache:")
+
+
+class TestConsumeLoopConcurrency:
+    """_consume_loop() must dispatch DIFFERENT (speaker, target_lang) keys
+    concurrently, while keeping any ONE key's own messages strictly ordered (they
+    share a single LiveKit track — see LiveKitTTSPublisher — and Cartesia's per-call
+    latency varies, so out-of-order dispatch could play sentence 2 before sentence 1)."""
+
+    def _make_worker(self) -> TTSWorker:
+        worker = TTSWorker.__new__(TTSWorker)
+        worker.logger = MagicMock()
+        worker._shutdown_event = asyncio.Event()
+        worker._consumer_name = "test-consumer"
+        worker.input_stream = "translate:results"
+        worker.consumer_group = "tts-workers"
+        worker._key_locks = {}
+        return worker
+
+    async def test_different_keys_dispatch_concurrently(self, mock_redis_client) -> None:
+        worker = self._make_worker()
+        worker.redis = mock_redis_client
+
+        started: list[bytes] = []
+        both_started = asyncio.Event()
+
+        async def fake_process(message_id: bytes, data: dict) -> None:
+            started.append(message_id)
+            if len(started) == 2:
+                both_started.set()
+            # msg-1 can only reach here if msg-2 (a DIFFERENT speaker+lang) has
+            # already started — impossible unless both run concurrently.
+            await asyncio.wait_for(both_started.wait(), timeout=1.0)
+
+        worker.process = fake_process
+
+        async def fake_consume(**kwargs):
+            yield b"msg-1", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}
+            yield b"msg-2", {"meeting_id": "m1", "speaker_id": "s2", "target_lang": "ja"}
+            worker._shutdown_event.set()
+
+        worker.redis.consume = fake_consume
+
+        await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
+        await asyncio.sleep(0.05)
+
+        assert started == [b"msg-1", b"msg-2"]
+
+    async def test_same_key_chunks_stay_ordered(self, mock_redis_client) -> None:
+        worker = self._make_worker()
+        worker.redis = mock_redis_client
+
+        events: list[tuple[str, bytes]] = []
+
+        async def fake_process(message_id: bytes, data: dict) -> None:
+            events.append(("start", message_id))
+            await asyncio.sleep(0.05)
+            events.append(("end", message_id))
+
+        worker.process = fake_process
+
+        async def fake_consume(**kwargs):
+            # Same speaker AND same target_lang — same LiveKit track, must stay ordered
+            # even though this is sentence 1 and 2 of one utterance.
+            yield b"msg-1", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}
+            yield b"msg-2", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}
+            worker._shutdown_event.set()
+
+        worker.redis.consume = fake_consume
+
+        await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
+        await asyncio.sleep(0.2)
+
+        assert events == [
+            ("start", b"msg-1"),
+            ("end", b"msg-1"),
+            ("start", b"msg-2"),
+            ("end", b"msg-2"),
+        ]
+
+    async def test_same_speaker_different_target_lang_dispatch_concurrently(
+        self, mock_redis_client
+    ) -> None:
+        """One speaker dubbed into two languages at once must not serialize just
+        because it's the same speaker — target_lang is part of the key."""
+        worker = self._make_worker()
+        worker.redis = mock_redis_client
+
+        started: list[bytes] = []
+        both_started = asyncio.Event()
+
+        async def fake_process(message_id: bytes, data: dict) -> None:
+            started.append(message_id)
+            if len(started) == 2:
+                both_started.set()
+            await asyncio.wait_for(both_started.wait(), timeout=1.0)
+
+        worker.process = fake_process
+
+        async def fake_consume(**kwargs):
+            yield b"msg-1", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}
+            yield b"msg-2", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "ja"}
+            worker._shutdown_event.set()
+
+        worker.redis.consume = fake_consume
+
+        await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
+        await asyncio.sleep(0.05)
+
+        assert started == [b"msg-1", b"msg-2"]
+
+    async def test_cleanup_room_purges_key_locks(self) -> None:
+        worker = self._make_worker()
+        worker._route_states = {}
+        worker._paused_rooms = set()
+        worker._room_routes = {}
+        worker._key_locks = {
+            ("m1", "s1", "vi"): asyncio.Lock(),
+            ("m2", "s2", "en"): asyncio.Lock(),
+        }
+
+        worker._cleanup_room("m1")
+
+        assert ("m1", "s1", "vi") not in worker._key_locks
+        assert ("m2", "s2", "en") in worker._key_locks
+
+
+class TestVoiceCatalog:
+    """_get_voice_catalog() / _hashed_default_voice_id() — the auto-diversity pool."""
+
+    async def test_fetches_and_caches_catalog(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = _make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.get.return_value = None
+        worker.cartesia.list_voices = AsyncMock(
+            return_value=[{"id": "v1", "name": "A", "gender": "m"}]
+        )
+
+        catalog = await worker._get_voice_catalog("vi")
+
+        assert catalog == [{"id": "v1", "name": "A", "gender": "m"}]
+        worker.cartesia.list_voices.assert_awaited_once_with(
+            "vi", limit=worker.tts_settings.voice_catalog_size
+        )
+        mock_redis_client._redis.setex.assert_called()
+
+    async def test_uses_cache_without_calling_cartesia(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = _make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.get.return_value = json.dumps(
+            [{"id": "cached-v", "name": "X", "gender": ""}]
+        ).encode()
+
+        catalog = await worker._get_voice_catalog("vi")
+
+        assert catalog == [{"id": "cached-v", "name": "X", "gender": ""}]
+        worker.cartesia.list_voices.assert_not_called()
+
+    async def test_hashed_default_is_deterministic_per_speaker(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = _make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.get.return_value = None
+        worker.cartesia.list_voices = AsyncMock(
+            return_value=[{"id": f"v{i}", "name": f"V{i}", "gender": ""} for i in range(3)]
+        )
+
+        first = await worker._hashed_default_voice_id("vi", "speaker-A")
+        second = await worker._hashed_default_voice_id("vi", "speaker-A")
+
+        assert first == second
+        assert first in {"v0", "v1", "v2"}
+
+    async def test_hashed_default_falls_back_to_static_when_catalog_empty(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = _make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.get.return_value = None
+        worker.cartesia.list_voices = AsyncMock(return_value=[])
+
+        voice_id = await worker._hashed_default_voice_id("vi", "speaker-A")
+
+        assert voice_id == CartesiaSynthesizer._default_voice_id("vi")
+
+    async def test_different_speakers_can_get_different_default_voices(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """The actual fix for 'A and B sound identical when they talk over each
+        other': with a multi-voice catalog, different un-cloned speakers must not
+        all collapse onto the same single voice."""
+        worker = _make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.get.return_value = None
+        worker.cartesia.list_voices = AsyncMock(
+            return_value=[{"id": f"v{i}", "name": f"V{i}", "gender": ""} for i in range(6)]
+        )
+
+        results = {
+            await worker._hashed_default_voice_id("vi", f"speaker-{i}") for i in range(20)
+        }
+
+        assert len(results) > 1
+
+
+class TestExplicitVoiceChoices:
+    """_get_explicit_voice_choices() — cross-referencing who's listening in a
+    language against who explicitly picked a voice for it."""
+
+    async def test_filters_to_listeners_currently_in_this_language(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = _make_worker(mock_redis_client, worker_settings)
+
+        async def hgetall_side_effect(key):
+            if key.endswith(":languages"):
+                return {b"listener-1": b"vi", b"listener-2": b"en"}
+            if key.endswith(":voice_preferences"):
+                return {b"listener-1": b"chosen-voice-1", b"listener-2": b"chosen-voice-2"}
+            return {}
+
+        mock_redis_client._redis.hgetall = AsyncMock(side_effect=hgetall_side_effect)
+
+        choices = await worker._get_explicit_voice_choices("m1", "vi")
+
+        # listener-2 is tuned to "en", not "vi" — their pick must not leak into "vi"'s set.
+        assert choices == {"chosen-voice-1"}
+
+    async def test_empty_when_nobody_listening_in_language(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = _make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall = AsyncMock(return_value={})
+
+        choices = await worker._get_explicit_voice_choices("m1", "vi")
+
+        assert choices == set()
+
+
+class TestVoiceVariantFanOut:
+    """process() end-to-end: an explicit listener voice preference must reach
+    LiveKit as its own track, WITHOUT causing a second billing_worker charge for
+    what is still just one translated utterance."""
+
+    async def test_explicit_preference_adds_livekit_track_without_extra_billing(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = _make_worker(mock_redis_client, worker_settings, consented=False)  # not cloned
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None  # no cache hits anywhere
+        # Audio must exceed _WAV_HEADER_BYTES (44) or the LiveKit publish is skipped
+        # as "nothing left after stripping the header" — see _publish_livekit_only.
+        worker.cartesia.synthesize = AsyncMock(
+            return_value=(b"R" * 44 + b"\x01\x02" * 50, 1000, "resolved-voice-id")
+        )
+
+        async def hgetall_side_effect(key):
+            if key.endswith(":languages"):
+                return {b"listener-1": b"vi"}
+            if key.endswith(":voice_preferences"):
+                return {b"listener-1": b"preferred-voice-xyz"}
+            return {}
+
+        mock_redis_client._redis.hgetall = AsyncMock(side_effect=hgetall_side_effect)
+
+        await worker.process(b"msg-1", _make_msg(target_lang="vi").to_redis())
+
+        # Two Cartesia calls (default hashed voice + the explicit preference voice)
+        # and two LiveKit publishes — one per distinct voice variant.
+        assert worker.cartesia.synthesize.await_count == 2
+        assert worker.livekit_publisher.publish_pcm.await_count == 2
+        voice_keys = {
+            c.kwargs.get("voice_key") for c in worker.livekit_publisher.publish_pcm.await_args_list
+        }
+        assert voice_keys == {"", f"voice-{'preferred-voice-xyz'[:8]}"}
+
+        # Only the DEFAULT variant publishes tts:results (2 xadd calls: per-room +
+        # global stream, via BaseWorker.publish()'s dual-write) — the preference
+        # variant must not add a second billing event for the same utterance.
+        tts_result_calls = [
+            c for c in mock_redis_client._redis.xadd.call_args_list
+            if "tts:results" in str(c.args[0])
+        ]
+        assert len(tts_result_calls) == 2
+
+    async def test_preference_matching_default_voice_is_not_duplicated(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """If a listener's explicit pick happens to equal the resolved default voice,
+        it must not trigger a second, redundant synthesis+track."""
+        worker = _make_worker(mock_redis_client, worker_settings, consented=False)
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
+        worker.cartesia.list_voices = AsyncMock(return_value=[])  # -> static default id
+        worker.cartesia.synthesize = AsyncMock(
+            return_value=(b"R" * 44 + b"\x01\x02" * 50, 1000, "resolved-voice-id")
+        )
+        default_id = CartesiaSynthesizer._default_voice_id("vi")
+
+        async def hgetall_side_effect(key):
+            if key.endswith(":languages"):
+                return {b"listener-1": b"vi"}
+            if key.endswith(":voice_preferences"):
+                return {b"listener-1": default_id.encode()}
+            return {}
+
+        mock_redis_client._redis.hgetall = AsyncMock(side_effect=hgetall_side_effect)
+
+        await worker.process(b"msg-1", _make_msg(target_lang="vi").to_redis())
+
+        assert worker.cartesia.synthesize.await_count == 1
+        assert worker.livekit_publisher.publish_pcm.await_count == 1

@@ -155,6 +155,17 @@ class TranslationResultMessage(BaseModel):
     is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
     translator_model: str = ""  # OpenAITranslator.model — needed by TranscriptService to populate transcript.translation_contents.translator_model (NOT NULL)
+    # The originating STTResultMessage.segment_id, BEFORE the "-{target_lang}-c{idx}"
+    # suffix this message's own segment_id gets (see translation_worker._translate_and_publish).
+    # Lets a consumer (gateway/frontend) join a translation back to the exact transcript
+    # bubble it belongs to instead of guessing from the suffixed id — the two ids only
+    # coincided by string-prefix luck before this field existed, and that's what let
+    # original/translated text drift into separate, unmerged bubbles.
+    source_segment_id: str = ""
+    # Position of this sentence within the source STT segment's sentence split — 0 for
+    # the first (and usually only) sentence. A consumer uses this to APPEND rather than
+    # overwrite when one STT segment yields more than one translated chunk.
+    chunk_index: int = 0
 
     def to_redis(self) -> dict[str, str]:
         return {
@@ -171,6 +182,8 @@ class TranslationResultMessage(BaseModel):
             "is_final_chunk": "1" if self.is_final_chunk else "0",
             "timestamp_ms": str(self.timestamp_ms),
             "translator_model": self.translator_model,
+            "source_segment_id": self.source_segment_id,
+            "chunk_index": str(self.chunk_index),
         }
 
     @classmethod
@@ -190,6 +203,8 @@ class TranslationResultMessage(BaseModel):
             is_final_chunk=d.get("is_final_chunk") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
             translator_model=d.get("translator_model", ""),
+            source_segment_id=d.get("source_segment_id", ""),
+            chunk_index=int(d.get("chunk_index", "0")),
         )
 
 

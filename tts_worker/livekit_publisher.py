@@ -15,6 +15,7 @@ when multiple target languages are active in the same room — see room page.)
 from __future__ import annotations
 
 import asyncio
+import time
 
 import numpy as np
 from livekit import api, rtc
@@ -30,6 +31,15 @@ FRAME_MS = 20
 # margin — isolated testing (see session notes) did not reproduce any failure with or
 # without this delay, but it's cheap insurance against a slow WebRTC negotiation.
 _PUBLISH_SETTLE_S = 0.2
+
+# Mirrors stt_worker's SESSION_IDLE_TIMEOUT_S. A bot is keyed by (meeting_id, speaker_id,
+# target_lang) — once a listener switches away from that language (see
+# TranslationRoomHub.SetListenLanguage) or leaves, translation_worker stops producing
+# that target_lang on any new utterance (_get_target_languages re-reads the room's
+# listen-language hash on every message), so publish_pcm() is simply never called again
+# for that key. Nothing previously told this bot to disconnect, so it — and its LiveKit
+# room connection — would otherwise leak for the rest of the process's lifetime.
+SESSION_IDLE_TIMEOUT_S = 300.0
 
 # Each STT chunk's translated text is synthesized as its own independent Cartesia call,
 # so every clip starts/ends at whatever sample amplitude Cartesia happened to render —
@@ -60,11 +70,18 @@ def _apply_fade(pcm_s16le: bytes, sample_rate: int) -> bytes:
     return samples.astype(np.int16).tobytes()
 
 
+# (meeting_id, speaker_id, target_lang, voice_key) — voice_key "" is the shared
+# default/cloned track (backward-compatible identity, unchanged from before per-
+# listener voice preferences existed); a non-empty voice_key ("voice-{id8}") is an
+# extra track for listeners who explicitly picked that voice via SetVoicePreference.
+_BotKey = tuple[str, str, str, str]
+
+
 class LiveKitTTSPublisher:
-    """One bot participant + audio track per (meeting_id, speaker_id, target_lang),
-    reused across every synthesized sentence for that triple — same session-reuse
-    pattern as stt_worker's realtime sessions, so only the first sentence for a given
-    speaker+language pays the room-join handshake.
+    """One bot participant + audio track per (meeting_id, speaker_id, target_lang,
+    voice_key), reused across every synthesized sentence for that key — same
+    session-reuse pattern as stt_worker's realtime sessions, so only the first
+    sentence for a given key pays the room-join handshake.
 
     Keying by speaker (not just language) is what lets concurrent speakers be dubbed in
     PARALLEL: each speaker's interpreted audio is its own independent WebRTC track that
@@ -72,17 +89,28 @@ class LiveKitTTSPublisher:
     single shared "ai-interpreter-{lang}" track. It also lines up one interpreter track
     per human speaker, so a listener can attribute (and a cloned voice can match) the dub
     to the person who actually spoke.
+
+    Keying by voice_key on top of that is what lets a listener hear a DIFFERENT voice
+    for the same speaker+language than everyone else who hasn't picked one — see
+    TTSWorker._resolve_voice_variants.
     """
 
     def __init__(self, settings: LiveKitSettings) -> None:
         self.settings = settings
-        self._bots: dict[tuple[str, str, str], dict] = {}
-        # publish_pcm() is called fire-and-forget (asyncio.create_task) from
-        # tts_worker, so two sentences translated close together can both reach
-        # _get_or_create_bot() before either has finished connecting — without this
-        # lock, both create a room connection under the SAME bot identity, and
-        # LiveKit kicks one with "DuplicateIdentity" (observed live).
-        self._locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        self._bots: dict[_BotKey, dict] = {}
+        # One lock per key, held for a caller's ENTIRE publish_pcm() call — not just bot
+        # creation. tts_worker now dispatches translate:results messages concurrently
+        # (see TTSWorker._consume_loop), so two sentences for the SAME key can genuinely
+        # run at the same time; without this, both could reach _get_or_create_bot()
+        # before either finishes connecting (the original bug this lock existed to
+        # prevent — LiveKit kicks the second connection with "DuplicateIdentity"), and
+        # even after that, two concurrent _capture_all() calls on the SAME AudioSource
+        # would interleave sentence 2's frames into the middle of sentence 1's,
+        # corrupting playback order. A different key (another speaker, another target
+        # language, or another voice variant) has its own independent lock and runs
+        # fully in parallel — this is what actually lets concurrent speakers be dubbed
+        # in parallel end-to-end.
+        self._locks: dict[_BotKey, asyncio.Lock] = {}
 
     async def publish_pcm(
         self,
@@ -91,8 +119,13 @@ class LiveKitTTSPublisher:
         target_lang: str,
         pcm_s16le: bytes,
         sample_rate: int,
+        voice_key: str = "",
     ) -> None:
         """Feed raw 16-bit mono PCM (no WAV header) into this speaker's interpreter track.
+
+        `voice_key` selects WHICH track for this (speaker, target_lang): "" is the
+        shared default/cloned track, anything else ("voice-{id8}") is a dedicated
+        track for listeners who explicitly chose that voice.
 
         capture_frame() fails intermittently with "InvalidState" — a known, sporadic,
         upstream LiveKit issue (livekit/rust-sdks#497, livekit/agents-js#270), not tied
@@ -103,30 +136,37 @@ class LiveKitTTSPublisher:
         if not pcm_s16le:
             return
 
-        key = (meeting_id, speaker_id, target_lang)
-        for attempt in range(2):
-            try:
-                bot = await self._get_or_create_bot(meeting_id, speaker_id, target_lang, sample_rate)
-            except Exception:
-                logger.exception(
-                    "livekit_tts_bot_connect_error",
+        key: _BotKey = (meeting_id, speaker_id, target_lang, voice_key)
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            for attempt in range(2):
+                try:
+                    bot = await self._get_or_create_bot(
+                        meeting_id, speaker_id, target_lang, voice_key, sample_rate
+                    )
+                    bot["last_used"] = time.monotonic()
+                except Exception:
+                    logger.exception(
+                        "livekit_tts_bot_connect_error",
+                        meeting_id=meeting_id,
+                        speaker_id=speaker_id,
+                        target_lang=target_lang,
+                        voice_key=voice_key,
+                    )
+                    return
+
+                if await self._capture_all(bot["source"], pcm_s16le, sample_rate):
+                    return
+
+                logger.warning(
+                    "livekit_tts_publish_retry",
                     meeting_id=meeting_id,
                     speaker_id=speaker_id,
                     target_lang=target_lang,
+                    voice_key=voice_key,
+                    attempt=attempt,
                 )
-                return
-
-            if await self._capture_all(bot["source"], pcm_s16le, sample_rate):
-                return
-
-            logger.warning(
-                "livekit_tts_publish_retry",
-                meeting_id=meeting_id,
-                speaker_id=speaker_id,
-                target_lang=target_lang,
-                attempt=attempt,
-            )
-            self._bots.pop(key, None)
+                self._bots.pop(key, None)
 
     async def _capture_all(self, source: rtc.AudioSource, pcm_s16le: bytes, sample_rate: int) -> bool:
         """Push all frames; returns False (and logs) on the first capture_frame failure."""
@@ -152,54 +192,79 @@ class LiveKitTTSPublisher:
             return False
 
     async def _get_or_create_bot(
-        self, meeting_id: str, speaker_id: str, target_lang: str, sample_rate: int
+        self, meeting_id: str, speaker_id: str, target_lang: str, voice_key: str, sample_rate: int
     ) -> dict:
-        key = (meeting_id, speaker_id, target_lang)
+        """Caller (publish_pcm) already holds this key's lock for its whole call, so no
+        locking is needed here — only one task can ever be inside this method for a
+        given key at a time."""
+        self._sweep_idle_bots()
+
+        key: _BotKey = (meeting_id, speaker_id, target_lang, voice_key)
         cached = self._bots.get(key)
         if cached is not None:
             return cached
 
-        lock = self._locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            # Re-check: another task may have created the bot while we waited for the lock.
-            cached = self._bots.get(key)
-            if cached is not None:
-                return cached
+        # Language first so the frontend can match by a stable prefix
+        # (`ai-interpreter-{lang}-`) — speaker_id is a GUID that contains its own
+        # hyphens, so putting it last keeps the language token unambiguous. voice_key
+        # (when set — "voice-{id8}") sits between language and speaker; a GUID never
+        # starts with "voice-", so the frontend can tell a voice-suffixed identity
+        # apart from a bare default one unambiguously. The `ai-interpreter-` prefix
+        # still matches livekit_ingress_worker's _is_ai_bot_identity filter, so this
+        # bot's own track is never re-ingested.
+        identity = (
+            f"ai-interpreter-{target_lang}-{voice_key}-{speaker_id}"
+            if voice_key
+            else f"ai-interpreter-{target_lang}-{speaker_id}"
+        )
+        token = (
+            api.AccessToken(self.settings.api_key, self.settings.api_secret)
+            .with_identity(identity)
+            .with_name(f"AI Interpreter ({target_lang})")
+            .with_grants(api.VideoGrants(room_join=True, room=meeting_id))
+            .to_jwt()
+        )
 
-            # Language first so the frontend can match by a stable prefix
-            # (`ai-interpreter-{lang}-`) — speaker_id is a GUID that contains its own
-            # hyphens, so putting it last keeps the language token unambiguous. The
-            # `ai-interpreter-` prefix still matches livekit_ingress_worker's
-            # _is_ai_bot_identity filter, so this bot's own track is never re-ingested.
-            identity = f"ai-interpreter-{target_lang}-{speaker_id}"
-            token = (
-                api.AccessToken(self.settings.api_key, self.settings.api_secret)
-                .with_identity(identity)
-                .with_name(f"AI Interpreter ({target_lang})")
-                .with_grants(api.VideoGrants(room_join=True, room=meeting_id))
-                .to_jwt()
-            )
+        room = rtc.Room()
+        await room.connect(self.settings.url, token)
 
-            room = rtc.Room()
-            await room.connect(self.settings.url, token)
+        source = rtc.AudioSource(sample_rate=sample_rate, num_channels=1)
+        track = rtc.LocalAudioTrack.create_audio_track("tts-audio", source)
+        await room.local_participant.publish_track(
+            track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+        )
+        await asyncio.sleep(_PUBLISH_SETTLE_S)
 
-            source = rtc.AudioSource(sample_rate=sample_rate, num_channels=1)
-            track = rtc.LocalAudioTrack.create_audio_track("tts-audio", source)
-            await room.local_participant.publish_track(
-                track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
-            )
-            await asyncio.sleep(_PUBLISH_SETTLE_S)
+        bot = {"room": room, "source": source, "last_used": time.monotonic()}
+        self._bots[key] = bot
+        logger.info(
+            "livekit_tts_bot_published",
+            meeting_id=meeting_id,
+            speaker_id=speaker_id,
+            target_lang=target_lang,
+            voice_key=voice_key,
+            identity=identity,
+        )
+        return bot
 
-            bot = {"room": room, "source": source}
-            self._bots[key] = bot
+    def _sweep_idle_bots(self) -> None:
+        now = time.monotonic()
+        stale = [k for k, b in self._bots.items() if now - b["last_used"] > SESSION_IDLE_TIMEOUT_S]
+        for k in stale:
+            bot = self._bots.pop(k)
+            self._locks.pop(k, None)
+            asyncio.create_task(self._close_bot(bot))
             logger.info(
-                "livekit_tts_bot_published",
-                meeting_id=meeting_id,
-                speaker_id=speaker_id,
-                target_lang=target_lang,
-                identity=identity,
+                "livekit_tts_bot_idle_closed",
+                meeting_id=k[0], speaker_id=k[1], target_lang=k[2], voice_key=k[3],
             )
-            return bot
+
+    @staticmethod
+    async def _close_bot(bot: dict) -> None:
+        try:
+            await bot["room"].disconnect()
+        except Exception:
+            logger.exception("livekit_tts_bot_close_error")
 
     async def close_all(self) -> None:
         for bot in self._bots.values():

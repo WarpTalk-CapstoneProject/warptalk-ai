@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -321,6 +322,34 @@ class TestFilterSegments:
         assert len(result) == 1
         assert result[0].language == "en"
 
+    def test_long_text_on_near_silent_audio_filtered(self) -> None:
+        """Classic Whisper-family hallucination: a full sentence invented over < 0.5s of
+        real audio. Only checked when a real duration is supplied (see transcribe()'s
+        trailing-fragment call) — never for early-emitted sentences."""
+        segs = [_segment("This is a surprisingly long sentence for such little audio")]
+        result = _filter_segments(segs, "en", 0, real_duration_s=0.2)
+        assert result == []
+
+    def test_short_text_on_short_audio_not_filtered(self) -> None:
+        """A brief real reply ('Yes.', 'OK.') in a short audio chunk must not be
+        penalized just for being short — only LONG text on short audio is suspicious."""
+        segs = [_segment("Yes")]
+        result = _filter_segments(segs, "en", 0, real_duration_s=0.2)
+        assert len(result) == 1
+
+    def test_long_text_without_real_duration_not_filtered(self) -> None:
+        """Early-emitted sentences (see stt_worker.model.OpenAISTT._emit_early) have no
+        real per-sentence timing — real_duration_s defaults to None and this filter must
+        stay inert, or every early multi-word sentence would be wrongly dropped."""
+        segs = [_segment("This is a surprisingly long sentence for such little audio")]
+        result = _filter_segments(segs, "en", 0)
+        assert len(result) == 1
+
+    def test_long_text_on_long_audio_not_filtered(self) -> None:
+        segs = [_segment("This is a perfectly reasonable sentence for a few seconds of speech")]
+        result = _filter_segments(segs, "en", 0, real_duration_s=3.0)
+        assert len(result) == 1
+
 
 class TestNormalizeLanguage:
     def test_full_name_to_code(self) -> None:
@@ -542,3 +571,99 @@ class TestSTTWorker:
 
         langs = await worker._get_room_languages("m1")
         assert langs == {"vi", "en", "ja"}
+
+
+class TestConsumeLoopConcurrency:
+    """_consume_loop() must dispatch DIFFERENT speakers' chunks concurrently, while
+    keeping any ONE speaker's own chunks strictly ordered (their Realtime session is a
+    single reused WebSocket connection — see OpenAISTT._get_or_create_session)."""
+
+    def _make_worker(self) -> STTWorker:
+        worker = STTWorker.__new__(STTWorker)
+        worker.logger = MagicMock()
+        worker._shutdown_event = asyncio.Event()
+        worker._consumer_name = "test-consumer"
+        worker.input_stream = "audio:chunks"
+        worker.consumer_group = "stt-workers"
+        worker._speaker_locks = {}
+        return worker
+
+    async def test_different_speakers_dispatch_concurrently(self, mock_redis_client) -> None:
+        worker = self._make_worker()
+        worker.redis = mock_redis_client
+
+        started: list[bytes] = []
+        both_started = asyncio.Event()
+
+        async def fake_process(message_id: bytes, data: dict) -> None:
+            started.append(message_id)
+            if len(started) == 2:
+                both_started.set()
+            # msg-1 can only reach here if msg-2 (a DIFFERENT speaker) has already
+            # started — impossible unless both run concurrently, not sequentially.
+            await asyncio.wait_for(both_started.wait(), timeout=1.0)
+
+        worker.process = fake_process
+
+        async def fake_consume(**kwargs):
+            yield b"msg-1", {"meeting_id": "m1", "speaker_id": "speaker-A"}
+            yield b"msg-2", {"meeting_id": "m1", "speaker_id": "speaker-B"}
+            worker._shutdown_event.set()
+
+        worker.redis.consume = fake_consume
+
+        await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
+        await asyncio.sleep(0.05)  # let the dispatched create_task()s finish
+
+        assert started == [b"msg-1", b"msg-2"]
+
+    async def test_same_speaker_chunks_stay_ordered(self, mock_redis_client) -> None:
+        worker = self._make_worker()
+        worker.redis = mock_redis_client
+
+        events: list[tuple[str, bytes]] = []
+
+        async def fake_process(message_id: bytes, data: dict) -> None:
+            events.append(("start", message_id))
+            await asyncio.sleep(0.05)
+            events.append(("end", message_id))
+
+        worker.process = fake_process
+
+        async def fake_consume(**kwargs):
+            yield b"msg-1", {"meeting_id": "m1", "speaker_id": "speaker-A"}
+            yield b"msg-2", {"meeting_id": "m1", "speaker_id": "speaker-A"}
+            worker._shutdown_event.set()
+
+        worker.redis.consume = fake_consume
+
+        await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
+        await asyncio.sleep(0.2)
+
+        # msg-2 must not start until msg-1 has fully finished — same speaker, same
+        # reused Realtime session.
+        assert events == [
+            ("start", b"msg-1"),
+            ("end", b"msg-1"),
+            ("start", b"msg-2"),
+            ("end", b"msg-2"),
+        ]
+
+    async def test_cleanup_room_purges_speaker_locks(self) -> None:
+        worker = self._make_worker()
+        worker._stt_prompts = {"m1": "glossary"}
+        worker._room_languages = {"m1": ({"vi"}, 0.0)}
+        worker._route_states = {}
+        worker._paused_rooms = set()
+        worker._room_routes = {}
+        worker._speaker_locks = {
+            ("m1", "speaker-A"): asyncio.Lock(),
+            ("m2", "speaker-B"): asyncio.Lock(),
+        }
+
+        worker._cleanup_room("m1")
+
+        assert "m1" not in worker._stt_prompts
+        assert "m1" not in worker._room_languages
+        assert ("m1", "speaker-A") not in worker._speaker_locks
+        assert ("m2", "speaker-B") in worker._speaker_locks
