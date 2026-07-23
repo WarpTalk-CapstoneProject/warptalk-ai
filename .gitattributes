@@ -1,0 +1,41 @@
+# ====================================================================
+# Line-ending normalization — keep the repo OS-agnostic (Mac/Windows/Linux).
+# Files executed inside Linux containers/shells MUST stay LF, or a CRLF
+# checkout on Windows breaks Docker builds and entrypoint scripts.
+# ====================================================================
+
+# Sane default: git auto-detects text vs binary, normalize text to LF.
+* text=auto eol=lf
+
+# Anything run in a Linux container / shell — force LF unconditionally.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.sql   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.env   text eol=lf
+Dockerfile      text eol=lf
+*.dockerfile    text eol=lf
+
+# Windows-only helpers keep CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Binaries — never touch.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.mp3 binary
+*.wav binary
+*.flac binary
+*.mp4 binary
+*.onnx binary
+*.bin binary
+*.pt binary
+*.pth binary
+*.ckpt binary
+*.safetensors binary
