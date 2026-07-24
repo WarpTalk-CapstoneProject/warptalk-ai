@@ -242,6 +242,51 @@ class TestOpenAISTT:
 
         stt._client.realtime.connect.assert_called_once()
 
+    async def test_transcribe_reopens_session_when_language_changes(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """A live speak-language change (TranslationRoomHub.SetSpeakLanguage) must close
+        the cached session and open a fresh one pinned to the new language — silently
+        reusing the old session while ignoring the new `language` arg would leave the
+        Realtime API's own accuracy/hallucination behavior stuck on whichever language
+        the session happened to be created with first.
+        """
+        events1 = [SimpleNamespace(
+            type="conversation.item.input_audio_transcription.completed", transcript="Hi",
+        )]
+        events2 = [SimpleNamespace(
+            type="conversation.item.input_audio_transcription.completed", transcript="Xin chao",
+        )]
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.api_key = ""
+        stt.model = "gpt-realtime-whisper"
+        stt._sessions = {}
+        conn1, conn2 = FakeRealtimeConn(events1), FakeRealtimeConn(events2)
+        stt._client = MagicMock()
+        stt._client.realtime.connect = MagicMock(
+            side_effect=[FakeRealtimeManager(conn1), FakeRealtimeManager(conn2)]
+        )
+
+        await stt.transcribe(sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1")
+        await stt.transcribe(sample_audio_bytes, language="vi", meeting_id="m1", speaker_id="s1")
+
+        assert stt._client.realtime.connect.call_count == 2
+
+    async def test_transcribe_reuses_session_when_language_unchanged(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """Sanity counterpart to the above: passing the SAME language on every call
+        (the common case) must still hit the cache, not reconnect every time."""
+        events = [SimpleNamespace(
+            type="conversation.item.input_audio_transcription.completed", transcript="Hi",
+        )]
+        stt, conn = _make_stt_with_conn(events)
+
+        await stt.transcribe(sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1")
+        await stt.transcribe(sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1")
+
+        stt._client.realtime.connect.assert_called_once()
+
 
 class TestFilterSegments:
     """_filter_segments utility tests."""
@@ -285,6 +330,24 @@ class TestFilterSegments:
         segs = [_segment("こんにちは")]
         result = _filter_segments(segs, "en", 0)
         assert result == []
+
+    def test_unknown_language_foreign_script_filtered_when_room_all_latin(self) -> None:
+        """A speaker who joined with speak_language left on "auto" has no per-utterance
+        language hint (detected_language="unknown") — but if every language this meeting
+        has declared is Latin-script, a CJK/Kana hallucination is still unambiguous and
+        must be dropped, same as the known-language case."""
+        segs = [_segment("こんにちは")]
+        result = _filter_segments(segs, "unknown", 0, allowed_languages={"vi", "en"})
+        assert result == []
+
+    def test_unknown_language_foreign_script_kept_when_room_has_cjk_speaker(self) -> None:
+        """If the room has a genuinely declared CJK/Thai language (e.g. a Japanese
+        speaker), the guard must NOT apply for an unknown-language utterance — there's no
+        way to tell whose script is legitimate, and dropping could eat a real speaker's
+        transcript."""
+        segs = [_segment("こんにちは")]
+        result = _filter_segments(segs, "unknown", 0, allowed_languages={"vi", "ja"})
+        assert len(result) == 1
 
     def test_low_confidence_filtered(self) -> None:
         segs = [_segment("Some text", avg_logprob=-1.5)]

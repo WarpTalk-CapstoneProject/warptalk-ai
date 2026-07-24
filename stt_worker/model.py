@@ -270,7 +270,20 @@ def _filter_segments(
 
     # The cross-script guard is only valid when the speaker's declared language is
     # Latin-script; for a declared CJK/Thai/Hangul language that script is legitimate.
-    apply_foreign_script_guard = language_known and lang_code in _LATIN_SCRIPT_LANGUAGES
+    #
+    # When the per-utterance language is unknown (speaker joined with speak_language left
+    # on "auto" — see TranslationRoomHub.SetSpeakLanguage/JoinTranslationRoom — so there's
+    # no session-level hint at all), still apply the guard IF every language this meeting
+    # has actually declared (allowed, computed above) is Latin-script: nobody in the room
+    # is expected to produce Thai/Hangul/CJK/Kana regardless of which Latin-script language
+    # this particular speaker turns out to be using, so a hallucinated foreign-script
+    # segment is still safe to drop. If the room has a real CJK/Thai speaker declared,
+    # skip the guard here — there's no way to tell whose script is legitimate without a
+    # known per-segment language, and dropping could silently eat that speaker's real
+    # transcript.
+    apply_foreign_script_guard = (language_known and lang_code in _LATIN_SCRIPT_LANGUAGES) or (
+        not language_known and bool(allowed) and all(lang in _LATIN_SCRIPT_LANGUAGES for lang in allowed)
+    )
 
     results: list[TranscribedSegment] = []
     seen_texts: set[str] = set()
@@ -617,7 +630,25 @@ class OpenAISTT:
 
         cached = self._sessions.get(key)
         if cached is not None:
-            return cached
+            if cached.get("language") == language:
+                return cached
+            # The speaker's registered language changed mid-meeting (e.g. via the live
+            # speak-language control — TranslationRoomHub.SetSpeakLanguage). The Realtime
+            # API has no live way to re-pin an already-open session's
+            # input_audio_transcription.language, so close this one and fall through to
+            # open a fresh session pinned to the new language for the next chunk.
+            logger.info(
+                "stt_session_language_changed",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                old_language=cached.get("language"),
+                new_language=language,
+            )
+            try:
+                await cached["manager"].__aexit__(None, None, None)
+            except Exception:
+                logger.debug("stt_session_close_on_language_change_failed", meeting_id=key[0], speaker_id=key[1])
+            self._sessions.pop(key, None)
 
         manager = self._client.realtime.connect(extra_query={"intent": "transcription"})
         conn = await manager.__aenter__()
@@ -636,7 +667,7 @@ class OpenAISTT:
             )
             await conn.session.update(session=self._session_payload(None, None))
 
-        session = {"manager": manager, "conn": conn, "last_used": time.monotonic()}
+        session = {"manager": manager, "conn": conn, "last_used": time.monotonic(), "language": language}
         self._sessions[key] = session
         logger.info(
             "realtime_session_opened",
