@@ -76,7 +76,7 @@ class BillingSettlementWorker:
         self.settings = billing_settings or BillingSettings()
         self.worker_settings = worker_settings or WorkerSettings()
         self.redis = RedisStreamClient(redis_settings or self.worker_settings.redis)
-        self.db = BillingRepository(self.settings.database)
+        self.db = BillingRepository(self.settings.database, redis_settings or self.worker_settings.redis)
         self.logger = logger
         self._consumer_name = f"billing-{socket.gethostname()}"
         self._shutdown_event = asyncio.Event()
