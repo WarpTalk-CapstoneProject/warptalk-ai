@@ -142,6 +142,8 @@ class TranslationWorker(BaseWorker):
                         is_final_chunk=True,
                         timestamp_ms=stt_result.timestamp_ms,
                         translator_model=self.translator.model,
+                        source_segment_id=stt_result.segment_id,
+                        chunk_index=0,
                     )
                     await self.publish("translate:results", stt_result.meeting_id, result.to_redis())
             return
@@ -212,6 +214,8 @@ class TranslationWorker(BaseWorker):
                 is_final_chunk=is_final,
                 timestamp_ms=stt_result.timestamp_ms,
                 translator_model=self.translator.model,
+                source_segment_id=stt_result.segment_id,
+                chunk_index=idx,
             )
 
             # Publish IMMEDIATELY so TTS can synthesize while next chunk is translated

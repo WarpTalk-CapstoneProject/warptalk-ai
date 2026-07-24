@@ -124,9 +124,44 @@ class CartesiaSynthesizer:
 
     @staticmethod
     def _default_voice_id(language: str) -> str:
-        """Built-in Cartesia voice IDs per language (fallback before cloning)."""
+        """Built-in Cartesia voice IDs per language — last-resort fallback used only
+        when list_voices() below can't be reached or returns nothing for this
+        language (never fabricate additional IDs beyond these two confirmed-working
+        ones; anything else must come from Cartesia's real /voices API)."""
         defaults = {
             "en": "694f9389-aac1-45b6-b726-9d9369183238",  # Cartesia "Barbershop Man"
             "vi": "5619d38c-cf51-4d8e-9575-48f61a280413",  # Cartesia Vietnamese voice
         }
         return defaults.get(language, defaults["en"])
+
+    async def list_voices(self, language: str, limit: int = 12, max_scanned: int = 300) -> list[dict]:
+        """Public library voices for `language`, from Cartesia's real /voices API.
+
+        The SDK's voices.list() has no `language` filter param — it returns Cartesia's
+        whole public library (600+ voices across 40+ languages), so this scans pages
+        client-side and keeps only matches, capped at `max_scanned` total items looked
+        at so a rare language can't force an unbounded scan of the whole catalog.
+
+        Best-effort: any failure (network, auth, SDK shape change) returns [] rather
+        than raising — every caller must treat an empty result as "fall back to
+        _default_voice_id()", never as a reason to fail synthesis.
+        """
+        voices: list[dict] = []
+        scanned = 0
+        try:
+            async for voice in self._client.voices.list(is_owner=False, limit=100):
+                scanned += 1
+                if voice.language == language:
+                    voices.append({
+                        "id": voice.id,
+                        "name": voice.name,
+                        "gender": voice.gender or "",
+                    })
+                    if len(voices) >= limit:
+                        break
+                if scanned >= max_scanned:
+                    break
+        except Exception:
+            logger.exception("cartesia_list_voices_failed", language=language)
+            return []
+        return voices

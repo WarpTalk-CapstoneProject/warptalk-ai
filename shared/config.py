@@ -118,6 +118,13 @@ class TTSSettings(BaseSettings):
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
     voice_clone_key_ttl_seconds: int = 43200  # 12h — unbounded before this; matches AudioRouteCacheService's own Redis TTL
+    # How many public Cartesia voices to offer per language — both for the per-speaker
+    # hashed default (auto-diversity when nobody has cloned/chosen a voice) and for the
+    # control-bar voice picker's option list.
+    voice_catalog_size: int = 6
+    # Cartesia's public library doesn't churn often — cache the per-language catalog
+    # in Redis this long before re-fetching, to avoid a /voices call on every miss.
+    voice_catalog_cache_ttl_seconds: int = 21600  # 6h
 
 
 class AssistantSettings(BaseSettings):
@@ -129,6 +136,30 @@ class AssistantSettings(BaseSettings):
     model: str = "gpt-4.1"
     max_tokens: int = 2048
     temperature: float = 0.3
+
+
+class ChatAssistantSettings(BaseSettings):
+    """Global AI assistant (chat-with-tools) worker settings.
+
+    Distinct from AssistantSettings (per-meeting summarization) — this worker answers
+    free-form questions in the global "Ask WarpTalk" widget and can call tools that read
+    real workspace data from sibling .NET services.
+    """
+
+    model_config = {"env_prefix": "ASSISTANT_CHAT_"}
+
+    api_key: str = ""
+    model: str = "gpt-4o-mini"
+    max_tokens: int = 1024
+    temperature: float = 0.4
+    max_tool_iterations: int = 5
+    # Flush a streamed chunk to Redis every N characters rather than per-token — keeps
+    # Redis Stream / SignalR traffic bounded, matching the rest of the pipeline's coarse
+    # buffered-unit convention (STT/TTS/AI-assistant results are never per-token either).
+    chunk_flush_chars: int = 40
+    workspace_service_url: str = "http://localhost:5106"
+    transcript_service_url: str = "http://localhost:5103"
+    translation_room_service_url: str = "http://localhost:5102"
 
 
 class EmbeddingSettings(BaseSettings):

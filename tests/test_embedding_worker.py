@@ -24,9 +24,13 @@ class FakeEmbeddingProvider(EmbeddingProvider):
 class FakeVectorStore(VectorStore):
     def __init__(self) -> None:
         self.upsert_mock = AsyncMock()
+        self.search_mock = AsyncMock(return_value=[])
 
     async def upsert(self, *args, **kwargs) -> None:
         await self.upsert_mock(*args, **kwargs)
+
+    async def search(self, *args, **kwargs):
+        return await self.search_mock(*args, **kwargs)
 
 
 def _request(**overrides) -> EmbeddingIndexRequest:

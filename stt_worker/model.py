@@ -22,10 +22,17 @@ from typing import Awaitable, Callable
 
 import numpy as np
 
+from shared.config import STTSettings
 from shared.logger import get_logger
 from shared.text_utils import split_into_sentences
 
 logger = get_logger(__name__)
+
+# Mirrors STTSettings.model — the value production code actually runs with
+# (stt_worker/worker.py always passes it explicitly). Sourcing the default from here
+# instead of a second hardcoded literal keeps direct/test instantiation in sync with
+# config.py without anyone having to remember to update both places.
+_DEFAULTS = STTSettings()
 
 # gpt-realtime-whisper rejects session.audio.input.format.rate below this.
 REALTIME_SAMPLE_RATE = 24000
@@ -162,6 +169,12 @@ _FOREIGN_SCRIPT_RE = re.compile(
     r'぀-ヿ]'   # Hiragana/Katakana
 )
 
+# Even the fastest human speech in any language doesn't clear ~30 chars/sec, so this
+# pair (< 0.5s of real audio, yet > 20 chars of text) only fires on the classic
+# Whisper-family hallucination pattern: a full phrase invented over near-silence/noise.
+_MIN_SPEECH_SECONDS_FOR_LONG_TEXT = 0.5
+_MAX_CHARS_FOR_SHORT_AUDIO = 20
+
 _HALLUCINATIONS = {
     "thank you", "thanks for watching", "bye", "bye bye",
     "good night", "oh", "you", "yeah", "okay",
@@ -227,6 +240,7 @@ def _filter_segments(
     detected_language: str,
     chunk_offset_ms: int,
     allowed_languages: set[str] | None = None,
+    real_duration_s: float | None = None,
 ) -> list[TranscribedSegment]:
     language_known = detected_language != "unknown"
     lang_code = _normalize_language(detected_language) if language_known else None
@@ -256,7 +270,20 @@ def _filter_segments(
 
     # The cross-script guard is only valid when the speaker's declared language is
     # Latin-script; for a declared CJK/Thai/Hangul language that script is legitimate.
-    apply_foreign_script_guard = language_known and lang_code in _LATIN_SCRIPT_LANGUAGES
+    #
+    # When the per-utterance language is unknown (speaker joined with speak_language left
+    # on "auto" — see TranslationRoomHub.SetSpeakLanguage/JoinTranslationRoom — so there's
+    # no session-level hint at all), still apply the guard IF every language this meeting
+    # has actually declared (allowed, computed above) is Latin-script: nobody in the room
+    # is expected to produce Thai/Hangul/CJK/Kana regardless of which Latin-script language
+    # this particular speaker turns out to be using, so a hallucinated foreign-script
+    # segment is still safe to drop. If the room has a real CJK/Thai speaker declared,
+    # skip the guard here — there's no way to tell whose script is legitimate without a
+    # known per-segment language, and dropping could silently eat that speaker's real
+    # transcript.
+    apply_foreign_script_guard = (language_known and lang_code in _LATIN_SCRIPT_LANGUAGES) or (
+        not language_known and bool(allowed) and all(lang in _LATIN_SCRIPT_LANGUAGES for lang in allowed)
+    )
 
     results: list[TranscribedSegment] = []
     seen_texts: set[str] = set()
@@ -290,6 +317,24 @@ def _filter_segments(
 
         if avg_logprob < -1.0:
             logger.debug("filtered_low_confidence", text=text, logprob=round(avg_logprob, 2))
+            continue
+
+        # Unlike no_speech/avg_logprob above, this IS a real signal — only passed for the
+        # trailing fragment in transcribe() (the whole chunk's actual PCM duration via
+        # _pcm16_duration_seconds), never for early-emitted sentences (which have no real
+        # per-sentence timing to check against, see _emit_early). No human produces this
+        # many characters, in any language, in this little audio — the classic
+        # Whisper-family failure mode of a full sentence hallucinated onto near-silence.
+        if (
+            real_duration_s is not None
+            and real_duration_s < _MIN_SPEECH_SECONDS_FOR_LONG_TEXT
+            and len(text) > _MAX_CHARS_FOR_SHORT_AUDIO
+        ):
+            logger.debug(
+                "filtered_text_too_long_for_audio",
+                text=text[:60],
+                duration_s=round(real_duration_s, 2),
+            )
             continue
 
         if text_lower in _HALLUCINATIONS:
@@ -348,7 +393,7 @@ class OpenAISTT:
     connection handshake.
     """
 
-    def __init__(self, api_key: str = "", model: str = "gpt-4o-transcribe") -> None:
+    def __init__(self, api_key: str = "", model: str = _DEFAULTS.model) -> None:
         self.api_key = api_key
         self.model = model
         self._client = None
@@ -457,7 +502,15 @@ class OpenAISTT:
             "no_speech_prob": 0.0,
         }]
 
-        return _filter_segments(segments_dicts, detected_language, chunk_offset_ms, allowed_languages)
+        # duration_s is the WHOLE chunk's audio, while `text` here is only the trailing
+        # fragment not already flushed via on_early_segment — so this over-estimates the
+        # audio actually backing this specific text, making the check in _filter_segments
+        # more lenient than perfectly accurate. That's the safe direction: it only ever
+        # risks missing a hallucination, never dropping real trailing speech.
+        return _filter_segments(
+            segments_dicts, detected_language, chunk_offset_ms, allowed_languages,
+            real_duration_s=duration_s,
+        )
 
     async def _transcribe_via_session(
         self,
@@ -577,7 +630,25 @@ class OpenAISTT:
 
         cached = self._sessions.get(key)
         if cached is not None:
-            return cached
+            if cached.get("language") == language:
+                return cached
+            # The speaker's registered language changed mid-meeting (e.g. via the live
+            # speak-language control — TranslationRoomHub.SetSpeakLanguage). The Realtime
+            # API has no live way to re-pin an already-open session's
+            # input_audio_transcription.language, so close this one and fall through to
+            # open a fresh session pinned to the new language for the next chunk.
+            logger.info(
+                "stt_session_language_changed",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                old_language=cached.get("language"),
+                new_language=language,
+            )
+            try:
+                await cached["manager"].__aexit__(None, None, None)
+            except Exception:
+                logger.debug("stt_session_close_on_language_change_failed", meeting_id=key[0], speaker_id=key[1])
+            self._sessions.pop(key, None)
 
         manager = self._client.realtime.connect(extra_query={"intent": "transcription"})
         conn = await manager.__aenter__()
@@ -596,7 +667,7 @@ class OpenAISTT:
             )
             await conn.session.update(session=self._session_payload(None, None))
 
-        session = {"manager": manager, "conn": conn, "last_used": time.monotonic()}
+        session = {"manager": manager, "conn": conn, "last_used": time.monotonic(), "language": language}
         self._sessions[key] = session
         logger.info(
             "realtime_session_opened",

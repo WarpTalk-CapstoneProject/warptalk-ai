@@ -236,10 +236,15 @@ class TestTranslationWorker:
         # per-chunk character-count charge depends on.
         assert len(published) == 4
         chunk_ids = {data["segment_id"] for _stream, data in published}
-        assert chunk_ids == {f"{msg.segment_id}-c0", f"{msg.segment_id}-c1"}
+        # segment_id carries target_lang (f"{stt_segment_id}-{target_lang}-c{idx}") so
+        # concurrent translations of the same STT segment into different listener
+        # languages don't collide on the same chunk id — see the comment in
+        # _translate_and_publish. billing_worker's _extract_underlying_segment_id()
+        # only reads the first 36 chars (the GUID), so it is unaffected by this suffix.
+        assert chunk_ids == {f"{msg.segment_id}-vi-c0", f"{msg.segment_id}-vi-c1"}
         texts_by_chunk = {data["segment_id"]: data["translated_text"] for _stream, data in published}
-        assert texts_by_chunk[f"{msg.segment_id}-c0"] == "Xin chào"
-        assert texts_by_chunk[f"{msg.segment_id}-c1"] == "Bạn khỏe không"
+        assert texts_by_chunk[f"{msg.segment_id}-vi-c0"] == "Xin chào"
+        assert texts_by_chunk[f"{msg.segment_id}-vi-c1"] == "Bạn khỏe không"
 
     async def test_skips_paused_room(
         self, mock_redis_client, worker_settings: WorkerSettings
