@@ -59,11 +59,26 @@ class WorkerSettings(BaseSettings):
     redis: RedisSettings = RedisSettings()
     livekit: LiveKitSettings = LiveKitSettings()
 
-    # VAD gating settings (used by ingress worker)
-    vad_threshold: float = 0.3        # Speech detection threshold
+    # VAD gating settings (used by ingress worker). 0.5 matches Silero/OpenAI's own
+    # documented default and guidance ("a higher threshold ... might perform better in
+    # noisy environments") — raised from an earlier, more permissive 0.3 that let
+    # distant/muffled speech and ambiguous noise trip VAD too easily, reaching the STT
+    # model (which has no confidence signal of its own to reject them — see
+    # STTSettings.model) and getting hallucinated into a full sentence.
+    vad_threshold: float = 0.5        # Speech detection threshold
     vad_pre_speech_ms: int = 300      # Pre-speech buffer to capture word onsets
     vad_silence_hangover_ms: int = 600  # 600ms hangover — faster turnaround
     vad_min_speech_ms: int = 500      # Minimum speech length to publish
+
+    # Near-field energy gate (ingress worker only, see livekit_ingress_worker/near_field_gate.py)
+    # — rejects a speech chunk whose peak amplitude is much quieter than this SAME
+    # track's own established near-field baseline. VAD alone can't tell "close and
+    # clear" from "far away and muffled" — both are speech-shaped. Pure energy/peak
+    # math, no ML dependency, negligible latency.
+    near_field_gate_enabled: bool = True
+    near_field_gate_relative_floor: float = 0.35  # chunk peak must be >= 35% of this track's own established near-field peak
+    near_field_gate_min_baseline_chunks: int = 2
+    near_field_gate_baseline_ema_alpha: float = 0.3
 
 
 class STTSettings(BaseSettings):
@@ -81,6 +96,12 @@ class STTSettings(BaseSettings):
     # backed way to cut hallucination (arXiv 2410.18363). See model.py.
     model: str = "gpt-4o-transcribe"
     language: str = "auto"  # Auto-detect for code-switching (Vi + En)
+    # OpenAI Realtime's own input-side denoiser, applied before VAD/the model ever see
+    # the audio — "far_field" is tuned for laptop/room mics (WarpTalk's actual usage),
+    # "near_field" for headset mics, "off" disables it. Distinct from and upstream of
+    # livekit_ingress_worker's Silero VAD / NearFieldGate, which run on raw PCM before
+    # this session ever receives it.
+    noise_reduction: str = "far_field"
 
 
 class TranslationSettings(BaseSettings):

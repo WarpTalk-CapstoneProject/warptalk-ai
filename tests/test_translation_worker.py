@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from shared.config import TranslationSettings, WorkerSettings
 from shared.schemas import STTResultMessage
-from translation_worker.translator import OpenAITranslator, _lang_name
+from translation_worker.translator import OpenAITranslator, _build_glossary_block, _exception_clause, _lang_name
 from translation_worker.worker import TranslationWorker
 
 
@@ -26,6 +26,41 @@ class TestLangName:
     def test_hyphenated_code_uses_base(self) -> None:
         # "en-US" → "en" → "English"
         assert _lang_name("en-US") == "English"
+
+
+class TestGlossaryBlock:
+    """_build_glossary_block / _exception_clause — code-switching glossary support
+    (see docs/code-switching-research.md).
+    """
+
+    def test_empty_returns_empty_string(self) -> None:
+        assert _build_glossary_block(None) == ""
+        assert _build_glossary_block([]) == ""
+
+    def test_keep_verbatim_when_target_equals_source(self) -> None:
+        block = _build_glossary_block([{"source": "architect", "target": "architect"}])
+        assert "architect" in block
+        assert "do not translate" in block.lower()
+
+    def test_keep_verbatim_when_target_missing(self) -> None:
+        block = _build_glossary_block([{"source": "sprint", "target": ""}])
+        assert "sprint" in block
+        assert "do not translate" in block.lower()
+
+    def test_exact_mapping_when_target_differs(self) -> None:
+        block = _build_glossary_block([{"source": "marketing plan", "target": "kế hoạch marketing"}])
+        assert "marketing plan" in block
+        assert "kế hoạch marketing" in block
+        assert "exact translations" in block.lower()
+
+    def test_skips_entries_without_source(self) -> None:
+        block = _build_glossary_block([{"source": "", "target": "x"}])
+        assert block == ""
+
+    def test_exception_clause_mentions_glossary_only_when_present(self) -> None:
+        assert "glossary" not in _exception_clause(None)
+        assert "glossary" not in _exception_clause([])
+        assert "glossary" in _exception_clause([{"source": "a", "target": "a"}])
 
 
 class TestOpenAITranslator:
@@ -63,6 +98,33 @@ class TestOpenAITranslator:
         result = await translator.translate("Hello", "en", "en")
         assert result == "Hello"
         translator._client.chat.completions.create.assert_not_called()
+
+    async def test_translate_forwards_glossary_into_prompt(self) -> None:
+        """The glossary must actually reach the OpenAI call, not just be accepted as a
+        parameter — this is the fix for "architect" being over-translated/mistranslated
+        (see docs/code-switching-research.md).
+        """
+        translator = OpenAITranslator.__new__(OpenAITranslator)
+        translator.model = "gpt-4.1-mini"
+        translator.max_tokens = 512
+        translator.temperature = 0.1
+
+        mock_response = MagicMock()
+        mock_response.choices[0].message.content = "Cái architect hôm bữa không được ổn."
+        translator._client = MagicMock()
+        translator._client.chat.completions.create = AsyncMock(return_value=mock_response)
+
+        await translator.translate(
+            "The architect thing wasn't good the other day.",
+            "en",
+            "vi",
+            glossary_terms=[{"source": "architect", "target": "architect"}],
+        )
+
+        _, kwargs = translator._client.chat.completions.create.call_args
+        user_message = kwargs["messages"][1]["content"]
+        assert "architect" in user_message
+        assert "do not translate" in user_message.lower()
 
 
 class TestTranslateBatch:
@@ -124,6 +186,7 @@ class TestTranslationWorker:
         worker.logger = MagicMock()
         worker.translation_settings = TranslationSettings()
         worker._paused_rooms = set()
+        worker._mt_glossaries = {}
         worker.worker_name = "translation"
         mock_translator = MagicMock()
         mock_translator.model = "gpt-4.1-mini"
@@ -220,10 +283,10 @@ class TestTranslationWorker:
         await worker.process(b"msg-1", msg.to_redis())
 
         worker.translator.translate.assert_awaited_once_with(
-            "Hello there.", source_lang="en", target_lang="vi"
+            "Hello there.", source_lang="en", target_lang="vi", glossary_terms=[]
         )
         worker.translator.translate_batch.assert_awaited_once_with(
-            ["How are you?"], source_lang="en", target_lang="vi"
+            ["How are you?"], source_lang="en", target_lang="vi", glossary_terms=[]
         )
 
         published = [
@@ -257,6 +320,81 @@ class TestTranslationWorker:
 
         worker.translator.translate.assert_not_called()
         mock_redis_client._redis.xadd.assert_not_called()
+
+    async def test_process_forwards_workspace_glossary_to_translator(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """The glossary published by GlossaryStartedEventConsumer at
+        `translationRoom:{meeting_id}:mt_glossary` must reach translate()/translate_batch()
+        — this is the wiring that fixes over-translation of workspace terms.
+        """
+        import json
+
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
+        mock_redis_client._redis.get.return_value = json.dumps(
+            [{"source": "architect", "target": "architect"}]
+        ).encode()
+
+        msg = self._make_stt_msg(language="en", text="Hello there.")
+        await worker.process(b"msg-1", msg.to_redis())
+
+        worker.translator.translate.assert_awaited_once_with(
+            "Hello there.",
+            source_lang="en",
+            target_lang="vi",
+            glossary_terms=[{"source": "architect", "target": "architect"}],
+        )
+
+    async def test_get_mt_glossary_caches_per_meeting(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        import json
+
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.get.return_value = json.dumps(
+            [{"source": "sprint", "target": "sprint"}]
+        ).encode()
+
+        first = await worker._get_mt_glossary("m1")
+        mock_redis_client._redis.get.return_value = b"[]"
+        second = await worker._get_mt_glossary("m1")
+
+        assert first == [{"source": "sprint", "target": "sprint"}]
+        assert second == first  # served from cache, not re-fetched
+        mock_redis_client._redis.get.assert_called_once()
+
+    async def test_get_mt_glossary_returns_empty_when_unset(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.get.return_value = None
+
+        result = await worker._get_mt_glossary("m1")
+
+        assert result == []
+
+    async def test_get_mt_glossary_fails_open_on_malformed_json(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.get.return_value = b"not json"
+
+        result = await worker._get_mt_glossary("m1")
+
+        assert result == []
+
+    def test_cleanup_room_clears_mt_glossary_cache(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        worker._route_states = {}
+        worker._room_routes = {}
+        worker._mt_glossaries = {"m1": [{"source": "a", "target": "a"}]}
+
+        worker._cleanup_room("m1")
+
+        assert "m1" not in worker._mt_glossaries
 
 
 class TestConsumeLoopConcurrency:
