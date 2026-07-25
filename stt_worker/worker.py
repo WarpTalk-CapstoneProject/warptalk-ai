@@ -45,12 +45,26 @@ def _extract_speaker_key(data: dict) -> tuple[str, str]:
 # ("thanks for watching", "subscribe", etc. — see model._HALLUCINATIONS). It is
 # deliberately generic so it never fabricates specifics: no names, no product terms, just
 # the register of a real work meeting. Any room glossary is appended AFTER this base.
+#
+# The code-switching sentence exists because session.audio.input.transcription.language is
+# pinned to the speaker's declared language (see _session_payload in model.py) — a real,
+# necessary fix for a different bug (cross-script hallucination), but it means the model
+# decodes the WHOLE utterance in that one language's phoneme space. An English word dropped
+# into a Vietnamese sentence (e.g. "architect") then gets forced into the nearest
+# Vietnamese-sounding syllables instead of transcribed as English (e.g. "hai kiên thách") —
+# see docs/code-switching-research.md for the full diagnosis. This sentence doesn't fix
+# recognition on its own (that's what the glossary prompt from GlossaryStartedEventConsumer
+# is for — see _get_stt_prompt below); it only stops a correctly-recognized English word
+# from being re-spelled phonetically once the model does catch it.
 _GENERIC_STT_BASE_PROMPT = (
     "This is a live professional work meeting. Participants discuss projects, tasks, "
     "schedules, decisions, requirements, features, and technical details in clear, "
     "conversational speech. Transcribe exactly what is said, verbatim. Do not add "
     "greetings, sign-offs, video captions, channel/subscribe phrases, or any words that "
-    "were not spoken."
+    "were not spoken. Speakers often mix in English words or phrases (e.g. product, "
+    "technical, or business terms) mid-sentence even when speaking another language — "
+    "write those words in their original English spelling, never phonetically "
+    "transliterated into another script or language."
 )
 
 # The room language set is derived from participants' declared speak-languages, which
@@ -88,6 +102,7 @@ class STTWorker(BaseWorker):
         self.model = OpenAISTT(
             api_key=resolve_openai_api_key(self.stt_settings.api_key),
             model=self.stt_settings.model,
+            noise_reduction=self.stt_settings.noise_reduction,
         )
         await self.model.load()
 

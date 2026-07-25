@@ -17,6 +17,8 @@ from livekit import api
 from shared.base_worker import BaseWorker
 from shared.schemas import AudioChunkMessage
 
+from livekit_ingress_worker.near_field_gate import NearFieldGate
+
 # Bot participant identities used elsewhere in this pipeline — this worker's own
 # "AIBot_{room}" (join_room, below) and the TTS publisher's "ai-interpreter-{lang}"
 # (tts_worker/livekit_publisher.py). Without this filter, subscribing to the AI
@@ -187,6 +189,11 @@ class LiveKitIngressWorker(BaseWorker):
         min_speech_samples = int(sample_rate * (min_speech_ms / 1000.0))
         max_chunk_samples = int(sample_rate * (max_chunk_ms / 1000.0))
 
+        # One near-field gate per track — see near_field_gate.py. It builds a running
+        # peak-amplitude reference from this track's own earlier chunks, so it must live
+        # for the whole track lifetime, not be recreated per chunk.
+        near_field_gate = NearFieldGate(self.settings)
+
         # State
         raw_buffer = bytearray()  # Incoming raw resampled audio
         speech_buffer = bytearray()  # Audio collected during speech
@@ -279,6 +286,7 @@ class LiveKitIngressWorker(BaseWorker):
                             await self._publish_speech_chunk(
                                 room_name, speaker_id, speech_buffer,
                                 chunk_index, sample_rate,
+                                near_field_gate=near_field_gate,
                             )
                             chunk_index += 1
                             speech_buffer = bytearray()
@@ -296,6 +304,7 @@ class LiveKitIngressWorker(BaseWorker):
                                     await self._publish_speech_chunk(
                                         room_name, speaker_id, speech_buffer,
                                         chunk_index, sample_rate,
+                                        near_field_gate=near_field_gate,
                                     )
                                     chunk_index += 1
                                 else:
@@ -321,6 +330,7 @@ class LiveKitIngressWorker(BaseWorker):
                 await self._publish_speech_chunk(
                     room_name, speaker_id, speech_buffer,
                     chunk_index, sample_rate,
+                    near_field_gate=near_field_gate,
                 )
             self.logger.info("stopped_audio_stream_processing", track_sid=track.sid)
 
@@ -331,9 +341,11 @@ class LiveKitIngressWorker(BaseWorker):
         speech_buffer: bytearray,
         chunk_index: int,
         sample_rate: int,
+        near_field_gate: NearFieldGate | None = None,
     ) -> None:
         """Normalize and publish a speech chunk to Redis."""
-        pcm = np.frombuffer(bytes(speech_buffer), dtype=np.int16)
+        raw_bytes = bytes(speech_buffer)
+        pcm = np.frombuffer(raw_bytes, dtype=np.int16)
         raw_rms = np.sqrt(np.mean((pcm.astype(np.float32) / 32768.0) ** 2))
         raw_peak = np.max(np.abs(pcm.astype(np.float32) / 32768.0))
         duration_ms = len(pcm) * 1000 // sample_rate
@@ -344,6 +356,17 @@ class LiveKitIngressWorker(BaseWorker):
                 "skipped_low_energy_chunk",
                 chunk_index=chunk_index,
                 raw_rms=round(float(raw_rms), 6),
+            )
+            return
+
+        # Near-field gate: reject a chunk that's much quieter than this track's own
+        # established near-field peak — a far-away/muffled voice, not the primary
+        # speaker. See near_field_gate.py — fails open by design.
+        if near_field_gate is not None and not near_field_gate.accept(float(raw_peak)):
+            self.logger.info(
+                "skipped_far_field_chunk",
+                speaker_id=speaker_id,
+                chunk_index=chunk_index,
             )
             return
 

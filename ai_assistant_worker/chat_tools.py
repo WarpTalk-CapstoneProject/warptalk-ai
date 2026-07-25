@@ -93,6 +93,9 @@ async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> st
     if not query:
         return json.dumps({"error": "A search term is required."})
 
+    query_lower = query.lower()
+    matches: list[dict[str, Any]] = []
+
     try:
         glossaries_response = await ctx.transcript_client.get(
             f"/api/v1/glossaries/workspace/{ctx.workspace_id}",
@@ -101,9 +104,6 @@ async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> st
         if glossaries_response.status_code != 200:
             logger.warning("search_terminology_glossaries_failed", status=glossaries_response.status_code)
             return json.dumps({"error": "Could not look up terminology right now."})
-
-        matches: list[dict[str, Any]] = []
-        query_lower = query.lower()
 
         for glossary in glossaries_response.json():
             if not glossary.get("isActive", True):
@@ -124,17 +124,53 @@ async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> st
                 ).lower()
                 if query_lower in haystack:
                     matches.append({
+                        "source": "workspace",
                         "glossary": glossary.get("name"),
                         "term": term.get("sourceTerm"),
                         "translation": term.get("targetTerm"),
                         "context": term.get("context"),
                         "domain": term.get("domain"),
                     })
-
-        return json.dumps(matches[:5])
     except Exception:
         logger.exception("search_terminology_error")
         return json.dumps({"error": "Could not look up terminology right now."})
+
+    # Fall back to the system-managed global glossary (docs/global-glossary-plan.md) only for
+    # terms the workspace hasn't already defined itself — a workspace term always takes
+    # precedence, same rule GlossaryStartedEventConsumer uses for the STT/MT prompt merge.
+    # On-demand, tool-triggered lookup only (no unconditional system-prompt injection): the
+    # assistant already burns a request for this the moment the user asks about a term, so
+    # there's no baseline token cost paid on every turn regardless of whether it's needed —
+    # the tradeoff workspace-memory-research.md §2.2 flags against context_snapshot.
+    if len(matches) < 5:
+        try:
+            global_response = await ctx.transcript_client.get(
+                "/api/v1/glossaries/global", headers=_auth_headers(ctx)
+            )
+            if global_response.status_code == 200:
+                workspace_terms_lower = {m["term"].lower() for m in matches if m.get("term")}
+                for term in global_response.json():
+                    if len(matches) >= 8:
+                        break
+                    term_name = term.get("term") or ""
+                    if term_name.lower() in workspace_terms_lower:
+                        continue
+                    haystack = " ".join(
+                        filter(None, [term_name, term.get("preferredTranslation"), term.get("definition")])
+                    ).lower()
+                    if query_lower in haystack:
+                        matches.append({
+                            "source": "global",
+                            "glossary": "System (Global Glossary)",
+                            "term": term_name,
+                            "translation": term.get("preferredTranslation"),
+                            "context": term.get("definition"),
+                            "domain": term.get("businessDomain"),
+                        })
+        except Exception:
+            logger.warning("search_terminology_global_fallback_failed")
+
+    return json.dumps(matches[:8])
 
 
 async def _list_recent_meetings(ctx: ToolContext, arguments: dict[str, Any]) -> str:
@@ -194,23 +230,33 @@ async def _translate_text(ctx: ToolContext, arguments: dict[str, Any]) -> str:
         return json.dumps({"error": "Could not translate that text right now."})
 
 
-async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
-    query = ((arguments or {}).get("query") or "").strip()
-    if not query:
-        return json.dumps({"error": "A search query is required."})
+# The system-managed global glossary lives in its own Qdrant collection (published by
+# GlobalGlossaryService.TryPublishEmbeddingIndexRequestAsync in the .NET TranscriptService) —
+# not fanned out into every "workspace_{id}" collection, so a single publish stays O(1). Both
+# constants must match that C# side exactly: EmbeddingSearchWorker.process (warptalk-ai) hard-
+# filters vector search on payload["workspace_id"], so querying the global collection without
+# this sentinel would silently return zero rows. See docs/global-glossary-plan.md §5.4.
+GLOBAL_GLOSSARY_COLLECTION_ID = "global_glossary"
+GLOBAL_GLOSSARY_WORKSPACE_SENTINEL = "global"
 
+
+async def _run_embedding_search(
+    ctx: ToolContext, *, collection_id: str, workspace_id: str, query: str, top_k: int
+) -> list[dict[str, Any]]:
+    """One request/reply round-trip against EmbeddingSearchWorker for a single collection.
+
+    Returns [] on timeout or error rather than raising — callers merge results from multiple
+    collections and a slow/absent one (e.g. no global terms published yet) must not sink the
+    whole search.
+    """
     job_id = str(uuid.uuid4())
     result_key = f"embedding:search_result:{job_id}"
-    # workspace_{id} is the collection-naming convention semantic_search expects;
-    # nothing in this codebase publishes to embedding:index_requests yet (no producer
-    # wires documents/transcripts/glossary into the RAG pipeline), so this will
-    # honestly return no matches until that indexing path is built.
     request = {
         "job_id": job_id,
-        "workspace_id": ctx.workspace_id,
-        "collection_id": f"workspace_{ctx.workspace_id}",
+        "workspace_id": workspace_id,
+        "collection_id": collection_id,
         "query": query,
-        "top_k": "5",
+        "top_k": str(top_k),
         "timestamp_ms": str(int(time.time() * 1000)),
     }
 
@@ -221,17 +267,59 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             timeout=SEMANTIC_SEARCH_TIMEOUT_SECONDS + 1,
         )
         if raw is None:
-            return json.dumps({"matches": [], "note": "Search timed out — no results available."})
+            return []
 
         _key, payload = raw
         payload = payload.decode() if isinstance(payload, bytes) else payload
         result = json.loads(payload)
-        return json.dumps({"matches": result.get("matches", [])})
+        return result.get("matches", [])
     except (asyncio.TimeoutError, TimeoutError):
-        return json.dumps({"matches": [], "note": "Search timed out — no results available."})
+        return []
+    except Exception:
+        logger.exception("semantic_search_collection_error", extra={"collection_id": collection_id})
+        return []
+
+
+async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    query = ((arguments or {}).get("query") or "").strip()
+    if not query:
+        return json.dumps({"error": "A search query is required."})
+
+    top_k = 5
+
+    # workspace_{id} is the collection-naming convention 3 producers already publish
+    # into: TranscriptRedisConsumerService (per segment), DocumentSecurityGuardrail-
+    # ConsumerService (per document), and GlossaryService (per term) — see
+    # docs/workspace-memory-research.md for the full pipeline map. Global glossary terms live
+    # in a separate collection (see constants above), so both are queried and merged — a
+    # workspace's own knowledge should never be shadowed by the system baseline, but the
+    # baseline is still useful context when the workspace has nothing on the topic itself.
+    try:
+        workspace_matches, global_matches = await asyncio.gather(
+            _run_embedding_search(
+                ctx,
+                collection_id=f"workspace_{ctx.workspace_id}",
+                workspace_id=ctx.workspace_id,
+                query=query,
+                top_k=top_k,
+            ),
+            _run_embedding_search(
+                ctx,
+                collection_id=GLOBAL_GLOSSARY_COLLECTION_ID,
+                workspace_id=GLOBAL_GLOSSARY_WORKSPACE_SENTINEL,
+                query=query,
+                top_k=top_k,
+            ),
+        )
     except Exception:
         logger.exception("semantic_search_error")
         return json.dumps({"error": "Could not perform semantic search right now."})
+
+    merged = sorted(workspace_matches + global_matches, key=lambda m: m.get("score", 0), reverse=True)[:top_k]
+    if not merged:
+        return json.dumps({"matches": [], "note": "No results available."})
+
+    return json.dumps({"matches": merged})
 
 
 async def _get_meeting_summary(ctx: ToolContext, arguments: dict[str, Any]) -> str:
@@ -420,9 +508,10 @@ TOOLS: list[ChatTool] = [
     ChatTool(
         name="search_terminology",
         description=(
-            "Search the workspace's glossary/terminology for a term. Use this when the user "
-            "asks what a specific term means, how it should be translated, or what "
-            "terminology exists."
+            "Search terminology for a term: first the workspace's own glossary, then falling "
+            "back to the platform's system-managed global glossary of common IT/business "
+            "terms. Use this when the user asks what a specific term means, how it should be "
+            "translated, or what terminology exists."
         ),
         parameters={
             "type": "object",

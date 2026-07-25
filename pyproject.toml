@@ -5,7 +5,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["shared*", "stt_worker*", "translation_worker*", "tts_worker*", "ai_assistant_worker*", "embedding_worker*", "billing_worker*", "security_worker*", "livekit_ingress_worker*"]
 
-
 [project]
 name = "warptalk-ai"
 version = "0.1.0"

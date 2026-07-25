@@ -51,6 +51,15 @@ class BaseWorker(ABC):
     input_stream: str = ""
     consumer_group: str = ""
 
+    # Opt-in: how many messages this worker processes at once. Default 1 preserves the
+    # exact one-at-a-time behavior every worker has always had — audio/text workers with
+    # per-room ordering assumptions (stt/translation/tts/assistant/livekit-ingress) must NOT
+    # change this. Set > 1 only for workers whose messages are independent of each other and
+    # whose per-message work is I/O-bound (e.g. embedding_worker: an OpenAI embed call + a
+    # Qdrant upsert per message) — see consume_concurrent() in shared/redis_client.py for why
+    # a single message's ack is still tied to its own handler completion under concurrency.
+    concurrency: int = 1
+
     def __init__(
         self,
         settings: WorkerSettings | None = None,
@@ -255,29 +264,35 @@ class BaseWorker(ABC):
             stream=self.input_stream,
             group=self.consumer_group,
             consumer=self._consumer_name,
+            concurrency=self.concurrency,
         )
 
         while not self._shutdown_event.is_set():
             try:
-                async for message_id, data in self.redis.consume(
-                    stream=self.input_stream,
-                    group=self.consumer_group,
-                    consumer=self._consumer_name,
-                    block_ms=2000,  # Check shutdown every 2s
-                ):
-                    if self._shutdown_event.is_set():
-                        break
+                if self.concurrency > 1:
+                    # Owns its own read-dispatch-ack cycle — see consume_concurrent()'s
+                    # docstring for why this can't be built by just not awaiting process()
+                    # in the loop below.
+                    await self.redis.consume_concurrent(
+                        stream=self.input_stream,
+                        group=self.consumer_group,
+                        handler=self._process_and_log_errors,
+                        consumer=self._consumer_name,
+                        block_ms=2000,
+                        count=self.concurrency,
+                        concurrency=self.concurrency,
+                    )
+                else:
+                    async for message_id, data in self.redis.consume(
+                        stream=self.input_stream,
+                        group=self.consumer_group,
+                        consumer=self._consumer_name,
+                        block_ms=2000,  # Check shutdown every 2s
+                    ):
+                        if self._shutdown_event.is_set():
+                            break
 
-                    try:
-                        await self.process(message_id, data)
-                    except Exception:
-                        self.logger.exception(
-                            "process_error",
-                            message_id=message_id,
-                            stream=self.input_stream,
-                        )
-                        # Message is already acked in consume(); in production,
-                        # we may want to push to a dead-letter stream instead.
+                        await self._process_and_log_errors(message_id, data)
 
             except asyncio.CancelledError:
                 raise
@@ -285,6 +300,18 @@ class BaseWorker(ABC):
                 self.logger.exception("consume_loop_error")
                 # Exponential backoff before retry
                 await asyncio.sleep(1.0)
+
+    async def _process_and_log_errors(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        try:
+            await self.process(message_id, data)
+        except Exception:
+            self.logger.exception(
+                "process_error",
+                message_id=message_id,
+                stream=self.input_stream,
+            )
+            # Message is already acked (by consume() or consume_concurrent()); in
+            # production, we may want to push to a dead-letter stream instead.
 
     # ------------------------------------------------------------------
     # Signal handling
