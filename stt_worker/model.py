@@ -393,9 +393,15 @@ class OpenAISTT:
     connection handshake.
     """
 
-    def __init__(self, api_key: str = "", model: str = _DEFAULTS.model) -> None:
+    def __init__(
+        self,
+        api_key: str = "",
+        model: str = _DEFAULTS.model,
+        noise_reduction: str = _DEFAULTS.noise_reduction,
+    ) -> None:
         self.api_key = api_key
         self.model = model
+        self.noise_reduction = noise_reduction
         self._client = None
         # (meeting_id, speaker_id) -> {"manager": ..., "conn": ..., "last_used": float}
         self._sessions: dict[tuple[str, str], dict] = {}
@@ -612,15 +618,21 @@ class OpenAISTT:
         if prompt:
             transcription_config["prompt"] = prompt
 
+        input_config: dict = {
+            "format": {"type": "audio/pcm", "rate": REALTIME_SAMPLE_RATE},
+            "transcription": transcription_config,
+            "turn_detection": None,
+        }
+        # Runs before VAD/the model ever see the audio — "improves VAD and turn
+        # detection accuracy (reducing false positives) and model performance" per
+        # OpenAI's own docs. self.noise_reduction == "off" omits the field entirely
+        # (server default is no noise reduction).
+        if self.noise_reduction and self.noise_reduction != "off":
+            input_config["noise_reduction"] = {"type": self.noise_reduction}
+
         return {
             "type": "transcription",
-            "audio": {
-                "input": {
-                    "format": {"type": "audio/pcm", "rate": REALTIME_SAMPLE_RATE},
-                    "transcription": transcription_config,
-                    "turn_detection": None,
-                }
-            },
+            "audio": {"input": input_config},
         }
 
     async def _get_or_create_session(

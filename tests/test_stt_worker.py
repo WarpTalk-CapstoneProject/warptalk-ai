@@ -50,6 +50,7 @@ def _make_stt_with_conn(events: list) -> tuple[OpenAISTT, FakeRealtimeConn]:
     stt = OpenAISTT.__new__(OpenAISTT)
     stt.api_key = ""
     stt.model = "gpt-realtime-whisper"
+    stt.noise_reduction = "far_field"
     stt._sessions = {}
     conn = FakeRealtimeConn(events)
     stt._client = MagicMock()
@@ -101,12 +102,40 @@ class TestOpenAISTT:
         result = await stt.transcribe(b"")
         assert result == []
 
+    def test_session_payload_includes_noise_reduction_by_default(self) -> None:
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.model = "gpt-4o-transcribe"
+        stt.noise_reduction = "far_field"
+
+        payload = stt._session_payload(language=None, prompt=None)
+
+        assert payload["audio"]["input"]["noise_reduction"] == {"type": "far_field"}
+
+    def test_session_payload_supports_near_field(self) -> None:
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.model = "gpt-4o-transcribe"
+        stt.noise_reduction = "near_field"
+
+        payload = stt._session_payload(language=None, prompt=None)
+
+        assert payload["audio"]["input"]["noise_reduction"] == {"type": "near_field"}
+
+    def test_session_payload_omits_noise_reduction_when_off(self) -> None:
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.model = "gpt-4o-transcribe"
+        stt.noise_reduction = "off"
+
+        payload = stt._session_payload(language=None, prompt=None)
+
+        assert "noise_reduction" not in payload["audio"]["input"]
+
     async def test_transcribe_api_error_raises_for_worker_degrade_signal(
         self, sample_audio_bytes: bytes
     ) -> None:
         stt = OpenAISTT.__new__(OpenAISTT)
         stt.api_key = ""
         stt.model = "gpt-realtime-whisper"
+        stt.noise_reduction = "far_field"
         stt._sessions = {}
         stt._client = MagicMock()
         stt._client.realtime.connect = MagicMock(side_effect=Exception("API error"))
@@ -260,6 +289,7 @@ class TestOpenAISTT:
         stt = OpenAISTT.__new__(OpenAISTT)
         stt.api_key = ""
         stt.model = "gpt-realtime-whisper"
+        stt.noise_reduction = "far_field"
         stt._sessions = {}
         conn1, conn2 = FakeRealtimeConn(events1), FakeRealtimeConn(events2)
         stt._client = MagicMock()

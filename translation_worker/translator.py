@@ -55,6 +55,61 @@ _BATCH_SYSTEM_PROMPT = (
     "Output ONLY those numbered lines — no explanations, no notes, no alternatives."
 )
 
+
+def _build_glossary_block(glossary_terms: list[dict] | None) -> str:
+    """Render this workspace's active glossary terms (see GlossaryStartedEventConsumer,
+    published to `translationRoom:{meeting_id}:mt_glossary`) as a system-prompt addendum.
+
+    Two shapes come out of the same glossary data: a term whose SourceTerm equals its
+    TargetTerm (case-insensitively) is an admin's explicit "don't translate this" —
+    slang, a brand name, or a term the team just says in English (e.g. "marketing plan",
+    "sprint"). A term where they differ is an exact required mapping, overriding whatever
+    generic translation the model would otherwise pick. Without this, the base prompt's
+    blanket "translate everything" instruction has no way to know either exists — see
+    docs/code-switching-research.md §1.2/§2.3 for why that over-translates jargon by default.
+    """
+    if not glossary_terms:
+        return ""
+
+    keep_lines: list[str] = []
+    map_lines: list[str] = []
+    for term in glossary_terms:
+        source = (term.get("source") or "").strip()
+        target = (term.get("target") or "").strip()
+        if not source:
+            continue
+        if not target or target.lower() == source.lower():
+            keep_lines.append(f'- "{source}"')
+        else:
+            map_lines.append(f'- "{source}" → "{target}"')
+
+    if not keep_lines and not map_lines:
+        return ""
+
+    sections = [
+        "\n\nThis workspace has a glossary. Apply it exactly, overriding your own "
+        "default translation choice whenever one of these terms appears:"
+    ]
+    if keep_lines:
+        sections.append(
+            "Keep these terms exactly as written in the source — do not translate them:\n"
+            + "\n".join(keep_lines)
+        )
+    if map_lines:
+        sections.append(
+            "Use these exact translations instead of a generic one:\n" + "\n".join(map_lines)
+        )
+    return "\n\n".join(sections)
+
+
+def _exception_clause(glossary_terms: list[dict] | None) -> str:
+    """The "never leave any word..." instruction's exception clause — only mentions the
+    glossary when there actually is one, so the sentence doesn't dangle a reference to
+    "the glossary below" when _build_glossary_block returned nothing.
+    """
+    base = "except for proper nouns/brand names with no natural translation"
+    return f"{base}, or terms covered by the glossary below" if glossary_terms else base
+
 _BATCH_LINE_RE = re.compile(r"^\s*\[(\d+)\]\s*(.*)$")
 
 
@@ -98,13 +153,22 @@ class OpenAITranslator:
         self._client = AsyncOpenAI(api_key=self.api_key)
         logger.info("openai_translator_loaded", model=self.model)
 
-    async def translate(self, text: str, source_lang: str, target_lang: str) -> str:
+    async def translate(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        glossary_terms: list[dict] | None = None,
+    ) -> str:
         """Translate text using OpenAI chat completion.
 
         Args:
             text: Input text to translate
             source_lang: Source language ISO 639-1 code (e.g. 'vi', 'en')
             target_lang: Target language ISO 639-1 code (e.g. 'en', 'ja')
+            glossary_terms: This meeting's workspace glossary, as [{"source": ..., "target":
+                ...}, ...] — see _build_glossary_block. None/empty when the workspace has no
+                active glossary; translation falls back to the plain proper-nouns exception.
 
         Returns:
             Translated text string
@@ -123,8 +187,8 @@ class OpenAITranslator:
         user_message = (
             f"Translate from {src_name} to {tgt_name}:\n{text}\n\n"
             f"Respond entirely in {tgt_name} — never leave any word in {src_name} or "
-            "switch to a third language, except for proper nouns/brand names with no "
-            "natural translation."
+            f"switch to a third language, {_exception_clause(glossary_terms)}."
+            f"{_build_glossary_block(glossary_terms)}"
         )
 
         response = await self._client.chat.completions.create(
@@ -150,7 +214,11 @@ class OpenAITranslator:
         return result
 
     async def translate_batch(
-        self, texts: list[str], source_lang: str, target_lang: str
+        self,
+        texts: list[str],
+        source_lang: str,
+        target_lang: str,
+        glossary_terms: list[dict] | None = None,
     ) -> list[str]:
         """Translate several sentences in a single OpenAI call.
 
@@ -178,8 +246,8 @@ class OpenAITranslator:
         user_message = (
             f"Translate from {src_name} to {tgt_name}:\n{numbered_input}\n\n"
             f"Respond entirely in {tgt_name} — never leave any word in {src_name} or "
-            "switch to a third language, except for proper nouns/brand names with no "
-            "natural translation."
+            f"switch to a third language, {_exception_clause(glossary_terms)}."
+            f"{_build_glossary_block(glossary_terms)}"
         )
 
         response = await self._client.chat.completions.create(
@@ -212,7 +280,7 @@ class OpenAITranslator:
             )
             return list(
                 await asyncio.gather(
-                    *(self.translate(t, source_lang, target_lang) for t in texts)
+                    *(self.translate(t, source_lang, target_lang, glossary_terms) for t in texts)
                 )
             )
 

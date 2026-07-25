@@ -11,6 +11,7 @@ Passthrough: if source_lang == target_lang, forward without translation.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from shared.base_worker import BaseWorker
@@ -38,6 +39,12 @@ class TranslationWorker(BaseWorker):
         super().__init__(**kwargs)
         self.translation_settings = translation_settings or TranslationSettings()
         self.translator: OpenAITranslator | None = None
+        # meeting_id -> this workspace's glossary as [{"source": ..., "target": ...}, ...],
+        # published to `translationRoom:{meeting_id}:mt_glossary` by
+        # GlossaryStartedEventConsumer (TranscriptService) when the room starts. Cached for
+        # the room's lifetime — same "don't hit Redis on every chunk" reasoning as
+        # stt_worker's _stt_prompts (see docs/code-switching-research.md).
+        self._mt_glossaries: dict[str, list[dict]] = {}
 
     async def load_model(self) -> None:
         """Initialize OpenAI translation client."""
@@ -124,6 +131,7 @@ class TranslationWorker(BaseWorker):
         target_langs = await self._get_target_languages(
             stt_result.meeting_id, stt_result.speaker_id
         )
+        glossary_terms = await self._get_mt_glossary(stt_result.meeting_id)
 
         # Split long STT results into smaller sentences (streaming mechanism)
         sentences = split_into_sentences(stt_result.text)
@@ -149,12 +157,16 @@ class TranslationWorker(BaseWorker):
             return
 
         await asyncio.gather(*(
-            self._translate_and_publish(stt_result, sentences, target_lang)
+            self._translate_and_publish(stt_result, sentences, target_lang, glossary_terms)
             for target_lang in target_langs
         ))
 
     async def _translate_and_publish(
-        self, stt_result: STTResultMessage, sentences: list[str], target_lang: str
+        self,
+        stt_result: STTResultMessage,
+        sentences: list[str],
+        target_lang: str,
+        glossary_terms: list[dict] | None = None,
     ) -> None:
         # Fire off translation for all sentences UP FRONT so they run concurrently instead
         # of one-sentence-at-a-time (each translate() call is a real OpenAI network
@@ -171,7 +183,10 @@ class TranslationWorker(BaseWorker):
         if not passthrough:
             first_task = asyncio.create_task(
                 self.translator.translate(
-                    sentences[0], source_lang=stt_result.language, target_lang=target_lang
+                    sentences[0],
+                    source_lang=stt_result.language,
+                    target_lang=target_lang,
+                    glossary_terms=glossary_terms,
                 )
             )
             if len(sentences) > 1:
@@ -180,6 +195,7 @@ class TranslationWorker(BaseWorker):
                         sentences[1:],
                         source_lang=stt_result.language,
                         target_lang=target_lang,
+                        glossary_terms=glossary_terms,
                     )
                 )
 
@@ -259,3 +275,37 @@ class TranslationWorker(BaseWorker):
 
         # No other participant registered yet — avoid assuming Vietnamese for all users.
         return targets or {"en"}
+
+    async def _get_mt_glossary(self, meeting_id: str) -> list[dict]:
+        """This meeting's workspace glossary, as [{"source": ..., "target": ...}, ...] —
+        published to `translationRoom:{meeting_id}:mt_glossary` by
+        GlossaryStartedEventConsumer (TranscriptService) when the room starts. Cached for
+        the room's lifetime (see self._mt_glossaries), same reasoning as stt_worker's
+        _get_stt_prompt: the glossary is set before the meeting, not mid-meeting.
+
+        Empty list (not an error) when the workspace has no active glossary — translate()/
+        translate_batch() already treat that as "no glossary", falling back to their plain
+        proper-nouns exception.
+        """
+        cached = self._mt_glossaries.get(meeting_id)
+        if cached is not None:
+            return cached
+
+        raw = await self.redis.get(f"translationRoom:{meeting_id}:mt_glossary")
+        glossary: list[dict] = []
+        if raw:
+            try:
+                parsed = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                if isinstance(parsed, list):
+                    glossary = [t for t in parsed if isinstance(t, dict)]
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.logger.warning("mt_glossary_parse_failed", meeting_id=meeting_id)
+
+        self._mt_glossaries[meeting_id] = glossary
+        if glossary:
+            self.logger.info("mt_glossary_loaded", meeting_id=meeting_id, terms=len(glossary))
+        return glossary
+
+    def _cleanup_room(self, room_id: str) -> None:
+        super()._cleanup_room(room_id)
+        self._mt_glossaries.pop(room_id, None)
