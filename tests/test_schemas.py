@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from shared.schemas import (
+    AIUsageMessage,
     AudioChunkMessage,
     STTResultMessage,
     TranslationResultMessage,
@@ -170,6 +171,7 @@ class TestTTSResultMessage:
 
         assert restored.audio_data == audio
         assert restored.duration_ms == 1500
+        assert restored.char_count == 0
         assert restored.voice_type == "cloned"
 
     def test_roundtrip_voice_blending_metadata(self) -> None:
@@ -241,6 +243,34 @@ class TestTTSResultMessage:
         assert restored.clone_provider == ""
         assert restored.render_location == "server"
         assert restored.cache_hit is False
+
+
+class TestAIUsageMessage:
+    """AIUsageMessage tests."""
+
+    def test_roundtrip(self) -> None:
+        original = AIUsageMessage(
+            workspace_id="workspace-1",
+            room_id="room-1",
+            user_id="user-1",
+            charge_type="TRANSLATION",
+            model="gpt-4.1-mini",
+            prompt_tokens=120,
+            cached_tokens=20,
+            completion_tokens=40,
+            source_lang="en",
+            target_lang="vi",
+            idempotency_key="TRANSLATION:room-1:1",
+        )
+
+        restored = AIUsageMessage.from_redis(original.to_redis())
+
+        assert restored.workspace_id == original.workspace_id
+        assert restored.room_id == original.room_id
+        assert restored.prompt_tokens == 120
+        assert restored.cached_tokens == 20
+        assert restored.completion_tokens == 40
+        assert restored.idempotency_key == original.idempotency_key
 
 
 @pytest.mark.parametrize(

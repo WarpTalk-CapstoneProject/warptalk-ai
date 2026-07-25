@@ -262,7 +262,10 @@ class TTSWorker(BaseWorker):
             except Exception:
                 self.logger.warning("voice_catalog_cache_corrupt", language=language)
 
-        voices = await self.cartesia.list_voices(language, limit=self.tts_settings.voice_catalog_size)
+        voices = await self.cartesia.list_voices(
+            language,
+            limit=self.tts_settings.voice_catalog_size,
+        )
         if voices:
             await self.redis.set_with_ttl(
                 cache_key, json.dumps(voices), self.tts_settings.voice_catalog_cache_ttl_seconds
@@ -423,6 +426,7 @@ class TTSWorker(BaseWorker):
             speaker_id=translation.speaker_id,
             audio_data=audio_bytes,
             duration_ms=duration_ms,
+            char_count=len(translation.translated_text),
             voice_type=voice_type,
             voice_mode=voice_type,
             clone_strength=1.0 if voice_type == "cloned" else 0.0,

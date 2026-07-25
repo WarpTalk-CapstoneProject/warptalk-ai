@@ -24,9 +24,11 @@ import httpx
 from ai_assistant_worker.chat_tools import TOOLS, TOOLS_BY_NAME, ToolContext
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
-from shared.schemas import ChatRequestMessage, ChatResultMessage
+from shared.openai_usage import TokenUsage
+from shared.schemas import AIUsageMessage, ChatRequestMessage, ChatResultMessage
 
 SIBLING_SERVICE_TIMEOUT_SECONDS = 10.0
+AI_ASSISTANT_CHARGE_TYPE = "AI_ASSISTANT"
 
 SYSTEM_PROMPT = (
     "You are WarpTalk AI, the assistant embedded in the WarpTalk real-time speech "
@@ -142,18 +144,25 @@ class ChatAssistantWorker(BaseWorker):
 
         self._openai = AsyncOpenAI(api_key=api_key)
         self._workspace_client = httpx.AsyncClient(
-            base_url=self.chat_settings.workspace_service_url, timeout=SIBLING_SERVICE_TIMEOUT_SECONDS
+            base_url=self.chat_settings.workspace_service_url,
+            timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
         )
         self._transcript_client = httpx.AsyncClient(
-            base_url=self.chat_settings.transcript_service_url, timeout=SIBLING_SERVICE_TIMEOUT_SECONDS
+            base_url=self.chat_settings.transcript_service_url,
+            timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
         )
         self._translation_room_client = httpx.AsyncClient(
-            base_url=self.chat_settings.translation_room_service_url, timeout=SIBLING_SERVICE_TIMEOUT_SECONDS
+            base_url=self.chat_settings.translation_room_service_url,
+            timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
         )
         self.logger.info("chat_assistant_ready", model=self.chat_settings.model)
 
     async def _cleanup(self) -> None:
-        for client in (self._workspace_client, self._transcript_client, self._translation_room_client):
+        for client in (
+            self._workspace_client,
+            self._transcript_client,
+            self._translation_room_client,
+        ):
             if client is not None:
                 await client.aclose()
 
@@ -161,7 +170,9 @@ class ChatAssistantWorker(BaseWorker):
         request = ChatRequestMessage.from_redis(data)
 
         try:
-            history: list[dict[str, str]] = json.loads(request.history_json) if request.history_json else []
+            history: list[dict[str, str]] = (
+                json.loads(request.history_json) if request.history_json else []
+            )
         except json.JSONDecodeError:
             history = []
 
@@ -178,17 +189,25 @@ class ChatAssistantWorker(BaseWorker):
         )
 
         try:
-            final_text, tool_call_log = await self._run_agent_loop(request, history, tool_context)
+            final_text, tool_call_log, usage = await self._run_agent_loop(
+                request,
+                history,
+                tool_context,
+            )
             await self._publish_result(
                 request,
                 type_="completed",
                 content=final_text,
                 tool_calls_json=json.dumps(tool_call_log) if tool_call_log else "",
             )
+            if usage.has_tokens:
+                await self._publish_usage(request, usage)
         except Exception as exc:
             self.logger.exception("chat_turn_failed", request_id=request.request_id)
             await self._publish_result(
-                request, type_="failed", content=str(exc) or "The assistant could not generate a reply."
+                request,
+                type_="failed",
+                content=str(exc) or "The assistant could not generate a reply.",
             )
 
     async def _run_agent_loop(
@@ -196,7 +215,7 @@ class ChatAssistantWorker(BaseWorker):
         request: ChatRequestMessage,
         history: list[dict[str, str]],
         tool_context: ToolContext,
-    ) -> tuple[str, list[dict[str, Any]]]:
+    ) -> tuple[str, list[dict[str, Any]], TokenUsage]:
         messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         page_context_message = _format_page_context(request.page_context_json)
         if page_context_message:
@@ -204,11 +223,14 @@ class ChatAssistantWorker(BaseWorker):
         mentions_message = _format_mentions(request.mentions_json)
         if mentions_message:
             messages.append({"role": "system", "content": mentions_message})
-        messages.extend({"role": turn.get("role"), "content": turn.get("content")} for turn in history)
+        messages.extend(
+            {"role": turn.get("role"), "content": turn.get("content")} for turn in history
+        )
 
         tool_schemas = [t.to_openai_schema() for t in TOOLS]
         tool_call_log: list[dict[str, Any]] = []
         final_text = ""
+        usage_total = TokenUsage()
 
         for _ in range(self.chat_settings.max_tool_iterations):
             buffer = ""
@@ -224,9 +246,17 @@ class ChatAssistantWorker(BaseWorker):
                 tools=tool_schemas,
                 tool_choice="auto",
                 stream=True,
+                stream_options={"include_usage": True},
             )
 
             async for chunk in stream:
+                usage = TokenUsage.from_openai_usage(getattr(chunk, "usage", None))
+                if usage.has_tokens:
+                    usage_total += usage
+
+                if not getattr(chunk, "choices", None):
+                    continue
+
                 choice = chunk.choices[0]
                 delta = choice.delta
 
@@ -239,7 +269,10 @@ class ChatAssistantWorker(BaseWorker):
 
                 if delta.tool_calls:
                     for tc in delta.tool_calls:
-                        acc = tool_calls_acc.setdefault(tc.index, {"id": None, "name": None, "arguments": ""})
+                        acc = tool_calls_acc.setdefault(
+                            tc.index,
+                            {"id": None, "name": None, "arguments": ""},
+                        )
                         if tc.id:
                             acc["id"] = tc.id
                         if tc.function and tc.function.name:
@@ -293,7 +326,12 @@ class ChatAssistantWorker(BaseWorker):
                         result_json = json.dumps({"error": "The tool failed to execute."})
                         status = "failed"
 
-                await self._publish_result(request, type_="tool_call_completed", tool_name=tool_name, tool_status=status)
+                await self._publish_result(
+                    request,
+                    type_="tool_call_completed",
+                    tool_name=tool_name,
+                    tool_status=status,
+                )
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": result_json})
                 tool_call_log.append({
                     "tool": tool_name,
@@ -303,9 +341,11 @@ class ChatAssistantWorker(BaseWorker):
                 })
         else:
             # Hit max_tool_iterations without a non-tool-call finish.
-            final_text = final_text or "I wasn't able to finish looking that up — please try rephrasing your question."
+            final_text = final_text or (
+                "I wasn't able to finish looking that up — please try rephrasing your question."
+            )
 
-        return final_text, tool_call_log
+        return final_text, tool_call_log, usage_total
 
     async def _publish_result(
         self,
@@ -326,3 +366,17 @@ class ChatAssistantWorker(BaseWorker):
             tool_calls_json=tool_calls_json,
         )
         await self.publish("assistant:chat_results", request.conversation_id, result.to_redis())
+
+    async def _publish_usage(self, request: ChatRequestMessage, usage: TokenUsage) -> None:
+        message = AIUsageMessage(
+            workspace_id=request.workspace_id,
+            room_id=request.conversation_id,
+            user_id=request.user_id,
+            charge_type=AI_ASSISTANT_CHARGE_TYPE,
+            model=self.chat_settings.model,
+            prompt_tokens=usage.prompt_tokens,
+            cached_tokens=usage.cached_tokens,
+            completion_tokens=usage.completion_tokens,
+            idempotency_key=f"{AI_ASSISTANT_CHARGE_TYPE}:{request.request_id}",
+        )
+        await self.publish("ai:usage", request.conversation_id, message.to_redis())

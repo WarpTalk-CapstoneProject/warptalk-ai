@@ -18,7 +18,9 @@ import time
 from ai_assistant_worker.assistant import MeetingAssistant
 from shared.base_worker import BaseWorker
 from shared.config import AssistantSettings, resolve_openai_api_key
-from shared.schemas import STTResultMessage
+from shared.schemas import AIUsageMessage, STTResultMessage
+
+AI_SUMMARY_CHARGE_TYPE = "AI_SUMMARY"
 
 
 class AIAssistantWorker(BaseWorker):
@@ -107,8 +109,15 @@ class AIAssistantWorker(BaseWorker):
         except Exception:
             self.logger.warning("failed_to_read_target_languages", meeting_id=meeting_id)
 
+        usage_total = None
+
         # Generate summary
-        summary = await self.assistant.summarize(transcript_text, context_snapshot=context_snapshot)
+        summary_result = await self.assistant.summarize_with_usage(
+            transcript_text,
+            context_snapshot=context_snapshot,
+        )
+        summary = summary_result.text
+        usage_total = summary_result.usage
 
         # Store summary in Redis Hash for persistent retrieval
         await self.redis.hset(
@@ -125,10 +134,12 @@ class AIAssistantWorker(BaseWorker):
         })
 
         # Generate action items
-        action_items = await self.assistant.extract_action_items(
+        action_items_result = await self.assistant.extract_action_items_with_usage(
             transcript_text,
             context_snapshot=context_snapshot,
         )
+        action_items = action_items_result.text
+        usage_total += action_items_result.usage
         await self.redis.hset(
             f"meeting:{meeting_id}:summary",
             "action_items",
@@ -146,16 +157,30 @@ class AIAssistantWorker(BaseWorker):
         # that TranslationRoomService.ArtifactsFinalizer stores as the SUMMARY_EXPORT
         # artifact's inline Content, so the frontend can render an overview, a decisions
         # list, and an owner/task action-item checklist instead of parsing markdown.
-        structured = await self.assistant.generate_structured_summary(
+        structured_result = await self.assistant.generate_structured_summary_with_usage(
             transcript_text,
             target_languages=target_languages,
             context_snapshot=context_snapshot,
         )
+        structured = structured_result.data
+        usage_total += structured_result.usage
         await self.redis.hset(
             f"meeting:{meeting_id}:summary",
             "structured_json",
             json.dumps(structured),
         )
+
+        if usage_total.has_tokens:
+            usage_message = AIUsageMessage(
+                room_id=meeting_id,
+                charge_type=AI_SUMMARY_CHARGE_TYPE,
+                model=self.assistant.model,
+                prompt_tokens=usage_total.prompt_tokens,
+                cached_tokens=usage_total.cached_tokens,
+                completion_tokens=usage_total.completion_tokens,
+                idempotency_key=f"{AI_SUMMARY_CHARGE_TYPE}:{meeting_id}",
+            )
+            await self.publish("ai:usage", meeting_id, usage_message.to_redis())
 
         self.logger.info(
             "summary_generated",

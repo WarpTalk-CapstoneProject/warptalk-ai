@@ -154,7 +154,9 @@ class TranslationResultMessage(BaseModel):
     end_ms: int = 0
     is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
-    translator_model: str = ""  # OpenAITranslator.model — needed by TranscriptService to populate transcript.translation_contents.translator_model (NOT NULL)
+    # OpenAITranslator.model — needed by TranscriptService to populate
+    # transcript.translation_contents.translator_model (NOT NULL).
+    translator_model: str = ""
     # The originating STTResultMessage.segment_id, BEFORE the "-{target_lang}-c{idx}"
     # suffix this message's own segment_id gets (see translation_worker._translate_and_publish).
     # Lets a consumer (gateway/frontend) join a translation back to the exact transcript
@@ -221,12 +223,14 @@ class TTSResultMessage(BaseModel):
     speaker_id: str
     audio_data: bytes  # Synthesized audio bytes (WAV)
     duration_ms: int = 0  # Audio duration in milliseconds
+    char_count: int = 0  # Number of synthesized text characters sent to the TTS provider
     voice_type: str = "default"  # 'default' | 'cloned'
     voice_mode: str = "standard"  # 'standard' | 'blended' | 'cloned' | 'caption_only'
     clone_strength: float = 0.0
     anchor_provider: str = ""
     clone_provider: str = ""
-    provider_voice_id: str = ""  # Cartesia voice id actually used — set even for voice_type='default'
+    # Cartesia voice id actually used — set even for voice_type='default'.
+    provider_voice_id: str = ""
     render_location: str = "server"
     cache_key: str = ""
     cache_hit: bool = False
@@ -246,6 +250,7 @@ class TTSResultMessage(BaseModel):
             "speaker_id": self.speaker_id,
             "audio_data": base64.b64encode(self.audio_data).decode("ascii"),
             "duration_ms": str(self.duration_ms),
+            "char_count": str(self.char_count),
             "voice_type": self.voice_type,
             "voice_mode": self.voice_mode,
             "clone_strength": str(self.clone_strength),
@@ -272,6 +277,7 @@ class TTSResultMessage(BaseModel):
             speaker_id=d["speaker_id"],
             audio_data=base64.b64decode(d["audio_data"]),
             duration_ms=int(d.get("duration_ms", "0")),
+            char_count=int(d.get("char_count", "0")),
             voice_type=d.get("voice_type", "default"),
             voice_mode=d.get("voice_mode", "standard"),
             clone_strength=float(d.get("clone_strength", "0.0")),
@@ -286,6 +292,64 @@ class TTSResultMessage(BaseModel):
             fallback_reason=d.get("fallback_reason", ""),
             target_lang=d.get("target_lang", ""),
             is_final_chunk=d.get("is_final_chunk") == "1",
+            timestamp_ms=int(d.get("timestamp_ms", "0")),
+        )
+
+
+class AIUsageMessage(BaseModel):
+    """OpenAI usage event for billing settlement.
+
+    Translation/assistant workers publish one event per provider call or per completed
+    assistant turn. Billing can resolve subscription/workspace from room_id when
+    workspace_id is not available at publish time.
+    """
+
+    __slots__ = ()
+
+    workspace_id: str = ""
+    room_id: str
+    user_id: str = ""
+    charge_type: str
+    model: str
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
+    completion_tokens: int = 0
+    source_lang: str = ""
+    target_lang: str = ""
+    idempotency_key: str
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_redis(self) -> dict[str, str]:
+        return {
+            "workspace_id": self.workspace_id,
+            "room_id": self.room_id,
+            "user_id": self.user_id,
+            "charge_type": self.charge_type,
+            "model": self.model,
+            "prompt_tokens": str(self.prompt_tokens),
+            "cached_tokens": str(self.cached_tokens),
+            "completion_tokens": str(self.completion_tokens),
+            "source_lang": self.source_lang,
+            "target_lang": self.target_lang,
+            "idempotency_key": self.idempotency_key,
+            "timestamp_ms": str(self.timestamp_ms),
+        }
+
+    @classmethod
+    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> AIUsageMessage:
+        d = _decode_dict(data)
+        return cls(
+            workspace_id=d.get("workspace_id", ""),
+            room_id=d["room_id"],
+            user_id=d.get("user_id", ""),
+            charge_type=d["charge_type"],
+            model=d["model"],
+            prompt_tokens=int(d.get("prompt_tokens", "0")),
+            cached_tokens=int(d.get("cached_tokens", "0")),
+            completion_tokens=int(d.get("completion_tokens", "0")),
+            source_lang=d.get("source_lang", ""),
+            target_lang=d.get("target_lang", ""),
+            idempotency_key=d["idempotency_key"],
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 
@@ -306,8 +370,10 @@ class ChatRequestMessage(BaseModel):
     user_id: str
     bearer_token: str = ""
     history_json: str = "[]"  # JSON array of {"role": ..., "content": ...}
-    page_context_json: str = ""  # JSON {"pageType", "entityId", "workspaceId", "snapshot"} or "" if none
-    mentions_json: str = ""  # JSON array of {"entityType", "entityId", "label", "workspaceId"} or "" if none
+    # JSON {"pageType", "entityId", "workspaceId", "snapshot"} or "" if none.
+    page_context_json: str = ""
+    # JSON array of {"entityType", "entityId", "label", "workspaceId"} or "" if none.
+    mentions_json: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:

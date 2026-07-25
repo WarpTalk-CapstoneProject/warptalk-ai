@@ -7,9 +7,11 @@ extracting action items, and answering questions about the meeting.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 from shared.config import AssistantSettings
 from shared.logger import get_logger
+from shared.openai_usage import TokenUsage
 
 logger = get_logger(__name__)
 
@@ -21,13 +23,26 @@ logger = get_logger(__name__)
 _DEFAULTS = AssistantSettings()
 
 
+@dataclass(frozen=True)
+class TextWithUsage:
+    text: str
+    usage: TokenUsage = TokenUsage()
+
+
+@dataclass(frozen=True)
+class DictWithUsage:
+    data: dict
+    usage: TokenUsage = TokenUsage()
+
+
 class MeetingAssistant:
     """OpenAI-powered meeting assistant.
 
     Accumulates transcript segments and generates summaries on demand.
     """
 
-    SYSTEM_PROMPT = """You are a professional meeting assistant. Your task is to analyze meeting transcripts and produce clear, concise outputs.
+    SYSTEM_PROMPT = """You are a professional meeting assistant. Your task is to analyze meeting \
+transcripts and produce clear, concise outputs.
 
 When summarizing:
 - Highlight key decisions made
@@ -75,8 +90,14 @@ When extracting action items:
         Returns:
             Summary text with key decisions, action items, etc.
         """
+        result = await self.summarize_with_usage(transcript, context_snapshot)
+        return result.text
+
+    async def summarize_with_usage(
+        self, transcript: str, context_snapshot: str = ""
+    ) -> TextWithUsage:
         if not transcript.strip():
-            return "No transcript content to summarize."
+            return TextWithUsage("No transcript content to summarize.")
 
         system_content = self.SYSTEM_PROMPT
         if context_snapshot:
@@ -95,7 +116,8 @@ When extracting action items:
             temperature=self.temperature,
         )
 
-        return response.choices[0].message.content or ""
+        usage = TokenUsage.from_openai_usage(getattr(response, "usage", None))
+        return TextWithUsage(response.choices[0].message.content or "", usage)
 
     async def extract_action_items(self, transcript: str, context_snapshot: str = "") -> str:
         """Extract action items from the transcript.
@@ -103,8 +125,14 @@ When extracting action items:
         Returns:
             Formatted action items list
         """
+        result = await self.extract_action_items_with_usage(transcript, context_snapshot)
+        return result.text
+
+    async def extract_action_items_with_usage(
+        self, transcript: str, context_snapshot: str = ""
+    ) -> TextWithUsage:
         if not transcript.strip():
-            return "No action items found."
+            return TextWithUsage("No action items found.")
 
         system_content = self.SYSTEM_PROMPT
         if context_snapshot:
@@ -116,25 +144,31 @@ When extracting action items:
                 {"role": "system", "content": system_content},
                 {
                     "role": "user",
-                    "content": f"Extract all action items from this meeting transcript. Format each as a checkbox item:\n\n{transcript}",
+                    "content": (
+                        "Extract all action items from this meeting transcript. "
+                        f"Format each as a checkbox item:\n\n{transcript}"
+                    ),
                 },
             ],
             max_tokens=self.max_tokens,
             temperature=0.2,
         )
 
-        return response.choices[0].message.content or ""
+        usage = TokenUsage.from_openai_usage(getattr(response, "usage", None))
+        return TextWithUsage(response.choices[0].message.content or "", usage)
 
-    STRUCTURED_SYSTEM_PROMPT = """You are a professional meeting assistant. Analyze the meeting transcript and \
+    STRUCTURED_SYSTEM_PROMPT = """You are a professional meeting assistant. Analyze the meeting \
+transcript and \
 respond with a single JSON object only (no markdown, no commentary) matching exactly this shape:
 {
   "summary": "a concise overview paragraph of what the meeting covered",
   "decisions": ["one string per key decision that was made"],
   "actionItems": [{"owner": "assignee name, or empty string if unclear", "task": "the action item"}]
 }
-Only include explicit decisions and commitments — do not invent content that isn't in the transcript.
-If the transcript is empty or has no substantive content, return summary describing that, and empty arrays
-for decisions and actionItems."""
+Only include explicit decisions and commitments — do not invent content that isn't in the \
+transcript.
+If the transcript is empty or has no substantive content, return summary describing that, and \
+empty arrays for decisions and actionItems."""
 
     async def generate_structured_summary(
         self,
@@ -158,13 +192,26 @@ for decisions and actionItems."""
             returns a safe fallback dict with insufficientData=True instead of raising —
             callers should never have to special-case exceptions from this method.
         """
+        result = await self.generate_structured_summary_with_usage(
+            transcript,
+            target_languages=target_languages,
+            context_snapshot=context_snapshot,
+        )
+        return result.data
+
+    async def generate_structured_summary_with_usage(
+        self,
+        transcript: str,
+        target_languages: list[str] | None = None,
+        context_snapshot: str = "",
+    ) -> DictWithUsage:
         if not transcript.strip():
-            return {
+            return DictWithUsage({
                 "summary": "No transcript content to summarize.",
                 "decisions": [],
                 "actionItems": [],
                 "insufficientData": True,
-            }
+            })
 
         system_content = self.STRUCTURED_SYSTEM_PROMPT
         if context_snapshot:
@@ -195,17 +242,20 @@ for decisions and actionItems."""
                 response_format={"type": "json_object"},
             )
             raw = response.choices[0].message.content or "{}"
+            usage = TokenUsage.from_openai_usage(getattr(response, "usage", None))
             parsed = json.loads(raw)
             parsed.setdefault("summary", "")
             parsed.setdefault("decisions", [])
             parsed.setdefault("actionItems", [])
             parsed["insufficientData"] = False
-            return parsed
+            return DictWithUsage(parsed, usage)
         except Exception:
             logger.exception("structured_summary_generation_failed")
-            return {
-                "summary": "The AI assistant could not generate a structured summary for this meeting.",
+            return DictWithUsage({
+                "summary": (
+                    "The AI assistant could not generate a structured summary for this meeting."
+                ),
                 "decisions": [],
                 "actionItems": [],
                 "insufficientData": True,
-            }
+            })

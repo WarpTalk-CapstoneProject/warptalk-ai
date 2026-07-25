@@ -1,6 +1,6 @@
 """Billing settlement worker.
 
-Consumes the three AI pipeline result streams (stt:results, translate:results,
+Consumes billable AI pipeline streams (audio:chunks, translate:results,
 tts:results) *after the fact* — via its own consumer groups, alongside whatever else
 already reads those streams (e.g. TranscriptService's Redis consumer persists segment/
 translation content; this worker only settles credits, it does not duplicate that job)
@@ -28,18 +28,38 @@ import signal
 import socket
 import time
 import uuid
+from dataclasses import dataclass
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 
+from billing_worker.db import BillingRepository
 from shared.config import BillingSettings, RedisSettings, WorkerSettings
 from shared.logger import get_logger
 from shared.redis_client import RedisStreamClient
-from shared.schemas import STTResultMessage, TranslationResultMessage, TTSResultMessage
-
-from billing_worker.db import BillingRepository
+from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
 
 logger = get_logger("worker.billing")
 
 STT_CHARGE_TYPE = "STT"
 TRANSLATION_CHARGE_TYPE = "TRANSLATION"
+ACCUMULATOR_KEY_PREFIX = "billing:acc"
+ACCUMULATOR_SEQUENCE_PREFIX = "billing:accseq"
+CHARGE_DEDUPE_PREFIX = "billing:charge"
+EVENT_DEDUPE_PREFIX = "billing:event"
+
+
+@dataclass(frozen=True)
+class BillingEvent:
+    subscription_id: uuid.UUID
+    workspace_id: uuid.UUID
+    translation_room_id: str
+    usage_type: str
+    charge_type: str
+    quantity: Decimal
+    unit: str
+    credits_event: Decimal
+    event_idempotency_key: str
+    force_flush: bool = False
+    details: dict | None = None
 
 
 def _extract_underlying_segment_id(raw_segment_id: str) -> str | None:
@@ -76,7 +96,10 @@ class BillingSettlementWorker:
         self.settings = billing_settings or BillingSettings()
         self.worker_settings = worker_settings or WorkerSettings()
         self.redis = RedisStreamClient(redis_settings or self.worker_settings.redis)
-        self.db = BillingRepository(self.settings.database, redis_settings or self.worker_settings.redis)
+        self.db = BillingRepository(
+            self.settings.database,
+            redis_settings or self.worker_settings.redis,
+        )
         self.logger = logger
         self._consumer_name = f"billing-{socket.gethostname()}"
         self._shutdown_event = asyncio.Event()
@@ -94,15 +117,17 @@ class BillingSettlementWorker:
         self.logger.info("billing_worker_started")
         try:
             await asyncio.gather(
-                self._consume_loop("stt:results", "billing-stt-workers", self._handle_stt),
+                self._consume_loop("audio:chunks", "billing-stt-workers", self._handle_stt),
                 self._consume_loop(
                     "translate:results", "billing-translation-workers", self._handle_translation
                 ),
                 self._consume_loop("tts:results", "billing-tts-workers", self._handle_tts),
+                self._flush_loop(),
             )
         except asyncio.CancelledError:
             pass
         finally:
+            await self._flush_all_accumulators()
             await self.db.disconnect()
             await self.redis.disconnect()
             self.logger.info("billing_worker_stopped")
@@ -155,9 +180,9 @@ class BillingSettlementWorker:
     # ------------------------------------------------------------------
 
     async def _handle_stt(self, data: dict) -> None:
-        msg = STTResultMessage.from_redis(data)
-        if not msg.text.strip():
-            return  # empty/flush messages carry no billable transcription
+        msg = AudioChunkMessage.from_redis(data)
+        if not msg.audio_data or msg.sample_rate <= 0:
+            return
 
         resolved = await self._resolve_subscription(msg.meeting_id)
         if resolved is None:
@@ -165,35 +190,23 @@ class BillingSettlementWorker:
             return
         subscription_id, workspace_id = resolved
 
-        quantity_s = (
-            max((msg.end_ms - msg.start_ms) / 1000.0, 0.1) if msg.end_ms > msg.start_ms else 1.0
-        )
-        # Flat credits-per-second placeholder — real pricing is a usage_rate_card lookup
-        # by source_language (see subscription.usage_rate_card), not implemented yet.
-        await self.db.record_usage_and_charge(
+        audio_seconds = Decimal(len(msg.audio_data)) / Decimal(2) / Decimal(msg.sample_rate)
+        if audio_seconds <= 0:
+            return
+
+        await self._accumulate_and_maybe_flush(BillingEvent(
             subscription_id=subscription_id,
-            user_id=msg.speaker_id,
             workspace_id=workspace_id,
             translation_room_id=msg.meeting_id,
             usage_type=STT_CHARGE_TYPE,
             charge_type=STT_CHARGE_TYPE,
-            reference_id=msg.segment_id,
-            reference_type="transcript_segment",
-            quantity=quantity_s,
+            quantity=audio_seconds,
             unit="second",
-            credits_consumed=max(1, round(quantity_s)),
-            # msg.segment_id IS the real TranscriptSegment.Id for STT events (unlike
-            # translation/TTS, which carry a composite "{guid}-c{idx}" string) — no
-            # extraction needed here.
-            transcript_segment_id=msg.segment_id,
-            # NOTE: msg.segment_id is randomly generated per STTResultMessage
-            # (Field(default_factory=uuid4) in shared/schemas.py) — it is NOT stable
-            # across a Redis Streams redelivery of the *upstream* audio chunk, since
-            # stt_worker.process() would mint a fresh one on retry. This idempotency
-            # key only protects against redelivery/retry at THIS worker's own consumer
-            # group, not against stt_worker re-processing the same audio chunk twice.
-            idempotency_key=f"{STT_CHARGE_TYPE}:{msg.segment_id}:NA",
-        )
+            credits_event=audio_seconds,
+            event_idempotency_key=f"{STT_CHARGE_TYPE}:{msg.meeting_id}:{msg.speaker_id}:{msg.chunk_index}",
+            force_flush=msg.is_final_chunk,
+            details={"event_source": "audio_chunks", "sample_rate": msg.sample_rate},
+        ))
 
     async def _handle_translation(self, data: dict) -> None:
         msg = TranslationResultMessage.from_redis(data)
@@ -217,27 +230,31 @@ class BillingSettlementWorker:
                 "segment_id_extraction_failed", raw_segment_id=msg.segment_id
             )
 
-        quantity_chars = float(len(msg.translated_text))
-        await self.db.record_usage_and_charge(
+        if msg.source_lang.split("-")[0] == msg.target_lang.split("-")[0]:
+            return
+
+        quantity_chars = Decimal(len(msg.original_text))
+        if quantity_chars <= 0:
+            return
+
+        await self._accumulate_and_maybe_flush(BillingEvent(
             subscription_id=subscription_id,
-            user_id=msg.speaker_id,
             workspace_id=workspace_id,
             translation_room_id=msg.meeting_id,
             usage_type=TRANSLATION_CHARGE_TYPE,
             charge_type=TRANSLATION_CHARGE_TYPE,
-            reference_id=underlying_segment_id,
-            reference_type="translation_content",
             quantity=quantity_chars,
             unit="character",
-            credits_consumed=max(1, round(quantity_chars / 100)),
-            transcript_segment_id=underlying_segment_id,
-            # msg.segment_id here IS deterministic (translation_worker builds it as
-            # f"{stt_result.segment_id}-{target_lang}-c{idx}"), so this key is redelivery-safe. The
-            # idempotency key keeps using the raw composite msg.segment_id, unaffected by
-            # the extraction above (which only changes what's stored in reference_id /
-            # transcript_segment_id).
-            idempotency_key=f"{TRANSLATION_CHARGE_TYPE}:{msg.segment_id}:{msg.target_lang}",
-        )
+            credits_event=quantity_chars / Decimal(100),
+            event_idempotency_key=f"{TRANSLATION_CHARGE_TYPE}:{msg.segment_id}:{msg.target_lang}",
+            force_flush=msg.is_final_chunk,
+            details={
+                "event_source": "translate_results",
+                "source_lang": msg.source_lang,
+                "target_lang": msg.target_lang,
+                "transcript_segment_id": underlying_segment_id,
+            },
+        ))
 
     async def _handle_tts(self, data: dict) -> None:
         msg = TTSResultMessage.from_redis(data)
@@ -264,23 +281,212 @@ class BillingSettlementWorker:
                 "segment_id_extraction_failed", raw_segment_id=msg.segment_id
             )
 
-        quantity_s = max(msg.duration_ms / 1000.0, 0.1)
-        await self.db.record_usage_and_charge(
+        quantity_s = Decimal(msg.duration_ms) / Decimal(1000)
+        if quantity_s <= 0:
+            return
+
+        await self._accumulate_and_maybe_flush(BillingEvent(
             subscription_id=subscription_id,
-            user_id=msg.speaker_id,
             workspace_id=workspace_id,
             translation_room_id=msg.meeting_id,
             usage_type=charge_type,
             charge_type=charge_type,
-            reference_id=underlying_segment_id,
-            reference_type="audio_dubbing",
             quantity=quantity_s,
             unit="second",
-            credits_consumed=max(1, round(quantity_s)),
-            transcript_segment_id=underlying_segment_id,
-            idempotency_key=f"{charge_type}:{msg.segment_id}:{msg.target_lang}",
-            details={"clone_provider": msg.clone_provider, "voice_mode": msg.voice_mode},
+            credits_event=quantity_s,
+            event_idempotency_key=f"{charge_type}:{msg.segment_id}:{msg.target_lang}",
+            force_flush=msg.is_final_chunk,
+            details={
+                "event_source": "tts_results",
+                "clone_provider": msg.clone_provider,
+                "voice_mode": msg.voice_mode,
+                "char_count": msg.char_count,
+                "transcript_segment_id": underlying_segment_id,
+            },
+        ))
+
+    # ------------------------------------------------------------------
+    # Redis accumulator + flush
+    # ------------------------------------------------------------------
+
+    async def _accumulate_and_maybe_flush(self, event: BillingEvent) -> None:
+        dedupe_key = f"{EVENT_DEDUPE_PREFIX}:{event.event_idempotency_key}"
+        accepted = await self.redis.redis.set(
+            dedupe_key,
+            "1",
+            ex=self.settings.billing_event_dedupe_ttl_seconds,
+            nx=True,
         )
+        if not accepted:
+            self.logger.info(
+                "billing_event_duplicate_skipped",
+                idempotency_key=event.event_idempotency_key,
+            )
+            return
+
+        key = self._accumulator_key(
+            event.subscription_id,
+            event.translation_room_id,
+            event.charge_type,
+        )
+        now_ms = int(time.time() * 1000)
+
+        if not await self.redis.redis.hexists(key, "window_seq"):
+            window_seq = await self.redis.redis.incr(
+                f"{ACCUMULATOR_SEQUENCE_PREFIX}:{event.subscription_id}:{event.translation_room_id}:{event.charge_type}"
+            )
+            await self.redis.redis.hset(
+                key,
+                mapping={
+                    "subscription_id": str(event.subscription_id),
+                    "workspace_id": str(event.workspace_id),
+                    "translation_room_id": event.translation_room_id,
+                    "usage_type": event.usage_type,
+                    "charge_type": event.charge_type,
+                    "unit": event.unit,
+                    "window_seq": str(window_seq),
+                    "window_start_ms": str(now_ms),
+                },
+            )
+
+        pipe = self.redis.redis.pipeline(transaction=True)
+        pipe.hincrbyfloat(key, "credits", float(event.credits_event))
+        pipe.hincrbyfloat(key, f"quantity_{event.unit}", float(event.quantity))
+        pipe.hincrby(key, "event_count", 1)
+        await pipe.execute()
+
+        if event.details:
+            await self.redis.redis.hset(
+                key,
+                "last_event_details",
+                self._json_details(event.details),
+            )
+
+        snapshot = self._decode_hash(await self.redis.redis.hgetall(key))
+        if self._should_flush(snapshot, now_ms, force=event.force_flush):
+            await self._flush_accumulator(key)
+
+    async def _flush_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(1.0)
+            await self._flush_due_accumulators()
+
+    async def _flush_due_accumulators(self) -> None:
+        now_ms = int(time.time() * 1000)
+        async for raw_key in self.redis.redis.scan_iter(f"{ACCUMULATOR_KEY_PREFIX}:*"):
+            key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+            snapshot = self._decode_hash(await self.redis.redis.hgetall(key))
+            if snapshot and self._should_flush(snapshot, now_ms):
+                await self._flush_accumulator(key)
+
+    async def _flush_all_accumulators(self) -> None:
+        async for raw_key in self.redis.redis.scan_iter(f"{ACCUMULATOR_KEY_PREFIX}:*"):
+            key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+            await self._flush_accumulator(key)
+
+    async def _flush_accumulator(self, key: str) -> None:
+        pipe = self.redis.redis.pipeline(transaction=True)
+        pipe.hgetall(key)
+        pipe.delete(key)
+        raw_snapshot, _ = await pipe.execute()
+        snapshot = self._decode_hash(raw_snapshot)
+        if not snapshot:
+            return
+
+        credits_raw = self._decimal_from_snapshot(snapshot, "credits")
+        if credits_raw <= 0:
+            return
+
+        credits_consumed = int(credits_raw.to_integral_value(rounding=ROUND_CEILING))
+        if credits_consumed <= 0:
+            return
+        if credits_consumed > self.settings.max_credits_per_flush:
+            self.logger.error(
+                "billing_flush_rejected_over_cap",
+                accumulator_key=key,
+                credits_consumed=credits_consumed,
+                max_credits_per_flush=self.settings.max_credits_per_flush,
+            )
+            return
+
+        idempotency_key = (
+            f"{snapshot['charge_type']}:{snapshot['translation_room_id']}:{snapshot['window_seq']}"
+        )
+        charge_dedupe_key = f"{CHARGE_DEDUPE_PREFIX}:{idempotency_key}"
+        accepted = await self.redis.redis.set(
+            charge_dedupe_key,
+            "1",
+            ex=self.settings.billing_event_dedupe_ttl_seconds,
+            nx=True,
+        )
+        if not accepted:
+            self.logger.info("billing_flush_duplicate_skipped", idempotency_key=idempotency_key)
+            return
+
+        try:
+            unit = snapshot["unit"]
+            await self.db.record_usage_and_charge(
+                subscription_id=uuid.UUID(snapshot["subscription_id"]),
+                user_id=None,
+                workspace_id=uuid.UUID(snapshot["workspace_id"]),
+                translation_room_id=snapshot["translation_room_id"],
+                usage_type=snapshot["usage_type"],
+                charge_type=snapshot["charge_type"],
+                reference_id=None,
+                reference_type="billing_accumulator",
+                quantity=float(self._decimal_from_snapshot(snapshot, f"quantity_{unit}")),
+                unit=unit,
+                credits_consumed=credits_consumed,
+                transcript_segment_id=None,
+                idempotency_key=idempotency_key,
+                details={
+                    "event_count": int(float(snapshot.get("event_count", "0"))),
+                    "raw_credits": str(credits_raw),
+                    "window_seq": int(snapshot["window_seq"]),
+                    "window_start_ms": int(float(snapshot["window_start_ms"])),
+                    "last_event": snapshot.get("last_event_details"),
+                },
+            )
+        except Exception:
+            await self.redis.redis.delete(charge_dedupe_key)
+            raise
+
+    def _should_flush(self, snapshot: dict[str, str], now_ms: int, *, force: bool = False) -> bool:
+        if force:
+            return True
+        started_at = int(float(snapshot.get("window_start_ms", now_ms)))
+        age_ms = now_ms - started_at
+        credits = self._decimal_from_snapshot(snapshot, "credits")
+        return (
+            age_ms >= self.settings.accumulator_flush_interval_seconds * 1000
+            or credits >= Decimal(self.settings.max_credits_per_flush)
+        )
+
+    @staticmethod
+    def _accumulator_key(subscription_id: uuid.UUID, room_id: str, charge_type: str) -> str:
+        return f"{ACCUMULATOR_KEY_PREFIX}:{subscription_id}:{room_id}:{charge_type}"
+
+    @staticmethod
+    def _decode_hash(data: dict) -> dict[str, str]:
+        return {
+            (k.decode() if isinstance(k, bytes) else k): (
+                v.decode() if isinstance(v, bytes) else v
+            )
+            for k, v in (data or {}).items()
+        }
+
+    @staticmethod
+    def _decimal_from_snapshot(snapshot: dict[str, str], key: str) -> Decimal:
+        try:
+            return Decimal(str(snapshot.get(key, "0")))
+        except (InvalidOperation, ValueError):
+            return Decimal(0)
+
+    @staticmethod
+    def _json_details(details: dict) -> str:
+        import json
+
+        return json.dumps(details, separators=(",", ":"), sort_keys=True)
 
     # ------------------------------------------------------------------
     # Signal handling

@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import dataclass
 
 from shared.config import TranslationSettings
 from shared.logger import get_logger
+from shared.openai_usage import TokenUsage
 
 logger = get_logger(__name__)
 
@@ -117,6 +119,18 @@ def _lang_name(iso_code: str) -> str:
     return _LANG_NAMES.get(iso_code.split("-")[0], iso_code)
 
 
+@dataclass(frozen=True)
+class TranslationWithUsage:
+    text: str
+    usage: TokenUsage = TokenUsage()
+
+
+@dataclass(frozen=True)
+class TranslationBatchWithUsage:
+    texts: list[str]
+    usage: TokenUsage = TokenUsage()
+
+
 class OpenAITranslator:
     """OpenAI gpt-4.1-mini translation backend.
 
@@ -173,14 +187,23 @@ class OpenAITranslator:
         Returns:
             Translated text string
         """
-        if not text.strip():
-            return ""
+        result = await self.translate_with_usage(text, source_lang, target_lang, glossary_terms)
+        return result.text
 
-        # Skip if same language
+    async def translate_with_usage(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        glossary_terms: list[dict] | None = None,
+    ) -> TranslationWithUsage:
+        if not text.strip():
+            return TranslationWithUsage("")
+
         src = source_lang.split("-")[0]
         tgt = target_lang.split("-")[0]
         if src == tgt:
-            return text
+            return TranslationWithUsage(text)
 
         src_name = _lang_name(src)
         tgt_name = _lang_name(tgt)
@@ -203,6 +226,7 @@ class OpenAITranslator:
 
         result = response.choices[0].message.content or ""
         result = result.strip()
+        usage = TokenUsage.from_openai_usage(getattr(response, "usage", None))
 
         logger.debug(
             "translation_complete",
@@ -210,8 +234,11 @@ class OpenAITranslator:
             tgt=tgt_name,
             input_chars=len(text),
             output_chars=len(result),
+            prompt_tokens=usage.prompt_tokens,
+            cached_tokens=usage.cached_tokens,
+            completion_tokens=usage.completion_tokens,
         )
-        return result
+        return TranslationWithUsage(result, usage)
 
     async def translate_batch(
         self,
@@ -232,13 +259,31 @@ class OpenAITranslator:
 
         Returns a list the same length and order as `texts`.
         """
+        result = await self.translate_batch_with_usage(
+            texts,
+            source_lang,
+            target_lang,
+            glossary_terms,
+            fallback_uses_legacy_translate=True,
+        )
+        return result.texts
+
+    async def translate_batch_with_usage(
+        self,
+        texts: list[str],
+        source_lang: str,
+        target_lang: str,
+        glossary_terms: list[dict] | None = None,
+        *,
+        fallback_uses_legacy_translate: bool = False,
+    ) -> TranslationBatchWithUsage:
         if not texts:
-            return []
+            return TranslationBatchWithUsage([])
 
         src = source_lang.split("-")[0]
         tgt = target_lang.split("-")[0]
         if src == tgt:
-            return list(texts)
+            return TranslationBatchWithUsage(list(texts))
 
         src_name = _lang_name(src)
         tgt_name = _lang_name(tgt)
@@ -261,6 +306,7 @@ class OpenAITranslator:
         )
 
         raw = (response.choices[0].message.content or "").strip()
+        usage = TokenUsage.from_openai_usage(getattr(response, "usage", None))
         parsed: dict[int, str] = {}
         for line in raw.splitlines():
             m = _BATCH_LINE_RE.match(line)
@@ -278,10 +324,29 @@ class OpenAITranslator:
                 src=src_name,
                 tgt=tgt_name,
             )
-            return list(
-                await asyncio.gather(
-                    *(self.translate(t, source_lang, target_lang, glossary_terms) for t in texts)
+            if fallback_uses_legacy_translate:
+                fallback_texts = list(
+                    await asyncio.gather(
+                        *(
+                            self.translate(t, source_lang, target_lang, glossary_terms)
+                            for t in texts
+                        )
+                    )
                 )
+                return TranslationBatchWithUsage(fallback_texts, usage)
+
+            fallback_results = await asyncio.gather(
+                *(
+                    self.translate_with_usage(t, source_lang, target_lang, glossary_terms)
+                    for t in texts
+                )
+            )
+            fallback_usage = usage
+            for item in fallback_results:
+                fallback_usage += item.usage
+            return TranslationBatchWithUsage(
+                [item.text for item in fallback_results],
+                fallback_usage,
             )
 
         results = [parsed[i + 1] for i in range(len(texts))]
@@ -292,5 +357,8 @@ class OpenAITranslator:
             count=len(texts),
             total_input_chars=sum(len(t) for t in texts),
             total_output_chars=sum(len(t) for t in results),
+            prompt_tokens=usage.prompt_tokens,
+            cached_tokens=usage.cached_tokens,
+            completion_tokens=usage.completion_tokens,
         )
-        return results
+        return TranslationBatchWithUsage(results, usage)

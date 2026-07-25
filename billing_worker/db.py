@@ -8,13 +8,13 @@ This module is where those logical references get resolved at read time instead.
 
 from __future__ import annotations
 
+import json
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
-import json
 import redis.asyncio as aioredis
-from datetime import datetime, timezone
 
 from shared.config import DatabaseSettings, RedisSettings
 from shared.logger import get_logger
@@ -29,7 +29,11 @@ def _as_uuid(value: str) -> uuid.UUID:
 class BillingRepository:
     """asyncpg-backed access to the subscription (billing) schema, with redis for temp logging."""
 
-    def __init__(self, settings: DatabaseSettings | None = None, redis_settings: RedisSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: DatabaseSettings | None = None,
+        redis_settings: RedisSettings | None = None,
+    ) -> None:
         self.settings = settings or DatabaseSettings()
         self.redis_settings = redis_settings or RedisSettings()
         self._pool: asyncpg.Pool | None = None
@@ -42,10 +46,10 @@ class BillingRepository:
             max_size=self.settings.max_pool_size,
         )
         self._redis = aioredis.from_url(
-            self.redis_settings.dsn,
+            self.redis_settings.url,
             decode_responses=True,
-            socket_timeout=self.redis_settings.socket_timeout_seconds,
-            socket_connect_timeout=self.redis_settings.socket_connect_timeout_seconds,
+            socket_timeout=self.redis_settings.socket_timeout,
+            socket_connect_timeout=self.redis_settings.socket_connect_timeout,
         )
         logger.info("billing_db_connected")
 
@@ -152,7 +156,7 @@ class BillingRepository:
             "TranscriptSegmentId": str(segment_uuid) if segment_uuid else None,
             "IdempotencyKey": idempotency_key,
             "Details": json.dumps(details or {}),
-            "CreatedAt": datetime.now(timezone.utc).isoformat()
+            "CreatedAt": datetime.now(UTC).isoformat()
         }
 
         # Update the live balance in PostgreSQL synchronously to prevent overdraft.
@@ -176,7 +180,7 @@ class BillingRepository:
         # However, since this was just inserting directly, we rely on the DB transaction
         # to catch unique idempotency_key. For temp logs, we'll let C# worker handle deduplication
         # when it bulk-inserts.
-        
+
         await self._redis.rpush("warptalk:billing:temp_usage_logs", json.dumps(temp_log))
 
         logger.info(

@@ -76,7 +76,8 @@ class WorkerSettings(BaseSettings):
     # clear" from "far away and muffled" — both are speech-shaped. Pure energy/peak
     # math, no ML dependency, negligible latency.
     near_field_gate_enabled: bool = True
-    near_field_gate_relative_floor: float = 0.35  # chunk peak must be >= 35% of this track's own established near-field peak
+    # chunk peak must be >= 35% of this track's own established near-field peak
+    near_field_gate_relative_floor: float = 0.35
     near_field_gate_min_baseline_chunks: int = 2
     near_field_gate_baseline_ema_alpha: float = 0.3
 
@@ -138,7 +139,8 @@ class TTSSettings(BaseSettings):
     min_clone_chars: int = 8
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
-    voice_clone_key_ttl_seconds: int = 43200  # 12h — unbounded before this; matches AudioRouteCacheService's own Redis TTL
+    # 12h — unbounded before this; matches AudioRouteCacheService's own Redis TTL
+    voice_clone_key_ttl_seconds: int = 43200
     # How many public Cartesia voices to offer per language — both for the per-speaker
     # hashed default (auto-diversity when nobody has cloned/chosen a voice) and for the
     # control-bar voice picker's option list.
@@ -228,6 +230,9 @@ class BillingSettings(BaseSettings):
     # room's lifetime — refresh periodically in case a workspace's active subscription
     # changes mid-room (plan upgrade/downgrade).
     subscription_cache_ttl_seconds: int = 300
+    accumulator_flush_interval_seconds: int = 10
+    max_credits_per_flush: int = 2000
+    billing_event_dedupe_ttl_seconds: int = 86400
 
 
 class VectorDbSettings(BaseSettings):

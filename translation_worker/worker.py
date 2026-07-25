@@ -16,9 +16,16 @@ import time
 
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
-from shared.schemas import STTResultMessage, TranslationResultMessage
+from shared.openai_usage import TokenUsage
+from shared.schemas import AIUsageMessage, STTResultMessage, TranslationResultMessage
 from shared.text_utils import split_into_sentences
-from translation_worker.translator import OpenAITranslator
+from translation_worker.translator import (
+    OpenAITranslator,
+    TranslationBatchWithUsage,
+    TranslationWithUsage,
+)
+
+TRANSLATION_CHARGE_TYPE = "TRANSLATION"
 
 
 class TranslationWorker(BaseWorker):
@@ -153,7 +160,11 @@ class TranslationWorker(BaseWorker):
                         source_segment_id=stt_result.segment_id,
                         chunk_index=0,
                     )
-                    await self.publish("translate:results", stt_result.meeting_id, result.to_redis())
+                    await self.publish(
+                        "translate:results",
+                        stt_result.meeting_id,
+                        result.to_redis(),
+                    )
             return
 
         await asyncio.gather(*(
@@ -177,12 +188,12 @@ class TranslationWorker(BaseWorker):
         # same as before — while sentences 1..N-1 translate together in ONE batched call
         # that's already running in the background by the time we get to them.
         passthrough = stt_result.language == target_lang
-        first_task: asyncio.Task[str] | None = None
-        rest_task: asyncio.Task[list[str]] | None = None
-        rest_results: list[str] | None = None
+        first_task: asyncio.Task[TranslationWithUsage] | None = None
+        rest_task: asyncio.Task[TranslationBatchWithUsage] | None = None
+        rest_results: TranslationBatchWithUsage | None = None
         if not passthrough:
             first_task = asyncio.create_task(
-                self.translator.translate(
+                self._translate_sentence(
                     sentences[0],
                     source_lang=stt_result.language,
                     target_lang=target_lang,
@@ -191,7 +202,7 @@ class TranslationWorker(BaseWorker):
             )
             if len(sentences) > 1:
                 rest_task = asyncio.create_task(
-                    self.translator.translate_batch(
+                    self._translate_batch(
                         sentences[1:],
                         source_lang=stt_result.language,
                         target_lang=target_lang,
@@ -208,11 +219,27 @@ class TranslationWorker(BaseWorker):
             if passthrough:
                 translated_text = sentence
             elif idx == 0:
-                translated_text = await first_task
+                first_result = await first_task
+                translated_text = first_result.text
+                await self._publish_ai_usage(
+                    stt_result,
+                    target_lang,
+                    first_result.usage,
+                    idempotency_key=f"{TRANSLATION_CHARGE_TYPE}:{chunk_segment_id}:usage",
+                )
             else:
                 if rest_results is None:
                     rest_results = await rest_task
-                translated_text = rest_results[idx - 1]
+                    await self._publish_ai_usage(
+                        stt_result,
+                        target_lang,
+                        rest_results.usage,
+                        idempotency_key=(
+                            f"{TRANSLATION_CHARGE_TYPE}:{stt_result.segment_id}:{target_lang}:"
+                            f"batch:{len(sentences) - 1}"
+                        ),
+                    )
+                translated_text = rest_results.texts[idx - 1]
 
             is_final = (idx == len(sentences) - 1) and stt_result.is_final_chunk
 
@@ -246,6 +273,79 @@ class TranslationWorker(BaseWorker):
                 original=sentence[:60],
                 translated=translated_text[:60],
             )
+
+    async def _translate_sentence(
+        self,
+        text: str,
+        *,
+        source_lang: str,
+        target_lang: str,
+        glossary_terms: list[dict] | None,
+    ) -> TranslationWithUsage:
+        if "translate_with_usage" in type(self.translator).__dict__:
+            return await self.translator.translate_with_usage(
+                text,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                glossary_terms=glossary_terms,
+            )
+
+        translated = await self.translator.translate(
+            text,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            glossary_terms=glossary_terms,
+        )
+        return TranslationWithUsage(translated)
+
+    async def _translate_batch(
+        self,
+        texts: list[str],
+        *,
+        source_lang: str,
+        target_lang: str,
+        glossary_terms: list[dict] | None,
+    ) -> TranslationBatchWithUsage:
+        if "translate_batch_with_usage" in type(self.translator).__dict__:
+            return await self.translator.translate_batch_with_usage(
+                texts,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                glossary_terms=glossary_terms,
+            )
+
+        translated = await self.translator.translate_batch(
+            texts,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            glossary_terms=glossary_terms,
+        )
+        return TranslationBatchWithUsage(translated)
+
+    async def _publish_ai_usage(
+        self,
+        stt_result: STTResultMessage,
+        target_lang: str,
+        usage: TokenUsage,
+        *,
+        idempotency_key: str,
+    ) -> None:
+        if not usage.has_tokens:
+            return
+
+        message = AIUsageMessage(
+            room_id=stt_result.meeting_id,
+            user_id=stt_result.speaker_id,
+            charge_type=TRANSLATION_CHARGE_TYPE,
+            model=self.translator.model,
+            prompt_tokens=usage.prompt_tokens,
+            cached_tokens=usage.cached_tokens,
+            completion_tokens=usage.completion_tokens,
+            source_lang=stt_result.language,
+            target_lang=target_lang,
+            idempotency_key=idempotency_key,
+        )
+        await self.publish("ai:usage", stt_result.meeting_id, message.to_redis())
 
     async def _get_target_languages(self, meeting_id: str, speaker_id: str) -> set[str]:
         """Every DISTINCT listen-language among the OTHER participants in this meeting.
