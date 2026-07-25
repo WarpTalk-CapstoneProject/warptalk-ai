@@ -47,9 +47,21 @@ class SecurityWorker(BaseWorker):
             except Exception:
                 keywords_blacklist = []
 
-            # If both are disabled, return clean scan result
+            # Fast-path 1: If both are disabled, return clean scan result immediately
             if not pii_enabled and not dlp_enabled:
                 await self._save_result(scan_id, pii_detected=False, dlp_detected=False, violation_found=False)
+                return
+
+            # Fast-path 2: Local DLP Keyword Check (Instant local evaluation < 1ms)
+            dlp_detected_local = False
+            if dlp_enabled and keywords_blacklist:
+                content_lower = content.lower()
+                dlp_detected_local = any(kw.lower() in content_lower for kw in keywords_blacklist if isinstance(kw, str) and kw.strip())
+
+            # Fast-path 3: If PII is disabled and only DLP is enabled, return local result without calling OpenAI
+            if not pii_enabled and dlp_enabled:
+                await self._save_result(scan_id, pii_detected=False, dlp_detected=dlp_detected_local, violation_found=dlp_detected_local)
+                self.logger.info("completed_local_dlp_scan", scan_id=scan_id, violation_found=dlp_detected_local)
                 return
 
             if not self.openai_client or not self.openai_client.api_key:
@@ -89,7 +101,9 @@ class SecurityWorker(BaseWorker):
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                response_format={"type": "json_object"}
+                response_format={"type": "json_object"},
+                temperature=0.0,
+                max_tokens=60,
             )
 
             content_str = completion.choices[0].message.content
@@ -98,8 +112,8 @@ class SecurityWorker(BaseWorker):
 
             result = json.loads(content_str)
             pii_detected = result.get("piiDetected", False)
-            dlp_detected = result.get("dlpDetected", False)
-            violation_found = result.get("violationFound", False)
+            dlp_detected = result.get("dlpDetected", False) or dlp_detected_local
+            violation_found = result.get("violationFound", False) or pii_detected or dlp_detected
 
             await self._save_result(scan_id, pii_detected, dlp_detected, violation_found)
             self.logger.info("completed_scan_request", scan_id=scan_id, violation_found=violation_found)
