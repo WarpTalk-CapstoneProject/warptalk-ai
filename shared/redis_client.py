@@ -178,6 +178,72 @@ class RedisStreamClient:
                     yield message_id, data
                     await self.redis.xack(stream, group, message_id)
 
+    async def consume_concurrent(
+        self,
+        stream: str,
+        group: str,
+        handler,
+        consumer: str | None = None,
+        block_ms: int = 2000,
+        count: int = 4,
+        concurrency: int = 4,
+    ) -> None:
+        """Like consume(), but runs up to `concurrency` handler calls at once instead of
+        one message at a time.
+
+        Deliberately NOT implemented as "wrap consume() and fire tasks without awaiting" —
+        consume() is a generator whose XACK line runs when the caller's `async for` asks it
+        for the next item, not when the current item's processing actually finishes. Racing
+        ahead to the next item before the current handler completes would XACK a message
+        before we know its handler even ran, let alone succeeded — a crash mid-handler would
+        then lose that message silently (already acked, never redelivered). This method owns
+        the whole read-dispatch-ack cycle itself instead, so each message's XACK is tied to
+        its own handler's completion (success or failure — same "ack regardless" semantics
+        consume() already has, just no longer serialized across messages).
+
+        Only used when a worker opts in via BaseWorker.concurrency > 1 (see base_worker.py);
+        consume() is untouched and remains the default path for every other worker.
+        """
+        consumer = consumer or f"worker-{socket.gethostname()}"
+
+        try:
+            await self.redis.xgroup_create(stream, group, id="0", mkstream=True)
+            logger.info("consumer_group_created", stream=stream, group=group)
+        except aioredis.ResponseError as e:
+            if "BUSYGROUP" not in str(e):
+                raise
+
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _run_one(message_id: bytes, data: dict[bytes, bytes]) -> None:
+            async with semaphore:
+                try:
+                    await handler(message_id, data)
+                except Exception:
+                    logger.exception("consume_concurrent_handler_error", message_id=message_id, stream=stream)
+                finally:
+                    await self.redis.xack(stream, group, message_id)
+
+        while True:
+            messages = await self._retry(
+                self.redis.xreadgroup,
+                groupname=group,
+                consumername=consumer,
+                streams={stream: ">"},
+                count=count,
+                block=block_ms,
+            )
+
+            if not messages:
+                return  # block timeout, yield control back to caller (same as consume())
+
+            tasks = [
+                asyncio.create_task(_run_one(message_id, data))
+                for _stream_name, stream_messages in messages
+                for message_id, data in stream_messages
+            ]
+            await asyncio.gather(*tasks)
+
     # ------------------------------------------------------------------
     # Key-value helpers (for voice embeddings, speaker cache, etc.)
     # ------------------------------------------------------------------

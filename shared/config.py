@@ -194,6 +194,12 @@ class EmbeddingSettings(BaseSettings):
     dimensions: int = 1536
     batch_size: int = 64
     timeout_ms: int = 30000
+    # How many index-request messages (each = one document/transcript/glossary source, itself
+    # made of one or more chunks) EmbeddingWorker processes at once. Unlike stt/tts/translation,
+    # these jobs are independent of each other and I/O-bound (an OpenAI embed call + a Qdrant
+    # upsert), so this is a real throughput win rather than a correctness risk — see
+    # BaseWorker.concurrency in shared/base_worker.py for why it's opt-in per worker.
+    concurrency: int = 5
 
 
 class DatabaseSettings(BaseSettings):

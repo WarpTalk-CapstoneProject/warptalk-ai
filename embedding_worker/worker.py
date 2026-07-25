@@ -36,6 +36,12 @@ class EmbeddingWorker(BaseWorker):
         self.vector_settings = vector_settings or VectorDbSettings()
         self.provider = provider
         self.vector_store = vector_store
+        # Per-instance override of BaseWorker's class-level default (1) — see
+        # EmbeddingSettings.concurrency for why this worker specifically is safe to
+        # parallelize. process() has no shared mutable state across calls (each call's
+        # request/chunks/vectors/payloads are locals); self.provider/self.vector_store are
+        # async clients designed for concurrent use.
+        self.concurrency = self.embedding_settings.concurrency
 
     async def load_model(self) -> None:
         if self.provider is None:
