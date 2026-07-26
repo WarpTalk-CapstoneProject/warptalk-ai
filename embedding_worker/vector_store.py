@@ -37,6 +37,16 @@ class VectorStore(ABC):
         honest answer rather than a failure.
         """
 
+    @abstractmethod
+    async def delete(self, collection: str, ids: list[str]) -> None:
+        """Remove points by id from `collection`.
+
+        Must be a no-op — never raise — when the collection doesn't exist, or when an id
+        isn't present in it: callers (EmbeddingWorker.process, on a deletion_state="deleted"
+        request) fire this on every archive/delete of a source row, including ones that were
+        never actually indexed (e.g. a draft term archived without ever being published).
+        """
+
 
 class QdrantVectorStore(VectorStore):
     """Qdrant vector store used by production WarpBot RAG."""
@@ -111,6 +121,23 @@ class QdrantVectorStore(VectorStore):
             {"id": str(point.id), "score": point.score, "payload": point.payload or {}}
             for point in result.points
         ]
+
+    async def delete(self, collection: str, ids: list[str]) -> None:
+        if not ids:
+            return
+
+        client = await self._get_client()
+
+        try:
+            await client.get_collection(collection)
+        except Exception:
+            # Nothing has ever been indexed into this collection — deleting from it is
+            # already a no-op, same honest-empty reasoning as search() above.
+            return
+
+        from qdrant_client import models
+
+        await client.delete(collection_name=collection, points_selector=models.PointIdsList(points=ids))
 
     async def _ensure_collection(self, client: Any, collection: str, dimensions: int) -> None:
         from qdrant_client import models

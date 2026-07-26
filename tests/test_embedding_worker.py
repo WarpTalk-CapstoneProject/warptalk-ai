@@ -25,12 +25,16 @@ class FakeVectorStore(VectorStore):
     def __init__(self) -> None:
         self.upsert_mock = AsyncMock()
         self.search_mock = AsyncMock(return_value=[])
+        self.delete_mock = AsyncMock()
 
     async def upsert(self, *args, **kwargs) -> None:
         await self.upsert_mock(*args, **kwargs)
 
     async def search(self, *args, **kwargs):
         return await self.search_mock(*args, **kwargs)
+
+    async def delete(self, *args, **kwargs) -> None:
+        await self.delete_mock(*args, **kwargs)
 
 
 def _request(**overrides) -> EmbeddingIndexRequest:
@@ -117,3 +121,58 @@ class TestEmbeddingWorker:
         result = worker.publish.call_args.args[2]
         assert result["status"] == "indexed"
         assert result["chunks_indexed"] == "1"
+
+    async def test_deletion_state_deletes_vector_instead_of_indexing(self) -> None:
+        """A deletion_state="deleted" request (e.g. GlobalGlossaryService.ArchiveTermAsync/
+        DeleteTermAsync) must actually remove the previously-indexed vector — not just get
+        silently blocked, which used to leave it in Qdrant forever with no other path to
+        ever clean it up.
+        """
+        worker = EmbeddingWorker.__new__(EmbeddingWorker)
+        worker.embedding_settings = EmbeddingSettings(provider="openai", api_key="test-key", dimensions=2)
+        worker.provider = FakeEmbeddingProvider(vectors=[[0.1, 0.2]])
+        worker.vector_store = FakeVectorStore()
+        worker.publish = AsyncMock()
+
+        await worker.process(b"msg-1", _request(deletion_state="deleted").to_redis())
+
+        worker.vector_store.delete_mock.assert_awaited_once_with(collection="workspace-1-rag", ids=["chunk-1"])
+        worker.vector_store.upsert_mock.assert_not_awaited()
+        worker.provider.calls == []
+        result = worker.publish.call_args.args[2]
+        assert result["status"] == "deleted"
+        assert result["chunks_indexed"] == "1"
+
+    async def test_deletion_state_skips_delete_call_when_no_chunk_ids(self) -> None:
+        worker = EmbeddingWorker.__new__(EmbeddingWorker)
+        worker.embedding_settings = EmbeddingSettings(provider="openai", api_key="test-key", dimensions=2)
+        worker.provider = FakeEmbeddingProvider(vectors=[])
+        worker.vector_store = FakeVectorStore()
+        worker.publish = AsyncMock()
+
+        await worker.process(b"msg-1", _request(deletion_state="deleted", chunks=[]).to_redis())
+
+        worker.vector_store.delete_mock.assert_not_awaited()
+        result = worker.publish.call_args.args[2]
+        assert result["status"] == "deleted"
+        assert result["chunks_indexed"] == "0"
+
+    async def test_deletion_state_takes_priority_over_other_block_reasons(self) -> None:
+        """A deletion request must delete even when ai_retrieval_allowed/external_llm_allowed
+        would otherwise have blocked an index request — those policy flags govern whether
+        NEW content may be embedded, not whether stale vectors may be cleaned up.
+        """
+        worker = EmbeddingWorker.__new__(EmbeddingWorker)
+        worker.embedding_settings = EmbeddingSettings(provider="openai", api_key="test-key", dimensions=2)
+        worker.provider = OpenAIEmbeddingProvider(settings=worker.embedding_settings, client=object())
+        worker.vector_store = FakeVectorStore()
+        worker.publish = AsyncMock()
+
+        await worker.process(
+            b"msg-1",
+            _request(deletion_state="deleted", ai_retrieval_allowed=False, external_llm_allowed=False).to_redis(),
+        )
+
+        worker.vector_store.delete_mock.assert_awaited_once()
+        result = worker.publish.call_args.args[2]
+        assert result["status"] == "deleted"

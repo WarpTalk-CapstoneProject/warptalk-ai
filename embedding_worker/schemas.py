@@ -79,7 +79,7 @@ class EmbeddingIndexResult(BaseModel):
     collection_id: str
     source_type: str
     source_id: str
-    status: str  # indexed | blocked | failed
+    status: str  # indexed | blocked | failed | deleted
     chunks_indexed: int = 0
     provider: str = ""
     model: str = ""
