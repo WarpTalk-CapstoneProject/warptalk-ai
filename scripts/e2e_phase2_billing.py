@@ -80,10 +80,16 @@ async def _cleanup(conn: asyncpg.Connection, redis_client: redis.Redis) -> None:
 
 async def _setup_data(conn: asyncpg.Connection, user_id: uuid.UUID) -> dict[str, uuid.UUID]:
     plan_id = await conn.fetchval(
-        "SELECT id FROM subscription.plans WHERE slug = 'startup' LIMIT 1"
+        """
+        SELECT id
+        FROM subscription.plans
+        WHERE slug = 'enterprise'
+          AND is_active = true
+        LIMIT 1
+        """
     )
     if plan_id is None:
-        raise RuntimeError("Missing subscription.plans row with slug='startup'.")
+        raise RuntimeError("Missing active subscription.plans row with slug='enterprise'.")
 
     ids = {
         "user_id": user_id,
