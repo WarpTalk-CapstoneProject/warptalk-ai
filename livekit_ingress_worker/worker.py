@@ -344,6 +344,10 @@ class LiveKitIngressWorker(BaseWorker):
         near_field_gate: NearFieldGate | None = None,
     ) -> None:
         """Normalize and publish a speech chunk to Redis."""
+        if await self._is_ai_service_suspended(room_name):
+            self.logger.warning("ai_service_suspended_skip_audio_chunk", room=room_name)
+            return
+
         raw_bytes = bytes(speech_buffer)
         pcm = np.frombuffer(raw_bytes, dtype=np.int16)
         raw_rms = np.sqrt(np.mean((pcm.astype(np.float32) / 32768.0) ** 2))
@@ -403,3 +407,11 @@ class LiveKitIngressWorker(BaseWorker):
         )
 
         await self.publish("audio:chunks", room_name, msg.to_redis())
+
+    async def _is_ai_service_suspended(self, room_name: str) -> bool:
+        value = await self.redis.get(f"translationRoom:{room_name}:ai_service_suspended")
+        if value is None:
+            return False
+        if isinstance(value, bytes):
+            value = value.decode()
+        return str(value).lower() == "true"

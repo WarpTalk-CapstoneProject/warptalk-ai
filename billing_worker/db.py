@@ -341,27 +341,10 @@ class BillingRepository:
             "CreatedAt": datetime.now(UTC).isoformat()
         }
 
-        # Update the live balance in PostgreSQL synchronously to prevent overdraft.
-        # This matches the C# API behavior.
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE subscription.subscriptions
-                SET credits_remaining = credits_remaining - $2,
-                    credits_used_this_cycle = credits_used_this_cycle + $2
-                WHERE id = $1
-                """,
-                subscription_id,
-                credits_consumed,
-            )
-
-        # Instead of directly writing to Postgres logs, we just push to Redis.
-        # This will be picked up by C#'s BillingAggregationWorker.
-        # Idempotency relies on the C# worker or Redis consumer deduplication if redelivered,
-        # but pushing to a Redis List allows duplicates if not careful.
-        # However, since this was just inserting directly, we rely on the DB transaction
-        # to catch unique idempotency_key. For temp logs, we'll let C# worker handle deduplication
-        # when it bulk-inserts.
+        # C# BillingAggregationWorker is the single settlement owner for Phase 3.
+        # It calls subscription.settle_usage_charge(), which atomically creates usage,
+        # creates the credit transaction, updates balance, and updates overage/suspend state.
+        # Python only stages the temp log so we do not double-deduct credits.
 
         await self._redis.rpush("warptalk:billing:temp_usage_logs", json.dumps(temp_log))
 
