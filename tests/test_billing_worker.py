@@ -11,6 +11,7 @@ import pytest
 
 from billing_worker.db import BillingRepository
 from billing_worker.worker import _extract_underlying_segment_id
+from shared.config import DatabaseSettings, RedisSettings
 
 
 class FakeBillingRepository(BillingRepository):
@@ -260,3 +261,44 @@ class TestRecordUsageAndCharge:
         assert temp_log["UnitPriceSnapshot"] == 0.1315
         assert temp_log["Provider"] == "openai"
         assert temp_log["Model"] == "gpt-4.1"
+
+
+class TestBillingRepositoryConnection:
+    async def test_connect_passes_redis_password_setting(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        class FakePool:
+            async def close(self) -> None:
+                return None
+
+        class FakeRedisClient:
+            async def aclose(self) -> None:
+                return None
+
+        async def fake_create_pool(**kwargs: Any) -> FakePool:
+            captured["pool_kwargs"] = kwargs
+            return FakePool()
+
+        def fake_from_url(url: str, **kwargs: Any) -> FakeRedisClient:
+            captured["redis_url"] = url
+            captured["redis_kwargs"] = kwargs
+            return FakeRedisClient()
+
+        monkeypatch.setattr("billing_worker.db.asyncpg.create_pool", fake_create_pool)
+        monkeypatch.setattr("billing_worker.db.aioredis.from_url", fake_from_url)
+
+        repo = BillingRepository(
+            settings=DatabaseSettings(dsn="postgresql://example"),
+            redis_settings=RedisSettings(
+                url="redis://localhost:6379",
+                password="secret",
+            ),
+        )
+
+        await repo.connect()
+
+        assert captured["redis_url"] == "redis://localhost:6379"
+        assert captured["redis_kwargs"]["password"] == "secret"

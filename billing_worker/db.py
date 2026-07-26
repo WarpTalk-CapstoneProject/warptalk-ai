@@ -65,6 +65,7 @@ class BillingRepository:
         )
         self._redis = aioredis.from_url(
             self.redis_settings.url,
+            password=self.redis_settings.password or None,
             decode_responses=True,
             socket_timeout=self.redis_settings.socket_timeout,
             socket_connect_timeout=self.redis_settings.socket_connect_timeout,
