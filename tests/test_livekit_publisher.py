@@ -18,6 +18,10 @@ def _settings() -> LiveKitSettings:
     return LiveKitSettings(url="ws://livekit:7880", api_key="key", api_secret="secret")
 
 
+def test_tts_bot_idle_timeout_limits_cloud_participant_minutes() -> None:
+    assert SESSION_IDLE_TIMEOUT_S == 60.0
+
+
 @pytest.fixture(autouse=True)
 def mock_livekit_sdk():
     with patch("tts_worker.livekit_publisher.rtc") as mock_rtc, \
