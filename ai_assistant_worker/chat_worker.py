@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -158,7 +158,15 @@ class ChatAssistantWorker(BaseWorker):
                 await client.aclose()
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
-        request = ChatRequestMessage.from_redis(data)
+        request = ChatRequestMessage.from_redis(cast(Any, data))
+
+        if (
+            self._workspace_client is None
+            or self._transcript_client is None
+            or self._translation_room_client is None
+            or self._openai is None
+        ):
+            raise RuntimeError("ChatAssistantWorker is not initialized — call load_model() first")
 
         try:
             history: list[dict[str, str]] = json.loads(request.history_json) if request.history_json else []
@@ -216,6 +224,7 @@ class ChatAssistantWorker(BaseWorker):
             tool_calls_acc: dict[int, dict[str, Any]] = {}
             finish_reason: str | None = None
 
+            assert self._openai is not None, "OpenAI client must be initialized"
             stream = await self._openai.chat.completions.create(
                 model=self.chat_settings.model,
                 temperature=self.chat_settings.temperature,

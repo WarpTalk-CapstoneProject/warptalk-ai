@@ -16,7 +16,7 @@ services:
       target: stt
     env_file: .env
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
     restart: unless-stopped
@@ -28,7 +28,7 @@ services:
       target: translation
     env_file: .env
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
     restart: unless-stopped
@@ -40,7 +40,7 @@ services:
       target: tts
     env_file: .env
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
     restart: unless-stopped
@@ -52,7 +52,7 @@ services:
       target: assistant
     env_file: .env
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
     restart: unless-stopped
@@ -64,7 +64,7 @@ services:
       target: embedding
     env_file: .env
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
       - VECTOR_DB_URL=http://qdrant:6333
     networks:
       - warptalk-infrastructure_warptalk-net
@@ -81,7 +81,7 @@ services:
       target: billing
     env_file: .env
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
       - BILLING_DB_DSN=${BILLING_DB_DSN}
     networks:
       - warptalk-infrastructure_warptalk-net
@@ -98,7 +98,7 @@ services:
       target: livekit-ingress
     env_file: .env
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
       - LIVEKIT_URL=${LIVEKIT_URL}
       - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
@@ -126,7 +126,7 @@ services:
       target: security
     env_file: .env
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
     restart: unless-stopped
