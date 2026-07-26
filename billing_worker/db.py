@@ -9,8 +9,11 @@ This module is where those logical references get resolved at read time instead.
 from __future__ import annotations
 
 import json
+import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 import asyncpg
@@ -20,10 +23,21 @@ from shared.config import DatabaseSettings, RedisSettings
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
+USAGE_RATE_CACHE_TTL_SECONDS = 60.0
 
 
 def _as_uuid(value: str) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
+
+@dataclass(frozen=True)
+class UsageRate:
+    id: uuid.UUID
+    unit_price: Decimal
+    provider: str
+    model: str
+    provider_unit_cost: Decimal | None = None
+    markup_multiplier: Decimal | None = None
 
 
 class BillingRepository:
@@ -38,6 +52,10 @@ class BillingRepository:
         self.redis_settings = redis_settings or RedisSettings()
         self._pool: asyncpg.Pool | None = None
         self._redis: aioredis.Redis | None = None
+        self._usage_rate_cache: dict[
+            tuple[str, str, str, str, str, str | None, str | None],
+            tuple[float, UsageRate | None],
+        ] = {}
 
     async def connect(self) -> None:
         self._pool = await asyncpg.create_pool(
@@ -92,6 +110,159 @@ class BillingRepository:
 
             return subscription_id, workspace_id
 
+    async def resolve_usage_rate(
+        self,
+        *,
+        charge_type: str,
+        unit: str,
+        provider: str,
+        model: str,
+        currency: str = "VND",
+        source_language_code: str | None = None,
+        target_language_code: str | None = None,
+    ) -> UsageRate | None:
+        """Resolve the active rate card row for a concrete provider/model/unit.
+
+        Language-specific rows win over generic rows. Missing rows are not guessed:
+        callers must skip billing and surface a log until seed data is corrected.
+        """
+        assert self._pool is not None, "call connect() first"
+        if not unit or not provider or not model:
+            logger.warning(
+                "usage_rate_invalid_lookup",
+                metric_name="billing_usage_rate_invalid_lookup",
+                charge_type=charge_type,
+                unit=unit,
+                provider=provider,
+                model=model,
+                currency=currency,
+            )
+            return None
+
+        source_language_code = source_language_code or None
+        target_language_code = target_language_code or None
+        cache_key = (
+            charge_type,
+            unit,
+            currency,
+            provider,
+            model,
+            source_language_code,
+            target_language_code,
+        )
+        now = time.monotonic()
+        cached = self._usage_rate_cache.get(cache_key)
+        if cached and now - cached[0] < USAGE_RATE_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        row = await self._fetch_usage_rate_row(
+            charge_type=charge_type,
+            unit=unit,
+            currency=currency,
+            provider=provider,
+            model=model,
+            source_language_code=source_language_code,
+            target_language_code=target_language_code,
+        )
+
+        if row is None:
+            logger.warning(
+                "usage_rate_missing",
+                metric_name="billing_usage_rate_missing",
+                charge_type=charge_type,
+                unit=unit,
+                provider=provider,
+                model=model,
+                currency=currency,
+                source_language_code=source_language_code,
+                target_language_code=target_language_code,
+            )
+            self._usage_rate_cache[cache_key] = (now, None)
+            return None
+        if not row["provider"] or not row["model"]:
+            logger.warning(
+                "usage_rate_invalid_row",
+                metric_name="billing_usage_rate_invalid_row",
+                charge_type=charge_type,
+                unit=unit,
+                provider=row["provider"],
+                model=row["model"],
+                currency=currency,
+                source_language_code=source_language_code,
+                target_language_code=target_language_code,
+            )
+            self._usage_rate_cache[cache_key] = (now, None)
+            return None
+
+        rate = UsageRate(
+            id=row["id"],
+            unit_price=Decimal(str(row["unit_price"])),
+            provider=row["provider"],
+            model=row["model"],
+            provider_unit_cost=(
+                Decimal(str(row["provider_unit_cost"]))
+                if row["provider_unit_cost"] is not None
+                else None
+            ),
+            markup_multiplier=(
+                Decimal(str(row["markup_multiplier"]))
+                if row["markup_multiplier"] is not None
+                else None
+            ),
+        )
+        self._usage_rate_cache[cache_key] = (now, rate)
+        return rate
+
+    async def _fetch_usage_rate_row(
+        self,
+        *,
+        charge_type: str,
+        unit: str,
+        currency: str,
+        provider: str,
+        model: str,
+        source_language_code: str | None,
+        target_language_code: str | None,
+    ) -> asyncpg.Record | dict[str, Any] | None:
+        assert self._pool is not None, "call connect() first"
+        async with self._pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT id, unit_price, provider, model, provider_unit_cost, markup_multiplier
+                FROM subscription.usage_rate_card
+                WHERE charge_type = $1
+                  AND unit = $2
+                  AND currency = $3
+                  AND provider = $4
+                  AND model = $5
+                  AND is_active = true
+                  AND effective_from <= now()
+                  AND (effective_to IS NULL OR effective_to > now())
+                  AND (
+                    (source_language_code = $6 AND target_language_code = $7) OR
+                    (source_language_code = $6 AND target_language_code IS NULL) OR
+                    (source_language_code IS NULL AND target_language_code = $7) OR
+                    (source_language_code IS NULL AND target_language_code IS NULL)
+                  )
+                ORDER BY
+                  CASE
+                    WHEN source_language_code = $6 AND target_language_code = $7 THEN 0
+                    WHEN source_language_code = $6 AND target_language_code IS NULL THEN 1
+                    WHEN source_language_code IS NULL AND target_language_code = $7 THEN 2
+                    ELSE 3
+                  END,
+                  effective_from DESC
+                LIMIT 1
+                """,
+                charge_type,
+                unit,
+                currency,
+                provider,
+                model,
+                source_language_code,
+                target_language_code,
+            )
+
     async def record_usage_and_charge(
         self,
         *,
@@ -107,6 +278,10 @@ class BillingRepository:
         unit: str,
         credits_consumed: int,
         idempotency_key: str,
+        pricing_rate_card_id: uuid.UUID | None = None,
+        unit_price_snapshot: Decimal | None = None,
+        provider: str | None = None,
+        model: str | None = None,
         transcript_segment_id: str | uuid.UUID | None = None,
         details: dict[str, Any] | None = None,
     ) -> bool:
@@ -153,6 +328,12 @@ class BillingRepository:
             "Quantity": quantity,
             "Unit": unit,
             "CreditsConsumed": credits_consumed,
+            "PricingRateCardId": str(pricing_rate_card_id) if pricing_rate_card_id else None,
+            "UnitPriceSnapshot": (
+                float(unit_price_snapshot) if unit_price_snapshot is not None else None
+            ),
+            "Provider": provider,
+            "Model": model,
             "TranscriptSegmentId": str(segment_uuid) if segment_uuid else None,
             "IdempotencyKey": idempotency_key,
             "Details": json.dumps(details or {}),

@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import time
 import uuid
+from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
@@ -349,6 +350,53 @@ class AIUsageMessage(BaseModel):
             completion_tokens=int(d.get("completion_tokens", "0")),
             source_lang=d.get("source_lang", ""),
             target_lang=d.get("target_lang", ""),
+            idempotency_key=d["idempotency_key"],
+            timestamp_ms=int(d.get("timestamp_ms", "0")),
+        )
+
+
+class ProviderUsageMessage(BaseModel):
+    """Provider-side non-token usage event for billing settlement."""
+
+    __slots__ = ()
+
+    workspace_id: str = ""
+    room_id: str
+    user_id: str = ""
+    charge_type: str
+    provider: str
+    model: str
+    quantity: Decimal
+    unit: str
+    idempotency_key: str
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_redis(self) -> dict[str, str]:
+        return {
+            "workspace_id": self.workspace_id,
+            "room_id": self.room_id,
+            "user_id": self.user_id,
+            "charge_type": self.charge_type,
+            "provider": self.provider,
+            "model": self.model,
+            "quantity": str(self.quantity),
+            "unit": self.unit,
+            "idempotency_key": self.idempotency_key,
+            "timestamp_ms": str(self.timestamp_ms),
+        }
+
+    @classmethod
+    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> ProviderUsageMessage:
+        d = _decode_dict(data)
+        return cls(
+            workspace_id=d.get("workspace_id", ""),
+            room_id=d["room_id"],
+            user_id=d.get("user_id", ""),
+            charge_type=d["charge_type"],
+            provider=d["provider"],
+            model=d["model"],
+            quantity=Decimal(d.get("quantity", "0")),
+            unit=d["unit"],
             idempotency_key=d["idempotency_key"],
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )

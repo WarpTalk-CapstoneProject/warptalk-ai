@@ -18,10 +18,16 @@ import asyncio
 import hashlib
 import json
 import time
+from decimal import Decimal
 
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
-from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
+from shared.schemas import (
+    AudioChunkMessage,
+    ProviderUsageMessage,
+    TranslationResultMessage,
+    TTSResultMessage,
+)
 from tts_worker.livekit_publisher import LiveKitTTSPublisher
 from tts_worker.synthesizer import CartesiaSynthesizer
 
@@ -558,6 +564,20 @@ class TTSWorker(BaseWorker):
                 room_id=meeting_id,
                 event_type="voice_clone_ready",
                 payload={"speakerId": speaker_id, "voiceId": voice_id},
+            )
+            await self.publish(
+                "billing:usage",
+                meeting_id,
+                ProviderUsageMessage(
+                    room_id=meeting_id,
+                    user_id=speaker_id,
+                    charge_type="VOICE_CLONE_ENROLLMENT",
+                    provider=self.tts_settings.provider,
+                    model="cartesia-localizing-voice",
+                    quantity=Decimal(1),
+                    unit="profile",
+                    idempotency_key=f"VOICE_CLONE_ENROLLMENT:{meeting_id}:{speaker_id}",
+                ).to_redis(),
             )
         except Exception as e:
             self.logger.error(

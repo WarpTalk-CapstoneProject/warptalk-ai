@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from shared.schemas import (
     AIUsageMessage,
     AudioChunkMessage,
+    ProviderUsageMessage,
     STTResultMessage,
     TranslationResultMessage,
     TTSResultMessage,
@@ -271,6 +274,32 @@ class TestAIUsageMessage:
         assert restored.cached_tokens == 20
         assert restored.completion_tokens == 40
         assert restored.idempotency_key == original.idempotency_key
+
+
+class TestProviderUsageMessage:
+    """ProviderUsageMessage tests."""
+
+    def test_roundtrip_voice_clone_enrollment(self) -> None:
+        original = ProviderUsageMessage(
+            room_id="room-1",
+            user_id="speaker-1",
+            charge_type="VOICE_CLONE_ENROLLMENT",
+            provider="cartesia",
+            model="cartesia-localizing-voice",
+            quantity=Decimal(1),
+            unit="profile",
+            idempotency_key="VOICE_CLONE_ENROLLMENT:room-1:speaker-1",
+        )
+
+        restored = ProviderUsageMessage.from_redis(original.to_redis())
+
+        assert restored.room_id == "room-1"
+        assert restored.user_id == "speaker-1"
+        assert restored.charge_type == "VOICE_CLONE_ENROLLMENT"
+        assert restored.provider == "cartesia"
+        assert restored.model == "cartesia-localizing-voice"
+        assert restored.quantity == Decimal(1)
+        assert restored.unit == "profile"
 
 
 @pytest.mark.parametrize(
