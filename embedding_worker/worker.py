@@ -51,6 +51,21 @@ class EmbeddingWorker(BaseWorker):
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         request = EmbeddingIndexRequest.from_redis(data)
+
+        # An explicit deletion (a term/document/segment archived or removed at the source —
+        # see GlobalGlossaryService.ArchiveTermAsync/DeleteTermAsync and GlossaryService.
+        # DeleteTermAsync) must actually remove the previously-indexed vector, not just get
+        # silently blocked from re-indexing: deletion_state used to only ever gate new
+        # upserts (via _block_reason below), so an archived/deleted term's vector stayed in
+        # Qdrant forever with nothing left to ever clean it up. No embedding call needed here
+        # — deleting is pure vector-store bookkeeping, keyed by chunk id.
+        if request.deletion_state == "deleted":
+            chunk_ids = [chunk.id for chunk in request.chunks]
+            if chunk_ids:
+                await self.vector_store.delete(collection=request.collection_id, ids=chunk_ids)
+            await self._publish_result(request, status="deleted", chunks_indexed=len(chunk_ids))
+            return
+
         block_reason = self._block_reason(request)
         if block_reason:
             await self._publish_result(request, status="blocked", reason=block_reason)
@@ -97,10 +112,11 @@ class EmbeddingWorker(BaseWorker):
             await self._publish_result(request, status="failed", reason=str(exc))
 
     def _block_reason(self, request: EmbeddingIndexRequest) -> str:
+        # deletion_state == "deleted" is handled explicitly in process() before this is ever
+        # called (it deletes the vector rather than merely blocking a re-index) — by the time
+        # execution reaches here, deletion_state is always "active".
         if not request.ai_retrieval_allowed:
             return "ai_retrieval_not_allowed"
-        if request.deletion_state != "active":
-            return "source_deleted"
         if request.retention_state != "active":
             return "source_not_active"
         if (

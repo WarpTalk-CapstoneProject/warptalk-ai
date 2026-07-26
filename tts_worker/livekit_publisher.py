@@ -39,7 +39,10 @@ _PUBLISH_SETTLE_S = 0.2
 # listen-language hash on every message), so publish_pcm() is simply never called again
 # for that key. Nothing previously told this bot to disconnect, so it — and its LiveKit
 # room connection — would otherwise leak for the rest of the process's lifetime.
-SESSION_IDLE_TIMEOUT_S = 300.0
+# Cloud counts every connected interpreter bot toward concurrent participants and
+# participant minutes. One minute retains the handshake-reuse benefit without leaving
+# unused speaker/language/voice variants connected for five extra minutes.
+SESSION_IDLE_TIMEOUT_S = 60.0
 
 # Each STT chunk's translated text is synthesized as its own independent Cartesia call,
 # so every clip starts/ends at whatever sample amplitude Cartesia happened to render —

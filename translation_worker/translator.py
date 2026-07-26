@@ -153,6 +153,26 @@ class OpenAITranslator:
         self._client = AsyncOpenAI(api_key=self.api_key)
         logger.info("openai_translator_loaded", model=self.model)
 
+    async def _create_with_retry(self, **kwargs) -> Any:
+        """Call OpenAI chat completions with transient error retries (up to 2 retries)."""
+        retries = 2
+        delay = 0.5
+        for attempt in range(retries + 1):
+            try:
+                return await self._client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                if attempt < retries:
+                    logger.warning(
+                        "openai_translation_transient_error",
+                        attempt=attempt + 1,
+                        delay=delay,
+                        error=str(exc),
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2.0
+                else:
+                    raise
+
     async def translate(
         self,
         text: str,
@@ -191,7 +211,7 @@ class OpenAITranslator:
             f"{_build_glossary_block(glossary_terms)}"
         )
 
-        response = await self._client.chat.completions.create(
+        response = await self._create_with_retry(
             model=self.model,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
@@ -250,7 +270,7 @@ class OpenAITranslator:
             f"{_build_glossary_block(glossary_terms)}"
         )
 
-        response = await self._client.chat.completions.create(
+        response = await self._create_with_retry(
             model=self.model,
             messages=[
                 {"role": "system", "content": _BATCH_SYSTEM_PROMPT},

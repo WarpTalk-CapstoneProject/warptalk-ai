@@ -24,6 +24,13 @@ logger = get_logger(__name__)
 SEMANTIC_SEARCH_TIMEOUT_SECONDS = 8.0
 TRANSCRIPT_SEGMENT_LIMIT = 200
 DOCUMENT_EXCERPT_CHAR_LIMIT = 4000
+# GlossaryTerm.Context and GlobalGlossaryTerm.Definition are unbounded TEXT columns in
+# Postgres (unlike Term/PreferredTranslation, which are VARCHAR(255) with a DB-level cap) —
+# without this, one admin- or workspace-authored term with a long free-text definition would
+# make every _search_terminology call that surfaces it cost proportionally many tokens, with
+# no ceiling. 300 chars (~75 tokens) is plenty for a term explanation; see
+# docs/global-glossary-plan.md (token-cost follow-up on the search_terminology fallback).
+TERMINOLOGY_CONTEXT_CHAR_LIMIT = 300
 
 
 @dataclass
@@ -88,6 +95,17 @@ async def _search_workspace_members(ctx: ToolContext, arguments: dict[str, Any])
         return json.dumps({"error": "Could not look up workspace members right now."})
 
 
+def _truncate_terminology_context(text: str | None) -> str | None:
+    """Bounds GlossaryTerm.Context / GlobalGlossaryTerm.Definition — both unbounded TEXT
+    columns with no application-level length cap unlike Term/PreferredTranslation (VARCHAR
+    255) — to TERMINOLOGY_CONTEXT_CHAR_LIMIT so one long-winded term definition can't blow up
+    the token cost of every _search_terminology call that happens to surface it.
+    """
+    if not text:
+        return text
+    return text[:TERMINOLOGY_CONTEXT_CHAR_LIMIT]
+
+
 async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     query = ((arguments or {}).get("query") or "").strip()
     if not query:
@@ -128,7 +146,7 @@ async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> st
                         "glossary": glossary.get("name"),
                         "term": term.get("sourceTerm"),
                         "translation": term.get("targetTerm"),
-                        "context": term.get("context"),
+                        "context": _truncate_terminology_context(term.get("context")),
                         "domain": term.get("domain"),
                     })
     except Exception:
@@ -164,7 +182,7 @@ async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> st
                             "glossary": "System (Global Glossary)",
                             "term": term_name,
                             "translation": term.get("preferredTranslation"),
-                            "context": term.get("definition"),
+                            "context": _truncate_terminology_context(term.get("definition")),
                             "domain": term.get("businessDomain"),
                         })
         except Exception:
