@@ -26,7 +26,7 @@ from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
 from shared.schemas import ChatRequestMessage, ChatResultMessage
 
-SIBLING_SERVICE_TIMEOUT_SECONDS = 10.0
+SIBLING_SERVICE_TIMEOUT_SECONDS = 15.0
 
 SYSTEM_PROMPT = (
     "You are WarpTalk AI, the assistant embedded in the WarpTalk real-time speech "

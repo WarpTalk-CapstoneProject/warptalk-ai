@@ -83,6 +83,25 @@ class TestOpenAITranslator:
         assert result == "Xin chào"
         translator._client.chat.completions.create.assert_called_once()
 
+    async def test_translate_retries_on_transient_error(self) -> None:
+        translator = OpenAITranslator.__new__(OpenAITranslator)
+        translator.model = "gpt-4.1-mini"
+        translator.max_tokens = 512
+        translator.temperature = 0.1
+
+        mock_response = MagicMock()
+        mock_response.choices[0].message.content = "Xin chào"
+
+        translator._client = MagicMock()
+        translator._client.chat.completions.create = AsyncMock(
+            side_effect=[RuntimeError("API transient error"), mock_response]
+        )
+
+        result = await translator.translate("Hello", "en", "vi")
+
+        assert result == "Xin chào"
+        assert translator._client.chat.completions.create.call_count == 2
+
     async def test_translate_empty_returns_empty(self) -> None:
         translator = OpenAITranslator.__new__(OpenAITranslator)
         translator._client = MagicMock()
