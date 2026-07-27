@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from itertools import islice
+from typing import Any, cast
 
 from shared.base_worker import BaseWorker
 from shared.config import EmbeddingSettings, VectorDbSettings
@@ -50,7 +51,9 @@ class EmbeddingWorker(BaseWorker):
             self.vector_store = create_vector_store(self.vector_settings)
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
-        request = EmbeddingIndexRequest.from_redis(data)
+        request = EmbeddingIndexRequest.from_redis(cast(Any, data))
+        assert self.provider is not None
+        assert self.vector_store is not None
 
         # An explicit deletion (a term/document/segment archived or removed at the source —
         # see GlobalGlossaryService.ArchiveTermAsync/DeleteTermAsync and GlossaryService.
