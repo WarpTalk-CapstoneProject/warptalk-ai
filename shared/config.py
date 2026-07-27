@@ -251,3 +251,11 @@ class SecuritySettings(BaseSettings):
     model_config = {"env_prefix": "SECURITY_"}
 
     api_key: str = ""
+    model: str = "gpt-4o-mini"
+    max_tokens: int = 2000
+    temperature: float = 0.0
+    max_analyze_length: int = 20000
+    result_ttl_seconds: int = 300
+
+
+
