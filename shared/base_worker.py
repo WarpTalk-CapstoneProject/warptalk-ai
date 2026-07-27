@@ -176,7 +176,7 @@ class BaseWorker(ABC):
                         self.logger.warning("failed_to_parse_route_event", error=str(e))
         except asyncio.CancelledError:
             self.logger.info("route_listener_stopped")
-            if self._pubsub:
+            if self._pubsub is not None:
                 await self._pubsub.close()
 
     async def _on_route_status_changed(self, room_id: str, new_status: str) -> None:
