@@ -87,14 +87,49 @@ CROSS JOIN provider_cost pc;
 ACTUAL_PROVIDER_COST_SQL = "SELECT ($3::numeric + $4::numeric) AS provider_vnd"
 
 ESTIMATED_PROVIDER_COST_SQL = """
-SELECT COALESCE(SUM(ur.quantity * urc.provider_unit_cost * $5::numeric), 0)::numeric
-    AS provider_vnd
-FROM subscription.usage_records ur
-JOIN subscription.credit_transactions ct ON ct.usage_record_id = ur.id
-JOIN subscription.usage_rate_card urc ON urc.id = ct.pricing_rate_card_id
-WHERE ur.recorded_at >= $1::timestamptz
-  AND ur.recorded_at < $2::timestamptz
-  AND urc.provider_unit_cost IS NOT NULL
+WITH breakdown_cost AS (
+    SELECT COALESCE(
+        SUM((item->>'quantity')::numeric * urc.provider_unit_cost * $5::numeric),
+        0
+    )::numeric AS provider_vnd
+    FROM subscription.usage_records ur
+    CROSS JOIN LATERAL jsonb_array_elements(
+        CASE
+            WHEN jsonb_typeof(ur.details->'unit_breakdown') = 'array'
+                THEN ur.details->'unit_breakdown'
+            ELSE '[]'::jsonb
+        END
+    ) item
+    JOIN subscription.usage_rate_card urc
+      ON urc.id = NULLIF(item->>'pricing_rate_card_id', '')::uuid
+    WHERE ur.recorded_at >= $1::timestamptz
+      AND ur.recorded_at < $2::timestamptz
+      AND jsonb_typeof(ur.details->'unit_breakdown') = 'array'
+      AND urc.provider_unit_cost IS NOT NULL
+),
+fallback_cost AS (
+    SELECT COALESCE(SUM(ur.quantity * urc.provider_unit_cost * $5::numeric), 0)::numeric
+        AS provider_vnd
+    FROM subscription.usage_records ur
+    JOIN subscription.credit_transactions ct ON ct.usage_record_id = ur.id
+    JOIN subscription.usage_rate_card urc ON urc.id = ct.pricing_rate_card_id
+    WHERE ur.recorded_at >= $1::timestamptz
+      AND ur.recorded_at < $2::timestamptz
+      AND (
+          jsonb_typeof(ur.details->'unit_breakdown') IS DISTINCT FROM 'array'
+          OR jsonb_array_length(
+              CASE
+                  WHEN jsonb_typeof(ur.details->'unit_breakdown') = 'array'
+                      THEN ur.details->'unit_breakdown'
+                  ELSE '[]'::jsonb
+              END
+          ) = 0
+      )
+      AND urc.provider_unit_cost IS NOT NULL
+)
+SELECT (breakdown_cost.provider_vnd + fallback_cost.provider_vnd)::numeric AS provider_vnd
+FROM breakdown_cost
+CROSS JOIN fallback_cost
 """
 
 

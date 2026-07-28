@@ -29,7 +29,7 @@ import socket
 import time
 import uuid
 from dataclasses import dataclass
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
 
 from billing_worker.db import BillingRepository
 from shared.config import BillingSettings, RedisSettings, STTSettings, TTSSettings, WorkerSettings
@@ -48,6 +48,7 @@ ACCUMULATOR_KEY_PREFIX = "billing:acc"
 ACCUMULATOR_SEQUENCE_PREFIX = "billing:accseq"
 CHARGE_DEDUPE_PREFIX = "billing:charge"
 EVENT_DEDUPE_PREFIX = "billing:event"
+MICRO_SCALE = Decimal("1000000")
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,8 @@ class BillingEvent:
     model: str
     pricing_rate_card_id: uuid.UUID
     unit_price_snapshot: Decimal
+    source_language_code: str | None = None
+    target_language_code: str | None = None
     force_flush: bool = False
     details: dict | None = None
 
@@ -234,6 +237,8 @@ class BillingSettlementWorker:
             model=rate.model,
             pricing_rate_card_id=rate.id,
             unit_price_snapshot=rate.unit_price,
+            source_language_code=None,
+            target_language_code=None,
             force_flush=msg.is_final_chunk,
             details={"event_source": "audio_chunks", "sample_rate": msg.sample_rate},
         ))
@@ -296,6 +301,8 @@ class BillingSettlementWorker:
                 model=rate.model,
                 pricing_rate_card_id=rate.id,
                 unit_price_snapshot=rate.unit_price,
+                source_language_code=msg.source_lang or None,
+                target_language_code=msg.target_lang or None,
                 force_flush=True,
                 details={
                     "event_source": "ai_usage",
@@ -350,6 +357,8 @@ class BillingSettlementWorker:
             model=rate.model,
             pricing_rate_card_id=rate.id,
             unit_price_snapshot=rate.unit_price,
+            source_language_code=None,
+            target_language_code=None,
             force_flush=True,
             details={
                 "event_source": "provider_usage",
@@ -427,6 +436,8 @@ class BillingSettlementWorker:
             model=rate.model,
             pricing_rate_card_id=rate.id,
             unit_price_snapshot=rate.unit_price,
+            source_language_code=None,
+            target_language_code=msg.target_lang or None,
             force_flush=msg.is_final_chunk,
             details={
                 "event_source": "tts_results",
@@ -461,17 +472,19 @@ class BillingSettlementWorker:
             event.subscription_id,
             event.translation_room_id,
             event.charge_type,
-            event.unit,
-            event.provider,
-            event.model,
+            event.source_language_code,
+            event.target_language_code,
         )
         now_ms = int(time.time() * 1000)
+        pricing_scope = self._pricing_scope(
+            event.source_language_code,
+            event.target_language_code,
+        )
 
         if not await self.redis.redis.hexists(key, "window_seq"):
             window_seq = await self.redis.redis.incr(
                 f"{ACCUMULATOR_SEQUENCE_PREFIX}:{event.subscription_id}:"
-                f"{event.translation_room_id}:{event.charge_type}:{event.unit}:"
-                f"{event.provider}:{event.model}"
+                f"{event.translation_room_id}:{event.charge_type}:{pricing_scope}"
             )
             await self.redis.redis.hset(
                 key,
@@ -481,20 +494,25 @@ class BillingSettlementWorker:
                     "translation_room_id": event.translation_room_id,
                     "usage_type": event.usage_type,
                     "charge_type": event.charge_type,
-                    "unit": event.unit,
-                    "provider": event.provider,
-                    "model": event.model,
-                    "pricing_rate_card_id": str(event.pricing_rate_card_id),
-                    "unit_price_snapshot": str(event.unit_price_snapshot),
+                    "pricing_scope": pricing_scope,
+                    "source_language_code": event.source_language_code or "",
+                    "target_language_code": event.target_language_code or "",
                     "window_seq": str(window_seq),
                     "window_start_ms": str(now_ms),
                 },
             )
 
+        micro_credits_event = self._to_micro(event.credits_event)
+        quantity_micro = self._to_micro(event.quantity)
+        price_micro = self._to_micro(event.unit_price_snapshot)
         pipe = self.redis.redis.pipeline(transaction=True)
-        pipe.hincrbyfloat(key, "credits", float(event.credits_event))
-        pipe.hincrbyfloat(key, f"quantity_{event.unit}", float(event.quantity))
+        pipe.hincrby(key, "micro_credits", micro_credits_event)
+        pipe.hincrby(key, f"quantity_micro_{event.unit}", quantity_micro)
         pipe.hincrby(key, "event_count", 1)
+        pipe.hset(key, f"rate_{event.unit}_id", str(event.pricing_rate_card_id))
+        pipe.hset(key, f"rate_{event.unit}_price_micro", price_micro)
+        pipe.hset(key, f"provider_{event.unit}", event.provider)
+        pipe.hset(key, f"model_{event.unit}", event.model)
         await pipe.execute()
 
         if event.details:
@@ -535,7 +553,7 @@ class BillingSettlementWorker:
         if not snapshot:
             return
 
-        credits_raw = self._decimal_from_snapshot(snapshot, "credits")
+        credits_raw = self._micro_decimal_from_snapshot(snapshot, "micro_credits")
         if credits_raw <= 0:
             return
 
@@ -552,8 +570,8 @@ class BillingSettlementWorker:
             return
 
         idempotency_key = (
-            f"{snapshot['charge_type']}:{snapshot['unit']}:{snapshot['provider']}:"
-            f"{snapshot['model']}:{snapshot['translation_room_id']}:{snapshot['window_seq']}"
+            f"{snapshot['charge_type']}:{snapshot.get('pricing_scope', '_:_')}:"
+            f"{snapshot['translation_room_id']}:{snapshot['window_seq']}"
         )
         charge_dedupe_key = f"{CHARGE_DEDUPE_PREFIX}:{idempotency_key}"
         accepted = await self.redis.redis.set(
@@ -567,7 +585,12 @@ class BillingSettlementWorker:
             return
 
         try:
-            unit = snapshot["unit"]
+            breakdown = self._unit_breakdown(snapshot)
+            primary = self._primary_breakdown_unit(breakdown)
+            unit = primary["unit"]
+            quantity = primary["quantity"]
+            pricing_rate_card_id = primary.get("pricing_rate_card_id")
+            unit_price_snapshot = primary.get("unit_price_snapshot")
             await self.db.record_usage_and_charge(
                 subscription_id=uuid.UUID(snapshot["subscription_id"]),
                 user_id=None,
@@ -577,22 +600,28 @@ class BillingSettlementWorker:
                 charge_type=snapshot["charge_type"],
                 reference_id=None,
                 reference_type="billing_accumulator",
-                quantity=float(self._decimal_from_snapshot(snapshot, f"quantity_{unit}")),
+                quantity=float(quantity),
                 unit=unit,
                 credits_consumed=credits_consumed,
                 transcript_segment_id=None,
                 idempotency_key=idempotency_key,
-                pricing_rate_card_id=uuid.UUID(snapshot["pricing_rate_card_id"]),
-                unit_price_snapshot=self._decimal_from_snapshot(snapshot, "unit_price_snapshot"),
-                provider=snapshot["provider"],
-                model=snapshot["model"],
+                pricing_rate_card_id=pricing_rate_card_id,
+                unit_price_snapshot=unit_price_snapshot,
+                provider=primary.get("provider"),
+                model=primary.get("model"),
                 details={
                     "event_count": int(float(snapshot.get("event_count", "0"))),
                     "raw_credits": str(credits_raw),
-                    "provider": snapshot["provider"],
-                    "model": snapshot["model"],
-                    "pricing_rate_card_id": snapshot["pricing_rate_card_id"],
-                    "unit_price_snapshot": snapshot["unit_price_snapshot"],
+                    "rounding_delta": str(Decimal(credits_consumed) - credits_raw),
+                    "rounding_rate": str(
+                        Decimal("0")
+                        if credits_raw == 0
+                        else (Decimal(credits_consumed) - credits_raw) / credits_raw
+                    ),
+                    "pricing_scope": snapshot.get("pricing_scope", "_:_"),
+                    "source_language_code": snapshot.get("source_language_code") or None,
+                    "target_language_code": snapshot.get("target_language_code") or None,
+                    "unit_breakdown": breakdown,
                     "window_seq": int(snapshot["window_seq"]),
                     "window_start_ms": int(float(snapshot["window_start_ms"])),
                     "last_event": snapshot.get("last_event_details"),
@@ -607,7 +636,7 @@ class BillingSettlementWorker:
             return True
         started_at = int(float(snapshot.get("window_start_ms", now_ms)))
         age_ms = now_ms - started_at
-        credits = self._decimal_from_snapshot(snapshot, "credits")
+        credits = self._micro_decimal_from_snapshot(snapshot, "micro_credits")
         return (
             age_ms >= self.settings.accumulator_flush_interval_seconds * 1000
             or credits >= Decimal(self.settings.max_credits_per_flush)
@@ -643,14 +672,83 @@ class BillingSettlementWorker:
         subscription_id: uuid.UUID,
         room_id: str,
         charge_type: str,
-        unit: str,
-        provider: str,
-        model: str,
+        source_language_code: str | None,
+        target_language_code: str | None,
     ) -> str:
+        pricing_scope = BillingSettlementWorker._pricing_scope(
+            source_language_code,
+            target_language_code,
+        )
         return (
             f"{ACCUMULATOR_KEY_PREFIX}:{subscription_id}:{room_id}:{charge_type}:"
-            f"{unit}:{provider}:{model}"
+            f"{pricing_scope}"
         )
+
+    @staticmethod
+    def _pricing_scope(source_language_code: str | None, target_language_code: str | None) -> str:
+        source = source_language_code or "_"
+        target = target_language_code or "_"
+        return f"{source}:{target}"
+
+    @staticmethod
+    def _to_micro(value: Decimal) -> int:
+        return int((value * MICRO_SCALE).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+    @staticmethod
+    def _from_micro(value: str | int | Decimal) -> Decimal:
+        return Decimal(str(value)) / MICRO_SCALE
+
+    def _micro_decimal_from_snapshot(self, snapshot: dict[str, str], key: str) -> Decimal:
+        return self._from_micro(snapshot.get(key, "0"))
+
+    def _unit_breakdown(self, snapshot: dict[str, str]) -> list[dict]:
+        units = sorted(
+            key.removeprefix("quantity_micro_")
+            for key in snapshot
+            if key.startswith("quantity_micro_")
+        )
+        breakdown: list[dict] = []
+        for unit in units:
+            quantity = self._from_micro(snapshot[f"quantity_micro_{unit}"])
+            if quantity <= 0:
+                continue
+            unit_price_snapshot = self._from_micro(
+                snapshot.get(f"rate_{unit}_price_micro", "0")
+            )
+            pricing_rate_card_id = snapshot.get(f"rate_{unit}_id")
+            item = {
+                "unit": unit,
+                "quantity": str(quantity),
+                "pricing_rate_card_id": pricing_rate_card_id,
+                "unit_price_snapshot": str(unit_price_snapshot),
+                "provider": snapshot.get(f"provider_{unit}"),
+                "model": snapshot.get(f"model_{unit}"),
+            }
+            breakdown.append(item)
+        return breakdown
+
+    @staticmethod
+    def _primary_breakdown_unit(breakdown: list[dict]) -> dict:
+        if not breakdown:
+            return {
+                "unit": "unknown",
+                "quantity": Decimal("0"),
+                "pricing_rate_card_id": None,
+                "unit_price_snapshot": None,
+                "provider": None,
+                "model": None,
+            }
+        primary = max(breakdown, key=lambda item: Decimal(item["quantity"]))
+        return {
+            **primary,
+            "quantity": Decimal(primary["quantity"]),
+            "pricing_rate_card_id": (
+                uuid.UUID(primary["pricing_rate_card_id"])
+                if primary.get("pricing_rate_card_id")
+                else None
+            ),
+            "unit_price_snapshot": Decimal(primary["unit_price_snapshot"]),
+        }
 
     @staticmethod
     def _decode_hash(data: dict) -> dict[str, str]:

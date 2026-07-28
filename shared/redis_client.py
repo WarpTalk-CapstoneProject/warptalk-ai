@@ -256,11 +256,11 @@ class RedisStreamClient:
         """Set/refresh a TTL on an existing key (e.g. after hset, which has no TTL param)."""
         await self.redis.expire(key, ttl_seconds)
 
-    async def hget(self, key: str, field: str) -> bytes | None:
+    async def hget(self, key: str, field: str) -> bytes | str | None:
         """Get a hash field value."""
         return await self.redis.hget(key, field)
 
-    async def hgetall(self, key: str) -> dict[bytes, bytes]:
+    async def hgetall(self, key: str) -> dict[bytes | str, bytes | str]:
         """Get all fields/values of a hash."""
         return await self.redis.hgetall(key)
 
@@ -268,7 +268,7 @@ class RedisStreamClient:
         """Set a key with expiration."""
         await self.redis.setex(key, ttl_seconds, value)
 
-    async def get(self, key: str) -> bytes | None:
+    async def get(self, key: str) -> bytes | str | None:
         """Get a key value."""
         return await self.redis.get(key)
 

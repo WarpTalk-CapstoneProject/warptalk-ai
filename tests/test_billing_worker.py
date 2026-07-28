@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from billing_worker.db import BillingRepository
-from billing_worker.worker import _extract_underlying_segment_id
+from billing_worker.worker import BillingSettlementWorker, _extract_underlying_segment_id
 from shared.config import DatabaseSettings, RedisSettings
 
 
@@ -219,6 +219,62 @@ class TestResolveUsageRate:
 
         assert rate is None
         assert repo.fetch_count == 0
+
+
+class TestBillingAccumulatorFormula:
+    def test_accumulator_key_uses_language_pricing_scope(self) -> None:
+        subscription_id = uuid.uuid4()
+        key = BillingSettlementWorker._accumulator_key(
+            subscription_id,
+            "room-1",
+            "TRANSLATION",
+            "vi",
+            "en",
+        )
+
+        assert key == f"billing:acc:{subscription_id}:room-1:TRANSLATION:vi:en"
+
+    def test_accumulator_key_uses_placeholder_for_base_rate_scope(self) -> None:
+        subscription_id = uuid.uuid4()
+        key = BillingSettlementWorker._accumulator_key(
+            subscription_id,
+            "room-1",
+            "STT",
+            None,
+            None,
+        )
+
+        assert key == f"billing:acc:{subscription_id}:room-1:STT:_:_"
+
+    def test_micro_credit_conversion_rounds_to_integer_micro_units(self) -> None:
+        assert BillingSettlementWorker._to_micro(Decimal("1.2345674")) == 1234567
+        assert BillingSettlementWorker._to_micro(Decimal("1.2345675")) == 1234568
+        assert BillingSettlementWorker._from_micro("1234568") == Decimal("1.234568")
+
+    def test_unit_breakdown_reads_micro_quantities_and_rate_snapshots(self) -> None:
+        rate_id = uuid.uuid4()
+        worker = BillingSettlementWorker()
+
+        breakdown = worker._unit_breakdown(
+            {
+                "quantity_micro_token_in": "120000000",
+                "rate_token_in_id": str(rate_id),
+                "rate_token_in_price_micro": "6575",
+                "provider_token_in": "openai",
+                "model_token_in": "gpt-4.1-mini",
+            }
+        )
+
+        assert breakdown == [
+            {
+                "unit": "token_in",
+                "quantity": "120",
+                "pricing_rate_card_id": str(rate_id),
+                "unit_price_snapshot": "0.006575",
+                "provider": "openai",
+                "model": "gpt-4.1-mini",
+            }
+        ]
 
 
 class TestRecordUsageAndCharge:

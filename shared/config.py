@@ -32,7 +32,10 @@ class RedisSettings(BaseSettings):
     # is still live exhausted the pool ("MaxConnectionsError: Too many connections"),
     # which read as the whole AI pipeline going unresponsive.
     max_connections: int = 50
-    socket_timeout: float = 5.0
+    # XREADGROUP uses a blocking read (currently 2s for AI workers). Keep a
+    # generous socket margin for Docker Desktop/Redis scheduling jitter so a
+    # normal long-poll does not become a retry storm under load.
+    socket_timeout: float = 15.0
     socket_connect_timeout: float = 5.0
     stream_maxlen: int = 1000  # MAXLEN ~ for XADD trimming
     retry_max_attempts: int = 5
@@ -200,8 +203,9 @@ class EmbeddingSettings(BaseSettings):
     # made of one or more chunks) EmbeddingWorker processes at once. Unlike stt/tts/translation,
     # these jobs are independent of each other and I/O-bound (an OpenAI embed call + a Qdrant
     # upsert), so this is a real throughput win rather than a correctness risk — see
-    # BaseWorker.concurrency in shared/base_worker.py for why it's opt-in per worker.
-    concurrency: int = 5
+    # Keep embedding pressure bounded while sharing Redis with real-time audio.
+    # Increase deliberately after measuring Redis timeout/error rates.
+    concurrency: int = 2
 
 
 class DatabaseSettings(BaseSettings):
@@ -244,3 +248,19 @@ class VectorDbSettings(BaseSettings):
     url: str = "http://localhost:6333"
     api_key: str = ""
     distance_metric: str = "cosine"
+
+
+class SecuritySettings(BaseSettings):
+    """Security scanning worker settings."""
+
+    model_config = {"env_prefix": "SECURITY_"}
+
+    api_key: str = ""
+    model: str = "gpt-4o-mini"
+    max_tokens: int = 2000
+    temperature: float = 0.0
+    max_analyze_length: int = 20000
+    result_ttl_seconds: int = 300
+
+
+
