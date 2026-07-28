@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 from shared.config import TranslationSettings, WorkerSettings
 from shared.schemas import STTResultMessage
-from translation_worker.translator import OpenAITranslator, _build_glossary_block, _exception_clause, _lang_name
+from translation_worker.translator import (
+    OpenAITranslator,
+    _build_glossary_block,
+    _exception_clause,
+    _lang_name,
+)
 from translation_worker.worker import TranslationWorker
 
 
@@ -48,7 +53,9 @@ class TestGlossaryBlock:
         assert "do not translate" in block.lower()
 
     def test_exact_mapping_when_target_differs(self) -> None:
-        block = _build_glossary_block([{"source": "marketing plan", "target": "kế hoạch marketing"}])
+        block = _build_glossary_block(
+            [{"source": "marketing plan", "target": "kế hoạch marketing"}]
+        )
         assert "marketing plan" in block
         assert "kế hoạch marketing" in block
         assert "exact translations" in block.lower()
@@ -122,9 +129,11 @@ class TestOpenAITranslator:
         )
 
         _, kwargs = translator._client.chat.completions.create.call_args
+        system_message = kwargs["messages"][0]["content"]
         user_message = kwargs["messages"][1]["content"]
-        assert "architect" in user_message
-        assert "do not translate" in user_message.lower()
+        assert "architect" in system_message
+        assert "do not translate" in system_message.lower()
+        assert "architect\t->\tarchitect" not in user_message
 
 
 class TestTranslateBatch:
@@ -265,28 +274,28 @@ class TestTranslationWorker:
         ]
         assert any("translate:results" in s for s in streams_published)
 
-    async def test_multi_sentence_uses_translate_for_first_and_batch_for_rest(
+    async def test_multi_sentence_uses_batch_translation(
         self, mock_redis_client, worker_settings: WorkerSettings
     ) -> None:
-        """A 2-sentence segment should call translate() once (sentence 0) and
-        translate_batch() once (sentences 1..N-1) — not translate() in a per-sentence
-        loop — and each sentence must still be published as its own chunk with the
-        correct per-chunk text, since billing_worker charges credits per published
-        translate:results message (keyed by chunk_segment_id + text length).
+        """A multi-sentence segment should use one batched translation call and still
+        publish each sentence as its own chunk with the correct per-chunk text.
         """
         worker = self._make_worker(mock_redis_client, worker_settings)
         mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
         worker.translator.translate = AsyncMock(return_value="Xin chào")
-        worker.translator.translate_batch = AsyncMock(return_value=["Bạn khỏe không"])
+        worker.translator.translate_batch = AsyncMock(
+            return_value=["Xin chào", "Bạn khỏe không"]
+        )
 
         msg = self._make_stt_msg(language="en", text="Hello there. How are you?")
         await worker.process(b"msg-1", msg.to_redis())
 
-        worker.translator.translate.assert_awaited_once_with(
-            "Hello there.", source_lang="en", target_lang="vi", glossary_terms=[]
-        )
+        worker.translator.translate.assert_not_awaited()
         worker.translator.translate_batch.assert_awaited_once_with(
-            ["How are you?"], source_lang="en", target_lang="vi", glossary_terms=[]
+            ["Hello there.", "How are you?"],
+            source_lang="en",
+            target_lang="vi",
+            glossary_terms=[],
         )
 
         published = [
@@ -305,7 +314,9 @@ class TestTranslationWorker:
         # _translate_and_publish. billing_worker's _extract_underlying_segment_id()
         # only reads the first 36 chars (the GUID), so it is unaffected by this suffix.
         assert chunk_ids == {f"{msg.segment_id}-vi-c0", f"{msg.segment_id}-vi-c1"}
-        texts_by_chunk = {data["segment_id"]: data["translated_text"] for _stream, data in published}
+        texts_by_chunk = {
+            data["segment_id"]: data["translated_text"] for _stream, data in published
+        }
         assert texts_by_chunk[f"{msg.segment_id}-vi-c0"] == "Xin chào"
         assert texts_by_chunk[f"{msg.segment_id}-vi-c1"] == "Bạn khỏe không"
 

@@ -58,6 +58,11 @@ _BATCH_SYSTEM_PROMPT = (
 )
 
 
+def _build_system_prompt(base_prompt: str, glossary_terms: list[dict] | None) -> str:
+    glossary_block = _build_glossary_block(glossary_terms)
+    return f"{base_prompt}{glossary_block}" if glossary_block else base_prompt
+
+
 def _build_glossary_block(glossary_terms: list[dict] | None) -> str:
     """Render this workspace's active glossary terms (see GlossaryStartedEventConsumer,
     published to `translationRoom:{meeting_id}:mt_glossary`) as a system-prompt addendum.
@@ -105,12 +110,12 @@ def _build_glossary_block(glossary_terms: list[dict] | None) -> str:
 
 
 def _exception_clause(glossary_terms: list[dict] | None) -> str:
-    """The "never leave any word..." instruction's exception clause — only mentions the
-    glossary when there actually is one, so the sentence doesn't dangle a reference to
-    "the glossary below" when _build_glossary_block returned nothing.
+    """The "never leave any word..." instruction's exception clause.
+
+    It only mentions workspace glossary terms when there actually is a glossary.
     """
     base = "except for proper nouns/brand names with no natural translation"
-    return f"{base}, or terms covered by the glossary below" if glossary_terms else base
+    return f"{base}, or terms covered by the workspace glossary" if glossary_terms else base
 
 _BATCH_LINE_RE = re.compile(r"^\s*\[(\d+)\]\s*(.*)$")
 
@@ -211,13 +216,13 @@ class OpenAITranslator:
             f"Translate from {src_name} to {tgt_name}:\n{text}\n\n"
             f"Respond entirely in {tgt_name} — never leave any word in {src_name} or "
             f"switch to a third language, {_exception_clause(glossary_terms)}."
-            f"{_build_glossary_block(glossary_terms)}"
         )
+        system_message = _build_system_prompt(_SYSTEM_PROMPT, glossary_terms)
 
         response = await self._client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_message},
                 {"role": "user", "content": user_message},
             ],
             max_tokens=self.max_tokens,
@@ -292,13 +297,13 @@ class OpenAITranslator:
             f"Translate from {src_name} to {tgt_name}:\n{numbered_input}\n\n"
             f"Respond entirely in {tgt_name} — never leave any word in {src_name} or "
             f"switch to a third language, {_exception_clause(glossary_terms)}."
-            f"{_build_glossary_block(glossary_terms)}"
         )
+        system_message = _build_system_prompt(_BATCH_SYSTEM_PROMPT, glossary_terms)
 
         response = await self._client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": _BATCH_SYSTEM_PROMPT},
+                {"role": "system", "content": system_message},
                 {"role": "user", "content": user_message},
             ],
             max_tokens=self.max_tokens * len(texts),

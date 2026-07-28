@@ -26,6 +26,7 @@ from translation_worker.translator import (
 )
 
 TRANSLATION_CHARGE_TYPE = "TRANSLATION"
+TRANSLATION_BATCH_SIZE = 8
 
 
 class TranslationWorker(BaseWorker):
@@ -179,36 +180,33 @@ class TranslationWorker(BaseWorker):
         target_lang: str,
         glossary_terms: list[dict] | None = None,
     ) -> None:
-        # Fire off translation for all sentences UP FRONT so they run concurrently instead
-        # of one-sentence-at-a-time (each translate() call is a real OpenAI network
-        # round-trip — awaiting them sequentially in the publish loop below used to add a
-        # full round-trip of latency per extra sentence). Sentence 0 still gets its own
-        # single-sentence call (not folded into the batch) so it can be awaited and
-        # published on its own as soon as it's ready — TTS starts on it immediately,
-        # same as before — while sentences 1..N-1 translate together in ONE batched call
-        # that's already running in the background by the time we get to them.
+        # Single-sentence chunks keep the low-latency path; multi-sentence chunks are
+        # grouped into bounded batches so prompt overhead is shared across sentences.
         passthrough = stt_result.language == target_lang
         first_task: asyncio.Task[TranslationWithUsage] | None = None
-        rest_task: asyncio.Task[TranslationBatchWithUsage] | None = None
-        rest_results: TranslationBatchWithUsage | None = None
+        batch_tasks: dict[int, asyncio.Task[TranslationBatchWithUsage]] = {}
+        batch_results: dict[int, TranslationBatchWithUsage] = {}
         if not passthrough:
-            first_task = asyncio.create_task(
-                self._translate_sentence(
-                    sentences[0],
-                    source_lang=stt_result.language,
-                    target_lang=target_lang,
-                    glossary_terms=glossary_terms,
-                )
-            )
-            if len(sentences) > 1:
-                rest_task = asyncio.create_task(
-                    self._translate_batch(
-                        sentences[1:],
+            if len(sentences) == 1:
+                first_task = asyncio.create_task(
+                    self._translate_sentence(
+                        sentences[0],
                         source_lang=stt_result.language,
                         target_lang=target_lang,
                         glossary_terms=glossary_terms,
                     )
                 )
+            else:
+                for start in range(0, len(sentences), TRANSLATION_BATCH_SIZE):
+                    batch = sentences[start : start + TRANSLATION_BATCH_SIZE]
+                    batch_tasks[start] = asyncio.create_task(
+                        self._translate_batch(
+                            batch,
+                            source_lang=stt_result.language,
+                            target_lang=target_lang,
+                            glossary_terms=glossary_terms,
+                        )
+                    )
 
         for idx, sentence in enumerate(sentences):
             # Sequence the segment ID (per target language, so different listeners'
@@ -218,7 +216,7 @@ class TranslationWorker(BaseWorker):
 
             if passthrough:
                 translated_text = sentence
-            elif idx == 0:
+            elif len(sentences) == 1:
                 first_result = await first_task
                 translated_text = first_result.text
                 await self._publish_ai_usage(
@@ -228,18 +226,22 @@ class TranslationWorker(BaseWorker):
                     idempotency_key=f"{TRANSLATION_CHARGE_TYPE}:{chunk_segment_id}:usage",
                 )
             else:
-                if rest_results is None:
-                    rest_results = await rest_task
+                batch_start = (idx // TRANSLATION_BATCH_SIZE) * TRANSLATION_BATCH_SIZE
+                if batch_start not in batch_results:
+                    batch_results[batch_start] = await batch_tasks[batch_start]
+                    current_batch = sentences[
+                        batch_start : batch_start + TRANSLATION_BATCH_SIZE
+                    ]
                     await self._publish_ai_usage(
                         stt_result,
                         target_lang,
-                        rest_results.usage,
+                        batch_results[batch_start].usage,
                         idempotency_key=(
                             f"{TRANSLATION_CHARGE_TYPE}:{stt_result.segment_id}:{target_lang}:"
-                            f"batch:{len(sentences) - 1}"
+                            f"batch:{batch_start}:{len(current_batch)}"
                         ),
                     )
-                translated_text = rest_results.texts[idx - 1]
+                translated_text = batch_results[batch_start].texts[idx - batch_start]
 
             is_final = (idx == len(sentences) - 1) and stt_result.is_final_chunk
 
