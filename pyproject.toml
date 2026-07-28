@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["shared*", "stt_worker*", "translation_worker*", "tts_worker*", "ai_assistant_worker*", "embedding_worker*", "billing_worker*", "security_worker*", "livekit_ingress_worker*"]
+include = ["shared*", "stt_worker*", "translation_worker*", "tts_worker*", "ai_assistant_worker*", "embedding_worker*", "billing_worker*", "security_worker*", "livekit_ingress_worker*", "metrics_exporter*"]
 
 [project]
 name = "warptalk-ai"
@@ -53,10 +53,12 @@ embeddings = [
 ]
 ingress = [
     # Optional local VAD path for livekit_ingress_worker; not installed in API-backed Docker workers.
-    # torchaudio is a transitive runtime import inside silero-vad's hubconf (utils_vad.py),
-    # not declared by torch.hub.load() itself — omitting it fails at model-load time, not install time.
-    "torch>=2.1",
-    "torchaudio>=2.1",
+    # torchaudio and packaging are runtime imports inside silero-vad's hubconf,
+    # not declared by torch.hub.load() itself — omitting either fails at model-load time.
+    # TorchAudio binary compatibility requires the same PyTorch release.
+    "packaging>=24.0",
+    "torch==2.11.0",
+    "torchaudio==2.11.0",
 ]
 dev = [
     "pytest>=7.4",
@@ -65,7 +67,23 @@ dev = [
     "fakeredis[lua]>=2.20",
     "ruff>=0.1",
     "mypy>=1.8",
+    "asyncpg-stubs>=0.30.2",
 ]
+
+# Production App VMs have no GPU. Pin Linux Torch packages to the official
+# CPU-only index so the ingress image never carries CUDA/NVIDIA runtimes.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.ruff]
 target-version = "py311"
@@ -81,3 +99,20 @@ asyncio_mode = "auto"
 [tool.mypy]
 python_version = "3.11"
 strict = true
+explicit_package_bases = true
+files = [
+    "shared",
+    "stt_worker",
+    "translation_worker",
+    "tts_worker",
+    "ai_assistant_worker",
+    "embedding_worker",
+    "billing_worker",
+    "security_worker",
+    "livekit_ingress_worker",
+    "metrics_exporter",
+]
+
+[[tool.mypy.overrides]]
+module = ["soundfile", "torch", "torchaudio", "TTS", "TTS.*"]
+ignore_missing_imports = true

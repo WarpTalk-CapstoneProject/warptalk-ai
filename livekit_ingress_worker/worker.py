@@ -8,16 +8,18 @@ import asyncio
 import json
 import time
 from collections import deque
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 import torch
-from livekit import rtc
-from livekit import api
+from livekit import api, rtc
 
+from livekit_ingress_worker.near_field_gate import NearFieldGate
 from shared.base_worker import BaseWorker
 from shared.schemas import AudioChunkMessage
 
-from livekit_ingress_worker.near_field_gate import NearFieldGate
+SILERO_VAD_REPOSITORY = "snakers4/silero-vad:v6.2.1"
 
 # Bot participant identities used elsewhere in this pipeline — this worker's own
 # "AIBot_{room}" (join_room, below) and the TTS publisher's "ai-interpreter-{lang}"
@@ -31,6 +33,33 @@ def _is_ai_bot_identity(identity: str) -> bool:
     return identity.startswith(_AI_BOT_IDENTITY_PREFIXES)
 
 
+def _parse_track_published_event(
+    envelope: dict[str, Any],
+) -> tuple[str, str | None, str] | None:
+    """Validate and extract the versioned meeting.track_published contract."""
+    if (
+        envelope.get("event_type") != "meeting.track_published"
+        or envelope.get("schema_version") != 1
+        or envelope.get("producer") != "meeting-service"
+    ):
+        return None
+
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    room_name = payload.get("room_name")
+    participant_identity = payload.get("participant_identity")
+    track_id = payload.get("track_id")
+    if not isinstance(room_name, str) or not room_name:
+        return None
+    if participant_identity is not None and not isinstance(participant_identity, str):
+        return None
+    if not isinstance(track_id, str) or not track_id:
+        return None
+    return room_name, participant_identity, track_id
+
+
 class LiveKitIngressWorker(BaseWorker):
     """Worker that joins LiveKit rooms and pushes audio to Redis Streams."""
 
@@ -42,16 +71,18 @@ class LiveKitIngressWorker(BaseWorker):
     VAD_FRAME_SIZE = 512
     SAMPLE_RATE = 16000
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.rooms: dict[str, rtc.Room] = {}
-        self.audio_tasks: dict[str, asyncio.Task] = {}
-        self._vad_model = None
+        self.audio_tasks: dict[str, asyncio.Task[None]] = {}
+        self._vad_model: Any | None = None
 
     async def load_model(self) -> None:
         """Load Silero VAD model."""
         self._vad_model, _ = torch.hub.load(
-            "snakers4/silero-vad", "silero_vad", trust_repo=True
+            SILERO_VAD_REPOSITORY,
+            "silero_vad",
+            trust_repo=True,
         )
         self.logger.info("silero_vad_loaded")
 
@@ -62,35 +93,46 @@ class LiveKitIngressWorker(BaseWorker):
     async def _consume_loop(self) -> None:
         """Override to listen to Redis Pub/Sub instead of Streams."""
         self.logger.info("Starting Redis Pub/Sub listener for meeting.track_published")
-        pubsub = self.redis.redis.pubsub()
-        await pubsub.subscribe("meeting.track_published")
 
         while not self._shutdown_event.is_set():
+            pubsub = self.redis.redis.pubsub()
             try:
-                # get_message timeout prevents blocking indefinitely
-                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                if message:
-                    payload = json.loads(message["data"])
-                    asyncio.create_task(self.handle_track_published(payload))
+                await pubsub.subscribe("meeting.track_published")
+                self.logger.info("track_published_listener_started")
+                while not self._shutdown_event.is_set():
+                    # get_message timeout prevents blocking indefinitely
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=1.0,
+                    )
+                    if message:
+                        payload = json.loads(message["data"])
+                        asyncio.create_task(self.handle_track_published(payload))
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger.exception("Error processing pub/sub message")
+            finally:
+                try:
+                    await pubsub.close()
+                except Exception:
+                    self.logger.warning("track_published_listener_close_failed")
+
+            if not self._shutdown_event.is_set():
                 await asyncio.sleep(1.0)
 
-    async def handle_track_published(self, payload: dict) -> None:
-        room_name = payload.get("room_name") or payload.get("RoomName")
-        participant_identity = payload.get("participant_identity") or payload.get("ParticipantIdentity")
-        track_id = payload.get("track_sid") or payload.get("TrackId")
-
-        if not room_name or not track_id:
+    async def handle_track_published(self, payload: dict[str, Any]) -> None:
+        parsed = _parse_track_published_event(payload)
+        if parsed is None:
+            self.logger.warning("invalid_track_published_event")
             return
+        room_name, participant_identity, track_id = parsed
 
         self.logger.info(
             "received_track_published",
             room=room_name,
             participant=participant_identity,
-            track=track_id
+            track=track_id,
         )
 
         # Always disconnect old room and rejoin fresh
@@ -111,10 +153,7 @@ class LiveKitIngressWorker(BaseWorker):
         """Generate a token and connect an anonymous Bot to the LiveKit room."""
         # Generate token using livekit-api
         token = (
-            api.AccessToken(
-                self.settings.livekit.api_key,
-                self.settings.livekit.api_secret
-            )
+            api.AccessToken(self.settings.livekit.api_key, self.settings.livekit.api_secret)
             .with_identity(f"AIBot_{room_name}")
             .with_name("WarpTalk AI")
             .with_grants(api.VideoGrants(room_join=True, room=room_name))
@@ -124,10 +163,20 @@ class LiveKitIngressWorker(BaseWorker):
         room = rtc.Room()
 
         @room.on("track_subscribed")
-        def on_track_subscribed(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
-            if track.kind == rtc.TrackKind.KIND_AUDIO and not _is_ai_bot_identity(participant.identity):
-                self.logger.info("audio_track_subscribed", participant=participant.identity, track=track.sid)
-                task = asyncio.create_task(self.process_audio_track(room_name, participant.identity, track))
+        def on_track_subscribed(
+            track: rtc.Track,
+            publication: rtc.RemoteTrackPublication,
+            participant: rtc.RemoteParticipant,
+        ) -> None:
+            if track.kind == rtc.TrackKind.KIND_AUDIO and not _is_ai_bot_identity(
+                participant.identity
+            ):
+                self.logger.info(
+                    "audio_track_subscribed", participant=participant.identity, track=track.sid
+                )
+                task = asyncio.create_task(
+                    self.process_audio_track(room_name, participant.identity, track)
+                )
                 self.audio_tasks[track.sid] = task
 
         try:
@@ -155,7 +204,10 @@ class LiveKitIngressWorker(BaseWorker):
             self.logger.exception("failed_to_join_room", room=room_name)
             return None
 
-    def _run_vad_on_window(self, pcm_f32: np.ndarray) -> float:
+    def _run_vad_on_window(
+        self,
+        pcm_f32: npt.NDArray[np.float32],
+    ) -> float:
         """Run Silero VAD on a window of audio, return max speech probability.
 
         Silero requires 512-sample (32ms) frames. We process all frames
@@ -165,7 +217,7 @@ class LiveKitIngressWorker(BaseWorker):
         for i in range(0, len(pcm_f32) - self.VAD_FRAME_SIZE + 1, self.VAD_FRAME_SIZE):
             frame = pcm_f32[i : i + self.VAD_FRAME_SIZE]
             tensor = torch.from_numpy(frame).unsqueeze(0)
-            prob = self._vad_model(tensor, self.SAMPLE_RATE).item()
+            prob = self._require_vad_model()(tensor, self.SAMPLE_RATE).item()
             if prob > max_prob:
                 max_prob = prob
         return max_prob
@@ -215,7 +267,7 @@ class LiveKitIngressWorker(BaseWorker):
         )
 
         # Reset VAD model state for this track
-        self._vad_model.reset_states()
+        self._require_vad_model().reset_states()
 
         try:
             async for event in audio_stream:
@@ -284,8 +336,11 @@ class LiveKitIngressWorker(BaseWorker):
                         speech_samples = len(speech_buffer) // 2
                         if speech_samples >= max_chunk_samples:
                             await self._publish_speech_chunk(
-                                room_name, speaker_id, speech_buffer,
-                                chunk_index, sample_rate,
+                                room_name,
+                                speaker_id,
+                                speech_buffer,
+                                chunk_index,
+                                sample_rate,
                                 near_field_gate=near_field_gate,
                             )
                             chunk_index += 1
@@ -302,8 +357,11 @@ class LiveKitIngressWorker(BaseWorker):
                                 speech_samples = len(speech_buffer) // 2
                                 if speech_samples >= min_speech_samples:
                                     await self._publish_speech_chunk(
-                                        room_name, speaker_id, speech_buffer,
-                                        chunk_index, sample_rate,
+                                        room_name,
+                                        speaker_id,
+                                        speech_buffer,
+                                        chunk_index,
+                                        sample_rate,
                                         near_field_gate=near_field_gate,
                                     )
                                     chunk_index += 1
@@ -317,7 +375,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 is_speaking = False
                                 speech_buffer = bytearray()
                                 silence_counter = 0
-                                self._vad_model.reset_states()
+                                self._require_vad_model().reset_states()
                         else:
                             # Store in pre-speech ring for next onset
                             pre_speech_ring.append(window_data)
@@ -328,11 +386,19 @@ class LiveKitIngressWorker(BaseWorker):
             # Publish any remaining speech buffer
             if speech_buffer and len(speech_buffer) // 2 >= min_speech_samples:
                 await self._publish_speech_chunk(
-                    room_name, speaker_id, speech_buffer,
-                    chunk_index, sample_rate,
+                    room_name,
+                    speaker_id,
+                    speech_buffer,
+                    chunk_index,
+                    sample_rate,
                     near_field_gate=near_field_gate,
                 )
             self.logger.info("stopped_audio_stream_processing", track_sid=track.sid)
+
+    def _require_vad_model(self) -> Any:
+        if self._vad_model is None:
+            raise RuntimeError("Silero VAD model is not loaded")
+        return self._vad_model
 
     async def _publish_speech_chunk(
         self,

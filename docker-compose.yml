@@ -108,7 +108,7 @@ services:
 
   # ---- Qdrant Vector DB ----
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.15.3@sha256:31407c0e8e32eb771b71718f1a4772e2ad47a07557917b21ac96792f40eb8007
     container_name: warptalk-qdrant
     ports:
       - "6333:6333"

@@ -1,5 +1,7 @@
 import json
+
 from openai import AsyncOpenAI
+
 from shared.config import SecuritySettings
 
 # --- Constants ---
@@ -10,7 +12,8 @@ TEMPERATURE = 0.0
 
 
 class OpenAISecurityScanner:
-    """OpenAI-backed document scanner for dynamic multi-language PII & DLP inspection and masking."""
+    """OpenAI-backed document scanner for dynamic multi-language PII/DLP
+    inspection and masking."""
 
     def __init__(self, client: AsyncOpenAI, settings: SecuritySettings) -> None:
         self.client = client
@@ -37,19 +40,30 @@ class OpenAISecurityScanner:
         keywords_json = json.dumps(keywords_blacklist)
 
         system_prompt = (
-            "You are a multi-language document security scanner supporting all languages (English, Japanese, Vietnamese, etc.).\n"
-            "Analyze the provided text for PII (emails, phone numbers, SSN, My Number, CCCD/ID numbers, credit cards, full names, addresses) and DLP keyword violations.\n\n"
+            "You are a multi-language document security scanner supporting all "
+            "languages (English, Japanese, Vietnamese, etc.).\n"
+            "Analyze the provided text for PII (emails, phone numbers, SSN, My "
+            "Number, CCCD/ID numbers, credit cards, full names, addresses) and "
+            "DLP keyword violations.\n\n"
             "Instructions:\n"
-            "1. If PII Detection is enabled (pii_enabled is true), detect any PII in the text. Mask detected PII using [PII_REDACTED], [EMAIL_REDACTED], [PHONE_REDACTED], [ID_REDACTED], [CARD_REDACTED]. Set piiDetected to true if PII is found, otherwise false.\n"
-            "2. If DLP Detection is enabled (dlp_enabled is true), check if the text contains any of the blacklisted keywords (case-insensitive). Set dlpDetected to true if found, otherwise false.\n"
-            "3. Provide the complete final text with all PII masked in maskedContent. If no PII is found or PII Detection is disabled, keep maskedContent equal to the input text.\n"
+            "1. If PII Detection is enabled (pii_enabled is true), detect any PII "
+            "in the text. Mask detected PII using [PII_REDACTED], "
+            "[EMAIL_REDACTED], [PHONE_REDACTED], [ID_REDACTED], "
+            "[CARD_REDACTED]. Set piiDetected to true if PII is found, otherwise "
+            "false.\n"
+            "2. If DLP Detection is enabled (dlp_enabled is true), check if the "
+            "text contains any of the blacklisted keywords (case-insensitive). "
+            "Set dlpDetected to true if found, otherwise false.\n"
+            "3. Provide the complete final text with all PII masked in "
+            "maskedContent. If no PII is found or PII Detection is disabled, "
+            "keep maskedContent equal to the input text.\n"
             "4. Set violationFound to true if either piiDetected or dlpDetected is true.\n\n"
             "Respond ONLY in JSON format matching this schema:\n"
             "{\n"
-            "  \"piiDetected\": boolean,\n"
-            "  \"dlpDetected\": boolean,\n"
-            "  \"violationFound\": boolean,\n"
-            "  \"maskedContent\": string\n"
+            '  "piiDetected": boolean,\n'
+            '  "dlpDetected": boolean,\n'
+            '  "violationFound": boolean,\n'
+            '  "maskedContent": string\n'
             "}"
         )
 

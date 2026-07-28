@@ -17,10 +17,12 @@ import base64
 import re
 import time
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Awaitable, Callable
+from typing import Any, cast
 
 import numpy as np
+from openai import AsyncOpenAI
 
 from shared.config import STTSettings
 from shared.logger import get_logger
@@ -82,7 +84,7 @@ def _fix_vietnamese(text: str) -> str:
         lower = result.lower()
         idx = lower.find(wrong)
         while idx != -1:
-            result = result[:idx] + right + result[idx + len(wrong):]
+            result = result[:idx] + right + result[idx + len(wrong) :]
             lower = result.lower()
             idx = lower.find(wrong, idx + len(right))
     return result
@@ -131,12 +133,31 @@ _DEFAULT_ALLOWED_LANGUAGES = {"vi", "en"}
 # must NOT be filtered — applying the guard unconditionally is what would silently drop
 # a legitimate Japanese/Korean/Chinese/Thai speaker.
 _LATIN_SCRIPT_LANGUAGES = {
-    "en", "vi", "fr", "de", "es", "pt", "it", "id", "ms", "nl", "pl",
-    "tr", "sv", "da", "no", "fi", "cs", "sk", "hr", "ro", "hu",
+    "en",
+    "vi",
+    "fr",
+    "de",
+    "es",
+    "pt",
+    "it",
+    "id",
+    "ms",
+    "nl",
+    "pl",
+    "tr",
+    "sv",
+    "da",
+    "no",
+    "fi",
+    "cs",
+    "sk",
+    "hr",
+    "ro",
+    "hu",
 }
 
 _VI_CHAR_RE = re.compile(
-    r'[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]',
+    r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]",
     re.IGNORECASE,
 )
 
@@ -163,10 +184,10 @@ def _guess_language_from_text(text: str, allowed: set[str] | None = None) -> str
 
 
 _FOREIGN_SCRIPT_RE = re.compile(
-    r'[฀-๿'   # Thai
-    r'가-힣'    # Hangul syllables
-    r'一-鿿'    # CJK unified ideographs
-    r'぀-ヿ]'   # Hiragana/Katakana
+    r"[฀-๿"  # Thai
+    r"가-힣"  # Hangul syllables
+    r"一-鿿"  # CJK unified ideographs
+    r"぀-ヿ]"  # Hiragana/Katakana
 )
 
 # Even the fastest human speech in any language doesn't clear ~30 chars/sec, so this
@@ -176,29 +197,66 @@ _MIN_SPEECH_SECONDS_FOR_LONG_TEXT = 0.5
 _MAX_CHARS_FOR_SHORT_AUDIO = 20
 
 _HALLUCINATIONS = {
-    "thank you", "thanks for watching", "bye", "bye bye",
-    "good night", "oh", "you", "yeah", "okay",
-    "thanks for watching!", "thank you.", "good night.",
-    "bye.", "bye-bye.", "oh.", "you.", "yeah.", "okay.",
-    "fuck", "fuck.", "hmm", "hmm.", "i'm",
-    "subscribe", "like and subscribe",
-    "see you all later", "see you all later.",
-    "cảm ơn mọi người", "cảm ơn các bạn đã theo dõi",
-    "hãy subscribe cho kênh", "xin chào",
+    "thank you",
+    "thanks for watching",
+    "bye",
+    "bye bye",
+    "good night",
+    "oh",
+    "you",
+    "yeah",
+    "okay",
+    "thanks for watching!",
+    "thank you.",
+    "good night.",
+    "bye.",
+    "bye-bye.",
+    "oh.",
+    "you.",
+    "yeah.",
+    "okay.",
+    "fuck",
+    "fuck.",
+    "hmm",
+    "hmm.",
+    "i'm",
+    "subscribe",
+    "like and subscribe",
+    "see you all later",
+    "see you all later.",
+    "cảm ơn mọi người",
+    "cảm ơn các bạn đã theo dõi",
+    "hãy subscribe cho kênh",
+    "xin chào",
     "cảm ơn các bạn đã xem video",
-    "đăng ký kênh", "nhấn nút đăng ký",
+    "đăng ký kênh",
+    "nhấn nút đăng ký",
     "cuộc họp tiếng việt, có thể xen tiếng anh",
     "cuộc họp tiếng anh",
     "đây là cuộc họp bằng tiếng việt",
-    "nói", "ừ", "à", "ađe", "ade",
-    ".", "..", "...",
+    "nói",
+    "ừ",
+    "à",
+    "ađe",
+    "ade",
+    ".",
+    "..",
+    "...",
 }
 
 _HALLUCINATION_SUBSTRINGS = [
-    "subscribe", "đăng ký kênh", "theo dõi kênh",
-    "la la school", "xem video", "bỏ lỡ",
-    "ủng hộ kênh", "hẹn gặp lại", "chào mừng",
-    "ghiền mì gõ", "video tiếp theo", "video hấp dẫn",
+    "subscribe",
+    "đăng ký kênh",
+    "theo dõi kênh",
+    "la la school",
+    "xem video",
+    "bỏ lỡ",
+    "ủng hộ kênh",
+    "hẹn gặp lại",
+    "chào mừng",
+    "ghiền mì gõ",
+    "video tiếp theo",
+    "video hấp dẫn",
 ]
 
 
@@ -236,7 +294,7 @@ def _normalize_language(lang: str) -> str:
 
 
 def _filter_segments(
-    segments_raw: list[dict],
+    segments_raw: list[dict[str, Any]],
     detected_language: str,
     chunk_offset_ms: int,
     allowed_languages: set[str] | None = None,
@@ -282,7 +340,9 @@ def _filter_segments(
     # known per-segment language, and dropping could silently eat that speaker's real
     # transcript.
     apply_foreign_script_guard = (language_known and lang_code in _LATIN_SCRIPT_LANGUAGES) or (
-        not language_known and bool(allowed) and all(lang in _LATIN_SCRIPT_LANGUAGES for lang in allowed)
+        not language_known
+        and bool(allowed)
+        and all(lang in _LATIN_SCRIPT_LANGUAGES for lang in allowed)
     )
 
     results: list[TranscribedSegment] = []
@@ -309,7 +369,7 @@ def _filter_segments(
         # checks below are what actually catches bad output now.
         avg_logprob = seg.get("avg_logprob", -1.0) or -1.0
         no_speech = seg.get("no_speech_prob", 0.0) or 0.0
-        text_lower = text.lower().rstrip('.!,')
+        text_lower = text.lower().rstrip(".!,")
 
         if no_speech > 0.6:
             logger.debug("filtered_no_speech", text=text, no_speech_prob=round(no_speech, 2))
@@ -357,7 +417,7 @@ def _filter_segments(
                 logger.debug("filtered_repetition", text=text[:50])
                 continue
 
-        if re.search(r'(.)\1{3,}', text_lower):
+        if re.search(r"(.)\1{3,}", text_lower):
             logger.debug("filtered_char_repetition", text=text[:50])
             continue
 
@@ -402,15 +462,13 @@ class OpenAISTT:
         self.api_key = api_key
         self.model = model
         self.noise_reduction = noise_reduction
-        self._client = None
+        self._client: AsyncOpenAI | None = None
         # (meeting_id, speaker_id) -> {"manager": ..., "conn": ..., "last_used": float}
-        self._sessions: dict[tuple[str, str], dict] = {}
+        self._sessions: dict[tuple[str, str], dict[str, Any]] = {}
 
     async def load(self) -> None:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required for OpenAI STT")
-
-        from openai import AsyncOpenAI
 
         self._client = AsyncOpenAI(api_key=self.api_key)
         logger.info("openai_stt_ready", model=self.model)
@@ -466,13 +524,15 @@ class OpenAISTT:
             if on_early_segment is None:
                 return
             segs = _filter_segments(
-                [{
-                    "text": sentence_text,
-                    "start": 0.0,
-                    "end": 0.0,
-                    "avg_logprob": 0.0,
-                    "no_speech_prob": 0.0,
-                }],
+                [
+                    {
+                        "text": sentence_text,
+                        "start": 0.0,
+                        "end": 0.0,
+                        "avg_logprob": 0.0,
+                        "no_speech_prob": 0.0,
+                    }
+                ],
                 detected_language,
                 chunk_offset_ms,
                 allowed_languages,
@@ -491,7 +551,9 @@ class OpenAISTT:
             logger.warning("realtime_session_retry", meeting_id=meeting_id, speaker_id=speaker_id)
             self._sessions.pop(key, None)
             try:
-                text = await self._transcribe_via_session(key, pcm_24k, on_sentence, lang_arg, prompt)
+                text = await self._transcribe_via_session(
+                    key, pcm_24k, on_sentence, lang_arg, prompt
+                )
             except Exception as e:
                 logger.error("openai_stt_error", error=str(e))
                 raise
@@ -500,13 +562,15 @@ class OpenAISTT:
             return []
 
         duration_s = _pcm16_duration_seconds(audio_bytes, sample_rate)
-        segments_dicts = [{
-            "text": text.strip(),
-            "start": 0.0,
-            "end": duration_s,
-            "avg_logprob": 0.0,
-            "no_speech_prob": 0.0,
-        }]
+        segments_dicts = [
+            {
+                "text": text.strip(),
+                "start": 0.0,
+                "end": duration_s,
+                "avg_logprob": 0.0,
+                "no_speech_prob": 0.0,
+            }
+        ]
 
         # duration_s is the WHOLE chunk's audio, while `text` here is only the trailing
         # fragment not already flushed via on_early_segment — so this over-estimates the
@@ -514,7 +578,10 @@ class OpenAISTT:
         # more lenient than perfectly accurate. That's the safe direction: it only ever
         # risks missing a hallucination, never dropping real trailing speech.
         return _filter_segments(
-            segments_dicts, detected_language, chunk_offset_ms, allowed_languages,
+            segments_dicts,
+            detected_language,
+            chunk_offset_ms,
+            allowed_languages,
             real_duration_s=duration_s,
         )
 
@@ -583,7 +650,7 @@ class OpenAISTT:
                     if not flushed_stripped:
                         return final_text
                     if final_text.startswith(flushed_stripped):
-                        return final_text[len(flushed_stripped):].strip()
+                        return final_text[len(flushed_stripped) :].strip()
                     # Model revised something inside the already-flushed prefix — we
                     # can't safely recompute the diff (would risk re-publishing text
                     # that was already billed/translated). Drop the trailing part
@@ -600,7 +667,11 @@ class OpenAISTT:
 
         return await asyncio.wait_for(_collect(), timeout=TRANSCRIBE_EVENT_TIMEOUT_S)
 
-    def _session_payload(self, language: str | None, prompt: str | None) -> dict:
+    def _session_payload(
+        self,
+        language: str | None,
+        prompt: str | None,
+    ) -> dict[str, Any]:
         # input_audio_transcription.language is a real, documented field (ISO-639-1
         # hint): "improves accuracy and latency". Telling the model the speaker's
         # registered language outright (see livekit_ingress_worker's speak_languages
@@ -612,13 +683,13 @@ class OpenAISTT:
         # Seeded with this meeting's glossary/key terms, it steers the model toward
         # the expected domain vocabulary — the research-backed hallucination-reduction
         # lever (arXiv 2410.18363).
-        transcription_config: dict = {"model": self.model}
+        transcription_config: dict[str, Any] = {"model": self.model}
         if language:
             transcription_config["language"] = language
         if prompt:
             transcription_config["prompt"] = prompt
 
-        input_config: dict = {
+        input_config: dict[str, Any] = {
             "format": {"type": "audio/pcm", "rate": REALTIME_SAMPLE_RATE},
             "transcription": transcription_config,
             "turn_detection": None,
@@ -637,7 +708,7 @@ class OpenAISTT:
 
     async def _get_or_create_session(
         self, key: tuple[str, str], language: str | None = None, prompt: str | None = None
-    ) -> dict:
+    ) -> dict[str, Any]:
         self._sweep_idle_sessions()
 
         cached = self._sessions.get(key)
@@ -659,14 +730,21 @@ class OpenAISTT:
             try:
                 await cached["manager"].__aexit__(None, None, None)
             except Exception:
-                logger.debug("stt_session_close_on_language_change_failed", meeting_id=key[0], speaker_id=key[1])
+                logger.debug(
+                    "stt_session_close_on_language_change_failed",
+                    meeting_id=key[0],
+                    speaker_id=key[1],
+                )
             self._sessions.pop(key, None)
 
-        manager = self._client.realtime.connect(extra_query={"intent": "transcription"})
+        client = self._client
+        if client is None:
+            raise RuntimeError("OpenAI STT is not loaded")
+        manager = client.realtime.connect(extra_query={"intent": "transcription"})
         conn = await manager.__aenter__()
 
         try:
-            await conn.session.update(session=self._session_payload(language, prompt))
+            await conn.session.update(session=cast(Any, self._session_payload(language, prompt)))
         except Exception:
             if not language and not prompt:
                 raise
@@ -677,9 +755,14 @@ class OpenAISTT:
                 has_language=bool(language),
                 has_prompt=bool(prompt),
             )
-            await conn.session.update(session=self._session_payload(None, None))
+            await conn.session.update(session=cast(Any, self._session_payload(None, None)))
 
-        session = {"manager": manager, "conn": conn, "last_used": time.monotonic(), "language": language}
+        session = {
+            "manager": manager,
+            "conn": conn,
+            "last_used": time.monotonic(),
+            "language": language,
+        }
         self._sessions[key] = session
         logger.info(
             "realtime_session_opened",
@@ -692,14 +775,16 @@ class OpenAISTT:
 
     def _sweep_idle_sessions(self) -> None:
         now = time.monotonic()
-        stale = [k for k, s in self._sessions.items() if now - s["last_used"] > SESSION_IDLE_TIMEOUT_S]
+        stale = [
+            k for k, s in self._sessions.items() if now - s["last_used"] > SESSION_IDLE_TIMEOUT_S
+        ]
         for k in stale:
             session = self._sessions.pop(k)
             asyncio.create_task(self._close_session(session))
             logger.info("realtime_session_idle_closed", meeting_id=k[0], speaker_id=k[1])
 
     @staticmethod
-    async def _close_session(session: dict) -> None:
+    async def _close_session(session: dict[str, Any]) -> None:
         try:
             await session["manager"].__aexit__(None, None, None)
         except Exception:

@@ -107,7 +107,8 @@ class TestTTSWorker:
         mock_redis_client._redis.xadd.assert_called()
         # Find the tts:results publish (first call is room-specific stream)
         tts_call = next(
-            c for c in mock_redis_client._redis.xadd.call_args_list
+            c
+            for c in mock_redis_client._redis.xadd.call_args_list
             if "tts:results" in str(c.args[0])
         )
         published = tts_call.args[1]
@@ -130,7 +131,8 @@ class TestTTSWorker:
         await worker.process(b"msg-1", _make_msg().to_redis())
 
         tts_call = next(
-            c for c in mock_redis_client._redis.xadd.call_args_list
+            c
+            for c in mock_redis_client._redis.xadd.call_args_list
             if "tts:results" in str(c.args[0])
         )
         published = tts_call.args[1]
@@ -163,7 +165,8 @@ class TestTTSWorker:
         worker.cartesia.synthesize.assert_not_called()
         mock_redis_client._redis.xadd.assert_called()
         tts_call = next(
-            c for c in mock_redis_client._redis.xadd.call_args_list
+            c
+            for c in mock_redis_client._redis.xadd.call_args_list
             if "tts:results" in str(c.args[0])
         )
         assert tts_call.args[1]["cache_hit"] == "true"
@@ -212,9 +215,7 @@ class TestTTSWorker:
 
         # final_chunk_processed is published via publish_system_event → xadd to system_events
         xadd_calls = mock_redis_client._redis.xadd.call_args_list
-        system_event_calls = [
-            c for c in xadd_calls if "system_events" in str(c.args[0])
-        ]
+        system_event_calls = [c for c in xadd_calls if "system_events" in str(c.args[0])]
         assert len(system_event_calls) > 0
 
     async def test_publishes_to_livekit_with_wav_header_stripped(
@@ -227,7 +228,9 @@ class TestTTSWorker:
         worker = _make_worker(mock_redis_client, worker_settings)
         header = b"R" * 44
         pcm_body = b"\x01\x02" * 100
-        worker.cartesia.synthesize = AsyncMock(return_value=(header + pcm_body, 1000, "resolved-voice-id"))
+        worker.cartesia.synthesize = AsyncMock(
+            return_value=(header + pcm_body, 1000, "resolved-voice-id")
+        )
 
         mock_redis_client._redis.hget.return_value = None
         mock_redis_client._redis.get.return_value = None
@@ -237,7 +240,9 @@ class TestTTSWorker:
         worker.livekit_publisher.publish_pcm.assert_awaited_once()
         args, kwargs = worker.livekit_publisher.publish_pcm.call_args
         call_args = {
-            **dict(zip(["meeting_id", "speaker_id", "target_lang", "pcm_s16le", "sample_rate"], args)),
+            **dict(
+                zip(["meeting_id", "speaker_id", "target_lang", "pcm_s16le", "sample_rate"], args)
+            ),
             **kwargs,
         }
         assert call_args["meeting_id"] == "m1"
@@ -265,9 +270,7 @@ class TestTTSWorker:
 class TestGetVoiceId:
     """_get_voice_id Redis lookup tests."""
 
-    async def test_returns_none_when_not_cached(
-        self, mock_redis_client, worker_settings
-    ) -> None:
+    async def test_returns_none_when_not_cached(self, mock_redis_client, worker_settings) -> None:
         worker = TTSWorker.__new__(TTSWorker)
         worker.redis = mock_redis_client
         worker._room_routes = {"m1": [{"SourceUserId": "s1", "VoiceCloneEnabled": True}]}
@@ -276,9 +279,7 @@ class TestGetVoiceId:
         result = await worker._get_voice_id("m1", "s1")
         assert result is None
 
-    async def test_returns_decoded_string(
-        self, mock_redis_client, worker_settings
-    ) -> None:
+    async def test_returns_decoded_string(self, mock_redis_client, worker_settings) -> None:
         worker = TTSWorker.__new__(TTSWorker)
         worker.redis = mock_redis_client
         worker._room_routes = {"m1": [{"SourceUserId": "s1", "VoiceCloneEnabled": True}]}
@@ -372,15 +373,16 @@ class TestConsumeLoopConcurrency:
 
         worker.process = fake_process
 
-        async def fake_consume(**kwargs):
-            yield b"msg-1", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}
-            yield b"msg-2", {"meeting_id": "m1", "speaker_id": "s2", "target_lang": "ja"}
+        async def fake_consume_concurrent(*, handler, **kwargs):
+            await asyncio.gather(
+                handler(b"msg-1", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}),
+                handler(b"msg-2", {"meeting_id": "m1", "speaker_id": "s2", "target_lang": "ja"}),
+            )
             worker._shutdown_event.set()
 
-        worker.redis.consume = fake_consume
+        worker.redis.consume_concurrent = fake_consume_concurrent
 
         await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
-        await asyncio.sleep(0.05)
 
         assert started == [b"msg-1", b"msg-2"]
 
@@ -397,17 +399,18 @@ class TestConsumeLoopConcurrency:
 
         worker.process = fake_process
 
-        async def fake_consume(**kwargs):
+        async def fake_consume_concurrent(*, handler, **kwargs):
             # Same speaker AND same target_lang — same LiveKit track, must stay ordered
             # even though this is sentence 1 and 2 of one utterance.
-            yield b"msg-1", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}
-            yield b"msg-2", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}
+            await asyncio.gather(
+                handler(b"msg-1", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}),
+                handler(b"msg-2", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}),
+            )
             worker._shutdown_event.set()
 
-        worker.redis.consume = fake_consume
+        worker.redis.consume_concurrent = fake_consume_concurrent
 
         await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
-        await asyncio.sleep(0.2)
 
         assert events == [
             ("start", b"msg-1"),
@@ -435,15 +438,16 @@ class TestConsumeLoopConcurrency:
 
         worker.process = fake_process
 
-        async def fake_consume(**kwargs):
-            yield b"msg-1", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}
-            yield b"msg-2", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "ja"}
+        async def fake_consume_concurrent(*, handler, **kwargs):
+            await asyncio.gather(
+                handler(b"msg-1", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}),
+                handler(b"msg-2", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "ja"}),
+            )
             worker._shutdown_event.set()
 
-        worker.redis.consume = fake_consume
+        worker.redis.consume_concurrent = fake_consume_concurrent
 
         await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
-        await asyncio.sleep(0.05)
 
         assert started == [b"msg-1", b"msg-2"]
 
@@ -534,9 +538,7 @@ class TestVoiceCatalog:
             return_value=[{"id": f"v{i}", "name": f"V{i}", "gender": ""} for i in range(6)]
         )
 
-        results = {
-            await worker._hashed_default_voice_id("vi", f"speaker-{i}") for i in range(20)
-        }
+        results = {await worker._hashed_default_voice_id("vi", f"speaker-{i}") for i in range(20)}
 
         assert len(results) > 1
 
@@ -616,7 +618,8 @@ class TestVoiceVariantFanOut:
         # global stream, via BaseWorker.publish()'s dual-write) — the preference
         # variant must not add a second billing event for the same utterance.
         tts_result_calls = [
-            c for c in mock_redis_client._redis.xadd.call_args_list
+            c
+            for c in mock_redis_client._redis.xadd.call_args_list
             if "tts:results" in str(c.args[0])
         ]
         assert len(tts_result_calls) == 2

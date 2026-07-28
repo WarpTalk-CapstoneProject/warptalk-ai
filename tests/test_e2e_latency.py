@@ -104,8 +104,8 @@ async def main():
     os.makedirs(output_dir, exist_ok=True)
 
     for i, case in enumerate(TEST_CASES):
-        print(f"─── Test {i+1}/{len(TEST_CASES)}: {case['description']} ───")
-        print(f"  Input: \"{case['text']}\"")
+        print(f"─── Test {i + 1}/{len(TEST_CASES)}: {case['description']} ───")
+        print(f'  Input: "{case["text"]}"')
 
         # ── 1. Text Chunking (Simulate STT -> Translation Pipelining) ──
         sentences = split_into_sentences(case["text"])
@@ -115,16 +115,14 @@ async def main():
         # Only measure latency to the FIRST chunk (Time To First Byte)
         # In a real pipelined system, subsequent chunks process in background
         first_sentence = sentences[0] if sentences else ""
-        print(f"  First Chunk: \"{first_sentence}\"")
+        print(f'  First Chunk: "{first_sentence}"')
 
         # ── Translation ──
-        translated = await translator.translate(
-            first_sentence, case["language"], case["target"]
-        )
+        translated = await translator.translate(first_sentence, case["language"], case["target"])
         t_translate = time.perf_counter()
         translate_ms = (t_translate - t_start) * 1000
 
-        print(f"  Translated: \"{translated}\"")
+        print(f'  Translated: "{translated}"')
         print(f"  ⏱ Translation (Chunk 1): {translate_ms:.0f}ms")
 
         # ── TTS ──
@@ -146,20 +144,22 @@ async def main():
         print(f"  🔈 Audio:               {audio_kb:.1f} KB, ~{duration_ms}ms")
 
         # Save audio
-        audio_path = os.path.join(output_dir, f"test_{i+1}.mp3")
+        audio_path = os.path.join(output_dir, f"test_{i + 1}.mp3")
         with open(audio_path, "wb") as f:
             f.write(audio_bytes)
         print(f"  💾 Saved: {audio_path}")
         print()
 
-        results.append({
-            "desc": case["description"],
-            "translate_ms": translate_ms,
-            "tts_ms": tts_ms,
-            "total_ms": total_ms,
-            "audio_kb": audio_kb,
-            "translated": translated,
-        })
+        results.append(
+            {
+                "desc": case["description"],
+                "translate_ms": translate_ms,
+                "tts_ms": tts_ms,
+                "total_ms": total_ms,
+                "audio_kb": audio_kb,
+                "translated": translated,
+            }
+        )
 
         # Small gap between tests
         await asyncio.sleep(0.2)

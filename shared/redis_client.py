@@ -13,14 +13,32 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any, ParamSpec, TypeVar, cast
+from urllib.parse import urlsplit
 
 import redis.asyncio as aioredis
+from redis.asyncio.sentinel import Sentinel
 
 from shared.config import RedisSettings
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def _redact_redis_url(url: str) -> str:
+    """Return a log-safe endpoint without credentials or query parameters."""
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname or ""
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return f"{parsed.scheme}://{hostname}{port}{parsed.path}"
+    except ValueError:
+        return "redis://<invalid-endpoint>"
 
 
 class RedisStreamClient:
@@ -45,24 +63,59 @@ class RedisStreamClient:
         self._settings = settings or RedisSettings()
         self._pool: aioredis.ConnectionPool | None = None
         self._redis: aioredis.Redis | None = None
+        self._sentinel: Sentinel | None = None
 
     async def connect(self) -> None:
         """Establish Redis connection with connection pooling."""
-        self._pool = aioredis.ConnectionPool.from_url(
-            self._settings.url,
-            password=self._settings.password or None,
-            max_connections=self._settings.max_connections,
-            socket_timeout=self._settings.socket_timeout,
-            socket_connect_timeout=self._settings.socket_connect_timeout,
-            decode_responses=False,
-        )
-        self._redis = aioredis.Redis(connection_pool=self._pool)
+        if self._settings.sentinel_urls:
+            sentinel_endpoints: list[tuple[str, int]] = []
+            sentinel_uses_tls = False
+            for raw_url in self._settings.sentinel_urls.split(","):
+                parsed = urlsplit(raw_url.strip())
+                if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname:
+                    raise ValueError(f"Invalid Redis Sentinel URL: {_redact_redis_url(raw_url)}")
+                sentinel_endpoints.append((parsed.hostname, parsed.port or 26379))
+                sentinel_uses_tls = sentinel_uses_tls or parsed.scheme == "rediss"
+
+            connection_options: dict[str, Any] = {
+                "password": self._settings.password or None,
+                "max_connections": self._settings.max_connections,
+                "socket_timeout": self._settings.socket_timeout,
+                "socket_connect_timeout": self._settings.socket_connect_timeout,
+                "decode_responses": False,
+                "ssl": sentinel_uses_tls,
+            }
+            self._sentinel = Sentinel(  # type: ignore[no-untyped-call]
+                sentinel_endpoints,
+                sentinel_kwargs={
+                    "password": self._settings.password or None,
+                    "socket_timeout": self._settings.socket_timeout,
+                    "socket_connect_timeout": self._settings.socket_connect_timeout,
+                    "ssl": sentinel_uses_tls,
+                },
+                **connection_options,
+            )
+            self._redis = self._sentinel.master_for(self._settings.sentinel_service_name)
+            self._pool = self._redis.connection_pool
+        else:
+            self._pool = aioredis.ConnectionPool.from_url(
+                self._settings.url,
+                password=self._settings.password or None,
+                max_connections=self._settings.max_connections,
+                socket_timeout=self._settings.socket_timeout,
+                socket_connect_timeout=self._settings.socket_connect_timeout,
+                decode_responses=False,
+            )
+            self._redis = aioredis.Redis(connection_pool=self._pool)
 
         # Verify connection
         await self._redis.ping()
         logger.info(
             "redis_connected",
-            url=self._settings.url,
+            url=_redact_redis_url(self._settings.url),
+            sentinel_service=(
+                self._settings.sentinel_service_name if self._settings.sentinel_urls else None
+            ),
             max_connections=self._settings.max_connections,
         )
 
@@ -84,7 +137,7 @@ class RedisStreamClient:
     # Publishing
     # ------------------------------------------------------------------
 
-    async def publish(self, stream: str, data: dict[str, Any]) -> str:
+    async def publish(self, stream: str, data: dict[str, Any]) -> bytes | str:
         """Publish a message to a Redis Stream with MAXLEN trimming.
 
         Args:
@@ -94,40 +147,115 @@ class RedisStreamClient:
         Returns:
             Redis message ID
         """
-        message_id = await self._retry(
-            self.redis.xadd,
-            stream,
-            data,
-            maxlen=self._settings.stream_maxlen,
-            approximate=True,
-        )
+        redis_data: dict[str, bytes | str | int | float] = {
+            key: value if isinstance(value, (bytes, str, int, float)) else json.dumps(value)
+            for key, value in data.items()
+        }
+        message_id = await self._retry(self.redis.xadd, stream, cast(Any, redis_data))
+        await self._trim_stream_without_losing_unconsumed_entries(stream)
         return message_id
+
+    async def _trim_stream_without_losing_unconsumed_entries(self, stream: str) -> None:
+        """Bound a stream only when trimming cannot remove pending/unread messages.
+
+        Redis 7's ``XADD MAXLEN`` trims entries without considering consumer-group
+        state. A slow or crashed worker can therefore retain a PEL reference whose
+        payload has already disappeared. We prefer bounded growth when consumers
+        lag, then reclaim space as soon as every group advances.
+        """
+        maxlen = self._settings.stream_maxlen
+        if maxlen <= 0 or await self._retry(self.redis.xlen, stream) <= maxlen:
+            return
+
+        groups = cast(list[dict[Any, Any]], await self._retry(self.redis.xinfo_groups, stream))
+        if not groups:
+            await self._retry(
+                self.redis.xtrim,
+                stream,
+                maxlen=maxlen,
+                approximate=True,
+            )
+            return
+
+        required_ids: list[bytes | str] = []
+        for group in groups:
+            group_name = group.get("name") or group.get(b"name")
+            last_delivered = group.get("last-delivered-id") or group.get(b"last-delivered-id")
+            if group_name is None or last_delivered is None:
+                return
+            if self._stream_id_tuple(last_delivered) == (0, 0):
+                return
+
+            pending = cast(
+                dict[Any, Any],
+                await self._retry(self.redis.xpending, stream, group_name),
+            )
+            pending_count = pending.get("pending", pending.get(b"pending", 0))
+            pending_min = pending.get("min") or pending.get(b"min")
+            required = last_delivered
+            if pending_count and pending_min is not None:
+                required = min(
+                    (last_delivered, pending_min),
+                    key=self._stream_id_tuple,
+                )
+            required_ids.append(required)
+
+        earliest_required = min(required_ids, key=self._stream_id_tuple)
+        await self._retry(
+            self.redis.xtrim,
+            stream,
+            minid=earliest_required,
+            approximate=False,
+        )
+
+    @staticmethod
+    def _stream_id_tuple(message_id: bytes | str) -> tuple[int, int]:
+        raw = message_id.decode() if isinstance(message_id, bytes) else message_id
+        milliseconds, sequence = raw.split("-", 1)
+        return int(milliseconds), int(sequence)
 
     async def publish_telemetry(self, room_id: str, worker_type: str, latency_ms: int) -> None:
         """Publish raw telemetry data to the translationRoom:telemetry Pub/Sub channel."""
         import time
+
         payload = {
             "roomId": room_id,
             "routeId": "00000000-0000-0000-0000-000000000000",
             "workerType": worker_type,
             "latencyMs": latency_ms,
-            "timestamp": int(time.time() * 1000)
+            "timestamp": int(time.time() * 1000),
         }
         await self._retry(self.redis.publish, "translationRoom:telemetry", json.dumps(payload))
 
-    async def publish_system_event(self, room_id: str, event_type: str, payload: dict[str, Any]) -> str:
+    async def publish_system_event(
+        self, room_id: str, event_type: str, payload: dict[str, Any]
+    ) -> bytes | str:
         """Publish an event to the translationRoom:system_events Redis Stream."""
         data = {
             "event_type": event_type,
             "route_id": "00000000-0000-0000-0000-000000000000",
             "room_id": room_id,
-            "payload": json.dumps(payload)
+            "payload": json.dumps(payload),
         }
         return await self.publish("translationRoom:system_events", data)
 
     # ------------------------------------------------------------------
     # Consuming
     # ------------------------------------------------------------------
+
+    async def ensure_consumer_group(self, stream: str, group: str) -> None:
+        """Create a consumer group if Redis lost it during restart/failover.
+
+        Starting at ``0`` deliberately replays every retained entry when a group
+        has disappeared. Reprocessing through the existing idempotent consumers
+        is safer than silently skipping work that was appended before recovery.
+        """
+        try:
+            await self.redis.xgroup_create(stream, group, id="0", mkstream=True)
+            logger.info("consumer_group_created", stream=stream, group=group)
+        except aioredis.ResponseError as error:
+            if "BUSYGROUP" not in str(error):
+                raise
 
     async def consume(
         self,
@@ -151,23 +279,20 @@ class RedisStreamClient:
         """
         consumer = consumer or f"worker-{socket.gethostname()}"
 
-        # Ensure consumer group exists
-        try:
-            await self.redis.xgroup_create(stream, group, id="0", mkstream=True)
-            logger.info("consumer_group_created", stream=stream, group=group)
-        except aioredis.ResponseError as e:
-            if "BUSYGROUP" not in str(e):
-                raise
-            # Group already exists — this is fine
+        await self.ensure_consumer_group(stream, group)
 
         while True:
-            messages = await self._retry(
+            messages_raw = await self._retry(
                 self.redis.xreadgroup,
                 groupname=group,
                 consumername=consumer,
                 streams={stream: ">"},
                 count=count,
                 block=block_ms,
+            )
+            messages = cast(
+                list[tuple[bytes, list[tuple[bytes, dict[bytes, bytes]]]]],
+                messages_raw,
             )
 
             if not messages:
@@ -182,7 +307,7 @@ class RedisStreamClient:
         self,
         stream: str,
         group: str,
-        handler,
+        handler: Callable[[bytes, dict[bytes, bytes]], Awaitable[None]],
         consumer: str | None = None,
         block_ms: int = 2000,
         count: int = 4,
@@ -198,20 +323,18 @@ class RedisStreamClient:
         before we know its handler even ran, let alone succeeded — a crash mid-handler would
         then lose that message silently (already acked, never redelivered). This method owns
         the whole read-dispatch-ack cycle itself instead, so each message's XACK is tied to
-        its own handler's completion (success or failure — same "ack regardless" semantics
-        consume() already has, just no longer serialized across messages).
+        its own handler's successful completion. Failed work remains pending for the
+        reclaim/retry/dead-letter path.
 
         Only used when a worker opts in via BaseWorker.concurrency > 1 (see base_worker.py);
         consume() is untouched and remains the default path for every other worker.
         """
+        if count <= 0 or concurrency <= 0:
+            raise ValueError("count and concurrency must be positive")
+
         consumer = consumer or f"worker-{socket.gethostname()}"
 
-        try:
-            await self.redis.xgroup_create(stream, group, id="0", mkstream=True)
-            logger.info("consumer_group_created", stream=stream, group=group)
-        except aioredis.ResponseError as e:
-            if "BUSYGROUP" not in str(e):
-                raise
+        await self.ensure_consumer_group(stream, group)
 
         semaphore = asyncio.Semaphore(concurrency)
 
@@ -220,18 +343,24 @@ class RedisStreamClient:
                 try:
                     await handler(message_id, data)
                 except Exception:
-                    logger.exception("consume_concurrent_handler_error", message_id=message_id, stream=stream)
-                finally:
+                    logger.exception(
+                        "consume_concurrent_handler_error", message_id=message_id, stream=stream
+                    )
+                else:
                     await self.redis.xack(stream, group, message_id)
 
         while True:
-            messages = await self._retry(
+            messages_raw = await self._retry(
                 self.redis.xreadgroup,
                 groupname=group,
                 consumername=consumer,
                 streams={stream: ">"},
                 count=count,
                 block=block_ms,
+            )
+            messages = cast(
+                list[tuple[bytes, list[tuple[bytes, dict[bytes, bytes]]]]],
+                messages_raw,
             )
 
             if not messages:
@@ -243,6 +372,50 @@ class RedisStreamClient:
                 for message_id, data in stream_messages
             ]
             await asyncio.gather(*tasks)
+
+    async def reclaim_stale(
+        self,
+        stream: str,
+        group: str,
+        consumer: str,
+        min_idle_ms: int = 60_000,
+        count: int = 10,
+    ) -> list[tuple[bytes, dict[bytes, bytes]]]:
+        """Claim messages abandoned by a crashed or unhealthy consumer."""
+        # This runs before the normal XREADGROUP path in BaseWorker. Without
+        # recreating the group here, a Redis data loss/restart produces NOGROUP
+        # forever and the worker never reaches consume(), which previously made
+        # a healthy-looking container completely inert.
+        await self.ensure_consumer_group(stream, group)
+        result = await self._retry(
+            self.redis.xautoclaim,
+            stream,
+            group,
+            consumer,
+            min_idle_ms,
+            start_id="0-0",
+            count=count,
+        )
+        return list(result[1]) if len(result) > 1 else []
+
+    async def pending_delivery_count(
+        self,
+        stream: str,
+        group: str,
+        message_id: bytes,
+    ) -> int:
+        """Return how many times Redis has delivered one pending message."""
+        pending = await self._retry(
+            self.redis.xpending_range,
+            stream,
+            group,
+            min=message_id,
+            max=message_id,
+            count=1,
+        )
+        if not pending:
+            return 0
+        return int(pending[0].get("times_delivered", 0))
 
     # ------------------------------------------------------------------
     # Key-value helpers (for voice embeddings, speaker cache, etc.)
@@ -276,13 +449,23 @@ class RedisStreamClient:
     # Retry logic
     # ------------------------------------------------------------------
 
-    async def _retry(self, func, *args, **kwargs):
+    async def _retry(
+        self,
+        func: Callable[P, Awaitable[R]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> R:
         """Execute a Redis command with exponential backoff retry."""
-        last_err = None
+        last_err: BaseException | None = None
         for attempt in range(self._settings.retry_max_attempts):
             try:
                 return await func(*args, **kwargs)
-            except (aioredis.ConnectionError, aioredis.TimeoutError, OSError) as e:
+            except (
+                aioredis.ConnectionError,
+                aioredis.TimeoutError,
+                aioredis.ReadOnlyError,
+                OSError,
+            ) as e:
                 last_err = e
                 delay = self._settings.retry_base_delay * (2**attempt)
                 logger.warning(

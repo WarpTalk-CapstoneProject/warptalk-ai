@@ -9,6 +9,8 @@ from __future__ import annotations
 import base64
 import time
 import uuid
+from collections.abc import Mapping
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -58,7 +60,7 @@ class AudioChunkMessage(BaseModel):
         }
 
     @classmethod
-    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> AudioChunkMessage:
+    def from_redis(cls, data: Mapping[Any, Any]) -> AudioChunkMessage:
         """Deserialize from Redis Stream fields."""
         d = _decode_dict(data)
         return cls(
@@ -73,9 +75,7 @@ class AudioChunkMessage(BaseModel):
             speech_start_ms=int(d.get("speech_start_ms", "0")),
             speech_end_ms=int(d.get("speech_end_ms", "0")),
             input_lufs=float(d.get("input_lufs", "0.0")),
-            noise_suppression_enabled=_redis_to_bool(
-                d.get("noise_suppression_enabled", "false")
-            ),
+            noise_suppression_enabled=_redis_to_bool(d.get("noise_suppression_enabled", "false")),
             is_final_chunk=d.get("is_final_chunk") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
@@ -117,7 +117,7 @@ class STTResultMessage(BaseModel):
         }
 
     @classmethod
-    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> STTResultMessage:
+    def from_redis(cls, data: Mapping[Any, Any]) -> STTResultMessage:
         d = _decode_dict(data)
         return cls(
             segment_id=d.get("segment_id", str(uuid.uuid4())),
@@ -154,7 +154,9 @@ class TranslationResultMessage(BaseModel):
     end_ms: int = 0
     is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
-    translator_model: str = ""  # OpenAITranslator.model — needed by TranscriptService to populate transcript.translation_contents.translator_model (NOT NULL)
+    # OpenAITranslator.model — TranscriptService persists this into the NOT NULL
+    # transcript.translation_contents.translator_model column.
+    translator_model: str = ""
     # The originating STTResultMessage.segment_id, BEFORE the "-{target_lang}-c{idx}"
     # suffix this message's own segment_id gets (see translation_worker._translate_and_publish).
     # Lets a consumer (gateway/frontend) join a translation back to the exact transcript
@@ -187,7 +189,10 @@ class TranslationResultMessage(BaseModel):
         }
 
     @classmethod
-    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> TranslationResultMessage:
+    def from_redis(
+        cls,
+        data: Mapping[Any, Any],
+    ) -> TranslationResultMessage:
         d = _decode_dict(data)
         return cls(
             segment_id=d["segment_id"],
@@ -226,7 +231,9 @@ class TTSResultMessage(BaseModel):
     clone_strength: float = 0.0
     anchor_provider: str = ""
     clone_provider: str = ""
-    provider_voice_id: str = ""  # Cartesia voice id actually used — set even for voice_type='default'
+    provider_voice_id: str = (
+        ""  # Cartesia voice id actually used — set even for voice_type='default'
+    )
     render_location: str = "server"
     cache_key: str = ""
     cache_hit: bool = False
@@ -264,7 +271,7 @@ class TTSResultMessage(BaseModel):
         }
 
     @classmethod
-    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> TTSResultMessage:
+    def from_redis(cls, data: Mapping[Any, Any]) -> TTSResultMessage:
         d = _decode_dict(data)
         return cls(
             segment_id=d["segment_id"],
@@ -304,10 +311,15 @@ class ChatRequestMessage(BaseModel):
     conversation_id: str
     workspace_id: str
     user_id: str
+    origin: str = "assistant"
     bearer_token: str = ""
     history_json: str = "[]"  # JSON array of {"role": ..., "content": ...}
-    page_context_json: str = ""  # JSON {"pageType", "entityId", "workspaceId", "snapshot"} or "" if none
-    mentions_json: str = ""  # JSON array of {"entityType", "entityId", "label", "workspaceId"} or "" if none
+    page_context_json: str = (
+        ""  # JSON {"pageType", "entityId", "workspaceId", "snapshot"} or "" if none
+    )
+    mentions_json: str = (
+        ""  # JSON array of {"entityType", "entityId", "label", "workspaceId"} or "" if none
+    )
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -316,6 +328,7 @@ class ChatRequestMessage(BaseModel):
             "conversation_id": self.conversation_id,
             "workspace_id": self.workspace_id,
             "user_id": self.user_id,
+            "origin": self.origin,
             "bearer_token": self.bearer_token,
             "history_json": self.history_json,
             "page_context_json": self.page_context_json,
@@ -324,13 +337,14 @@ class ChatRequestMessage(BaseModel):
         }
 
     @classmethod
-    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> ChatRequestMessage:
+    def from_redis(cls, data: Mapping[Any, Any]) -> ChatRequestMessage:
         d = _decode_dict(data)
         return cls(
             request_id=d["request_id"],
             conversation_id=d["conversation_id"],
             workspace_id=d["workspace_id"],
             user_id=d["user_id"],
+            origin=d.get("origin", "assistant"),
             bearer_token=d.get("bearer_token", ""),
             history_json=d.get("history_json", "[]"),
             page_context_json=d.get("page_context_json", ""),
@@ -351,6 +365,7 @@ class ChatResultMessage(BaseModel):
     request_id: str
     conversation_id: str
     type: str  # "chunk" | "tool_call_started" | "tool_call_completed" | "completed" | "failed"
+    origin: str = "assistant"
     content: str = ""
     tool_name: str = ""
     tool_status: str = ""
@@ -362,6 +377,7 @@ class ChatResultMessage(BaseModel):
             "request_id": self.request_id,
             "conversation_id": self.conversation_id,
             "type": self.type,
+            "origin": self.origin,
             "content": self.content,
             "tool_name": self.tool_name,
             "tool_status": self.tool_status,
@@ -370,12 +386,13 @@ class ChatResultMessage(BaseModel):
         }
 
     @classmethod
-    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> ChatResultMessage:
+    def from_redis(cls, data: Mapping[Any, Any]) -> ChatResultMessage:
         d = _decode_dict(data)
         return cls(
             request_id=d["request_id"],
             conversation_id=d["conversation_id"],
             type=d["type"],
+            origin=d.get("origin", "assistant"),
             content=d.get("content", ""),
             tool_name=d.get("tool_name", ""),
             tool_status=d.get("tool_status", ""),
@@ -389,12 +406,10 @@ class ChatResultMessage(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _decode_dict(data: dict[bytes | str, bytes | str]) -> dict[str, str]:
+def _decode_dict(data: Mapping[Any, Any]) -> dict[str, str]:
     """Decode Redis byte keys/values to str."""
     return {
-        (k.decode() if isinstance(k, bytes) else k): (
-            v.decode() if isinstance(v, bytes) else v
-        )
+        (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
         for k, v in data.items()
     }
 

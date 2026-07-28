@@ -137,7 +137,10 @@ class QdrantVectorStore(VectorStore):
 
         from qdrant_client import models
 
-        await client.delete(collection_name=collection, points_selector=models.PointIdsList(points=ids))
+        await client.delete(
+            collection_name=collection,
+            points_selector=models.PointIdsList(points=list[int | str](ids)),
+        )
 
     async def _ensure_collection(self, client: Any, collection: str, dimensions: int) -> None:
         from qdrant_client import models

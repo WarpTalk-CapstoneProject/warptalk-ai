@@ -20,6 +20,7 @@ import uuid
 from typing import Any, cast
 
 import httpx
+from openai import AsyncOpenAI
 
 from ai_assistant_worker.chat_tools import TOOLS, TOOLS_BY_NAME, ToolContext
 from shared.base_worker import BaseWorker
@@ -125,35 +126,44 @@ class ChatAssistantWorker(BaseWorker):
     input_stream = "assistant:chat_requests"
     consumer_group = "assistant-chat-workers"
 
-    def __init__(self, chat_settings: ChatAssistantSettings | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        chat_settings: ChatAssistantSettings | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.chat_settings = chat_settings or ChatAssistantSettings()
-        self._openai = None
+        self._openai: AsyncOpenAI | None = None
         self._workspace_client: httpx.AsyncClient | None = None
         self._transcript_client: httpx.AsyncClient | None = None
         self._translation_room_client: httpx.AsyncClient | None = None
 
     async def load_model(self) -> None:
-        from openai import AsyncOpenAI
-
         api_key = resolve_openai_api_key(self.chat_settings.api_key)
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is required for ChatAssistantWorker")
 
         self._openai = AsyncOpenAI(api_key=api_key)
         self._workspace_client = httpx.AsyncClient(
-            base_url=self.chat_settings.workspace_service_url, timeout=SIBLING_SERVICE_TIMEOUT_SECONDS
+            base_url=self.chat_settings.workspace_service_url,
+            timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
         )
         self._transcript_client = httpx.AsyncClient(
-            base_url=self.chat_settings.transcript_service_url, timeout=SIBLING_SERVICE_TIMEOUT_SECONDS
+            base_url=self.chat_settings.transcript_service_url,
+            timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
         )
         self._translation_room_client = httpx.AsyncClient(
-            base_url=self.chat_settings.translation_room_service_url, timeout=SIBLING_SERVICE_TIMEOUT_SECONDS
+            base_url=self.chat_settings.translation_room_service_url,
+            timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
         )
         self.logger.info("chat_assistant_ready", model=self.chat_settings.model)
 
     async def _cleanup(self) -> None:
-        for client in (self._workspace_client, self._transcript_client, self._translation_room_client):
+        for client in (
+            self._workspace_client,
+            self._transcript_client,
+            self._translation_room_client,
+        ):
             if client is not None:
                 await client.aclose()
 
@@ -169,7 +179,9 @@ class ChatAssistantWorker(BaseWorker):
             raise RuntimeError("ChatAssistantWorker is not initialized — call load_model() first")
 
         try:
-            history: list[dict[str, str]] = json.loads(request.history_json) if request.history_json else []
+            history: list[dict[str, str]] = (
+                json.loads(request.history_json) if request.history_json else []
+            )
         except json.JSONDecodeError:
             history = []
 
@@ -196,7 +208,9 @@ class ChatAssistantWorker(BaseWorker):
         except Exception as exc:
             self.logger.exception("chat_turn_failed", request_id=request.request_id)
             await self._publish_result(
-                request, type_="failed", content=str(exc) or "The assistant could not generate a reply."
+                request,
+                type_="failed",
+                content=str(exc) or "The assistant could not generate a reply.",
             )
 
     async def _run_agent_loop(
@@ -212,7 +226,9 @@ class ChatAssistantWorker(BaseWorker):
         mentions_message = _format_mentions(request.mentions_json)
         if mentions_message:
             messages.append({"role": "system", "content": mentions_message})
-        messages.extend({"role": turn.get("role"), "content": turn.get("content")} for turn in history)
+        messages.extend(
+            {"role": turn.get("role"), "content": turn.get("content")} for turn in history
+        )
 
         tool_schemas = [t.to_openai_schema() for t in TOOLS]
         tool_call_log: list[dict[str, Any]] = []
@@ -229,8 +245,8 @@ class ChatAssistantWorker(BaseWorker):
                 model=self.chat_settings.model,
                 temperature=self.chat_settings.temperature,
                 max_tokens=self.chat_settings.max_tokens,
-                messages=messages,
-                tools=tool_schemas,
+                messages=cast(Any, messages),
+                tools=cast(Any, tool_schemas),
                 tool_choice="auto",
                 stream=True,
             )
@@ -248,7 +264,9 @@ class ChatAssistantWorker(BaseWorker):
 
                 if delta.tool_calls:
                     for tc in delta.tool_calls:
-                        acc = tool_calls_acc.setdefault(tc.index, {"id": None, "name": None, "arguments": ""})
+                        acc = tool_calls_acc.setdefault(
+                            tc.index, {"id": None, "name": None, "arguments": ""}
+                        )
                         if tc.id:
                             acc["id"] = tc.id
                         if tc.function and tc.function.name:
@@ -267,18 +285,20 @@ class ChatAssistantWorker(BaseWorker):
                 break
 
             ordered_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": call["id"] or f"call_{uuid.uuid4().hex}",
-                        "type": "function",
-                        "function": {"name": call["name"], "arguments": call["arguments"]},
-                    }
-                    for call in ordered_calls
-                ],
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call["id"] or f"call_{uuid.uuid4().hex}",
+                            "type": "function",
+                            "function": {"name": call["name"], "arguments": call["arguments"]},
+                        }
+                        for call in ordered_calls
+                    ],
+                }
+            )
 
             for call in ordered_calls:
                 call_id = call["id"] or f"call_{uuid.uuid4().hex}"
@@ -302,17 +322,24 @@ class ChatAssistantWorker(BaseWorker):
                         result_json = json.dumps({"error": "The tool failed to execute."})
                         status = "failed"
 
-                await self._publish_result(request, type_="tool_call_completed", tool_name=tool_name, tool_status=status)
+                await self._publish_result(
+                    request, type_="tool_call_completed", tool_name=tool_name, tool_status=status
+                )
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": result_json})
-                tool_call_log.append({
-                    "tool": tool_name,
-                    "arguments": call["arguments"],
-                    "result": result_json,
-                    "status": status,
-                })
+                tool_call_log.append(
+                    {
+                        "tool": tool_name,
+                        "arguments": call["arguments"],
+                        "result": result_json,
+                        "status": status,
+                    }
+                )
         else:
             # Hit max_tool_iterations without a non-tool-call finish.
-            final_text = final_text or "I wasn't able to finish looking that up — please try rephrasing your question."
+            final_text = (
+                final_text
+                or "I wasn't able to finish looking that up — please try rephrasing your question."
+            )
 
         return final_text, tool_call_log
 
@@ -329,6 +356,7 @@ class ChatAssistantWorker(BaseWorker):
             request_id=request.request_id,
             conversation_id=request.conversation_id,
             type=type_,
+            origin=request.origin,
             content=content,
             tool_name=tool_name,
             tool_status=tool_status,

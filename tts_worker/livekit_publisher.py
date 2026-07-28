@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 
 import numpy as np
 from livekit import api, rtc
@@ -100,7 +101,7 @@ class LiveKitTTSPublisher:
 
     def __init__(self, settings: LiveKitSettings) -> None:
         self.settings = settings
-        self._bots: dict[_BotKey, dict] = {}
+        self._bots: dict[_BotKey, dict[str, Any]] = {}
         # One lock per key, held for a caller's ENTIRE publish_pcm() call — not just bot
         # creation. tts_worker now dispatches translate:results messages concurrently
         # (see TTSWorker._consume_loop), so two sentences for the SAME key can genuinely
@@ -171,7 +172,9 @@ class LiveKitTTSPublisher:
                 )
                 self._bots.pop(key, None)
 
-    async def _capture_all(self, source: rtc.AudioSource, pcm_s16le: bytes, sample_rate: int) -> bool:
+    async def _capture_all(
+        self, source: rtc.AudioSource, pcm_s16le: bytes, sample_rate: int
+    ) -> bool:
         """Push all frames; returns False (and logs) on the first capture_frame failure."""
         frame_bytes = int(sample_rate * FRAME_MS / 1000) * 2  # 16-bit mono
         if frame_bytes <= 0:
@@ -196,7 +199,7 @@ class LiveKitTTSPublisher:
 
     async def _get_or_create_bot(
         self, meeting_id: str, speaker_id: str, target_lang: str, voice_key: str, sample_rate: int
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Caller (publish_pcm) already holds this key's lock for its whole call, so no
         locking is needed here — only one task can ever be inside this method for a
         given key at a time."""
@@ -259,11 +262,14 @@ class LiveKitTTSPublisher:
             asyncio.create_task(self._close_bot(bot))
             logger.info(
                 "livekit_tts_bot_idle_closed",
-                meeting_id=k[0], speaker_id=k[1], target_lang=k[2], voice_key=k[3],
+                meeting_id=k[0],
+                speaker_id=k[1],
+                target_lang=k[2],
+                voice_key=k[3],
             )
 
     @staticmethod
-    async def _close_bot(bot: dict) -> None:
+    async def _close_bot(bot: dict[str, Any]) -> None:
         try:
             await bot["room"].disconnect()
         except Exception:

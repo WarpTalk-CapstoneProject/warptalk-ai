@@ -5,7 +5,7 @@ Uses mocked Redis for unit tests and pytest-asyncio for async tests.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -51,6 +51,9 @@ def mock_redis_client(redis_settings: RedisSettings) -> RedisStreamClient:
 
     # Configure specific return values
     client._redis.xadd.return_value = b"1234567890-0"
+    client._redis.xlen.return_value = 1
+    client._redis.xinfo_groups.return_value = []
+    client._redis.xpending.return_value = {"pending": 0}
     client._redis.xreadgroup.return_value = []
     client._redis.hget.return_value = None
     client._redis.hgetall.return_value = {}

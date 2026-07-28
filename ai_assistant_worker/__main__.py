@@ -8,11 +8,10 @@ Both are lightweight consumers with their own consumer group; no need for separa
 
 import asyncio
 
-from shared.config import AssistantSettings, ChatAssistantSettings, WorkerSettings
-from shared.logger import setup_logging
-
 from ai_assistant_worker.chat_worker import ChatAssistantWorker
 from ai_assistant_worker.worker import AIAssistantWorker
+from shared.config import AssistantSettings, ChatAssistantSettings, WorkerSettings
+from shared.logger import setup_logging
 
 
 async def main() -> None:

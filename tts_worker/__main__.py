@@ -4,7 +4,6 @@ import asyncio
 
 from shared.config import TTSSettings, WorkerSettings
 from shared.logger import setup_logging
-
 from tts_worker.worker import TTSWorker
 
 
