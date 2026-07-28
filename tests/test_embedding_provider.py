@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from embedding_worker.providers import LocalEmbeddingProvider, OpenAIEmbeddingProvider
+from embedding_worker.providers import OpenAIEmbeddingProvider, create_embedding_provider
 from shared.config import EmbeddingSettings
 
 
@@ -52,9 +52,6 @@ class TestOpenAIEmbeddingProvider:
             await provider.embed_texts(["hello"])
 
 
-class TestLocalEmbeddingProvider:
-    async def test_local_provider_fails_clearly_until_configured(self) -> None:
-        provider = LocalEmbeddingProvider()
-
-        with pytest.raises(RuntimeError, match="Local embedding provider is not configured"):
-            await provider.embed_texts(["hello"])
+def test_rejects_unimplemented_local_provider_at_configuration_time() -> None:
+    with pytest.raises(ValueError, match="Unsupported embedding provider: local"):
+        create_embedding_provider(EmbeddingSettings(provider="local"))

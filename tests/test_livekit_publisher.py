@@ -24,8 +24,10 @@ def test_tts_bot_idle_timeout_limits_cloud_participant_minutes() -> None:
 
 @pytest.fixture(autouse=True)
 def mock_livekit_sdk():
-    with patch("tts_worker.livekit_publisher.rtc") as mock_rtc, \
-         patch("tts_worker.livekit_publisher.api") as mock_api:
+    with (
+        patch("tts_worker.livekit_publisher.rtc") as mock_rtc,
+        patch("tts_worker.livekit_publisher.api") as mock_api,
+    ):
         mock_room = MagicMock()
         mock_room.connect = AsyncMock()
         mock_room.disconnect = AsyncMock()
@@ -46,7 +48,13 @@ def mock_livekit_sdk():
         token_builder.to_jwt.return_value = "fake-jwt"
         mock_api.AccessToken.return_value = token_builder
 
-        yield {"rtc": mock_rtc, "api": mock_api, "room": mock_room, "source": mock_source, "token_builder": token_builder}
+        yield {
+            "rtc": mock_rtc,
+            "api": mock_api,
+            "room": mock_room,
+            "source": mock_source,
+            "token_builder": token_builder,
+        }
 
 
 class TestLiveKitTTSPublisher:
@@ -61,7 +69,9 @@ class TestLiveKitTTSPublisher:
         mock_livekit_sdk["room"].local_participant.publish_track.assert_awaited_once()
         assert mock_livekit_sdk["source"].capture_frame.await_count == 2
 
-    async def test_bot_identity_and_room_grant_match_speaker_and_lang(self, mock_livekit_sdk) -> None:
+    async def test_bot_identity_and_room_grant_match_speaker_and_lang(
+        self, mock_livekit_sdk
+    ) -> None:
         publisher = LiveKitTTSPublisher(_settings())
         pcm = b"\x00\x01" * 320  # one 20ms frame
 
@@ -77,7 +87,9 @@ class TestLiveKitTTSPublisher:
             room_join=True, room="019f6a39-a32c-7745-886e-1fe622c1f747"
         )
 
-    async def test_reuses_bot_across_calls_for_same_speaker_and_lang(self, mock_livekit_sdk) -> None:
+    async def test_reuses_bot_across_calls_for_same_speaker_and_lang(
+        self, mock_livekit_sdk
+    ) -> None:
         publisher = LiveKitTTSPublisher(_settings())
         pcm = b"\x00\x01" * 320
 
@@ -151,7 +163,9 @@ class TestLiveKitTTSPublisher:
         assert mock_livekit_sdk["room"].connect.await_count == 2
         assert ("room-1", "s1", "vi", "") in publisher._bots
 
-    async def test_capture_frame_fails_twice_gives_up_without_raising(self, mock_livekit_sdk) -> None:
+    async def test_capture_frame_fails_twice_gives_up_without_raising(
+        self, mock_livekit_sdk
+    ) -> None:
         mock_livekit_sdk["source"].capture_frame = AsyncMock(
             side_effect=Exception("InvalidState - failed to capture frame")
         )
@@ -195,7 +209,9 @@ class TestLiveKitTTSPublisher:
         assert ("room-1", "s1", "vi", "") in publisher._bots
         assert ("room-1", "s2", "ja", "") in publisher._bots
 
-    async def test_voice_key_gets_its_own_bot_with_suffixed_identity(self, mock_livekit_sdk) -> None:
+    async def test_voice_key_gets_its_own_bot_with_suffixed_identity(
+        self, mock_livekit_sdk
+    ) -> None:
         """A listener's explicit voice preference (see TTSWorker._resolve_voice_variants)
         must land on its own dedicated track, distinct from the shared default track for
         the same speaker+language — this is what lets that one listener hear a different

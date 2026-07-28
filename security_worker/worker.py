@@ -1,4 +1,6 @@
 import json
+from typing import Any
+
 from openai import AsyncOpenAI
 
 from security_worker.scanners import OpenAISecurityScanner
@@ -9,13 +11,18 @@ RESULT_TTL_SECONDS = 300
 
 
 class SecurityWorker(BaseWorker):
-    """Consumes document text scan requests, coordinates dynamic multi-language PII/DLP scanning & masking via OpenAI, and stores results in Redis."""
+    """Consumes document scan requests, coordinates multi-language PII/DLP
+    scanning and masking through OpenAI, and stores results in Redis."""
 
     worker_name = "security"
     input_stream = "security:scan_requests"
     consumer_group = "security-workers"
 
-    def __init__(self, security_settings: SecuritySettings | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        security_settings: SecuritySettings | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.security_settings = security_settings or SecuritySettings()
         self.openai_client: AsyncOpenAI | None = None
@@ -30,7 +37,9 @@ class SecurityWorker(BaseWorker):
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         decoded_data = {
-            k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else str(v)
+            k.decode() if isinstance(k, bytes) else k: v.decode()
+            if isinstance(v, bytes)
+            else str(v)
             for k, v in data.items()
         }
 
@@ -54,7 +63,13 @@ class SecurityWorker(BaseWorker):
 
             # Fast-path 1: Both disabled -> Return original clean content
             if not pii_enabled and not dlp_enabled:
-                await self._save_result(scan_id, pii_detected=False, dlp_detected=False, violation_found=False, masked_content=content)
+                await self._save_result(
+                    scan_id,
+                    pii_detected=False,
+                    dlp_detected=False,
+                    violation_found=False,
+                    masked_content=content,
+                )
                 return
 
             # Local DLP Keyword Check (<1ms)
@@ -76,7 +91,9 @@ class SecurityWorker(BaseWorker):
                     violation_found=dlp_detected_local,
                     masked_content=content,
                 )
-                self.logger.info("completed_local_dlp_scan", scan_id=scan_id, violation_found=dlp_detected_local)
+                self.logger.info(
+                    "completed_local_dlp_scan", scan_id=scan_id, violation_found=dlp_detected_local
+                )
                 return
 
             # Check OpenAI client
@@ -85,8 +102,9 @@ class SecurityWorker(BaseWorker):
                     scan_id,
                     pii_detected=False,
                     dlp_detected=dlp_detected_local,
-                    violation_found=dlp_detected_local,
-                    masked_content=content,
+                    violation_found=True,
+                    masked_content="",
+                    scan_failed=True,
                 )
                 return
 
@@ -106,18 +124,22 @@ class SecurityWorker(BaseWorker):
             dlp_detected = llm_dlp_detected or dlp_detected_local
             violation_found = violation_found or dlp_detected
 
-            await self._save_result(scan_id, pii_detected, dlp_detected, violation_found, final_masked_content)
-            self.logger.info("completed_scan_request", scan_id=scan_id, violation_found=violation_found)
+            await self._save_result(
+                scan_id, pii_detected, dlp_detected, violation_found, final_masked_content
+            )
+            self.logger.info(
+                "completed_scan_request", scan_id=scan_id, violation_found=violation_found
+            )
 
-        except Exception as e:
+        except Exception:
             self.logger.exception("failed_scan_request", scan_id=scan_id)
-            # Fallback to original content on exception
             await self._save_result(
                 scan_id,
                 pii_detected=False,
                 dlp_detected=False,
-                violation_found=False,
-                masked_content=decoded_data.get("content", ""),
+                violation_found=True,
+                masked_content="",
+                scan_failed=True,
             )
 
     async def _save_result(
@@ -127,6 +149,7 @@ class SecurityWorker(BaseWorker):
         dlp_detected: bool,
         violation_found: bool,
         masked_content: str = "",
+        scan_failed: bool = False,
     ) -> None:
         key = f"security:scan_result:{scan_id}"
         result_payload = {
@@ -134,5 +157,6 @@ class SecurityWorker(BaseWorker):
             "dlp_detected": dlp_detected,
             "violation_found": violation_found,
             "masked_content": masked_content,
+            "scan_failed": scan_failed,
         }
         await self.redis.set_with_ttl(key, json.dumps(result_payload), RESULT_TTL_SECONDS)

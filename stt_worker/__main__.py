@@ -4,7 +4,6 @@ import asyncio
 
 from shared.config import STTSettings, WorkerSettings
 from shared.logger import setup_logging
-
 from stt_worker.worker import STTWorker
 
 

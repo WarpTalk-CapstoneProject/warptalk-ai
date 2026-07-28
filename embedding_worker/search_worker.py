@@ -14,13 +14,13 @@ Pipeline:
 from __future__ import annotations
 
 import json
-
-from shared.base_worker import BaseWorker
-from shared.config import EmbeddingSettings, VectorDbSettings
+from typing import Any
 
 from embedding_worker.providers import EmbeddingProvider, create_embedding_provider
 from embedding_worker.schemas import EmbeddingSearchRequest
 from embedding_worker.vector_store import VectorStore, create_vector_store
+from shared.base_worker import BaseWorker
+from shared.config import EmbeddingSettings, VectorDbSettings
 
 RESULT_TTL_SECONDS = 30
 
@@ -38,7 +38,7 @@ class EmbeddingSearchWorker(BaseWorker):
         vector_settings: VectorDbSettings | None = None,
         provider: EmbeddingProvider | None = None,
         vector_store: VectorStore | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.embedding_settings = embedding_settings or EmbeddingSettings()
@@ -61,12 +61,14 @@ class EmbeddingSearchWorker(BaseWorker):
                 await self._reply(result_key, {"matches": []})
                 return
 
-            vectors = await self.provider.embed_texts([request.query])
+            provider = self._require_provider()
+            vector_store = self._require_vector_store()
+            vectors = await provider.embed_texts([request.query])
             if not vectors:
                 await self._reply(result_key, {"matches": []})
                 return
 
-            matches = await self.vector_store.search(
+            matches = await vector_store.search(
                 collection=request.collection_id,
                 vector=vectors[0],
                 top_k=request.top_k,
@@ -77,6 +79,16 @@ class EmbeddingSearchWorker(BaseWorker):
             self.logger.exception("semantic_search_failed", job_id=request.job_id)
             await self._reply(result_key, {"matches": [], "error": str(exc)})
 
-    async def _reply(self, result_key: str, payload: dict) -> None:
+    async def _reply(self, result_key: str, payload: dict[str, Any]) -> None:
         await self.redis.redis.rpush(result_key, json.dumps(payload))
         await self.redis.expire(result_key, RESULT_TTL_SECONDS)
+
+    def _require_provider(self) -> EmbeddingProvider:
+        if self.provider is None:
+            raise RuntimeError("Embedding provider is not loaded")
+        return self.provider
+
+    def _require_vector_store(self) -> VectorStore:
+        if self.vector_store is None:
+            raise RuntimeError("Vector store is not loaded")
+        return self.vector_store

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from typing import Any, cast
 
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
@@ -34,7 +35,7 @@ class TranslationWorker(BaseWorker):
     def __init__(
         self,
         translation_settings: TranslationSettings | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.translation_settings = translation_settings or TranslationSettings()
@@ -44,7 +45,7 @@ class TranslationWorker(BaseWorker):
         # GlossaryStartedEventConsumer (TranscriptService) when the room starts. Cached for
         # the room's lifetime — same "don't hit Redis on every chunk" reasoning as
         # stt_worker's _stt_prompts (see docs/code-switching-research.md).
-        self._mt_glossaries: dict[str, list[dict]] = {}
+        self._mt_glossaries: dict[str, list[dict[str, str]]] = {}
 
     async def load_model(self) -> None:
         """Initialize OpenAI translation client."""
@@ -70,10 +71,8 @@ class TranslationWorker(BaseWorker):
         concurrently (bounded by _CONCURRENCY_LIMIT) so sentence 2's translation can
         start while sentence 1's is still in flight.
 
-        Trade-off: RedisStreamClient.consume() acks a message right after yielding it,
-        not after process() returns, so a crash mid-flight loses whatever's currently
-        dispatched instead of it being redelivered. Accepted here — an occasional lost
-        translation chunk is a smaller cost than re-serializing every utterance.
+        RedisStreamClient.consume_concurrent ties XACK to successful handler
+        completion. Failed work remains pending for BaseWorker's reclaim/DLQ path.
         """
         self.logger.info(
             "consume_loop_started",
@@ -81,28 +80,22 @@ class TranslationWorker(BaseWorker):
             group=self.consumer_group,
             consumer=self._consumer_name,
         )
-        semaphore = asyncio.Semaphore(self._CONCURRENCY_LIMIT)
 
         async def _run(message_id: bytes, data: dict[bytes, bytes]) -> None:
-            async with semaphore:
-                try:
-                    await self.process(message_id, data)
-                except Exception:
-                    self.logger.exception(
-                        "process_error", message_id=message_id, stream=self.input_stream
-                    )
+            await self._process_and_log_errors(message_id, data)
 
         while not self._shutdown_event.is_set():
             try:
-                async for message_id, data in self.redis.consume(
+                await self._recover_stale_messages()
+                await self.redis.consume_concurrent(
                     stream=self.input_stream,
                     group=self.consumer_group,
+                    handler=_run,
                     consumer=self._consumer_name,
                     block_ms=2000,
-                ):
-                    if self._shutdown_event.is_set():
-                        break
-                    asyncio.create_task(_run(message_id, data))
+                    count=self._CONCURRENCY_LIMIT,
+                    concurrency=self._CONCURRENCY_LIMIT,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -149,24 +142,28 @@ class TranslationWorker(BaseWorker):
                         target_lang=target_lang,
                         is_final_chunk=True,
                         timestamp_ms=stt_result.timestamp_ms,
-                        translator_model=self.translator.model,
+                        translator_model=self._require_translator().model,
                         source_segment_id=stt_result.segment_id,
                         chunk_index=0,
                     )
-                    await self.publish("translate:results", stt_result.meeting_id, result.to_redis())
+                    await self.publish(
+                        "translate:results", stt_result.meeting_id, result.to_redis()
+                    )
             return
 
-        await asyncio.gather(*(
-            self._translate_and_publish(stt_result, sentences, target_lang, glossary_terms)
-            for target_lang in target_langs
-        ))
+        await asyncio.gather(
+            *(
+                self._translate_and_publish(stt_result, sentences, target_lang, glossary_terms)
+                for target_lang in target_langs
+            )
+        )
 
     async def _translate_and_publish(
         self,
         stt_result: STTResultMessage,
         sentences: list[str],
         target_lang: str,
-        glossary_terms: list[dict] | None = None,
+        glossary_terms: list[dict[str, str]] | None = None,
     ) -> None:
         # Fire off translation for all sentences UP FRONT so they run concurrently instead
         # of one-sentence-at-a-time (each translate() call is a real OpenAI network
@@ -180,9 +177,10 @@ class TranslationWorker(BaseWorker):
         first_task: asyncio.Task[str] | None = None
         rest_task: asyncio.Task[list[str]] | None = None
         rest_results: list[str] | None = None
+        translator = self._require_translator()
         if not passthrough:
             first_task = asyncio.create_task(
-                self.translator.translate(
+                translator.translate(
                     sentences[0],
                     source_lang=stt_result.language,
                     target_lang=target_lang,
@@ -191,7 +189,7 @@ class TranslationWorker(BaseWorker):
             )
             if len(sentences) > 1:
                 rest_task = asyncio.create_task(
-                    self.translator.translate_batch(
+                    translator.translate_batch(
                         sentences[1:],
                         source_lang=stt_result.language,
                         target_lang=target_lang,
@@ -208,9 +206,11 @@ class TranslationWorker(BaseWorker):
             if passthrough:
                 translated_text = sentence
             elif idx == 0:
+                assert first_task is not None
                 translated_text = await first_task
             else:
                 if rest_results is None:
+                    assert rest_task is not None
                     rest_results = await rest_task
                 translated_text = rest_results[idx - 1]
 
@@ -229,7 +229,7 @@ class TranslationWorker(BaseWorker):
                 end_ms=stt_result.end_ms,
                 is_final_chunk=is_final,
                 timestamp_ms=stt_result.timestamp_ms,
-                translator_model=self.translator.model,
+                translator_model=translator.model,
                 source_segment_id=stt_result.segment_id,
                 chunk_index=idx,
             )
@@ -276,7 +276,7 @@ class TranslationWorker(BaseWorker):
         # No other participant registered yet — avoid assuming Vietnamese for all users.
         return targets or {"en"}
 
-    async def _get_mt_glossary(self, meeting_id: str) -> list[dict]:
+    async def _get_mt_glossary(self, meeting_id: str) -> list[dict[str, str]]:
         """This meeting's workspace glossary, as [{"source": ..., "target": ...}, ...] —
         published to `translationRoom:{meeting_id}:mt_glossary` by
         GlossaryStartedEventConsumer (TranscriptService) when the room starts. Cached for
@@ -292,12 +292,12 @@ class TranslationWorker(BaseWorker):
             return cached
 
         raw = await self.redis.get(f"translationRoom:{meeting_id}:mt_glossary")
-        glossary: list[dict] = []
+        glossary: list[dict[str, str]] = []
         if raw:
             try:
                 parsed = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
                 if isinstance(parsed, list):
-                    glossary = [t for t in parsed if isinstance(t, dict)]
+                    glossary = [cast(dict[str, str], t) for t in parsed if isinstance(t, dict)]
             except (json.JSONDecodeError, UnicodeDecodeError):
                 self.logger.warning("mt_glossary_parse_failed", meeting_id=meeting_id)
 
@@ -309,3 +309,8 @@ class TranslationWorker(BaseWorker):
     def _cleanup_room(self, room_id: str) -> None:
         super()._cleanup_room(room_id)
         self._mt_glossaries.pop(room_id, None)
+
+    def _require_translator(self) -> OpenAITranslator:
+        if self.translator is None:
+            raise RuntimeError("Translation model is not loaded")
+        return self.translator

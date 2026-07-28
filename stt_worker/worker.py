@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
+from collections.abc import Mapping
+from typing import Any
 
 from shared.base_worker import BaseWorker
 from shared.config import STTSettings, resolve_openai_api_key
@@ -17,7 +20,7 @@ from shared.schemas import AudioChunkMessage, STTResultMessage
 from stt_worker.model import OpenAISTT, TranscribedSegment, _normalize_language
 
 
-def _decode_field(data: dict, key: str) -> str:
+def _decode_field(data: Mapping[Any, Any], key: str) -> str:
     raw = data.get(key)
     if raw is None:
         raw = data.get(key.encode())
@@ -26,7 +29,9 @@ def _decode_field(data: dict, key: str) -> str:
     return raw.decode() if isinstance(raw, bytes) else raw
 
 
-def _extract_speaker_key(data: dict) -> tuple[str, str]:
+def _extract_speaker_key(
+    data: Mapping[Any, Any],
+) -> tuple[str, str]:
     """Cheap (meeting_id, speaker_id) extraction from a raw audio:chunks Redis entry.
 
     Deliberately avoids AudioChunkMessage.from_redis(), which base64-decodes the (often
@@ -37,6 +42,7 @@ def _extract_speaker_key(data: dict) -> tuple[str, str]:
     meeting_id = _decode_field(data, "meeting_id") or _decode_field(data, "translation_room_id")
     speaker_id = _decode_field(data, "speaker_id")
     return meeting_id, speaker_id
+
 
 # Generic, domain-neutral biasing prompt fed to every STT session even when the room has
 # no glossary configured. transcription.prompt (gpt-4o-transcribe) conditions the model
@@ -73,6 +79,20 @@ _GENERIC_STT_BASE_PROMPT = (
 _ROOM_LANGUAGES_TTL_S = 15.0
 
 
+def _build_segment_id(
+    meeting_id: str,
+    speaker_id: str,
+    source_message_id: bytes,
+    start_ms: int,
+    end_ms: int,
+    text: str,
+) -> str:
+    """Create an idempotent segment id from the immutable Redis source event."""
+    source_id = source_message_id.decode("utf-8", errors="replace")
+    material = f"warptalk:stt:{meeting_id}:{speaker_id}:{source_id}:{start_ms}:{end_ms}:{text}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, material))
+
+
 class STTWorker(BaseWorker):
     """Speech-to-Text worker using OpenAI gpt-4o-mini-transcribe."""
 
@@ -80,7 +100,11 @@ class STTWorker(BaseWorker):
     input_stream = "audio:chunks"
     consumer_group = "stt-workers"
 
-    def __init__(self, stt_settings: STTSettings | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        stt_settings: STTSettings | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.stt_settings = stt_settings or STTSettings()
         self.model: OpenAISTT | None = None
@@ -126,10 +150,8 @@ class STTWorker(BaseWorker):
         session concurrently would interleave the transcription stream. Locking keeps
         that path exactly as ordered as before; only cross-speaker work is now parallel.
 
-        Same acking trade-off as translation_worker's override: RedisStreamClient.
-        consume() acks a message right after yielding it, not after process() returns,
-        so a crash mid-flight loses whatever's currently dispatched instead of it being
-        redelivered.
+        RedisStreamClient.consume_concurrent ties XACK to successful handler
+        completion. Failed work remains pending for BaseWorker's reclaim/DLQ path.
         """
         self.logger.info(
             "consume_loop_started",
@@ -142,24 +164,20 @@ class STTWorker(BaseWorker):
             key = _extract_speaker_key(data)
             lock = self._speaker_locks.setdefault(key, asyncio.Lock())
             async with lock:
-                try:
-                    await self.process(message_id, data)
-                except Exception:
-                    self.logger.exception(
-                        "process_error", message_id=message_id, stream=self.input_stream
-                    )
+                await self._process_and_log_errors(message_id, data)
 
         while not self._shutdown_event.is_set():
             try:
-                async for message_id, data in self.redis.consume(
+                await self._recover_stale_messages()
+                await self.redis.consume_concurrent(
                     stream=self.input_stream,
                     group=self.consumer_group,
+                    handler=_run,
                     consumer=self._consumer_name,
                     block_ms=2000,
-                ):
-                    if self._shutdown_event.is_set():
-                        break
-                    asyncio.create_task(_run(message_id, data))
+                    count=8,
+                    concurrency=8,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -209,6 +227,14 @@ class STTWorker(BaseWorker):
             # in the Realtime API's incremental delta stream, so translation/TTS can
             # start on it without waiting for the rest of the chunk to transcribe.
             result = STTResultMessage(
+                segment_id=_build_segment_id(
+                    chunk.meeting_id,
+                    chunk.speaker_id,
+                    message_id,
+                    segment.start_ms,
+                    segment.end_ms,
+                    segment.text,
+                ),
                 meeting_id=chunk.meeting_id,
                 speaker_id=chunk.speaker_id,
                 text=segment.text,
@@ -230,7 +256,8 @@ class STTWorker(BaseWorker):
 
         t0 = time.monotonic()
         try:
-            segments = await self.model.transcribe(
+            model = self._require_model()
+            segments = await model.transcribe(
                 chunk.audio_data,
                 sample_rate=chunk.sample_rate,
                 language=language_hint,
@@ -271,6 +298,14 @@ class STTWorker(BaseWorker):
 
         for segment in segments:
             result = STTResultMessage(
+                segment_id=_build_segment_id(
+                    chunk.meeting_id,
+                    chunk.speaker_id,
+                    message_id,
+                    segment.start_ms,
+                    segment.end_ms,
+                    segment.text,
+                ),
                 meeting_id=chunk.meeting_id,
                 speaker_id=chunk.speaker_id,
                 text=segment.text,
@@ -296,6 +331,14 @@ class STTWorker(BaseWorker):
 
         if not segments and chunk.is_final_chunk:
             result = STTResultMessage(
+                segment_id=_build_segment_id(
+                    chunk.meeting_id,
+                    chunk.speaker_id,
+                    message_id,
+                    0,
+                    0,
+                    "",
+                ),
                 meeting_id=chunk.meeting_id,
                 speaker_id=chunk.speaker_id,
                 text="",
@@ -304,6 +347,11 @@ class STTWorker(BaseWorker):
                 timestamp_ms=chunk.timestamp_ms,
             )
             await self.publish("stt:results", chunk.meeting_id, result.to_redis())
+
+    def _require_model(self) -> OpenAISTT:
+        if self.model is None:
+            raise RuntimeError("STT model is not loaded")
+        return self.model
 
     async def _get_stt_prompt(self, meeting_id: str) -> str | None:
         """Contextual-biasing prompt for this room: a generic anti-hallucination base

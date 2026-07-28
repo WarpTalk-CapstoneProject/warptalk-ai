@@ -1,0 +1,107 @@
+name: ai-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Secret scan for introduced commits
+        env:
+          SECRET_SCAN_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          range="$SECRET_SCAN_BASE..$GITHUB_SHA"
+          if [ -z "$SECRET_SCAN_BASE" ] || printf '%s' "$SECRET_SCAN_BASE" | grep -Eq '^0+$'; then
+            range=-1
+          fi
+          docker run --rm \
+            -v "$PWD:/repo:ro" \
+            zricethezav/gitleaks:v8.30.0@sha256:691af3c7c5a48b16f187ce3446d5f194838f91238f27270ed36eef6359a574d9 \
+            git /repo --log-opts="$range" --redact --exit-code 1 --no-banner
+      - name: Immutable workflow and runtime image references
+        run: |
+          if grep -REn 'uses:[[:space:]]+[^[:space:]#]+@(v[0-9]+|main|master|latest)([[:space:]#]|$)' .github/workflows; then
+            echo "GitHub Actions must be pinned to full commit SHAs." >&2
+            exit 1
+          fi
+          if grep -REn 'image:[[:space:]]+[^[:space:]#]+:(latest|main|master)([[:space:]#]|$)' docker-compose.yml; then
+            echo "Third-party runtime images must not use mutable tags." >&2
+            exit 1
+          fi
+          if ! find . -type f -name 'Dockerfile*' -print0 |
+            xargs -0 awk '
+              toupper($1) == "FROM" &&
+              $2 ~ /[/:]/ &&
+              $2 !~ /@sha256:[0-9a-f]{64}$/ {
+                print FILENAME ":" FNR ":" $0
+                invalid = 1
+              }
+              END { exit invalid }
+            '; then
+            echo "External Dockerfile base images must be pinned by digest." >&2
+            exit 1
+          fi
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: '0.9.18'
+          enable-cache: true
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - run: >-
+          uv sync --locked
+          --extra dev
+          --extra billing
+          --extra tts
+          --extra embeddings
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy
+      - run: >-
+          uv run pytest -q
+          -o faulthandler_timeout=30
+          -o faulthandler_exit_on_timeout=true
+          --junitxml=artifacts/ai-tests.xml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: ai-test-results
+          path: artifacts/ai-tests.xml
+
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - stt
+          - translation
+          - tts
+          - assistant
+          - embedding
+          - billing
+          - livekit-ingress
+          - security
+          - metrics
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=ai-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=ai-${{ matrix.target }}

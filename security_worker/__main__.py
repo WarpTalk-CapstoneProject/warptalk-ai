@@ -2,10 +2,9 @@
 
 import asyncio
 
+from security_worker.worker import SecurityWorker
 from shared.config import SecuritySettings, WorkerSettings
 from shared.logger import setup_logging
-
-from security_worker.worker import SecurityWorker
 
 
 async def main() -> None:

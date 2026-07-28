@@ -63,12 +63,17 @@ class NearFieldGate:
             self._update_baseline(raw_peak)
             return True
 
-        floor = self._baseline_peak * self._relative_floor
+        baseline_peak = self._baseline_peak
+        if baseline_peak is None:
+            self._update_baseline(raw_peak)
+            return True
+
+        floor = baseline_peak * self._relative_floor
         if raw_peak < floor:
             logger.info(
                 "near_field_gate_rejected_chunk",
                 raw_peak=round(raw_peak, 4),
-                baseline_peak=round(self._baseline_peak, 4),
+                baseline_peak=round(baseline_peak, 4),
                 floor=round(floor, 4),
             )
             return False

@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 from shared.config import TranslationSettings, WorkerSettings
 from shared.schemas import STTResultMessage
-from translation_worker.translator import OpenAITranslator, _build_glossary_block, _exception_clause, _lang_name
+from translation_worker.translator import (
+    OpenAITranslator,
+    _build_glossary_block,
+    _exception_clause,
+    _lang_name,
+)
 from translation_worker.worker import TranslationWorker
 
 
@@ -48,7 +53,9 @@ class TestGlossaryBlock:
         assert "do not translate" in block.lower()
 
     def test_exact_mapping_when_target_differs(self) -> None:
-        block = _build_glossary_block([{"source": "marketing plan", "target": "kế hoạch marketing"}])
+        block = _build_glossary_block(
+            [{"source": "marketing plan", "target": "kế hoạch marketing"}]
+        )
         assert "marketing plan" in block
         assert "kế hoạch marketing" in block
         assert "exact translations" in block.lower()
@@ -279,9 +286,7 @@ class TestTranslationWorker:
         await worker.process(b"msg-1", self._make_stt_msg().to_redis())
 
         # Verify publish to translate:results stream
-        streams_published = [
-            str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list
-        ]
+        streams_published = [str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list]
         assert any("translate:results" in s for s in streams_published)
 
     async def test_multi_sentence_uses_translate_for_first_and_batch_for_rest(
@@ -309,7 +314,8 @@ class TestTranslationWorker:
         )
 
         published = [
-            c.args for c in mock_redis_client._redis.xadd.call_args_list
+            c.args
+            for c in mock_redis_client._redis.xadd.call_args_list
             if "translate:results" in str(c.args[0])
         ]
         # BaseWorker.publish() dual-writes (per-room + flat global stream) per chunk,
@@ -324,7 +330,9 @@ class TestTranslationWorker:
         # _translate_and_publish. billing_worker's _extract_underlying_segment_id()
         # only reads the first 36 chars (the GUID), so it is unaffected by this suffix.
         assert chunk_ids == {f"{msg.segment_id}-vi-c0", f"{msg.segment_id}-vi-c1"}
-        texts_by_chunk = {data["segment_id"]: data["translated_text"] for _stream, data in published}
+        texts_by_chunk = {
+            data["segment_id"]: data["translated_text"] for _stream, data in published
+        }
         assert texts_by_chunk[f"{msg.segment_id}-vi-c0"] == "Xin chào"
         assert texts_by_chunk[f"{msg.segment_id}-vi-c1"] == "Bạn khỏe không"
 
@@ -450,14 +458,15 @@ class TestConsumeLoopConcurrency:
 
         worker.process = fake_process
 
-        async def fake_consume(**kwargs):
-            yield b"msg-1", {}
-            yield b"msg-2", {}
+        async def fake_consume_concurrent(*, handler, **kwargs):
+            await asyncio.gather(
+                handler(b"msg-1", {}),
+                handler(b"msg-2", {}),
+            )
             worker._shutdown_event.set()
 
-        worker.redis.consume = fake_consume
+        worker.redis.consume_concurrent = fake_consume_concurrent
 
         await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
-        await asyncio.sleep(0.05)  # let the dispatched create_task()s finish
 
         assert started == [b"msg-1", b"msg-2"]

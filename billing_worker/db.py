@@ -9,6 +9,7 @@ This module is where those logical references get resolved at read time instead.
 from __future__ import annotations
 
 import uuid
+from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
 import asyncpg
@@ -21,6 +22,12 @@ logger = get_logger(__name__)
 
 def _as_uuid(value: str) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
+
+def calculate_credit_charge(quantity: float, unit_price: Decimal) -> int:
+    """Apply an immutable rate-card snapshot and bill whole credits."""
+    raw_cost = Decimal(str(quantity)) * unit_price
+    return max(1, int(raw_cost.to_integral_value(rounding=ROUND_CEILING)))
 
 
 class BillingRepository:
@@ -43,24 +50,11 @@ class BillingRepository:
             await self._pool.close()
         logger.info("billing_db_disconnected")
 
-    async def resolve_subscription(
-        self, translation_room_id: str
-    ) -> tuple[uuid.UUID, uuid.UUID] | None:
-        """Return (subscription_id, workspace_id) for the room's active subscription.
-
-        None if the room, its workspace, or an active subscription can't be found —
-        callers must treat that as "cannot bill this event" and log+skip, never guess.
-        """
+    async def resolve_subscription(self, workspace_id: str) -> tuple[uuid.UUID, uuid.UUID] | None:
+        """Return the active Billing-owned subscription for a workspace projection."""
         assert self._pool is not None, "call connect() first"
-        room_id = _as_uuid(translation_room_id)
+        workspace_uuid = _as_uuid(workspace_id)
         async with self._pool.acquire() as conn:
-            workspace_id = await conn.fetchval(
-                "SELECT workspace_id FROM translation_room.translation_rooms WHERE id = $1",
-                room_id,
-            )
-            if workspace_id is None:
-                return None
-
             subscription_id = await conn.fetchval(
                 """
                 SELECT id FROM subscription.subscriptions
@@ -68,12 +62,12 @@ class BillingRepository:
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                workspace_id,
+                workspace_uuid,
             )
             if subscription_id is None:
                 return None
 
-            return subscription_id, workspace_id
+            return subscription_id, workspace_uuid
 
     async def record_usage_and_charge(
         self,
@@ -88,20 +82,17 @@ class BillingRepository:
         reference_type: str,
         quantity: float,
         unit: str,
-        credits_consumed: int,
         idempotency_key: str,
         transcript_segment_id: str | uuid.UUID | None = None,
+        source_language_code: str | None = None,
+        target_language_code: str | None = None,
+        currency: str = "CRD",
         details: dict[str, Any] | None = None,
     ) -> bool:
         """Insert usage_records + credit_transactions, idempotent on idempotency_key.
 
         Returns True if a new charge was recorded, False if this idempotency_key was
         already settled (safe on Redis Streams redelivery / worker restart / retry).
-
-        credits_consumed is currently a flat placeholder (see settlement.py) pending the
-        usage_rate_card lookup design (source/target language + currency tiers) from
-        warptalk-v4-final.dbml — wiring that up is real pricing work, not schema work,
-        and deliberately out of scope here so this doesn't ship guessed prices.
 
         transcript_segment_id should be the real transcript.transcript_segments.id GUID —
         callers must extract it from any composite segment_id (translation_worker mints
@@ -120,7 +111,9 @@ class BillingRepository:
         segment_uuid = (
             transcript_segment_id
             if isinstance(transcript_segment_id, uuid.UUID)
-            else _as_uuid(transcript_segment_id) if transcript_segment_id else None
+            else _as_uuid(transcript_segment_id)
+            if transcript_segment_id
+            else None
         )
 
         async with self._pool.acquire() as conn:
@@ -131,6 +124,37 @@ class BillingRepository:
                 )
                 if existing is not None:
                     return False
+
+                rate = await conn.fetchrow(
+                    """
+                    SELECT id, unit_price, currency
+                    FROM subscription.usage_rate_card
+                    WHERE charge_type = $1
+                      AND currency = $2
+                      AND effective_from <= now()
+                      AND (effective_to IS NULL OR effective_to > now())
+                      AND (source_language_code = $3 OR source_language_code IS NULL)
+                      AND (target_language_code = $4 OR target_language_code IS NULL)
+                    ORDER BY
+                      (source_language_code IS NOT NULL)::int DESC,
+                      (target_language_code IS NOT NULL)::int DESC,
+                      effective_from DESC
+                    LIMIT 1
+                    """,
+                    charge_type,
+                    currency,
+                    source_language_code,
+                    target_language_code,
+                )
+                if rate is None:
+                    raise RuntimeError(
+                        "No active usage rate card for "
+                        f"{charge_type}/{source_language_code}/{target_language_code}/{currency}"
+                    )
+                rate_card_id = rate["id"]
+                unit_price = Decimal(str(rate["unit_price"]))
+                applied_currency = rate["currency"]
+                credits_consumed = calculate_credit_charge(quantity, unit_price)
 
                 usage_record_id = await conn.fetchval(
                     """
@@ -157,20 +181,24 @@ class BillingRepository:
                     UPDATE subscription.subscriptions
                     SET credits_remaining = credits_remaining - $2,
                         credits_used_this_cycle = credits_used_this_cycle + $2
-                    WHERE id = $1
+                    WHERE id = $1 AND credits_remaining >= $2
                     RETURNING credits_remaining
                     """,
                     subscription_id,
                     credits_consumed,
                 )
+                if new_balance is None:
+                    raise RuntimeError(f"Insufficient credits for subscription {subscription_id}")
 
                 await conn.execute(
                     """
                     INSERT INTO subscription.credit_transactions
                         (subscription_id, user_id, amount, type, reference_id, reference_type,
                          balance_after, charge_type, usage_record_id, idempotency_key,
-                         transcript_segment_id)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                         transcript_segment_id, pricing_rate_card_id,
+                         unit_price_snapshot, currency)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                            $12, $13, $14)
                     """,
                     subscription_id,
                     user_uuid,
@@ -183,6 +211,9 @@ class BillingRepository:
                     usage_record_id,
                     idempotency_key,
                     segment_uuid,
+                    rate_card_id,
+                    unit_price,
+                    applied_currency,
                 )
 
         logger.info(

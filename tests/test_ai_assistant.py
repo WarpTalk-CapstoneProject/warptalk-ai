@@ -58,7 +58,7 @@ async def test_generate_structured_summary_parses_model_json() -> None:
     assert result["insufficientData"] is False
 
 
-async def test_generate_structured_summary_requests_bilingual_output_for_multiple_target_languages() -> None:
+async def test_structured_summary_requests_bilingual_output() -> None:
     assistant = _make_assistant_with_fake_client(json.dumps({"summary": "ok"}))
 
     await assistant.generate_structured_summary(

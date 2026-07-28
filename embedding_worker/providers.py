@@ -57,17 +57,8 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         return [list(item.embedding) for item in response.data]
 
 
-class LocalEmbeddingProvider(EmbeddingProvider):
-    """Placeholder for future privacy-preserving local embeddings."""
-
-    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        raise RuntimeError("Local embedding provider is not configured")
-
-
 def create_embedding_provider(settings: EmbeddingSettings | None = None) -> EmbeddingProvider:
     settings = settings or EmbeddingSettings()
     if settings.provider == "openai":
         return OpenAIEmbeddingProvider(settings)
-    if settings.provider == "local":
-        return LocalEmbeddingProvider()
     raise ValueError(f"Unsupported embedding provider: {settings.provider}")

@@ -4,7 +4,6 @@ import asyncio
 
 from shared.config import TranslationSettings, WorkerSettings
 from shared.logger import setup_logging
-
 from translation_worker.worker import TranslationWorker
 
 

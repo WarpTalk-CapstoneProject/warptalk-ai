@@ -6,10 +6,9 @@ Env vars beyond the shared REDIS_* ones:
 
 import asyncio
 
+from billing_worker.worker import BillingSettlementWorker
 from shared.config import BillingSettings, WorkerSettings
 from shared.logger import setup_logging
-
-from billing_worker.worker import BillingSettlementWorker
 
 
 async def main() -> None:

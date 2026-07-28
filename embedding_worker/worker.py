@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from itertools import islice
-from typing import Any, cast
-
-from shared.base_worker import BaseWorker
-from shared.config import EmbeddingSettings, VectorDbSettings
+from typing import Any, TypeVar, cast
 
 from embedding_worker.providers import (
     EmbeddingProvider,
@@ -15,6 +13,10 @@ from embedding_worker.providers import (
 )
 from embedding_worker.schemas import EmbeddingIndexRequest, EmbeddingIndexResult
 from embedding_worker.vector_store import VectorStore, create_vector_store
+from shared.base_worker import BaseWorker
+from shared.config import EmbeddingSettings, VectorDbSettings
+
+T = TypeVar("T")
 
 
 class EmbeddingWorker(BaseWorker):
@@ -30,7 +32,7 @@ class EmbeddingWorker(BaseWorker):
         vector_settings: VectorDbSettings | None = None,
         provider: EmbeddingProvider | None = None,
         vector_store: VectorStore | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.embedding_settings = embedding_settings or EmbeddingSettings()
@@ -122,10 +124,7 @@ class EmbeddingWorker(BaseWorker):
             return "ai_retrieval_not_allowed"
         if request.retention_state != "active":
             return "source_not_active"
-        if (
-            not request.external_llm_allowed
-            and isinstance(self.provider, OpenAIEmbeddingProvider)
-        ):
+        if not request.external_llm_allowed and isinstance(self.provider, OpenAIEmbeddingProvider):
             return "external_llm_disabled_without_local_embedding_provider"
         return ""
 
@@ -161,7 +160,7 @@ class EmbeddingWorker(BaseWorker):
         await self.publish("embedding:index_results", request.workspace_id, result.to_redis())
 
 
-def _batched(items: list, batch_size: int):
+def _batched(items: list[T], batch_size: int) -> Iterator[list[T]]:
     iterator = iter(items)
     while batch := list(islice(iterator, max(1, batch_size))):
         yield batch

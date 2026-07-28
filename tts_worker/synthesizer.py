@@ -7,6 +7,9 @@ TTFA: 40ms (Sonic Turbo). Voice cloning: 10-15s audio sample → voice_id via AP
 from __future__ import annotations
 
 import io
+from typing import Any, cast
+
+from cartesia import AsyncCartesia
 
 from shared.logger import get_logger
 
@@ -27,21 +30,21 @@ class CartesiaSynthesizer:
     def __init__(
         self,
         api_key: str,
-        model: str = "sonic-turbo",
+        model: str = "sonic-3.5",
         sample_rate: int = 44100,
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.sample_rate = sample_rate
-        self._client = None
+        self._client: AsyncCartesia | None = None
 
     async def load(self) -> None:
-        from cartesia import AsyncCartesia
-
         self._client = AsyncCartesia(api_key=self.api_key)
         logger.info("cartesia_ready", model=self.model, sample_rate=self.sample_rate)
 
-    async def clone_voice(self, audio_bytes: bytes, speaker_label: str, language: str = "en") -> str:
+    async def clone_voice(
+        self, audio_bytes: bytes, speaker_label: str, language: str = "en"
+    ) -> str:
         """Clone a speaker's voice from raw audio.
 
         Args:
@@ -58,7 +61,8 @@ class CartesiaSynthesizer:
 
         # cartesia==3.3.0's AsyncVoicesResource.clone() has no `enhance` kwarg
         # (that was a stale/pre-GA param name) and requires `language`.
-        voice = await self._client.voices.clone(
+        client = self._require_client()
+        voice = await client.voices.clone(
             clip=audio_io,
             name=speaker_label,
             language=language,
@@ -93,7 +97,7 @@ class CartesiaSynthesizer:
         if not text.strip():
             return b"", 0, resolved_voice_id
 
-        voice: dict = {"id": resolved_voice_id}
+        voice: dict[str, str] = {"id": resolved_voice_id}
 
         # cartesia-py 3.x's tts.bytes() is an async method whose awaited result is itself an
         # AsyncIterator[bytes] (it streams chunks) — never a plain bytes object, despite this
@@ -102,15 +106,19 @@ class CartesiaSynthesizer:
         # has no len()"; async-for alone (without the await) raises "'async for' requires an
         # object with __aiter__ method, got coroutine". Cartesia was unreachable/misconfigured
         # before now, so neither mistake had ever been exercised end-to-end.
-        stream = await self._client.tts.bytes(
+        client = self._require_client()
+        stream = await client.tts.bytes(
             model_id=self.model,
             transcript=text,
-            voice=voice,
-            output_format={
-                "container": "wav",
-                "sample_rate": self.sample_rate,
-                "encoding": "pcm_s16le",
-            },
+            voice=cast(Any, voice),
+            output_format=cast(
+                Any,
+                {
+                    "container": "wav",
+                    "sample_rate": self.sample_rate,
+                    "encoding": "pcm_s16le",
+                },
+            ),
             language=language,
         )
         chunks: list[bytes] = [chunk async for chunk in stream]
@@ -134,7 +142,9 @@ class CartesiaSynthesizer:
         }
         return defaults.get(language, defaults["en"])
 
-    async def list_voices(self, language: str, limit: int = 12, max_scanned: int = 300) -> list[dict]:
+    async def list_voices(
+        self, language: str, limit: int = 12, max_scanned: int = 300
+    ) -> list[dict[str, Any]]:
         """Public library voices for `language`, from Cartesia's real /voices API.
 
         The SDK's voices.list() has no `language` filter param — it returns Cartesia's
@@ -146,17 +156,20 @@ class CartesiaSynthesizer:
         than raising — every caller must treat an empty result as "fall back to
         _default_voice_id()", never as a reason to fail synthesis.
         """
-        voices: list[dict] = []
+        voices: list[dict[str, Any]] = []
         scanned = 0
         try:
-            async for voice in self._client.voices.list(is_owner=False, limit=100):
+            client = self._require_client()
+            async for voice in client.voices.list(is_owner=False, limit=100):
                 scanned += 1
                 if voice.language == language:
-                    voices.append({
-                        "id": voice.id,
-                        "name": voice.name,
-                        "gender": voice.gender or "",
-                    })
+                    voices.append(
+                        {
+                            "id": voice.id,
+                            "name": voice.name,
+                            "gender": voice.gender or "",
+                        }
+                    )
                     if len(voices) >= limit:
                         break
                 if scanned >= max_scanned:
@@ -165,3 +178,8 @@ class CartesiaSynthesizer:
             logger.exception("cartesia_list_voices_failed", language=language)
             return []
         return voices
+
+    def _require_client(self) -> AsyncCartesia:
+        if self._client is None:
+            raise RuntimeError("Cartesia synthesizer is not loaded")
+        return self._client
