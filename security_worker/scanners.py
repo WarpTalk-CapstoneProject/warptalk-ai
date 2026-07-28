@@ -5,7 +5,7 @@ from shared.config import SecuritySettings
 # --- Constants ---
 DEFAULT_MODEL = "gpt-4o-mini"
 MAX_ANALYZE_LENGTH = 20000
-MAX_TOKENS = 2000
+MAX_TOKENS = 8000
 TEMPERATURE = 0.0
 
 
@@ -76,7 +76,22 @@ class OpenAISecurityScanner:
         if not content_str:
             raise ValueError("Empty response from OpenAI")
 
-        result = json.loads(content_str)
+        try:
+            # Strip markdown formatting if present
+            cleaned_str = content_str.strip()
+            if cleaned_str.startswith("```json"):
+                cleaned_str = cleaned_str[7:]
+            if cleaned_str.startswith("```"):
+                cleaned_str = cleaned_str[3:]
+            if cleaned_str.endswith("```"):
+                cleaned_str = cleaned_str[:-3]
+            cleaned_str = cleaned_str.strip()
+
+            result = json.loads(cleaned_str)
+        except Exception:
+            # Safe fallback if OpenAI response was truncated or malformed
+            return False, False, False, text
+
         pii_detected = bool(result.get("piiDetected", False))
         dlp_detected = bool(result.get("dlpDetected", False))
         violation_found = bool(result.get("violationFound", False)) or pii_detected or dlp_detected
