@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import Any, cast
+
+from openai import AsyncOpenAI
+
 
 from shared.config import AssistantSettings
 from shared.logger import get_logger
@@ -41,8 +45,9 @@ class MeetingAssistant:
     Accumulates transcript segments and generates summaries on demand.
     """
 
-    SYSTEM_PROMPT = """You are a professional meeting assistant. Your task is to analyze meeting \
-transcripts and produce clear, concise outputs.
+    SYSTEM_PROMPT = """You are a professional meeting assistant. Your task is to analyze
+meeting transcripts and produce clear, concise outputs.
+
 
 When summarizing:
 - Highlight key decisions made
@@ -67,14 +72,12 @@ When extracting action items:
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
-        self._client = None
+        self._client: AsyncOpenAI | None = None
 
     async def load(self) -> None:
         """Initialize the OpenAI async client."""
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required for WarpBot assistant")
-
-        from openai import AsyncOpenAI
 
         self._client = AsyncOpenAI(api_key=self.api_key)
         logger.info("openai_client_initialized", model=self.model)
@@ -103,7 +106,8 @@ When extracting action items:
         if context_snapshot:
             system_content += f"\n\nMeeting Context (Reference Documents):\n{context_snapshot}"
 
-        response = await self._client.chat.completions.create(
+        client = self._require_client()
+        response = await client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": system_content},
@@ -138,7 +142,8 @@ When extracting action items:
         if context_snapshot:
             system_content += f"\n\nMeeting Context (Reference Documents):\n{context_snapshot}"
 
-        response = await self._client.chat.completions.create(
+        client = self._require_client()
+        response = await client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": system_content},
@@ -157,25 +162,27 @@ When extracting action items:
         usage = TokenUsage.from_openai_usage(getattr(response, "usage", None))
         return TextWithUsage(response.choices[0].message.content or "", usage)
 
-    STRUCTURED_SYSTEM_PROMPT = """You are a professional meeting assistant. Analyze the meeting \
-transcript and \
+    STRUCTURED_SYSTEM_PROMPT = """You are a professional meeting assistant.
+Analyze the meeting transcript and \
+
 respond with a single JSON object only (no markdown, no commentary) matching exactly this shape:
 {
   "summary": "a concise overview paragraph of what the meeting covered",
   "decisions": ["one string per key decision that was made"],
   "actionItems": [{"owner": "assignee name, or empty string if unclear", "task": "the action item"}]
 }
-Only include explicit decisions and commitments — do not invent content that isn't in the \
-transcript.
-If the transcript is empty or has no substantive content, return summary describing that, and \
-empty arrays for decisions and actionItems."""
+Only include explicit decisions and commitments ? do not invent content that
+isn't in the transcript.
+If the transcript is empty or has no substantive content, return a summary
+describing that, and empty arrays for decisions and actionItems."""
+
 
     async def generate_structured_summary(
         self,
         transcript: str,
         target_languages: list[str] | None = None,
         context_snapshot: str = "",
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Generate a structured {summary, decisions[], actionItems[]} JSON object.
 
         Args:
@@ -222,13 +229,14 @@ empty arrays for decisions and actionItems."""
             system_content += (
                 "\n\nThis meeting has multiple target languages: "
                 f"{', '.join(languages)}. In addition to the top-level fields (in the "
-                "meeting's primary/source language), include a \"translations\" object "
+                'meeting\'s primary/source language), include a "translations" object '
                 "keyed by each of these language codes, each value having the same "
                 "{summary, decisions, actionItems} shape translated into that language."
             )
 
         try:
-            response = await self._client.chat.completions.create(
+            client = self._require_client()
+            response = await client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_content},
@@ -243,7 +251,8 @@ empty arrays for decisions and actionItems."""
             )
             raw = response.choices[0].message.content or "{}"
             usage = TokenUsage.from_openai_usage(getattr(response, "usage", None))
-            parsed = json.loads(raw)
+            parsed = cast(dict[str, Any], json.loads(raw))
+
             parsed.setdefault("summary", "")
             parsed.setdefault("decisions", [])
             parsed.setdefault("actionItems", [])
@@ -252,6 +261,7 @@ empty arrays for decisions and actionItems."""
         except Exception:
             logger.exception("structured_summary_generation_failed")
             return DictWithUsage({
+
                 "summary": (
                     "The AI assistant could not generate a structured summary for this meeting."
                 ),
@@ -259,3 +269,8 @@ empty arrays for decisions and actionItems."""
                 "actionItems": [],
                 "insufficientData": True,
             })
+
+    def _require_client(self) -> AsyncOpenAI:
+        if self._client is None:
+            raise RuntimeError("Meeting assistant is not loaded")
+        return self._client

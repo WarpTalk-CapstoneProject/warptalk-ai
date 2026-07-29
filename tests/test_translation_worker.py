@@ -288,9 +288,7 @@ class TestTranslationWorker:
         await worker.process(b"msg-1", self._make_stt_msg().to_redis())
 
         # Verify publish to translate:results stream
-        streams_published = [
-            str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list
-        ]
+        streams_published = [str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list]
         assert any("translate:results" in s for s in streams_published)
 
     async def test_multi_sentence_uses_batch_translation(
@@ -318,7 +316,8 @@ class TestTranslationWorker:
         )
 
         published = [
-            c.args for c in mock_redis_client._redis.xadd.call_args_list
+            c.args
+            for c in mock_redis_client._redis.xadd.call_args_list
             if "translate:results" in str(c.args[0])
         ]
         # BaseWorker.publish() dual-writes (per-room + flat global stream) per chunk,
@@ -461,14 +460,15 @@ class TestConsumeLoopConcurrency:
 
         worker.process = fake_process
 
-        async def fake_consume(**kwargs):
-            yield b"msg-1", {}
-            yield b"msg-2", {}
+        async def fake_consume_concurrent(*, handler, **kwargs):
+            await asyncio.gather(
+                handler(b"msg-1", {}),
+                handler(b"msg-2", {}),
+            )
             worker._shutdown_event.set()
 
-        worker.redis.consume = fake_consume
+        worker.redis.consume_concurrent = fake_consume_concurrent
 
         await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
-        await asyncio.sleep(0.05)  # let the dispatched create_task()s finish
 
         assert started == [b"msg-1", b"msg-2"]

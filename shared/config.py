@@ -26,6 +26,8 @@ class RedisSettings(BaseSettings):
 
     url: str = "redis://localhost:6379"
     password: str = ""
+    sentinel_urls: str = ""
+    sentinel_service_name: str = "mymaster"
     # livekit_ingress alone holds 1 connection per concurrent room (pubsub listener)
     # plus one per in-flight XADD from VAD-triggered chunk publishes — 10 was only
     # enough for a single active room at a time; opening a second meeting while one
@@ -68,10 +70,10 @@ class WorkerSettings(BaseSettings):
     # distant/muffled speech and ambiguous noise trip VAD too easily, reaching the STT
     # model (which has no confidence signal of its own to reject them — see
     # STTSettings.model) and getting hallucinated into a full sentence.
-    vad_threshold: float = 0.5        # Speech detection threshold
-    vad_pre_speech_ms: int = 300      # Pre-speech buffer to capture word onsets
+    vad_threshold: float = 0.5  # Speech detection threshold
+    vad_pre_speech_ms: int = 300  # Pre-speech buffer to capture word onsets
     vad_silence_hangover_ms: int = 600  # 600ms hangover — faster turnaround
-    vad_min_speech_ms: int = 500      # Minimum speech length to publish
+    vad_min_speech_ms: int = 500  # Minimum speech length to publish
 
     # Near-field energy gate (ingress worker only, see livekit_ingress_worker/near_field_gate.py)
     # — rejects a speech chunk whose peak amplitude is much quieter than this SAME
@@ -79,8 +81,10 @@ class WorkerSettings(BaseSettings):
     # clear" from "far away and muffled" — both are speech-shaped. Pure energy/peak
     # math, no ML dependency, negligible latency.
     near_field_gate_enabled: bool = True
+
     # chunk peak must be >= 35% of this track's own established near-field peak
     near_field_gate_relative_floor: float = 0.35
+
     near_field_gate_min_baseline_chunks: int = 2
     near_field_gate_baseline_ema_alpha: float = 0.3
 
@@ -142,8 +146,10 @@ class TTSSettings(BaseSettings):
     min_clone_chars: int = 8
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
+
     # 12h — unbounded before this; matches AudioRouteCacheService's own Redis TTL
     voice_clone_key_ttl_seconds: int = 43200
+
     # How many public Cartesia voices to offer per language — both for the per-speaker
     # hashed default (auto-diversity when nobody has cloned/chosen a voice) and for the
     # control-bar voice picker's option list.
@@ -261,6 +267,3 @@ class SecuritySettings(BaseSettings):
     temperature: float = 0.0
     max_analyze_length: int = 20000
     result_ttl_seconds: int = 300
-
-
-

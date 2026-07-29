@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Any, cast
 
 from ai_assistant_worker.assistant import MeetingAssistant
 from shared.base_worker import BaseWorker
@@ -33,7 +34,7 @@ class AIAssistantWorker(BaseWorker):
     def __init__(
         self,
         assistant_settings: AssistantSettings | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.assistant_settings = assistant_settings or AssistantSettings()
@@ -82,9 +83,7 @@ class AIAssistantWorker(BaseWorker):
             return
 
         # Format transcript
-        transcript_lines = [
-            f"[{speaker}] {text}" for speaker, text, _ in segments
-        ]
+        transcript_lines = [f"[{speaker}] {text}" for speaker, text, _ in segments]
         transcript_text = "\n".join(transcript_lines)
 
         self.logger.info(
@@ -95,7 +94,11 @@ class AIAssistantWorker(BaseWorker):
 
         # Fetch context snapshot from Redis
         context_snapshot_bytes = await self.redis.get(f"meeting:{meeting_id}:context_snapshot")
-        context_snapshot = context_snapshot_bytes.decode("utf-8") if context_snapshot_bytes else ""
+        context_snapshot = (
+            context_snapshot_bytes.decode("utf-8")
+            if isinstance(context_snapshot_bytes, bytes)
+            else context_snapshot_bytes or ""
+        )
 
         # Best-effort: the room's configured target language(s), written by
         # MeetingService.EndMeetingAsync (WarpTalk.MeetingService) as a JSON array string.
@@ -105,19 +108,26 @@ class AIAssistantWorker(BaseWorker):
         try:
             target_languages_bytes = await self.redis.get(f"meeting:{meeting_id}:target_languages")
             if target_languages_bytes:
-                target_languages = json.loads(target_languages_bytes.decode("utf-8"))
+                raw_languages = (
+                    target_languages_bytes.decode("utf-8")
+                    if isinstance(target_languages_bytes, bytes)
+                    else target_languages_bytes
+                )
+                target_languages = cast(list[str], json.loads(raw_languages))
         except Exception:
             self.logger.warning("failed_to_read_target_languages", meeting_id=meeting_id)
 
         usage_total = None
 
         # Generate summary
-        summary_result = await self.assistant.summarize_with_usage(
+        assistant = self._require_assistant()
+        summary_result = await assistant.summarize_with_usage(
             transcript_text,
             context_snapshot=context_snapshot,
         )
         summary = summary_result.text
         usage_total = summary_result.usage
+
 
         # Store summary in Redis Hash for persistent retrieval
         await self.redis.hset(
@@ -127,14 +137,19 @@ class AIAssistantWorker(BaseWorker):
         )
 
         # Publish to stream for gateway to consume via SignalR
-        await self.publish("ai_assistant:results", meeting_id, {
-            "type": "summary",
-            "content": summary,
-            "timestamp_ms": str(int(time.time() * 1000)),
-        })
+        await self.publish(
+            "ai_assistant:results",
+            meeting_id,
+            {
+                "type": "summary",
+                "content": summary,
+                "timestamp_ms": str(int(time.time() * 1000)),
+            },
+        )
 
         # Generate action items
-        action_items_result = await self.assistant.extract_action_items_with_usage(
+        action_items_result = await assistant.extract_action_items_with_usage(
+
             transcript_text,
             context_snapshot=context_snapshot,
         )
@@ -147,17 +162,22 @@ class AIAssistantWorker(BaseWorker):
         )
 
         # Publish action items to stream
-        await self.publish("ai_assistant:results", meeting_id, {
-            "type": "action_items",
-            "content": action_items,
-            "timestamp_ms": str(int(time.time() * 1000)),
-        })
+        await self.publish(
+            "ai_assistant:results",
+            meeting_id,
+            {
+                "type": "action_items",
+                "content": action_items,
+                "timestamp_ms": str(int(time.time() * 1000)),
+            },
+        )
 
         # WT-13: also generate the structured {summary, decisions[], actionItems[]} JSON
         # that TranslationRoomService.ArtifactsFinalizer stores as the SUMMARY_EXPORT
         # artifact's inline Content, so the frontend can render an overview, a decisions
         # list, and an owner/task action-item checklist instead of parsing markdown.
-        structured_result = await self.assistant.generate_structured_summary_with_usage(
+        structured_result = await assistant.generate_structured_summary_with_usage(
+
             transcript_text,
             target_languages=target_languages,
             context_snapshot=context_snapshot,
@@ -190,3 +210,8 @@ class AIAssistantWorker(BaseWorker):
 
         # Cleanup
         del self._transcripts[meeting_id]
+
+    def _require_assistant(self) -> MeetingAssistant:
+        if self.assistant is None:
+            raise RuntimeError("Meeting assistant is not loaded")
+        return self.assistant

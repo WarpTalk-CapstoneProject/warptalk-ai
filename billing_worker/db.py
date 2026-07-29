@@ -13,7 +13,8 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
+
 from typing import Any
 
 import asyncpg
@@ -30,6 +31,7 @@ def _as_uuid(value: str) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
 
 
+
 @dataclass(frozen=True)
 class UsageRate:
     id: uuid.UUID
@@ -38,6 +40,13 @@ class UsageRate:
     model: str
     provider_unit_cost: Decimal | None = None
     markup_multiplier: Decimal | None = None
+
+
+def calculate_credit_charge(quantity: float, unit_price: Decimal) -> int:
+    """Apply an immutable rate-card snapshot and bill whole credits."""
+    raw_cost = Decimal(str(quantity)) * unit_price
+    return max(1, int(raw_cost.to_integral_value(rounding=ROUND_CEILING)))
+
 
 
 class BillingRepository:
@@ -79,24 +88,11 @@ class BillingRepository:
             await self._redis.aclose()
         logger.info("billing_db_disconnected")
 
-    async def resolve_subscription(
-        self, translation_room_id: str
-    ) -> tuple[uuid.UUID, uuid.UUID] | None:
-        """Return (subscription_id, workspace_id) for the room's active subscription.
-
-        None if the room, its workspace, or an active subscription can't be found —
-        callers must treat that as "cannot bill this event" and log+skip, never guess.
-        """
+    async def resolve_subscription(self, workspace_id: str) -> tuple[uuid.UUID, uuid.UUID] | None:
+        """Return the active Billing-owned subscription for a workspace projection."""
         assert self._pool is not None, "call connect() first"
-        room_id = _as_uuid(translation_room_id)
+        workspace_uuid = _as_uuid(workspace_id)
         async with self._pool.acquire() as conn:
-            workspace_id = await conn.fetchval(
-                "SELECT workspace_id FROM translation_room.translation_rooms WHERE id = $1",
-                room_id,
-            )
-            if workspace_id is None:
-                return None
-
             subscription_id = await conn.fetchval(
                 """
                 SELECT id FROM subscription.subscriptions
@@ -104,12 +100,12 @@ class BillingRepository:
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                workspace_id,
+                workspace_uuid,
             )
             if subscription_id is None:
                 return None
 
-            return subscription_id, workspace_id
+            return subscription_id, workspace_uuid
 
     async def resolve_usage_rate(
         self,
@@ -284,17 +280,15 @@ class BillingRepository:
         provider: str | None = None,
         model: str | None = None,
         transcript_segment_id: str | uuid.UUID | None = None,
+        source_language_code: str | None = None,
+        target_language_code: str | None = None,
+        currency: str = "CRD",
         details: dict[str, Any] | None = None,
     ) -> bool:
         """Insert usage_records + credit_transactions, idempotent on idempotency_key.
 
         Returns True if a new charge was recorded, False if this idempotency_key was
         already settled (safe on Redis Streams redelivery / worker restart / retry).
-
-        credits_consumed is currently a flat placeholder (see settlement.py) pending the
-        usage_rate_card lookup design (source/target language + currency tiers) from
-        warptalk-v4-final.dbml — wiring that up is real pricing work, not schema work,
-        and deliberately out of scope here so this doesn't ship guessed prices.
 
         transcript_segment_id should be the real transcript.transcript_segments.id GUID —
         callers must extract it from any composite segment_id (translation_worker mints
@@ -313,7 +307,9 @@ class BillingRepository:
         segment_uuid = (
             transcript_segment_id
             if isinstance(transcript_segment_id, uuid.UUID)
-            else _as_uuid(transcript_segment_id) if transcript_segment_id else None
+            else _as_uuid(transcript_segment_id)
+            if transcript_segment_id
+            else None
         )
 
         # Temp usage log structure for Redis (must match C# TempUsageLog struct)
@@ -338,8 +334,9 @@ class BillingRepository:
             "TranscriptSegmentId": str(segment_uuid) if segment_uuid else None,
             "IdempotencyKey": idempotency_key,
             "Details": json.dumps(details or {}),
-            "CreatedAt": datetime.now(UTC).isoformat()
+            "CreatedAt": datetime.now(UTC).isoformat(),
         }
+
 
         # C# BillingAggregationWorker is the single settlement owner for Phase 3.
         # It calls subscription.settle_usage_charge(), which atomically creates usage,
@@ -347,6 +344,7 @@ class BillingRepository:
         # Python only stages the temp log so we do not double-deduct credits.
 
         await self._redis.rpush("warptalk:billing:temp_usage_logs", json.dumps(temp_log))
+
 
         logger.info(
             "usage_charged",

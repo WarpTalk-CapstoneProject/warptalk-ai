@@ -9,11 +9,41 @@ import pytest
 from shared.schemas import (
     AIUsageMessage,
     AudioChunkMessage,
+    ChatRequestMessage,
+    ChatResultMessage,
     ProviderUsageMessage,
+
     STTResultMessage,
     TranslationResultMessage,
     TTSResultMessage,
 )
+
+
+def test_chat_request_origin_roundtrip() -> None:
+    request = ChatRequestMessage(
+        request_id="request-1",
+        conversation_id="conversation-1",
+        workspace_id="workspace-1",
+        user_id="user-1",
+        origin="meeting_chat",
+    )
+
+    restored = ChatRequestMessage.from_redis(request.to_redis())
+
+    assert restored.origin == "meeting_chat"
+
+
+def test_chat_result_origin_roundtrip() -> None:
+    result = ChatResultMessage(
+        request_id="request-1",
+        conversation_id="conversation-1",
+        type="completed",
+        origin="meeting_chat",
+    )
+
+    restored = ChatResultMessage.from_redis(result.to_redis())
+
+    assert restored.origin == "meeting_chat"
 
 
 class TestAudioChunkMessage:
@@ -62,9 +92,7 @@ class TestAudioChunkMessage:
             audio_data=sample_audio_bytes,
         )
         # Simulate Redis returning bytes
-        redis_data = {
-            k.encode(): v.encode() for k, v in msg.to_redis().items()
-        }
+        redis_data = {k.encode(): v.encode() for k, v in msg.to_redis().items()}
         restored = AudioChunkMessage.from_redis(redis_data)
         assert restored.meeting_id == "m1"
         assert restored.audio_data == sample_audio_bytes
@@ -124,9 +152,7 @@ class TestSTTResultMessage:
         assert restored.end_ms == original.end_ms
 
     def test_auto_generates_segment_id(self) -> None:
-        msg = STTResultMessage(
-            meeting_id="m1", speaker_id="s1", text="test", language="en"
-        )
+        msg = STTResultMessage(meeting_id="m1", speaker_id="s1", text="test", language="en")
         assert msg.segment_id  # Should be auto-generated UUID
 
 

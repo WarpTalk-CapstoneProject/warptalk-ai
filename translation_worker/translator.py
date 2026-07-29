@@ -8,6 +8,10 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
+from typing import Any
+
+from openai import AsyncOpenAI
+
 
 from shared.config import TranslationSettings
 from shared.logger import get_logger
@@ -58,12 +62,13 @@ _BATCH_SYSTEM_PROMPT = (
 )
 
 
-def _build_system_prompt(base_prompt: str, glossary_terms: list[dict] | None) -> str:
+def _build_system_prompt(base_prompt: str, glossary_terms: list[dict[str, str]] | None) -> str:
     glossary_block = _build_glossary_block(glossary_terms)
     return f"{base_prompt}{glossary_block}" if glossary_block else base_prompt
 
 
-def _build_glossary_block(glossary_terms: list[dict] | None) -> str:
+def _build_glossary_block(glossary_terms: list[dict[str, str]] | None) -> str:
+
     """Render this workspace's active glossary terms (see GlossaryStartedEventConsumer,
     published to `translationRoom:{meeting_id}:mt_glossary`) as a system-prompt addendum.
 
@@ -109,13 +114,11 @@ def _build_glossary_block(glossary_terms: list[dict] | None) -> str:
     return "\n\n".join(sections)
 
 
-def _exception_clause(glossary_terms: list[dict] | None) -> str:
-    """The "never leave any word..." instruction's exception clause.
-
-    It only mentions workspace glossary terms when there actually is a glossary.
-    """
+def _exception_clause(glossary_terms: list[dict[str, str]] | None) -> str:
+    """Return the proper-noun exception clause, mentioning glossary only when present."""
     base = "except for proper nouns/brand names with no natural translation"
     return f"{base}, or terms covered by the workspace glossary" if glossary_terms else base
+
 
 _BATCH_LINE_RE = re.compile(r"^\s*\[(\d+)\]\s*(.*)$")
 
@@ -160,25 +163,26 @@ class OpenAITranslator:
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
-        self._client = None
+        self._client: AsyncOpenAI | None = None
 
     async def load(self) -> None:
         """Initialize OpenAI async client."""
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required for OpenAI translation")
 
-        from openai import AsyncOpenAI
-
         self._client = AsyncOpenAI(api_key=self.api_key)
         logger.info("openai_translator_loaded", model=self.model)
 
-    async def _create_with_retry(self, **kwargs) -> Any:
+    async def _create_with_retry(self, **kwargs: Any) -> Any:
         """Call OpenAI chat completions with transient error retries (up to 2 retries)."""
         retries = 2
         delay = 0.5
         for attempt in range(retries + 1):
             try:
-                return await self._client.chat.completions.create(**kwargs)
+                client = self._client
+                if client is None:
+                    raise RuntimeError("OpenAI translator is not loaded")
+                return await client.chat.completions.create(**kwargs)
             except Exception as exc:
                 if attempt < retries:
                     logger.warning(
@@ -197,7 +201,7 @@ class OpenAITranslator:
         text: str,
         source_lang: str,
         target_lang: str,
-        glossary_terms: list[dict] | None = None,
+        glossary_terms: list[dict[str, str]] | None = None,
     ) -> str:
         """Translate text using OpenAI chat completion.
 
@@ -270,7 +274,7 @@ class OpenAITranslator:
         texts: list[str],
         source_lang: str,
         target_lang: str,
-        glossary_terms: list[dict] | None = None,
+        glossary_terms: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Translate several sentences in a single OpenAI call.
 

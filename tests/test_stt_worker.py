@@ -10,6 +10,7 @@ import pytest
 
 from shared.config import STTSettings, WorkerSettings
 from shared.schemas import AudioChunkMessage
+from stt_worker import worker as stt_worker_module
 from stt_worker.model import OpenAISTT, TranscribedSegment, _filter_segments, _normalize_language
 from stt_worker.worker import STTWorker
 
@@ -30,11 +31,13 @@ class FakeRealtimeConn:
         async def gen():
             for event in self._events:
                 yield event
+
         return gen()
 
 
 class FakeRealtimeManager:
-    """Minimal stand-in for AsyncRealtimeConnectionManager (`async with client.realtime.connect(...) as conn`)."""
+    """Minimal stand-in for AsyncRealtimeConnectionManager
+    (`async with client.realtime.connect(...) as conn`)."""
 
     def __init__(self, conn: FakeRealtimeConn) -> None:
         self._conn = conn
@@ -79,15 +82,20 @@ class TestOpenAISTT:
         response — a language hint must still be passed in since the API doesn't echo
         one back.
         """
-        events = [SimpleNamespace(
-            type="conversation.item.input_audio_transcription.completed",
-            transcript=" Hello, world!",
-        )]
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript=" Hello, world!",
+            )
+        ]
         stt, conn = _make_stt_with_conn(events)
 
         result = await stt.transcribe(
-            sample_audio_bytes, sample_rate=16000, language="en",
-            meeting_id="m1", speaker_id="s1",
+            sample_audio_bytes,
+            sample_rate=16000,
+            language="en",
+            meeting_id="m1",
+            speaker_id="s1",
         )
 
         assert len(result) == 1
@@ -155,8 +163,12 @@ class TestOpenAISTT:
         arrives via delta too, so nothing is left over for the return value.
         """
         events = [
-            SimpleNamespace(type="conversation.item.input_audio_transcription.delta", delta="Hello there."),
-            SimpleNamespace(type="conversation.item.input_audio_transcription.delta", delta=" How are you?"),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.delta", delta="Hello there."
+            ),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.delta", delta=" How are you?"
+            ),
             SimpleNamespace(
                 type="conversation.item.input_audio_transcription.completed",
                 transcript="Hello there. How are you?",
@@ -169,7 +181,10 @@ class TestOpenAISTT:
             early_segments.append(seg)
 
         result = await stt.transcribe(
-            sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1",
+            sample_audio_bytes,
+            language="en",
+            meeting_id="m1",
+            speaker_id="s1",
             on_early_segment=on_early,
         )
 
@@ -184,8 +199,12 @@ class TestOpenAISTT:
         once .completed supplies the authoritative final transcript.
         """
         events = [
-            SimpleNamespace(type="conversation.item.input_audio_transcription.delta", delta="Hello there."),
-            SimpleNamespace(type="conversation.item.input_audio_transcription.delta", delta=" How are"),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.delta", delta="Hello there."
+            ),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.delta", delta=" How are"
+            ),
             SimpleNamespace(
                 type="conversation.item.input_audio_transcription.completed",
                 transcript="Hello there. How are you today?",
@@ -198,7 +217,10 @@ class TestOpenAISTT:
             early_segments.append(seg)
 
         result = await stt.transcribe(
-            sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1",
+            sample_audio_bytes,
+            language="en",
+            meeting_id="m1",
+            speaker_id="s1",
             on_early_segment=on_early,
         )
 
@@ -213,7 +235,9 @@ class TestOpenAISTT:
         get the old all-at-once behavior — deltas are ignored, only .completed matters.
         """
         events = [
-            SimpleNamespace(type="conversation.item.input_audio_transcription.delta", delta="Hello there."),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.delta", delta="Hello there."
+            ),
             SimpleNamespace(
                 type="conversation.item.input_audio_transcription.completed",
                 transcript="Hello there.",
@@ -221,7 +245,9 @@ class TestOpenAISTT:
         ]
         stt, conn = _make_stt_with_conn(events)
 
-        result = await stt.transcribe(sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1")
+        result = await stt.transcribe(
+            sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1"
+        )
 
         assert len(result) == 1
         assert result[0].text == "Hello there."
@@ -234,7 +260,9 @@ class TestOpenAISTT:
         rather than risk re-publishing/double-billing already-flushed text.
         """
         events = [
-            SimpleNamespace(type="conversation.item.input_audio_transcription.delta", delta="Helo there."),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.delta", delta="Helo there."
+            ),
             SimpleNamespace(
                 type="conversation.item.input_audio_transcription.completed",
                 transcript="Hello there, how are you?",
@@ -247,23 +275,26 @@ class TestOpenAISTT:
             early_segments.append(seg)
 
         result = await stt.transcribe(
-            sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1",
+            sample_audio_bytes,
+            language="en",
+            meeting_id="m1",
+            speaker_id="s1",
             on_early_segment=on_early,
         )
 
         assert len(early_segments) == 1
         assert result == []
 
-    async def test_transcribe_reuses_session_across_calls(
-        self, sample_audio_bytes: bytes
-    ) -> None:
+    async def test_transcribe_reuses_session_across_calls(self, sample_audio_bytes: bytes) -> None:
         """A second chunk from the same (meeting, speaker) must NOT reconnect —
         that's the whole point of session reuse (pay the handshake once, not per chunk).
         """
-        events = [SimpleNamespace(
-            type="conversation.item.input_audio_transcription.completed",
-            transcript="Hi",
-        )]
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Hi",
+            )
+        ]
         stt, conn = _make_stt_with_conn(events)
 
         await stt.transcribe(sample_audio_bytes, meeting_id="m1", speaker_id="s1")
@@ -280,12 +311,18 @@ class TestOpenAISTT:
         Realtime API's own accuracy/hallucination behavior stuck on whichever language
         the session happened to be created with first.
         """
-        events1 = [SimpleNamespace(
-            type="conversation.item.input_audio_transcription.completed", transcript="Hi",
-        )]
-        events2 = [SimpleNamespace(
-            type="conversation.item.input_audio_transcription.completed", transcript="Xin chao",
-        )]
+        events1 = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Hi",
+            )
+        ]
+        events2 = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Xin chao",
+            )
+        ]
         stt = OpenAISTT.__new__(OpenAISTT)
         stt.api_key = ""
         stt.model = "gpt-realtime-whisper"
@@ -307,9 +344,12 @@ class TestOpenAISTT:
     ) -> None:
         """Sanity counterpart to the above: passing the SAME language on every call
         (the common case) must still hit the cache, not reconnect every time."""
-        events = [SimpleNamespace(
-            type="conversation.item.input_audio_transcription.completed", transcript="Hi",
-        )]
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Hi",
+            )
+        ]
         stt, conn = _make_stt_with_conn(events)
 
         await stt.transcribe(sample_audio_bytes, language="en", meeting_id="m1", speaker_id="s1")
@@ -499,9 +539,7 @@ class TestSTTWorker:
 
         # BaseWorker.publish() calls xadd twice: room stream + global stream
         mock_redis_client._redis.xadd.assert_called()
-        streams_published = [
-            str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list
-        ]
+        streams_published = [str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list]
         assert any("stt:results" in s for s in streams_published)
 
     async def test_process_publishes_early_segments_as_non_final(
@@ -526,10 +564,14 @@ class TestSTTWorker:
         async def fake_transcribe(*args, **kwargs):
             on_early_segment = kwargs["on_early_segment"]
             await on_early_segment(
-                TranscribedSegment(text="Hello there.", language="en", confidence=0.0, start_ms=0, end_ms=0)
+                TranscribedSegment(
+                    text="Hello there.", language="en", confidence=0.0, start_ms=0, end_ms=0
+                )
             )
             return [
-                TranscribedSegment(text="How are you?", language="en", confidence=0.0, start_ms=0, end_ms=1000)
+                TranscribedSegment(
+                    text="How are you?", language="en", confidence=0.0, start_ms=0, end_ms=1000
+                )
             ]
 
         worker.model = MagicMock()
@@ -546,8 +588,8 @@ class TestSTTWorker:
         await worker.process(b"msg-1", chunk.to_redis())
 
         published = [
-            data for stream, data in
-            (c.args for c in mock_redis_client._redis.xadd.call_args_list)
+            data
+            for stream, data in (c.args for c in mock_redis_client._redis.xadd.call_args_list)
             if "stt:results" in str(stream)
         ]
         by_text = {data["text"]: data["is_final_chunk"] for data in published}
@@ -609,9 +651,7 @@ class TestSTTWorker:
 
         await worker.process(b"msg-1", chunk.to_redis())
 
-        streams_published = [
-            str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list
-        ]
+        streams_published = [str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list]
         assert any("translationRoom:system_events" in stream for stream in streams_published)
         assert not any("stt:results" in stream for stream in streams_published)
 
@@ -630,9 +670,7 @@ class TestSTTWorker:
         prompt = await worker._get_stt_prompt("m1")
         assert prompt == _GENERIC_STT_BASE_PROMPT
 
-    async def test_get_stt_prompt_appends_glossary_to_base(
-        self, mock_redis_client
-    ) -> None:
+    async def test_get_stt_prompt_appends_glossary_to_base(self, mock_redis_client) -> None:
         """A published glossary is appended AFTER the generic base, not instead of it."""
         from stt_worker.worker import _GENERIC_STT_BASE_PROMPT
 
@@ -698,15 +736,16 @@ class TestConsumeLoopConcurrency:
 
         worker.process = fake_process
 
-        async def fake_consume(**kwargs):
-            yield b"msg-1", {"meeting_id": "m1", "speaker_id": "speaker-A"}
-            yield b"msg-2", {"meeting_id": "m1", "speaker_id": "speaker-B"}
+        async def fake_consume_concurrent(*, handler, **kwargs):
+            await asyncio.gather(
+                handler(b"msg-1", {"meeting_id": "m1", "speaker_id": "speaker-A"}),
+                handler(b"msg-2", {"meeting_id": "m1", "speaker_id": "speaker-B"}),
+            )
             worker._shutdown_event.set()
 
-        worker.redis.consume = fake_consume
+        worker.redis.consume_concurrent = fake_consume_concurrent
 
         await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
-        await asyncio.sleep(0.05)  # let the dispatched create_task()s finish
 
         assert started == [b"msg-1", b"msg-2"]
 
@@ -723,15 +762,16 @@ class TestConsumeLoopConcurrency:
 
         worker.process = fake_process
 
-        async def fake_consume(**kwargs):
-            yield b"msg-1", {"meeting_id": "m1", "speaker_id": "speaker-A"}
-            yield b"msg-2", {"meeting_id": "m1", "speaker_id": "speaker-A"}
+        async def fake_consume_concurrent(*, handler, **kwargs):
+            await asyncio.gather(
+                handler(b"msg-1", {"meeting_id": "m1", "speaker_id": "speaker-A"}),
+                handler(b"msg-2", {"meeting_id": "m1", "speaker_id": "speaker-A"}),
+            )
             worker._shutdown_event.set()
 
-        worker.redis.consume = fake_consume
+        worker.redis.consume_concurrent = fake_consume_concurrent
 
         await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
-        await asyncio.sleep(0.2)
 
         # msg-2 must not start until msg-1 has fully finished — same speaker, same
         # reused Realtime session.
@@ -760,3 +800,27 @@ class TestConsumeLoopConcurrency:
         assert "m1" not in worker._room_languages
         assert ("m1", "speaker-A") not in worker._speaker_locks
         assert ("m2", "speaker-B") in worker._speaker_locks
+
+
+# A Redis redelivery of the same audio chunk must not mint a second billable
+# transcript segment.
+def test_segment_id_is_stable_for_same_source_message() -> None:
+    build_segment_id = getattr(stt_worker_module, "_build_segment_id", None)
+    assert callable(build_segment_id)
+    first = build_segment_id(
+        "room-1",
+        "speaker-1",
+        b"1710000000000-0",
+        0,
+        1200,
+        "hello",
+    )
+    second = build_segment_id(
+        "room-1",
+        "speaker-1",
+        b"1710000000000-0",
+        0,
+        1200,
+        "hello",
+    )
+    assert first == second

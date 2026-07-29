@@ -76,13 +76,23 @@ class TestSearchTerminologyGlobalFallback:
         didn't already find >= 5 matches — see docs/global-glossary-plan.md.
         """
         five_terms = [
-            {"sourceTerm": f"term{i}", "targetTerm": f"t{i}", "context": "arch note", "domain": None, "isActive": True}
+            {
+                "sourceTerm": f"term{i}",
+                "targetTerm": f"t{i}",
+                "context": "arch note",
+                "domain": None,
+                "isActive": True,
+            }
             for i in range(5)
         ]
-        client = _make_client({
-            f"/api/v1/glossaries/workspace/ws-1": _response(200, [{"id": "g1", "name": "Eng", "isActive": True}]),
-            "/api/v1/glossaries/g1/terms": _response(200, five_terms),
-        })
+        client = _make_client(
+            {
+                "/api/v1/glossaries/workspace/ws-1": _response(
+                    200, [{"id": "g1", "name": "Eng", "isActive": True}]
+                ),
+                "/api/v1/glossaries/g1/terms": _response(200, five_terms),
+            }
+        )
         ctx = _make_ctx(client)
 
         result = json.loads(await _search_terminology(ctx, {"query": "arch"}))
@@ -95,17 +105,23 @@ class TestSearchTerminologyGlobalFallback:
         assert not any(path.startswith("/api/v1/glossaries/global") for path in requested_paths)
 
     async def test_global_term_truncates_long_definition(self) -> None:
-        client = _make_client({
-            "/api/v1/glossaries/workspace/ws-1": _response(200, []),
-            "/api/v1/glossaries/global": _response(200, [
-                {
-                    "term": "architect",
-                    "preferredTranslation": "architect",
-                    "definition": "A " * 1000,  # deliberately far longer than the DB VARCHAR caps
-                    "businessDomain": None,
-                }
-            ]),
-        })
+        client = _make_client(
+            {
+                "/api/v1/glossaries/workspace/ws-1": _response(200, []),
+                "/api/v1/glossaries/global": _response(
+                    200,
+                    [
+                        {
+                            "term": "architect",
+                            "preferredTranslation": "architect",
+                            "definition": "A "
+                            * 1000,  # deliberately far longer than the DB VARCHAR caps
+                            "businessDomain": None,
+                        }
+                    ],
+                ),
+            }
+        )
         ctx = _make_ctx(client)
 
         result = json.loads(await _search_terminology(ctx, {"query": "architect"}))
@@ -119,16 +135,42 @@ class TestSearchTerminologyGlobalFallback:
         GlossaryStartedEventConsumer uses for the STT/MT prompt merge — so the global fallback
         must not re-add (and re-cost tokens for) a term the workspace already defined.
         """
-        client = _make_client({
-            "/api/v1/glossaries/workspace/ws-1": _response(200, [{"id": "g1", "name": "Eng", "isActive": True}]),
-            "/api/v1/glossaries/g1/terms": _response(200, [
-                {"sourceTerm": "architect", "targetTerm": "kien truc su", "context": None, "domain": None, "isActive": True}
-            ]),
-            "/api/v1/glossaries/global": _response(200, [
-                {"term": "architect", "preferredTranslation": "architect", "definition": "A design role.", "businessDomain": None},
-                {"term": "sprint", "preferredTranslation": "sprint", "definition": "A work cycle.", "businessDomain": None},
-            ]),
-        })
+        client = _make_client(
+            {
+                "/api/v1/glossaries/workspace/ws-1": _response(
+                    200, [{"id": "g1", "name": "Eng", "isActive": True}]
+                ),
+                "/api/v1/glossaries/g1/terms": _response(
+                    200,
+                    [
+                        {
+                            "sourceTerm": "architect",
+                            "targetTerm": "kien truc su",
+                            "context": None,
+                            "domain": None,
+                            "isActive": True,
+                        }
+                    ],
+                ),
+                "/api/v1/glossaries/global": _response(
+                    200,
+                    [
+                        {
+                            "term": "architect",
+                            "preferredTranslation": "architect",
+                            "definition": "A design role.",
+                            "businessDomain": None,
+                        },
+                        {
+                            "term": "sprint",
+                            "preferredTranslation": "sprint",
+                            "definition": "A work cycle.",
+                            "businessDomain": None,
+                        },
+                    ],
+                ),
+            }
+        )
         ctx = _make_ctx(client)
 
         result = json.loads(await _search_terminology(ctx, {"query": "a"}))
@@ -153,10 +195,12 @@ class TestSearchTerminologyGlobalFallback:
             }
             for i in range(10)
         ]
-        client = _make_client({
-            "/api/v1/glossaries/workspace/ws-1": _response(200, []),
-            "/api/v1/glossaries/global": _response(200, global_terms),
-        })
+        client = _make_client(
+            {
+                "/api/v1/glossaries/workspace/ws-1": _response(200, []),
+                "/api/v1/glossaries/global": _response(200, global_terms),
+            }
+        )
         ctx = _make_ctx(client)
 
         raw = await _search_terminology(ctx, {"query": "term"})

@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any
+from typing import Any, cast
 
 import httpx
+from openai import AsyncOpenAI
 
 from ai_assistant_worker.chat_tools import TOOLS, TOOLS_BY_NAME, ToolContext
 from shared.base_worker import BaseWorker
@@ -127,17 +128,19 @@ class ChatAssistantWorker(BaseWorker):
     input_stream = "assistant:chat_requests"
     consumer_group = "assistant-chat-workers"
 
-    def __init__(self, chat_settings: ChatAssistantSettings | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        chat_settings: ChatAssistantSettings | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.chat_settings = chat_settings or ChatAssistantSettings()
-        self._openai = None
+        self._openai: AsyncOpenAI | None = None
         self._workspace_client: httpx.AsyncClient | None = None
         self._transcript_client: httpx.AsyncClient | None = None
         self._translation_room_client: httpx.AsyncClient | None = None
 
     async def load_model(self) -> None:
-        from openai import AsyncOpenAI
-
         api_key = resolve_openai_api_key(self.chat_settings.api_key)
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is required for ChatAssistantWorker")
@@ -242,8 +245,8 @@ class ChatAssistantWorker(BaseWorker):
                 model=self.chat_settings.model,
                 temperature=self.chat_settings.temperature,
                 max_tokens=self.chat_settings.max_tokens,
-                messages=messages,
-                tools=tool_schemas,
+                messages=cast(Any, messages),
+                tools=cast(Any, tool_schemas),
                 tool_choice="auto",
                 stream=True,
                 stream_options={"include_usage": True},
@@ -272,6 +275,7 @@ class ChatAssistantWorker(BaseWorker):
                         acc = tool_calls_acc.setdefault(
                             tc.index,
                             {"id": None, "name": None, "arguments": ""},
+
                         )
                         if tc.id:
                             acc["id"] = tc.id
@@ -291,18 +295,20 @@ class ChatAssistantWorker(BaseWorker):
                 break
 
             ordered_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": call["id"] or f"call_{uuid.uuid4().hex}",
-                        "type": "function",
-                        "function": {"name": call["name"], "arguments": call["arguments"]},
-                    }
-                    for call in ordered_calls
-                ],
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call["id"] or f"call_{uuid.uuid4().hex}",
+                            "type": "function",
+                            "function": {"name": call["name"], "arguments": call["arguments"]},
+                        }
+                        for call in ordered_calls
+                    ],
+                }
+            )
 
             for call in ordered_calls:
                 call_id = call["id"] or f"call_{uuid.uuid4().hex}"
@@ -331,18 +337,22 @@ class ChatAssistantWorker(BaseWorker):
                     type_="tool_call_completed",
                     tool_name=tool_name,
                     tool_status=status,
+
                 )
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": result_json})
-                tool_call_log.append({
-                    "tool": tool_name,
-                    "arguments": call["arguments"],
-                    "result": result_json,
-                    "status": status,
-                })
+                tool_call_log.append(
+                    {
+                        "tool": tool_name,
+                        "arguments": call["arguments"],
+                        "result": result_json,
+                        "status": status,
+                    }
+                )
         else:
             # Hit max_tool_iterations without a non-tool-call finish.
             final_text = final_text or (
-                "I wasn't able to finish looking that up — please try rephrasing your question."
+                "I wasn't able to finish looking that up ? please try rephrasing your question."
+
             )
 
         return final_text, tool_call_log, usage_total
@@ -360,6 +370,7 @@ class ChatAssistantWorker(BaseWorker):
             request_id=request.request_id,
             conversation_id=request.conversation_id,
             type=type_,
+            origin=request.origin,
             content=content,
             tool_name=tool_name,
             tool_status=tool_status,

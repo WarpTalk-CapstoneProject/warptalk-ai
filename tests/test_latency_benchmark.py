@@ -16,25 +16,14 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
 import statistics
 import time
 from dataclasses import dataclass, field
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
-import soundfile as sf
 
 from shared.audio_utils import numpy_to_bytes
-from shared.config import (
-    RedisSettings,
-    STTSettings,
-    TranslationSettings,
-    TTSSettings,
-    WorkerSettings,
-)
 from shared.schemas import (
     AudioChunkMessage,
     STTResultMessage,
@@ -42,22 +31,24 @@ from shared.schemas import (
     TTSResultMessage,
 )
 
-
 # ╔═══════════════════════════════════════════════════════════════╗
 # ║  LATENCY PROFILES — Realistic GPU inference timings          ║
 # ╠═══════════════════════════════════════════════════════════════╣
 # ║  Source: benchmarks from Faster-Whisper, NLLB, XTTS v2 docs ║
 # ╚═══════════════════════════════════════════════════════════════╝
 
+
 @dataclass
 class LatencyProfile:
     """Simulated latency for each pipeline stage."""
+
     name: str
-    stt_ms: float       # Faster-Whisper medium INT8, beam=1
+    stt_ms: float  # Faster-Whisper medium INT8, beam=1
     translate_ms: float  # NLLB-200 distilled 600M
-    tts_edge_ms: float   # Edge-TTS (API call, no GPU)
-    tts_xtts_ms: float   # XTTS v2 voice cloning (GPU)
+    tts_edge_ms: float  # Edge-TTS (API call, no GPU)
+    tts_xtts_ms: float  # XTTS v2 voice cloning (GPU)
     redis_overhead_ms: float = 2.0  # Per-hop serialization + network
+
 
 PROFILES = {
     # Optimistic: warm GPU, short text, no network jitter
@@ -94,9 +85,11 @@ PROFILES = {
 # ║  SIMULATED PIPELINE — Measures each stage independently      ║
 # ╚═══════════════════════════════════════════════════════════════╝
 
+
 @dataclass
 class StageResult:
     """Timing result for a single pipeline stage."""
+
     stage: str
     latency_ms: float
     input_size: str = ""
@@ -106,6 +99,7 @@ class StageResult:
 @dataclass
 class PipelineResult:
     """Full pipeline timing result."""
+
     profile_name: str
     stages: list[StageResult] = field(default_factory=list)
     total_ms: float = 0.0
@@ -118,10 +112,10 @@ class PipelineResult:
 
     def summary(self) -> str:
         lines = [
-            f"\n{'='*70}",
+            f"\n{'=' * 70}",
             f"  Pipeline Latency — {self.profile_name}",
             f"  Voice: {self.voice_type}",
-            f"{'='*70}",
+            f"{'=' * 70}",
         ]
         for s in self.stages:
             bar = "█" * int(s.latency_ms / 10)
@@ -132,13 +126,13 @@ class PipelineResult:
             if s.output_preview:
                 lines.append(f"  {'':20s} └── {s.output_preview}")
 
-        lines.append(f"  {'─'*50}")
+        lines.append(f"  {'─' * 50}")
         emoji = "✅" if self.meets_target else "❌"
         lines.append(
             f"  {'TOTAL':<20s} {self.total_ms:>7.1f}ms  "
             f"{emoji} {'PASS' if self.meets_target else 'FAIL'} (target: <1500ms)"
         )
-        lines.append(f"{'='*70}\n")
+        lines.append(f"{'=' * 70}\n")
         return "\n".join(lines)
 
 
@@ -169,7 +163,7 @@ async def run_pipeline_benchmark(
         "STT (Whisper)",
         profile.stt_ms + profile.redis_overhead_ms,
         input_size=f"audio: {len(audio_chunk)} bytes (1s @ 16kHz)",
-        output_preview=f"text: \"{text}\"",
+        output_preview=f'text: "{text}"',
     )
     result.stages.append(stt_stage)
 
@@ -177,8 +171,8 @@ async def run_pipeline_benchmark(
     translate_stage = await simulate_stage(
         "Translation (NLLB)",
         profile.translate_ms + profile.redis_overhead_ms,
-        input_size=f"text: \"{text}\" ({len(text)} chars)",
-        output_preview=f"translated: \"Xin chào, bạn khỏe không?\"",
+        input_size=f'text: "{text}" ({len(text)} chars)',
+        output_preview='translated: "Xin chào, bạn khỏe không?"',
     )
     result.stages.append(translate_stage)
 
@@ -188,8 +182,8 @@ async def run_pipeline_benchmark(
     tts_stage = await simulate_stage(
         tts_name,
         tts_delay + profile.redis_overhead_ms,
-        input_size=f"text: \"Xin chào, bạn khỏe không?\"",
-        output_preview=f"audio: ~2s WAV output",
+        input_size='text: "Xin chào, bạn khỏe không?"',
+        output_preview="audio: ~2s WAV output",
     )
     result.stages.append(tts_stage)
 
@@ -216,6 +210,7 @@ def _generate_test_audio(duration_s: float = 1.0, sample_rate: int = 16000) -> b
 # ╔═══════════════════════════════════════════════════════════════╗
 # ║  SERIALIZATION BENCHMARK — Measure Redis encode/decode cost  ║
 # ╚═══════════════════════════════════════════════════════════════╝
+
 
 def measure_serialization_overhead(n_iterations: int = 1000) -> dict:
     """Benchmark Redis serialization/deserialization cost."""
@@ -289,6 +284,7 @@ def measure_serialization_overhead(n_iterations: int = 1000) -> dict:
 # ║  PIPELINE STRESS TEST — Multiple concurrent sentences        ║
 # ╚═══════════════════════════════════════════════════════════════╝
 
+
 async def run_concurrent_pipeline(
     profile: LatencyProfile,
     n_sentences: int = 5,
@@ -299,7 +295,7 @@ async def run_concurrent_pipeline(
         run_pipeline_benchmark(
             profile,
             use_voice_clone=use_voice_clone,
-            text=f"Test sentence number {i+1} for latency benchmark.",
+            text=f"Test sentence number {i + 1} for latency benchmark.",
         )
         for i in range(n_sentences)
     ]
@@ -310,6 +306,7 @@ async def run_concurrent_pipeline(
 # ║  PYTEST TEST CASES                                           ║
 # ╚═══════════════════════════════════════════════════════════════╝
 
+
 class TestPipelineLatency:
     """End-to-end pipeline latency benchmark tests."""
 
@@ -319,7 +316,9 @@ class TestPipelineLatency:
         result = await run_pipeline_benchmark(PROFILES["optimistic"], use_voice_clone=False)
         print(result.summary())
         assert result.meets_target, f"Latency {result.total_ms:.0f}ms exceeds 1500ms target"
-        assert result.total_ms < 500, f"Optimistic Edge-TTS should be <500ms, got {result.total_ms:.0f}ms"
+        assert result.total_ms < 500, (
+            f"Optimistic Edge-TTS should be <500ms, got {result.total_ms:.0f}ms"
+        )
 
     @pytest.mark.asyncio
     async def test_edge_tts_realistic_under_target(self):
@@ -359,7 +358,7 @@ class TestPipelineLatency:
         avg = statistics.mean(latencies)
         p95 = sorted(latencies)[int(len(latencies) * 0.95)]
 
-        print(f"\n  Concurrent (5 sentences):")
+        print("\n  Concurrent (5 sentences):")
         print(f"    Average: {avg:.1f}ms")
         print(f"    P95:     {p95:.1f}ms")
         print(f"    Min:     {min(latencies):.1f}ms")
@@ -401,7 +400,6 @@ class TestChunkOverlapBenefit:
             sequential_total_ms += 1000 + result.total_ms  # 1s record + processing
 
         # Overlapping: process chunk N while recording chunk N+1
-        overlap_start = time.perf_counter()
         tasks = []
         for i in range(n_chunks):
             # Simulate recording + processing overlap
@@ -416,8 +414,10 @@ class TestChunkOverlapBenefit:
         print(f"\n  Chunk Processing Comparison ({n_chunks} chunks):")
         print(f"    Sequential:  {sequential_total_ms:>8.0f}ms (record+process+record+...)")
         print(f"    Overlapping: {overlapping_total_ms:>8.0f}ms (process while recording)")
-        print(f"    Savings:     {sequential_total_ms - overlapping_total_ms:>8.0f}ms "
-              f"({(1 - overlapping_total_ms/sequential_total_ms)*100:.0f}% faster)")
+        print(
+            f"    Savings:     {sequential_total_ms - overlapping_total_ms:>8.0f}ms "
+            f"({(1 - overlapping_total_ms / sequential_total_ms) * 100:.0f}% faster)"
+        )
 
         assert overlapping_total_ms < sequential_total_ms
 
@@ -426,13 +426,14 @@ class TestChunkOverlapBenefit:
 # ║  STANDALONE RUNNER — Full report                             ║
 # ╚═══════════════════════════════════════════════════════════════╝
 
+
 async def run_full_report():
     """Generate a complete latency analysis report."""
     print("\n" + "═" * 70)
     print("  WarpTalk AI Pipeline — Latency Benchmark Report")
     print("═" * 70)
     print(f"  Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Note: Using simulated ML inference delays (no GPU)")
+    print("  Note: Using simulated ML inference delays (no GPU)")
     print("═" * 70)
 
     # 1. Serialization costs
@@ -460,7 +461,7 @@ async def run_full_report():
     print("│  3. SUMMARY TABLE                                       │")
     print("└─────────────────────────────────────────────────────────┘")
     print(f"  {'Profile':<25s} {'Voice':<15s} {'Total':>8s} {'Status':>8s}")
-    print(f"  {'─'*25} {'─'*15} {'─'*8} {'─'*8}")
+    print(f"  {'─' * 25} {'─' * 15} {'─' * 8} {'─' * 8}")
     for r in all_results:
         voice = "Clone" if "clone" in r.voice_type else "Edge"
         status = "✅ PASS" if r.meets_target else "❌ FAIL"
@@ -478,7 +479,7 @@ async def run_full_report():
 
     # 5. Verdict
     print("\n" + "═" * 70)
-    realistic_edge = all_results[2]   # realistic + edge
+    realistic_edge = all_results[2]  # realistic + edge
     realistic_clone = all_results[3]  # realistic + clone
     if realistic_edge.meets_target and realistic_clone.meets_target:
         print("  ✅ VERDICT: Pipeline meets 1.5s latency target")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -53,7 +54,7 @@ class EmbeddingIndexRequest(BaseModel):
         }
 
     @classmethod
-    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> EmbeddingIndexRequest:
+    def from_redis(cls, data: Mapping[Any, Any]) -> EmbeddingIndexRequest:
         d = _decode_dict(data)
         chunks = json.loads(d.get("chunks_json", "[]"))
         return cls(
@@ -131,7 +132,7 @@ class EmbeddingSearchRequest(BaseModel):
         }
 
     @classmethod
-    def from_redis(cls, data: dict[bytes | str, bytes | str]) -> EmbeddingSearchRequest:
+    def from_redis(cls, data: Mapping[Any, Any]) -> EmbeddingSearchRequest:
         d = _decode_dict(data)
         return cls(
             job_id=d.get("job_id", str(uuid.uuid4())),
@@ -143,11 +144,9 @@ class EmbeddingSearchRequest(BaseModel):
         )
 
 
-def _decode_dict(data: dict[bytes | str, bytes | str]) -> dict[str, str]:
+def _decode_dict(data: Mapping[Any, Any]) -> dict[str, str]:
     return {
-        k.decode() if isinstance(k, bytes) else k: (
-            v.decode() if isinstance(v, bytes) else str(v)
-        )
+        k.decode() if isinstance(k, bytes) else k: (v.decode() if isinstance(v, bytes) else str(v))
         for k, v in data.items()
     }
 

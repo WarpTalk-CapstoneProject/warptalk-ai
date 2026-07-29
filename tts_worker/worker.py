@@ -18,7 +18,10 @@ import asyncio
 import hashlib
 import json
 import time
+from collections.abc import Mapping
 from decimal import Decimal
+from typing import Any, cast
+
 
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
@@ -40,9 +43,48 @@ _WAV_HEADER_BYTES = 44
 # defaults to "auto" (STT does language auto-detection, not the audio-chunk producer) — so
 # fall back to "en" for anything Cartesia's SDK wouldn't accept as a real language code.
 _CARTESIA_SUPPORTED_LANGUAGES = {
-    "en", "fr", "de", "es", "pt", "zh", "ja", "hi", "it", "ko", "nl", "pl", "ru", "sv",
-    "tr", "tl", "bg", "ro", "ar", "cs", "el", "fi", "hr", "ms", "sk", "da", "ta", "uk",
-    "hu", "no", "vi", "bn", "th", "he", "ka", "id", "te", "gu", "kn", "ml", "mr", "pa",
+    "en",
+    "fr",
+    "de",
+    "es",
+    "pt",
+    "zh",
+    "ja",
+    "hi",
+    "it",
+    "ko",
+    "nl",
+    "pl",
+    "ru",
+    "sv",
+    "tr",
+    "tl",
+    "bg",
+    "ro",
+    "ar",
+    "cs",
+    "el",
+    "fi",
+    "hr",
+    "ms",
+    "sk",
+    "da",
+    "ta",
+    "uk",
+    "hu",
+    "no",
+    "vi",
+    "bn",
+    "th",
+    "he",
+    "ka",
+    "id",
+    "te",
+    "gu",
+    "kn",
+    "ml",
+    "mr",
+    "pa",
 }
 
 
@@ -50,7 +92,7 @@ def _clone_language(hint: str) -> str:
     return hint if hint in _CARTESIA_SUPPORTED_LANGUAGES else "en"
 
 
-def _decode_field(data: dict, key: str) -> str:
+def _decode_field(data: Mapping[Any, Any], key: str) -> str:
     raw = data.get(key)
     if raw is None:
         raw = data.get(key.encode())
@@ -59,7 +101,9 @@ def _decode_field(data: dict, key: str) -> str:
     return raw.decode() if isinstance(raw, bytes) else raw
 
 
-def _extract_tts_key(data: dict) -> tuple[str, str, str]:
+def _extract_tts_key(
+    data: Mapping[Any, Any],
+) -> tuple[str, str, str]:
     """Cheap (meeting_id, speaker_id, target_lang) extraction from a raw translate:results
     Redis entry, ahead of process()'s own full TranslationResultMessage parse — this is
     the unit of ordering _consume_loop must preserve (one LiveKit track per this triple)."""
@@ -82,7 +126,7 @@ class TTSWorker(BaseWorker):
     def __init__(
         self,
         tts_settings: TTSSettings | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.tts_settings = tts_settings or TTSSettings()
@@ -126,10 +170,8 @@ class TTSWorker(BaseWorker):
         the right trade-off, since real speech itself paces how fast new same-key
         sentences even arrive.
 
-        Same acking trade-off as translation_worker's override: RedisStreamClient.
-        consume() acks a message right after yielding it, not after process() returns,
-        so a crash mid-flight loses whatever's currently dispatched instead of it being
-        redelivered.
+        RedisStreamClient.consume_concurrent ties XACK to successful handler
+        completion. Failed work remains pending for BaseWorker's reclaim/DLQ path.
         """
         self.logger.info(
             "consume_loop_started",
@@ -142,24 +184,20 @@ class TTSWorker(BaseWorker):
             key = _extract_tts_key(data)
             lock = self._key_locks.setdefault(key, asyncio.Lock())
             async with lock:
-                try:
-                    await self.process(message_id, data)
-                except Exception:
-                    self.logger.exception(
-                        "process_error", message_id=message_id, stream=self.input_stream
-                    )
+                await self._process_and_log_errors(message_id, data)
 
         while not self._shutdown_event.is_set():
             try:
-                async for message_id, data in self.redis.consume(
+                await self._recover_stale_messages()
+                await self.redis.consume_concurrent(
                     stream=self.input_stream,
                     group=self.consumer_group,
+                    handler=_run,
                     consumer=self._consumer_name,
                     block_ms=2000,
-                ):
-                    if self._shutdown_event.is_set():
-                        break
-                    asyncio.create_task(_run(message_id, data))
+                    count=8,
+                    concurrency=8,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -253,7 +291,7 @@ class TTSWorker(BaseWorker):
 
         return variants
 
-    async def _get_voice_catalog(self, language: str) -> list[dict]:
+    async def _get_voice_catalog(self, language: str) -> list[dict[str, Any]]:
         """Redis-cached (TTL) list of public Cartesia voices for a language.
 
         Falls back to [] on any cache/fetch problem — callers must fall back to
@@ -264,13 +302,14 @@ class TTSWorker(BaseWorker):
         if cached:
             try:
                 raw = cached.decode() if isinstance(cached, bytes) else cached
-                return json.loads(raw)
+                return cast(list[dict[str, Any]], json.loads(raw))
             except Exception:
                 self.logger.warning("voice_catalog_cache_corrupt", language=language)
 
-        voices = await self.cartesia.list_voices(
+        voices = await self._require_cartesia().list_voices(
             language,
             limit=self.tts_settings.voice_catalog_size,
+
         )
         if voices:
             await self.redis.set_with_ttl(
@@ -284,7 +323,7 @@ class TTSWorker(BaseWorker):
         if not catalog:
             return CartesiaSynthesizer._default_voice_id(language)
         index = int(hashlib.sha256(speaker_id.encode()).hexdigest(), 16) % len(catalog)
-        return catalog[index]["id"]
+        return str(catalog[index]["id"])
 
     async def _get_explicit_voice_choices(self, meeting_id: str, target_lang: str) -> set[str]:
         """Distinct voice_ids explicitly chosen (via TranslationRoomHub.
@@ -338,11 +377,21 @@ class TTSWorker(BaseWorker):
                 if voice_key:
                     # Extra voice variant — LiveKit only, never a second billing event
                     # for content already billed via the default variant's publish.
-                    await self._publish_livekit_only(translation, cached_audio, voice_key)
+                    cached_bytes = (
+                        cached_audio.encode("utf-8")
+                        if isinstance(cached_audio, str)
+                        else cached_audio
+                    )
+                    await self._publish_livekit_only(translation, cached_bytes, voice_key)
                 else:
+                    cached_bytes = (
+                        cached_audio.encode("utf-8")
+                        if isinstance(cached_audio, str)
+                        else cached_audio
+                    )
                     await self._publish_result(
                         translation=translation,
-                        audio_bytes=cached_audio,
+                        audio_bytes=cached_bytes,
                         duration_ms=0,
                         voice_type=voice_type,
                         voice_key=voice_key,
@@ -355,7 +404,7 @@ class TTSWorker(BaseWorker):
 
         t0 = time.monotonic()
         try:
-            audio_bytes, duration_ms, resolved_voice_id = await self.cartesia.synthesize(
+            audio_bytes, duration_ms, resolved_voice_id = await self._require_cartesia().synthesize(
                 text=text,
                 language=translation.target_lang,
                 voice_id=voice_id,
@@ -549,7 +598,11 @@ class TTSWorker(BaseWorker):
         """Clone voice via Cartesia and cache voice_id in Redis."""
         label = f"speaker-{speaker_id[:8]}-{meeting_id[:8]}"
         try:
-            voice_id = await self.cartesia.clone_voice(audio_bytes, label, language)
+            voice_id = await self._require_cartesia().clone_voice(
+                audio_bytes,
+                label,
+                language,
+            )
             cache_key = f"voice:{meeting_id}:{speaker_id}"
             await self.redis.hset(cache_key, "voice_id", voice_id)
             # hset has no TTL of its own — without this the key lives in Redis forever.
@@ -594,3 +647,8 @@ class TTSWorker(BaseWorker):
             f"{speaker_id}|{target_lang}|{normalized}|{voice_mode}".encode()
         ).hexdigest()
         return f"tts:cache:{digest}"
+
+    def _require_cartesia(self) -> CartesiaSynthesizer:
+        if self.cartesia is None:
+            raise RuntimeError("Cartesia synthesizer is not loaded")
+        return self.cartesia

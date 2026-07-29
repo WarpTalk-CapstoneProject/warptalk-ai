@@ -129,14 +129,18 @@ class TestEmbeddingWorker:
         ever clean it up.
         """
         worker = EmbeddingWorker.__new__(EmbeddingWorker)
-        worker.embedding_settings = EmbeddingSettings(provider="openai", api_key="test-key", dimensions=2)
+        worker.embedding_settings = EmbeddingSettings(
+            provider="openai", api_key="test-key", dimensions=2
+        )
         worker.provider = FakeEmbeddingProvider(vectors=[[0.1, 0.2]])
         worker.vector_store = FakeVectorStore()
         worker.publish = AsyncMock()
 
         await worker.process(b"msg-1", _request(deletion_state="deleted").to_redis())
 
-        worker.vector_store.delete_mock.assert_awaited_once_with(collection="workspace-1-rag", ids=["chunk-1"])
+        worker.vector_store.delete_mock.assert_awaited_once_with(
+            collection="workspace-1-rag", ids=["chunk-1"]
+        )
         worker.vector_store.upsert_mock.assert_not_awaited()
         worker.provider.calls == []
         result = worker.publish.call_args.args[2]
@@ -145,7 +149,9 @@ class TestEmbeddingWorker:
 
     async def test_deletion_state_skips_delete_call_when_no_chunk_ids(self) -> None:
         worker = EmbeddingWorker.__new__(EmbeddingWorker)
-        worker.embedding_settings = EmbeddingSettings(provider="openai", api_key="test-key", dimensions=2)
+        worker.embedding_settings = EmbeddingSettings(
+            provider="openai", api_key="test-key", dimensions=2
+        )
         worker.provider = FakeEmbeddingProvider(vectors=[])
         worker.vector_store = FakeVectorStore()
         worker.publish = AsyncMock()
@@ -163,14 +169,20 @@ class TestEmbeddingWorker:
         NEW content may be embedded, not whether stale vectors may be cleaned up.
         """
         worker = EmbeddingWorker.__new__(EmbeddingWorker)
-        worker.embedding_settings = EmbeddingSettings(provider="openai", api_key="test-key", dimensions=2)
-        worker.provider = OpenAIEmbeddingProvider(settings=worker.embedding_settings, client=object())
+        worker.embedding_settings = EmbeddingSettings(
+            provider="openai", api_key="test-key", dimensions=2
+        )
+        worker.provider = OpenAIEmbeddingProvider(
+            settings=worker.embedding_settings, client=object()
+        )
         worker.vector_store = FakeVectorStore()
         worker.publish = AsyncMock()
 
         await worker.process(
             b"msg-1",
-            _request(deletion_state="deleted", ai_retrieval_allowed=False, external_llm_allowed=False).to_redis(),
+            _request(
+                deletion_state="deleted", ai_retrieval_allowed=False, external_llm_allowed=False
+            ).to_redis(),
         )
 
         worker.vector_store.delete_mock.assert_awaited_once()

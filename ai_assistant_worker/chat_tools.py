@@ -11,8 +11,9 @@ import asyncio
 import json
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, cast
 
 import httpx
 
@@ -81,15 +82,17 @@ async def _search_workspace_members(ctx: ToolContext, arguments: dict[str, Any])
             return json.dumps({"error": "Could not look up workspace members right now."})
 
         items = response.json().get("items", [])
-        return json.dumps([
-            {
-                "name": m.get("fullName"),
-                "email": m.get("email"),
-                "role": m.get("roleName"),
-                "status": m.get("status"),
-            }
-            for m in items
-        ])
+        return json.dumps(
+            [
+                {
+                    "name": m.get("fullName"),
+                    "email": m.get("email"),
+                    "role": m.get("roleName"),
+                    "status": m.get("status"),
+                }
+                for m in items
+            ]
+        )
     except Exception:
         logger.exception("search_workspace_members_error")
         return json.dumps({"error": "Could not look up workspace members right now."})
@@ -120,7 +123,9 @@ async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> st
             headers=_auth_headers(ctx),
         )
         if glossaries_response.status_code != 200:
-            logger.warning("search_terminology_glossaries_failed", status=glossaries_response.status_code)
+            logger.warning(
+                "search_terminology_glossaries_failed", status=glossaries_response.status_code
+            )
             return json.dumps({"error": "Could not look up terminology right now."})
 
         for glossary in glossaries_response.json():
@@ -138,17 +143,21 @@ async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> st
                 if not term.get("isActive", True):
                     continue
                 haystack = " ".join(
-                    filter(None, [term.get("sourceTerm"), term.get("targetTerm"), term.get("context")])
+                    filter(
+                        None, [term.get("sourceTerm"), term.get("targetTerm"), term.get("context")]
+                    )
                 ).lower()
                 if query_lower in haystack:
-                    matches.append({
-                        "source": "workspace",
-                        "glossary": glossary.get("name"),
-                        "term": term.get("sourceTerm"),
-                        "translation": term.get("targetTerm"),
-                        "context": _truncate_terminology_context(term.get("context")),
-                        "domain": term.get("domain"),
-                    })
+                    matches.append(
+                        {
+                            "source": "workspace",
+                            "glossary": glossary.get("name"),
+                            "term": term.get("sourceTerm"),
+                            "translation": term.get("targetTerm"),
+                            "context": _truncate_terminology_context(term.get("context")),
+                            "domain": term.get("domain"),
+                        }
+                    )
     except Exception:
         logger.exception("search_terminology_error")
         return json.dumps({"error": "Could not look up terminology right now."})
@@ -174,17 +183,22 @@ async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> st
                     if term_name.lower() in workspace_terms_lower:
                         continue
                     haystack = " ".join(
-                        filter(None, [term_name, term.get("preferredTranslation"), term.get("definition")])
+                        filter(
+                            None,
+                            [term_name, term.get("preferredTranslation"), term.get("definition")],
+                        )
                     ).lower()
                     if query_lower in haystack:
-                        matches.append({
-                            "source": "global",
-                            "glossary": "System (Global Glossary)",
-                            "term": term_name,
-                            "translation": term.get("preferredTranslation"),
-                            "context": _truncate_terminology_context(term.get("definition")),
-                            "domain": term.get("businessDomain"),
-                        })
+                        matches.append(
+                            {
+                                "source": "global",
+                                "glossary": "System (Global Glossary)",
+                                "term": term_name,
+                                "translation": term.get("preferredTranslation"),
+                                "context": _truncate_terminology_context(term.get("definition")),
+                                "domain": term.get("businessDomain"),
+                            }
+                        )
         except Exception:
             logger.warning("search_terminology_global_fallback_failed")
 
@@ -204,17 +218,19 @@ async def _list_recent_meetings(ctx: ToolContext, arguments: dict[str, Any]) -> 
             return json.dumps({"error": "Could not look up recent meetings right now."})
 
         rooms = response.json().get("rooms", [])
-        return json.dumps([
-            {
-                "id": r.get("room", {}).get("id"),
-                "title": r.get("room", {}).get("title"),
-                "code": r.get("room", {}).get("translationRoomCode"),
-                "status": r.get("room", {}).get("status"),
-                "endedAt": r.get("room", {}).get("endedAt"),
-                "durationSeconds": r.get("room", {}).get("durationSeconds"),
-            }
-            for r in rooms
-        ])
+        return json.dumps(
+            [
+                {
+                    "id": r.get("room", {}).get("id"),
+                    "title": r.get("room", {}).get("title"),
+                    "code": r.get("room", {}).get("translationRoomCode"),
+                    "status": r.get("room", {}).get("status"),
+                    "endedAt": r.get("room", {}).get("endedAt"),
+                    "durationSeconds": r.get("room", {}).get("durationSeconds"),
+                }
+                for r in rooms
+            ]
+        )
     except Exception:
         logger.exception("list_recent_meetings_error")
         return json.dumps({"error": "Could not look up recent meetings right now."})
@@ -290,8 +306,8 @@ async def _run_embedding_search(
         _key, payload = raw
         payload = payload.decode() if isinstance(payload, bytes) else payload
         result = json.loads(payload)
-        return result.get("matches", [])
-    except (asyncio.TimeoutError, TimeoutError):
+        return cast(list[dict[str, Any]], result.get("matches", []))
+    except TimeoutError:
         return []
     except Exception:
         logger.exception("semantic_search_collection_error", extra={"collection_id": collection_id})
@@ -333,7 +349,9 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
         logger.exception("semantic_search_error")
         return json.dumps({"error": "Could not perform semantic search right now."})
 
-    merged = sorted(workspace_matches + global_matches, key=lambda m: m.get("score", 0), reverse=True)[:top_k]
+    merged = sorted(
+        workspace_matches + global_matches, key=lambda m: m.get("score", 0), reverse=True
+    )[:top_k]
     if not merged:
         return json.dumps({"matches": [], "note": "No results available."})
 
@@ -343,30 +361,34 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
 async def _get_meeting_summary(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     meeting_id = ((arguments or {}).get("meeting_id") or "").strip()
     if not meeting_id:
-        return json.dumps({
-            "error": "A meeting_id is required — call list_recent_meetings first to find one."
-        })
+        return json.dumps(
+            {"error": "A meeting_id is required — call list_recent_meetings first to find one."}
+        )
 
     try:
         summary_hash = await ctx.redis.hgetall(f"meeting:{meeting_id}:summary")
         if not summary_hash:
-            return json.dumps({
-                "summary": None,
-                "note": (
-                    "No summary has been generated for this meeting yet. Meeting summaries "
-                    "are only produced automatically as a meeting's transcript pipeline "
-                    "completes — there is currently no on-demand trigger."
-                ),
-            })
+            return json.dumps(
+                {
+                    "summary": None,
+                    "note": (
+                        "No summary has been generated for this meeting yet. Meeting summaries "
+                        "are only produced automatically as a meeting's transcript pipeline "
+                        "completes — there is currently no on-demand trigger."
+                    ),
+                }
+            )
 
         decoded = {
             (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
             for k, v in summary_hash.items()
         }
-        return json.dumps({
-            "summary": decoded.get("content"),
-            "action_items": decoded.get("action_items"),
-        })
+        return json.dumps(
+            {
+                "summary": decoded.get("content"),
+                "action_items": decoded.get("action_items"),
+            }
+        )
     except Exception:
         logger.exception("get_meeting_summary_error")
         return json.dumps({"error": "Could not look up the meeting summary right now."})
@@ -375,9 +397,9 @@ async def _get_meeting_summary(ctx: ToolContext, arguments: dict[str, Any]) -> s
 async def _get_room_detail(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     room_id = ((arguments or {}).get("room_id") or "").strip()
     if not room_id:
-        return json.dumps({
-            "error": "A room_id is required — call list_recent_meetings first to find one."
-        })
+        return json.dumps(
+            {"error": "A room_id is required — call list_recent_meetings first to find one."}
+        )
 
     try:
         response = await ctx.translation_room_client.get(
@@ -391,18 +413,20 @@ async def _get_room_detail(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             return json.dumps({"error": "Could not look up that room right now."})
 
         room = response.json()
-        return json.dumps({
-            "id": room.get("id"),
-            "title": room.get("title"),
-            "code": room.get("translationRoomCode"),
-            "status": room.get("status"),
-            "sourceLanguage": room.get("sourceLanguage"),
-            "targetLanguages": room.get("targetLanguages"),
-            "hostId": room.get("hostId"),
-            "scheduledAt": room.get("scheduledAt"),
-            "startedAt": room.get("startedAt"),
-            "endedAt": room.get("endedAt"),
-        })
+        return json.dumps(
+            {
+                "id": room.get("id"),
+                "title": room.get("title"),
+                "code": room.get("translationRoomCode"),
+                "status": room.get("status"),
+                "sourceLanguage": room.get("sourceLanguage"),
+                "targetLanguages": room.get("targetLanguages"),
+                "hostId": room.get("hostId"),
+                "scheduledAt": room.get("scheduledAt"),
+                "startedAt": room.get("startedAt"),
+                "endedAt": room.get("endedAt"),
+            }
+        )
     except Exception:
         logger.exception("get_room_detail_error")
         return json.dumps({"error": "Could not look up that room right now."})
@@ -411,9 +435,9 @@ async def _get_room_detail(ctx: ToolContext, arguments: dict[str, Any]) -> str:
 async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     meeting_id = ((arguments or {}).get("meeting_id") or "").strip()
     if not meeting_id:
-        return json.dumps({
-            "error": "A meeting_id is required — call list_recent_meetings first to find one."
-        })
+        return json.dumps(
+            {"error": "A meeting_id is required — call list_recent_meetings first to find one."}
+        )
 
     try:
         transcript_response = await ctx.transcript_client.get(
@@ -421,7 +445,9 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             headers=_auth_headers(ctx),
         )
         if transcript_response.status_code == 404:
-            return json.dumps({"segments": [], "note": "No transcript exists for this meeting yet."})
+            return json.dumps(
+                {"segments": [], "note": "No transcript exists for this meeting yet."}
+            )
         if transcript_response.status_code != 200:
             logger.warning("get_transcript_lookup_failed", status=transcript_response.status_code)
             return json.dumps({"error": "Could not look up the transcript right now."})
@@ -429,7 +455,9 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
         transcript = transcript_response.json()
         transcript_id = transcript.get("id")
         if not transcript_id:
-            return json.dumps({"segments": [], "note": "No transcript exists for this meeting yet."})
+            return json.dumps(
+                {"segments": [], "note": "No transcript exists for this meeting yet."}
+            )
 
         segments_response = await ctx.transcript_client.get(
             f"/api/v1/transcripts/{transcript_id}/segments",
@@ -442,19 +470,21 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
 
         items = segments_response.json().get("items", [])
         ordered = sorted(items, key=lambda s: s.get("sequenceOrder", 0))
-        return json.dumps({
-            "transcriptId": transcript_id,
-            "status": transcript.get("status"),
-            "segments": [
-                {
-                    "speaker": s.get("speakerName"),
-                    "language": s.get("originalLanguage"),
-                    "text": s.get("originalText"),
-                    "startMs": s.get("startTimeMs"),
-                }
-                for s in ordered
-            ],
-        })
+        return json.dumps(
+            {
+                "transcriptId": transcript_id,
+                "status": transcript.get("status"),
+                "segments": [
+                    {
+                        "speaker": s.get("speakerName"),
+                        "language": s.get("originalLanguage"),
+                        "text": s.get("originalText"),
+                        "startMs": s.get("startTimeMs"),
+                    }
+                    for s in ordered
+                ],
+            }
+        )
     except Exception:
         logger.exception("get_transcript_error")
         return json.dumps({"error": "Could not look up the transcript right now."})
@@ -490,14 +520,16 @@ async def _get_document(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             full_text = text_response.json().get("fullText") or ""
             excerpt = full_text[:DOCUMENT_EXCERPT_CHAR_LIMIT] or None
 
-        return json.dumps({
-            "id": doc.get("id"),
-            "name": doc.get("name"),
-            "status": doc.get("status"),
-            "ingestionStatus": doc.get("ingestionStatus"),
-            "isSensitive": doc.get("isSensitive"),
-            "excerpt": excerpt,
-        })
+        return json.dumps(
+            {
+                "id": doc.get("id"),
+                "name": doc.get("name"),
+                "status": doc.get("status"),
+                "ingestionStatus": doc.get("ingestionStatus"),
+                "isSensitive": doc.get("isSensitive"),
+                "excerpt": excerpt,
+            }
+        )
     except Exception:
         logger.exception("get_document_error")
         return json.dumps({"error": "Could not look up that document right now."})
@@ -516,7 +548,10 @@ TOOLS: list[ChatTool] = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Name or email fragment to search for. Leave blank to list the first few members.",
+                    "description": (
+                        "Name or email fragment to search for. Leave blank to "
+                        "list the first few members."
+                    ),
                 }
             },
             "required": [],
@@ -550,7 +585,10 @@ TOOLS: list[ChatTool] = [
         parameters={
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Optional keyword to filter meeting titles by."},
+                "query": {
+                    "type": "string",
+                    "description": "Optional keyword to filter meeting titles by.",
+                },
             },
             "required": [],
         },
@@ -624,7 +662,9 @@ TOOLS: list[ChatTool] = [
             "properties": {
                 "room_id": {
                     "type": "string",
-                    "description": "The room's id, from page context or a prior list_recent_meetings call.",
+                    "description": (
+                        "The room's id, from page context or a prior list_recent_meetings call."
+                    ),
                 },
             },
             "required": ["room_id"],
@@ -644,7 +684,10 @@ TOOLS: list[ChatTool] = [
             "properties": {
                 "meeting_id": {
                     "type": "string",
-                    "description": "The meeting/room's id, from page context or a prior list_recent_meetings call.",
+                    "description": (
+                        "The meeting/room's id, from page context or a prior "
+                        "list_recent_meetings call."
+                    ),
                 },
             },
             "required": ["meeting_id"],

@@ -24,15 +24,19 @@ violate the FK. Charging credits does not require that row to exist.
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 import socket
 import time
 import uuid
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
+from typing import Any
 
 from billing_worker.db import BillingRepository
 from shared.config import BillingSettings, RedisSettings, STTSettings, TTSSettings, WorkerSettings
+from shared.health_probe import heartbeat_key
 from shared.logger import get_logger
 from shared.redis_client import RedisStreamClient
 from shared.schemas import AIUsageMessage, AudioChunkMessage, ProviderUsageMessage, TTSResultMessage
@@ -49,6 +53,7 @@ ACCUMULATOR_SEQUENCE_PREFIX = "billing:accseq"
 CHARGE_DEDUPE_PREFIX = "billing:charge"
 EVENT_DEDUPE_PREFIX = "billing:event"
 MICRO_SCALE = Decimal("1000000")
+SettlementHandler = Callable[[Mapping[Any, Any]], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,10 @@ def _extract_underlying_segment_id(raw_segment_id: str) -> str | None:
 
 
 class BillingSettlementWorker:
+    max_delivery_attempts = 5
+    heartbeat_interval_seconds = 10
+    heartbeat_ttl_seconds = 30
+
     def __init__(
         self,
         billing_settings: BillingSettings | None = None,
@@ -115,8 +124,9 @@ class BillingSettlementWorker:
         self.logger = logger
         self._consumer_name = f"billing-{socket.gethostname()}"
         self._shutdown_event = asyncio.Event()
+        self._last_progress_unix_ms = int(time.time() * 1000)
         # translation_room_id -> (subscription_id, workspace_id, cached_at_monotonic)
-        self._subscription_cache: dict[str, tuple] = {}
+        self._subscription_cache: dict[str, tuple[uuid.UUID, uuid.UUID, float]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -126,9 +136,11 @@ class BillingSettlementWorker:
         self._register_signal_handlers()
         await self.redis.connect()
         await self.db.connect()
+        await self._publish_heartbeat()
         self.logger.info("billing_worker_started")
         try:
             await asyncio.gather(
+                self._heartbeat_loop(),
                 self._consume_loop("audio:chunks", "billing-stt-workers", self._handle_stt),
                 self._consume_loop("ai:usage", "billing-ai-usage-workers", self._handle_ai_usage),
                 self._consume_loop(
@@ -145,9 +157,15 @@ class BillingSettlementWorker:
             await self.redis.disconnect()
             self.logger.info("billing_worker_stopped")
 
-    async def _consume_loop(self, stream: str, group: str, handler) -> None:
+    async def _consume_loop(
+        self,
+        stream: str,
+        group: str,
+        handler: SettlementHandler,
+    ) -> None:
         while not self._shutdown_event.is_set():
             try:
+                await self._recover_stale(stream, group, handler)
                 async for message_id, data in self.redis.consume(
                     stream=stream,
                     group=group,
@@ -156,31 +174,172 @@ class BillingSettlementWorker:
                 ):
                     if self._shutdown_event.is_set():
                         break
-                    try:
-                        await handler(data)
-                    except Exception:
-                        self.logger.exception(
-                            "settlement_error", stream=stream, message_id=message_id
-                        )
-                        # Already acked by consume() — in production this should go to a
-                        # dead-letter stream instead of being silently dropped.
+                    await self._process_settlement_message(
+                        stream,
+                        message_id,
+                        data,
+                        handler,
+                    )
+                self._last_progress_unix_ms = int(time.time() * 1000)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger.exception("consume_loop_error", stream=stream)
                 await asyncio.sleep(1.0)
 
+    async def _process_settlement_message(
+        self,
+        stream: str,
+        message_id: bytes,
+        data: dict[bytes, bytes],
+        handler: SettlementHandler,
+    ) -> None:
+        try:
+            await handler(data)
+            self._last_progress_unix_ms = int(time.time() * 1000)
+        except Exception:
+            self.logger.exception(
+                "settlement_error",
+                stream=stream,
+                message_id=message_id,
+            )
+            raise
+
+    async def _recover_stale(
+        self,
+        stream: str,
+        group: str,
+        handler: SettlementHandler,
+    ) -> None:
+        messages = await self.redis.reclaim_stale(
+            stream,
+            group,
+            self._consumer_name,
+        )
+        for message_id, data in messages:
+            try:
+                await self._process_settlement_message(
+                    stream,
+                    message_id,
+                    data,
+                    handler,
+                )
+            except Exception:
+                attempts = await self.redis.pending_delivery_count(
+                    stream,
+                    group,
+                    message_id,
+                )
+                if attempts >= self.max_delivery_attempts:
+                    payload = {
+                        (
+                            key.decode("utf-8", errors="replace")
+                            if isinstance(key, bytes)
+                            else str(key)
+                        ): (
+                            value.decode("utf-8", errors="replace")
+                            if isinstance(value, bytes)
+                            else str(value)
+                        )
+                        for key, value in data.items()
+                    }
+                    await self.redis.publish(
+                        f"{stream}:dead-letter",
+                        {
+                            "original_message_id": message_id.decode(
+                                "utf-8",
+                                errors="replace",
+                            ),
+                            "consumer_group": group,
+                            "worker": "billing",
+                            "delivery_attempts": attempts,
+                            "failed_at_unix_ms": int(time.time() * 1000),
+                            "payload": json.dumps(payload),
+                        },
+                    )
+                    await self.redis.redis.xack(stream, group, message_id)
+                    self.logger.error(
+                        "settlement_dead_lettered",
+                        stream=stream,
+                        message_id=message_id,
+                        attempts=attempts,
+                    )
+                continue
+            await self.redis.redis.xack(stream, group, message_id)
+
+    async def _publish_heartbeat(self) -> None:
+        hostname = self._consumer_name.removeprefix("billing-")
+        now_unix_ms = int(time.time() * 1000)
+        await self.redis.set_with_ttl(
+            heartbeat_key("billing", hostname),
+            json.dumps(
+                {
+                    "worker": "billing",
+                    "consumer": self._consumer_name,
+                    "streams": [
+                        "audio:chunks",
+                        "ai:usage",
+                        "billing:usage",
+                        "tts:results",
+                    ],
+                    "timestamp_unix_ms": now_unix_ms,
+                    "last_progress_unix_ms": getattr(
+                        self,
+                        "_last_progress_unix_ms",
+                        now_unix_ms,
+                    ),
+                }
+            ),
+            self.heartbeat_ttl_seconds,
+        )
+
+    async def _heartbeat_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(self.heartbeat_interval_seconds)
+            try:
+                await self._publish_heartbeat()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.exception("billing_heartbeat_failed")
+
     # ------------------------------------------------------------------
     # Subscription resolution (cached per translation_room_id)
     # ------------------------------------------------------------------
 
-    async def _resolve_subscription(self, translation_room_id: str) -> tuple | None:
+    async def _resolve_subscription(
+        self,
+        translation_room_id: str,
+    ) -> tuple[uuid.UUID, uuid.UUID] | None:
         cached = self._subscription_cache.get(translation_room_id)
         now = time.monotonic()
         if cached and now - cached[2] < self.settings.subscription_cache_ttl_seconds:
             return cached[0], cached[1]
 
-        resolved = await self.db.resolve_subscription(translation_room_id)
+        raw_room = await self.redis.get(f"meeting:room:{translation_room_id}")
+        if raw_room is None:
+            self.logger.warning(
+                "room_projection_missing",
+                translation_room_id=translation_room_id,
+            )
+            raise RuntimeError(
+                f"Room projection is unavailable for translation room {translation_room_id}"
+            )
+        if isinstance(raw_room, bytes):
+            raw_room = raw_room.decode("utf-8")
+        room_projection = json.loads(raw_room)
+        workspace_id = room_projection.get("WorkspaceId") or room_projection.get("workspaceId")
+        if not workspace_id:
+            self.logger.warning(
+                "room_projection_missing_workspace",
+                translation_room_id=translation_room_id,
+            )
+            raise RuntimeError(
+                f"Room projection is unavailable for translation room {translation_room_id}: "
+                "workspace id is missing"
+            )
+
+        resolved = await self.db.resolve_subscription(workspace_id)
         if resolved is None:
             return None
 
@@ -192,7 +351,7 @@ class BillingSettlementWorker:
     # Per-stream handlers
     # ------------------------------------------------------------------
 
-    async def _handle_stt(self, data: dict) -> None:
+    async def _handle_stt(self, data: Mapping[Any, Any]) -> None:
         msg = AudioChunkMessage.from_redis(data)
         if not msg.audio_data or msg.sample_rate <= 0:
             return
@@ -243,7 +402,7 @@ class BillingSettlementWorker:
             details={"event_source": "audio_chunks", "sample_rate": msg.sample_rate},
         ))
 
-    async def _handle_ai_usage(self, data: dict) -> None:
+    async def _handle_ai_usage(self, data: Mapping[Any, Any]) -> None:
         msg = AIUsageMessage.from_redis(data)
         if msg.prompt_tokens <= 0 and msg.cached_tokens <= 0 and msg.completion_tokens <= 0:
             return
@@ -315,7 +474,7 @@ class BillingSettlementWorker:
                 },
             ))
 
-    async def _handle_provider_usage(self, data: dict) -> None:
+    async def _handle_provider_usage(self, data: Mapping[Any, Any]) -> None:
         msg = ProviderUsageMessage.from_redis(data)
         if msg.quantity <= 0:
             return
@@ -366,7 +525,7 @@ class BillingSettlementWorker:
             },
         ))
 
-    async def _handle_tts(self, data: dict) -> None:
+    async def _handle_tts(self, data: Mapping[Any, Any]) -> None:
         msg = TTSResultMessage.from_redis(data)
         if msg.cache_hit:
             return  # reused a previously synthesized clip — no new provider cost incurred
