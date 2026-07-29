@@ -12,7 +12,6 @@ from shared.schemas import (
     ChatRequestMessage,
     ChatResultMessage,
     ProviderUsageMessage,
-
     STTResultMessage,
     TranslationResultMessage,
     TTSResultMessage,

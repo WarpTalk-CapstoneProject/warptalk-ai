@@ -12,12 +12,16 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
-import torch
 from livekit import api, rtc
 
 from livekit_ingress_worker.near_field_gate import NearFieldGate
 from shared.base_worker import BaseWorker
 from shared.schemas import AudioChunkMessage
+
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
 
 SILERO_VAD_REPOSITORY = "snakers4/silero-vad:v6.2.1"
 
@@ -79,6 +83,8 @@ class LiveKitIngressWorker(BaseWorker):
 
     async def load_model(self) -> None:
         """Load Silero VAD model."""
+        if torch is None:
+            raise RuntimeError("Install the ingress optional dependencies to use Silero VAD.")
         self._vad_model, _ = torch.hub.load(
             SILERO_VAD_REPOSITORY,
             "silero_vad",
@@ -214,6 +220,8 @@ class LiveKitIngressWorker(BaseWorker):
         in the window and return the maximum probability.
         """
         max_prob = 0.0
+        if torch is None:
+            raise RuntimeError("Install the ingress optional dependencies to use Silero VAD.")
         for i in range(0, len(pcm_f32) - self.VAD_FRAME_SIZE + 1, self.VAD_FRAME_SIZE):
             frame = pcm_f32[i : i + self.VAD_FRAME_SIZE]
             tensor = torch.from_numpy(frame).unsqueeze(0)

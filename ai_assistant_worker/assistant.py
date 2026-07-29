@@ -12,7 +12,6 @@ from typing import Any, cast
 
 from openai import AsyncOpenAI
 
-
 from shared.config import AssistantSettings
 from shared.logger import get_logger
 from shared.openai_usage import TokenUsage
@@ -176,7 +175,6 @@ isn't in the transcript.
 If the transcript is empty or has no substantive content, return a summary
 describing that, and empty arrays for decisions and actionItems."""
 
-
     async def generate_structured_summary(
         self,
         transcript: str,
@@ -213,12 +211,14 @@ describing that, and empty arrays for decisions and actionItems."""
         context_snapshot: str = "",
     ) -> DictWithUsage:
         if not transcript.strip():
-            return DictWithUsage({
-                "summary": "No transcript content to summarize.",
-                "decisions": [],
-                "actionItems": [],
-                "insufficientData": True,
-            })
+            return DictWithUsage(
+                {
+                    "summary": "No transcript content to summarize.",
+                    "decisions": [],
+                    "actionItems": [],
+                    "insufficientData": True,
+                }
+            )
 
         system_content = self.STRUCTURED_SYSTEM_PROMPT
         if context_snapshot:
@@ -260,15 +260,16 @@ describing that, and empty arrays for decisions and actionItems."""
             return DictWithUsage(parsed, usage)
         except Exception:
             logger.exception("structured_summary_generation_failed")
-            return DictWithUsage({
-
-                "summary": (
-                    "The AI assistant could not generate a structured summary for this meeting."
-                ),
-                "decisions": [],
-                "actionItems": [],
-                "insufficientData": True,
-            })
+            return DictWithUsage(
+                {
+                    "summary": (
+                        "The AI assistant could not generate a structured summary for this meeting."
+                    ),
+                    "decisions": [],
+                    "actionItems": [],
+                    "insufficientData": True,
+                }
+            )
 
     def _require_client(self) -> AsyncOpenAI:
         if self._client is None:

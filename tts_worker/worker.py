@@ -22,7 +22,6 @@ from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any, cast
 
-
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
 from shared.schemas import (
@@ -309,7 +308,6 @@ class TTSWorker(BaseWorker):
         voices = await self._require_cartesia().list_voices(
             language,
             limit=self.tts_settings.voice_catalog_size,
-
         )
         if voices:
             await self.redis.set_with_ttl(

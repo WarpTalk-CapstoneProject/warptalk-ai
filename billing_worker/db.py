@@ -13,8 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import ROUND_CEILING, Decimal
-
+from decimal import Decimal
 from typing import Any
 
 import asyncpg
@@ -31,7 +30,6 @@ def _as_uuid(value: str) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
 
 
-
 @dataclass(frozen=True)
 class UsageRate:
     id: uuid.UUID
@@ -40,13 +38,6 @@ class UsageRate:
     model: str
     provider_unit_cost: Decimal | None = None
     markup_multiplier: Decimal | None = None
-
-
-def calculate_credit_charge(quantity: float, unit_price: Decimal) -> int:
-    """Apply an immutable rate-card snapshot and bill whole credits."""
-    raw_cost = Decimal(str(quantity)) * unit_price
-    return max(1, int(raw_cost.to_integral_value(rounding=ROUND_CEILING)))
-
 
 
 class BillingRepository:
@@ -337,14 +328,12 @@ class BillingRepository:
             "CreatedAt": datetime.now(UTC).isoformat(),
         }
 
-
         # C# BillingAggregationWorker is the single settlement owner for Phase 3.
         # It calls subscription.settle_usage_charge(), which atomically creates usage,
         # creates the credit transaction, updates balance, and updates overage/suspend state.
         # Python only stages the temp log so we do not double-deduct credits.
 
         await self._redis.rpush("warptalk:billing:temp_usage_logs", json.dumps(temp_log))
-
 
         logger.info(
             "usage_charged",

@@ -12,7 +12,6 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-
 from shared.config import TranslationSettings
 from shared.logger import get_logger
 from shared.openai_usage import TokenUsage
@@ -68,7 +67,6 @@ def _build_system_prompt(base_prompt: str, glossary_terms: list[dict[str, str]] 
 
 
 def _build_glossary_block(glossary_terms: list[dict[str, str]] | None) -> str:
-
     """Render this workspace's active glossary terms (see GlossaryStartedEventConsumer,
     published to `translationRoom:{meeting_id}:mt_glossary`) as a system-prompt addendum.
 

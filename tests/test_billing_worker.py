@@ -11,7 +11,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from billing_worker import db as billing_db
 from billing_worker.db import BillingRepository
 from billing_worker.worker import BillingSettlementWorker, _extract_underlying_segment_id
 from shared.config import DatabaseSettings, RedisSettings
@@ -402,13 +401,6 @@ async def test_subscription_resolution_fails_when_room_projection_is_missing() -
 
     with pytest.raises(RuntimeError, match="Room projection is unavailable"):
         await worker._resolve_subscription(room_id)
-
-
-def test_credit_charge_rounds_rate_card_cost_up_to_whole_credit() -> None:
-    calculate_credit_charge = getattr(billing_db, "calculate_credit_charge", None)
-    assert callable(calculate_credit_charge)
-    assert calculate_credit_charge(1.0, Decimal("0.25")) == 1
-    assert calculate_credit_charge(61.0, Decimal("0.25")) == 16
 
 
 async def test_settlement_error_propagates_so_message_remains_pending() -> None:
