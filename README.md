@@ -18,8 +18,8 @@ All workers communicate via **Redis Streams** with overlapping audio chunks for 
 
 | Worker | Purpose | Model |
 |--------|---------|-------|
-| `stt-worker` | Speech-to-Text | OpenAI `gpt-4o-mini-transcribe` |
-| `translation-worker` | Real-time translation | OpenAI `gpt-4.1-mini` |
+| `stt-worker` | Speech-to-Text | OpenAI `gpt-transcribe` |
+| `translation-worker` | Real-time translation | OpenAI `gpt-5.4-nano` + Realtime fallback |
 | `tts-worker` | Text-to-Speech + Voice Cloning | Cartesia `sonic-3.5` |
 | `ai-assistant-worker` | Meeting summarization & Q&A | OpenAI `gpt-4.1` |
 | `embedding-worker` | WarpBot RAG indexing | OpenAI `text-embedding-3-small` + Qdrant |

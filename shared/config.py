@@ -60,7 +60,10 @@ class WorkerSettings(BaseSettings):
     model_config = {"env_prefix": ""}
 
     log_level: str = "INFO"
-    chunk_duration_ms: int = 3000  # 3s chunk — balance between latency and STT context
+    # Max only for uninterrupted speech; ordinary short turns still flush on VAD silence.
+    # Six seconds gives the model enough lexical context for natural Vietnamese sentences
+    # containing English technical terms without adding delay after an ordinary pause.
+    chunk_duration_ms: int = 6000
     redis: RedisSettings = RedisSettings()
     livekit: LiveKitSettings = LiveKitSettings()
 
@@ -71,20 +74,21 @@ class WorkerSettings(BaseSettings):
     # model (which has no confidence signal of its own to reject them — see
     # STTSettings.model) and getting hallucinated into a full sentence.
     vad_threshold: float = 0.5  # Speech detection threshold
-    vad_pre_speech_ms: int = 300  # Pre-speech buffer to capture word onsets
-    vad_silence_hangover_ms: int = 600  # 600ms hangover — faster turnaround
-    vad_min_speech_ms: int = 500  # Minimum speech length to publish
+    vad_pre_speech_ms: int = 192  # Two ~96ms windows preserve word onsets
+    # Four ~96ms windows retain quiet final syllables and natural micro-pauses. A
+    # two-window production replay cut "Kubernetes" to "Kuber".
+    vad_silence_hangover_ms: int = 576
+    vad_min_speech_ms: int = 288  # Keeps short English keywords and acknowledgements
 
-    # Near-field energy gate (ingress worker only, see livekit_ingress_worker/near_field_gate.py)
-    # — rejects a speech chunk whose peak amplitude is much quieter than this SAME
-    # track's own established near-field baseline. VAD alone can't tell "close and
-    # clear" from "far away and muffled" — both are speech-shaped. Pure energy/peak
-    # math, no ML dependency, negligible latency.
-    near_field_gate_enabled: bool = True
-
-    # chunk peak must be >= 35% of this track's own established near-field peak
-    near_field_gate_relative_floor: float = 0.35
-
+    # Near-field energy gate (ingress worker only, see livekit_ingress_worker/near_field_gate.py).
+    # Opt-in only: a relative peak threshold cannot tell a distant speaker from a quiet
+    # syllable in the primary speaker's own turn. Enabling it dropped valid middle
+    # chunks in production, so the default preserves audio recall and lets the
+    # context-aware stage handle relevance instead.
+    near_field_gate_enabled: bool = False
+    near_field_gate_relative_floor: float = (
+        0.35  # chunk peak must be >= 35% of this track's own established near-field peak
+    )
     near_field_gate_min_baseline_chunks: int = 2
     near_field_gate_baseline_ema_alpha: float = 0.3
 
@@ -96,20 +100,22 @@ class STTSettings(BaseSettings):
 
     provider: str = "openai"
     api_key: str = ""
-    # gpt-4o-transcribe (not gpt-realtime-whisper): the realtime-whisper model is
-    # dialogue-optimized (forced min temperature 0.6) and supports neither a `prompt`
-    # field nor confidence signals, so it hallucinates more and can't be steered.
-    # gpt-4o-transcribe runs over the same realtime transcription session but accepts a
-    # free-text `prompt` for contextual biasing (glossary/key terms) — the research-
-    # backed way to cut hallucination (arXiv 2410.18363). See model.py.
-    model: str = "gpt-4o-transcribe"
+    # Accuracy-first model for completed utterances. It supports expected `languages`,
+    # structured `keywords`, and prompt context in Realtime transcription sessions.
+    model: str = "gpt-transcribe"
     language: str = "auto"  # Auto-detect for code-switching (Vi + En)
-    # OpenAI Realtime's own input-side denoiser, applied before VAD/the model ever see
-    # the audio — "far_field" is tuned for laptop/room mics (WarpTalk's actual usage),
-    # "near_field" for headset mics, "off" disables it. Distinct from and upstream of
-    # livekit_ingress_worker's Silero VAD / NearFieldGate, which run on raw PCM before
-    # this session ever receives it.
-    noise_reduction: str = "far_field"
+    # Browser capture already applies WebRTC echo cancellation/noise suppression and
+    # may additionally use the optional Krisp processor. A second Realtime denoising
+    # pass distorted clean close-mic speech in production replay tests, so leave it off
+    # by default. Deployments ingesting genuinely raw room audio can still opt in with
+    # STT_NOISE_REDUCTION=far_field.
+    noise_reduction: str = "off"
+    # Production replay placed unrelated, unstable sentences at -0.767 to -0.8833.
+    # Clear code-switched technical speech stayed above this boundary.
+    min_avg_logprob: float = -0.7
+    # Warm WebSockets are claimed by the first active speakers so their first utterance
+    # does not pay the ~1–2s Realtime connection handshake.
+    realtime_pool_size: int = 4
 
 
 class TranslationSettings(BaseSettings):
@@ -119,7 +125,23 @@ class TranslationSettings(BaseSettings):
 
     provider: str = "openai"  # 'openai' only — no fallback
     api_key: str = ""
-    model: str = "gpt-4.1-mini"  # Best cost/quality for short-text translation
+    # Live vi→en production probes were semantically equivalent to gpt-4.1-mini while
+    # cutting warm median translation latency from ~1.4–1.8s to ~0.8s.
+    model: str = "gpt-5.4-nano"
+    # Persistent Realtime text responses avoid a fresh HTTP/model-routing round trip.
+    # The chat model above remains the correctness fallback when a WebSocket is unhealthy.
+    # Mini was faster and more stable on the production Vietnamese/code-switching probe:
+    # 660/919/655/737/715ms versus the full model's 667/1873/864/880/920ms.
+    realtime_model: str = "gpt-realtime-2.1-mini"
+    realtime_pool_size: int = 4
+    # Do not turn a rare ~1.2s provider response into a 5–19s latency cliff by
+    # prematurely starting the slower HTTP fallback.
+    realtime_timeout_seconds: float = 2.0
+    # TranslationWorker already splits the stream into sentences. Keep this bounded,
+    # but leave enough headroom for the model's hidden minimal-reasoning tokens: 64
+    # intermittently ended short translations as `incomplete`, triggering a multi-second
+    # HTTP fallback that was far worse for p95 latency than the larger ceiling.
+    realtime_max_output_tokens: int = 128
     max_tokens: int = 512
     # Fully deterministic, not just "near" — measured via the real pipeline benchmark
     # that 0.1 let identical repeated sentences translate to different (equally valid)

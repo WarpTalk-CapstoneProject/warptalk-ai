@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,7 +14,15 @@ from shared.config import STTSettings, WorkerSettings
 from shared.schemas import AudioChunkMessage
 from stt_worker import worker as stt_worker_module
 from stt_worker.model import OpenAISTT, TranscribedSegment, _filter_segments, _normalize_language
-from stt_worker.worker import STTWorker
+from stt_worker.worker import STTWorker, _language_hint_for_stt
+
+
+def test_default_stt_model_uses_accuracy_first_transcribe_variant() -> None:
+    assert STTSettings().model == "gpt-transcribe"
+
+
+def test_default_chunk_window_preserves_long_code_switched_utterances() -> None:
+    assert WorkerSettings().chunk_duration_ms == 6000
 
 
 class FakeRealtimeConn:
@@ -73,6 +83,27 @@ def _segment(text: str, avg_logprob: float = -0.3, no_speech_prob: float = 0.01)
 
 class TestOpenAISTT:
     """OpenAISTT wrapper tests — mocks the Realtime API's WebSocket session."""
+
+    def test_default_stt_does_not_double_denoise_browser_audio(self) -> None:
+        assert STTSettings().noise_reduction == "off"
+
+    async def test_warm_pool_removes_first_speaker_websocket_handshake(self) -> None:
+        stt = OpenAISTT(api_key="test", model="gpt-4o-transcribe")
+        connections = [FakeRealtimeConn([]), FakeRealtimeConn([])]
+        managers = [FakeRealtimeManager(conn) for conn in connections]
+        stt._client = MagicMock()
+        stt._client.realtime.connect = MagicMock(side_effect=managers)
+
+        await stt.warm_up(pool_size=2)
+        session = await stt._get_or_create_session(
+            ("meeting-1", "speaker-1"),
+            language="vi",
+            prompt="Meeting topic: WarpTalk.",
+        )
+
+        assert session["conn"] in connections
+        assert stt._client.realtime.connect.call_count == 2
+        session["conn"].session.update.assert_awaited_once()
 
     async def test_transcribe_returns_segments(self, sample_audio_bytes: bytes) -> None:
         """transcribe() should return a filtered list of TranscribedSegment.
@@ -136,6 +167,311 @@ class TestOpenAISTT:
         payload = stt._session_payload(language=None, prompt=None)
 
         assert "noise_reduction" not in payload["audio"]["input"]
+
+    def test_session_payload_requests_transcription_logprobs(self) -> None:
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.model = "gpt-4o-transcribe"
+        stt.noise_reduction = "far_field"
+
+        payload = stt._session_payload(language=None, prompt=None)
+
+        assert payload["include"] == ["item.input_audio_transcription.logprobs"]
+
+    def test_gpt_transcribe_payload_uses_expected_languages_and_keywords(self) -> None:
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.model = "gpt-transcribe"
+        stt.noise_reduction = "off"
+
+        payload = stt._session_payload(
+            language="vi",
+            prompt="Meeting topic: WarpTalk.",
+            allowed_languages={"vi", "en"},
+            keywords=["WarpTalk", "Kubernetes", "gRPC"],
+        )
+
+        transcription = payload["audio"]["input"]["transcription"]
+        assert transcription["languages"] == ["vi", "en"]
+        assert transcription["keywords"] == ["WarpTalk", "Kubernetes", "gRPC"]
+        assert "language" not in transcription
+        assert "include" not in payload
+
+    async def test_transcribe_configures_room_languages_and_glossary_keywords(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Deploy Kubernetes",
+            )
+        ]
+        stt, conn = _make_stt_with_conn(events)
+        stt.model = "gpt-transcribe"
+
+        await stt.transcribe(
+            sample_audio_bytes,
+            language="vi",
+            allowed_languages={"vi", "en"},
+            keywords=["Kubernetes"],
+            meeting_id="m1",
+            speaker_id="s1",
+        )
+
+        payload = conn.session.update.await_args.kwargs["session"]
+        transcription = payload["audio"]["input"]["transcription"]
+        assert transcription["languages"] == ["vi", "en"]
+        assert transcription["keywords"] == ["Kubernetes"]
+
+    async def test_transcribe_uses_completed_event_logprobs_as_confidence(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Deploy the backend with Kubernetes",
+                logprobs=[
+                    SimpleNamespace(token="Deploy", logprob=-0.2),
+                    SimpleNamespace(token=" Kubernetes", logprob=-0.4),
+                ],
+            )
+        ]
+        stt, _ = _make_stt_with_conn(events)
+
+        result = await stt.transcribe(sample_audio_bytes, meeting_id="m1", speaker_id="s1")
+
+        assert len(result) == 1
+        assert result[0].confidence == pytest.approx(-0.3)
+
+    async def test_speculative_sentence_callback_keeps_final_validated_transcript(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """Speculation may start translation early, but final STT output must still
+        wait for completed-event logprobs and contain the validated sentence."""
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.delta",
+                delta="Deploy Docker.",
+            ),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Deploy Docker.",
+                logprobs=[SimpleNamespace(token="Deploy Docker.", logprob=-0.2)],
+            ),
+        ]
+        stt, _ = _make_stt_with_conn(events)
+        speculative = AsyncMock()
+
+        result = await stt.transcribe(
+            sample_audio_bytes,
+            meeting_id="m1",
+            speaker_id="s1",
+            on_speculative_segment=speculative,
+        )
+
+        speculative.assert_awaited_once()
+        assert speculative.await_args.args[0].text == "Deploy Docker."
+        assert [segment.text for segment in result] == ["Deploy Docker."]
+        assert result[0].confidence == pytest.approx(-0.2)
+
+    async def test_normal_production_chunk_uses_one_audio_append(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """Awaiting one websocket send per 100ms frame adds avoidable latency after
+        ingress has already assembled a bounded speech chunk."""
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Deploy Docker.",
+                logprobs=[SimpleNamespace(token="Deploy Docker.", logprob=-0.2)],
+            )
+        ]
+        stt, conn = _make_stt_with_conn(events)
+
+        await stt.transcribe(
+            sample_audio_bytes,
+            meeting_id="m1",
+            speaker_id="s1",
+        )
+
+        assert conn.input_audio_buffer.append.await_count == 1
+
+    async def test_transcribe_filters_low_confidence_completed_event(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Nhiều học sinh đang viết bài kiểm",
+                logprobs=[SimpleNamespace(token="garbage", logprob=-1.4)],
+            )
+        ]
+        stt, _ = _make_stt_with_conn(events)
+
+        result = await stt.transcribe(sample_audio_bytes, meeting_id="m1", speaker_id="s1")
+
+        assert result == []
+
+    @pytest.mark.parametrize("avg_logprob", [-0.767, -0.8652, -0.8833])
+    async def test_transcribe_filters_marginal_production_hallucinations(
+        self, sample_audio_bytes: bytes, avg_logprob: float
+    ) -> None:
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Câu nghe giống tiếng Việt nhưng không liên quan đến cuộc họp",
+                logprobs=[SimpleNamespace(token="marginal", logprob=avg_logprob)],
+            )
+        ]
+        stt, _ = _make_stt_with_conn(events)
+
+        result = await stt.transcribe(sample_audio_bytes, meeting_id="m1", speaker_id="s1")
+
+        assert result == []
+
+    async def test_transcribe_keeps_clear_segment_near_confidence_boundary(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Please approve the pull request",
+                logprobs=[SimpleNamespace(token="clear", logprob=-0.69)],
+            )
+        ]
+        stt, _ = _make_stt_with_conn(events)
+
+        result = await stt.transcribe(sample_audio_bytes, meeting_id="m1", speaker_id="s1")
+
+        assert [segment.text for segment in result] == ["Please approve the pull request"]
+
+    async def test_transcribe_filters_high_confidence_prompt_echo(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        prompt = "WarpTalk Kubernetes backend deployment"
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript=prompt,
+                logprobs=[SimpleNamespace(token=prompt, logprob=-0.02)],
+            )
+        ]
+        stt, _ = _make_stt_with_conn(events)
+
+        result = await stt.transcribe(
+            sample_audio_bytes, meeting_id="m1", speaker_id="s1", prompt=prompt
+        )
+
+        assert result == []
+
+    async def test_transcribe_filters_low_confidence_partial_prompt_echo(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """Production regression: marginal audio copied only the title fragment,
+        so exact-whole-line prompt matching did not catch it."""
+        prompt = (
+            "Meeting topic: WarpTalk transcript engineering review. "
+            "Meeting context: Docker Kubernetes deployment."
+        )
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="WarpTalk transcript engineering",
+                logprobs=[
+                    SimpleNamespace(
+                        token="WarpTalk transcript engineering",
+                        logprob=-0.6066,
+                    )
+                ],
+            )
+        ]
+        stt, _ = _make_stt_with_conn(events)
+
+        result = await stt.transcribe(
+            sample_audio_bytes,
+            meeting_id="m1",
+            speaker_id="s1",
+            prompt=prompt,
+        )
+
+        assert result == []
+
+    async def test_transcribe_keeps_clear_partial_prompt_phrase(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """A participant may genuinely say the meeting title; strong audio remains valid."""
+        prompt = "Meeting topic: WarpTalk transcript engineering review."
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="WarpTalk transcript engineering",
+                logprobs=[
+                    SimpleNamespace(
+                        token="WarpTalk transcript engineering",
+                        logprob=-0.1,
+                    )
+                ],
+            )
+        ]
+        stt, _ = _make_stt_with_conn(events)
+
+        result = await stt.transcribe(
+            sample_audio_bytes,
+            meeting_id="m1",
+            speaker_id="s1",
+            prompt=prompt,
+        )
+
+        assert [segment.text for segment in result] == ["WarpTalk transcript engineering"]
+
+    async def test_transcribe_filters_high_confidence_repeated_sentence_collage(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        hallucination = (
+            "Chỉ cần biết. Tin một người xa chỉ gần sống. Bạn em bị cái. "
+            "Cái em sẽ thấy nó khó. Tin một người xa chỉ gần sống. "
+            "Bạn em bị cái. Cái em sẽ thấy nó khó. Bạn em bị cái."
+        )
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript=hallucination,
+                logprobs=[SimpleNamespace(token=hallucination, logprob=-0.03)],
+            )
+        ]
+        stt, _ = _make_stt_with_conn(events)
+
+        result = await stt.transcribe(
+            sample_audio_bytes,
+            language="vi",
+            meeting_id="m1",
+            speaker_id="s1",
+        )
+
+        assert result == []
+
+    async def test_transcribe_keeps_non_repeating_multi_sentence_speech(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        speech = (
+            "Chúng ta kiểm tra validator. Sau đó review pull request. "
+            "Cuối cùng mới merge backend."
+        )
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript=speech,
+                logprobs=[SimpleNamespace(token=speech, logprob=-0.2)],
+            )
+        ]
+        stt, _ = _make_stt_with_conn(events)
+
+        result = await stt.transcribe(
+            sample_audio_bytes,
+            language="vi",
+            meeting_id="m1",
+            speaker_id="s1",
+        )
+
+        assert [segment.text for segment in result] == [speech]
 
     async def test_transcribe_api_error_raises_for_worker_degrade_signal(
         self, sample_audio_bytes: bytes
@@ -357,6 +693,30 @@ class TestOpenAISTT:
 
         stt._client.realtime.connect.assert_called_once()
 
+    async def test_reused_session_updates_when_context_prompt_changes(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript="Kubernetes",
+            )
+        ]
+        stt, conn = _make_stt_with_conn(events)
+
+        await stt.transcribe(
+            sample_audio_bytes, meeting_id="m1", speaker_id="s1", prompt="WarpTalk"
+        )
+        await stt.transcribe(
+            sample_audio_bytes,
+            meeting_id="m1",
+            speaker_id="s1",
+            prompt="WarpTalk\nKubernetes deployment",
+        )
+
+        stt._client.realtime.connect.assert_called_once()
+        assert conn.session.update.await_count == 2
+
 
 class TestFilterSegments:
     """_filter_segments utility tests."""
@@ -423,6 +783,16 @@ class TestFilterSegments:
         segs = [_segment("Some text", avg_logprob=-1.5)]
         result = _filter_segments(segs, "en", 0)
         assert result == []
+
+    def test_production_marginal_confidence_filtered(self) -> None:
+        segs = [_segment("Phải chạy qua về", avg_logprob=-0.8833)]
+        result = _filter_segments(segs, "vi", 0)
+        assert result == []
+
+    def test_clear_boundary_confidence_kept(self) -> None:
+        segs = [_segment("Please approve the pull request", avg_logprob=-0.69)]
+        result = _filter_segments(segs, "en", 0)
+        assert len(result) == 1
 
     def test_high_no_speech_filtered(self) -> None:
         segs = [_segment("Some text", no_speech_prob=0.8)]
@@ -498,6 +868,45 @@ class TestNormalizeLanguage:
 class TestSTTWorker:
     """STT Worker process() tests."""
 
+    async def test_track_event_prepares_language_pinned_session(
+        self,
+        mock_redis_client,
+        worker_settings: WorkerSettings,
+    ) -> None:
+        worker = STTWorker.__new__(STTWorker)
+        worker.settings = worker_settings
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._stt_prompts = {"room-1": "Meeting topic: WarpTalk."}
+        worker._stt_keywords = {}
+        worker._room_languages = {}
+        worker.model = MagicMock()
+        worker.model.prepare_session = AsyncMock()
+        mock_redis_client._redis.hget.return_value = b"vi"
+        mock_redis_client._redis.hgetall.return_value = {b"speaker-1": b"vi"}
+        mock_redis_client._redis.get.return_value = None
+
+        event = {
+            "event_type": "meeting.track_published",
+            "schema_version": 1,
+            "producer": "meeting-service",
+            "payload": {
+                "room_name": "room-1",
+                "participant_identity": "speaker-1",
+                "track_id": "audio-track",
+            },
+        }
+        await worker._prewarm_from_track_event(json.dumps(event))
+
+        worker.model.prepare_session.assert_awaited_once_with(
+            "room-1",
+            "speaker-1",
+            language="vi",
+            prompt=None,
+            allowed_languages={"vi"},
+            keywords=[],
+        )
+
     async def test_process_publishes_stt_result(
         self,
         mock_redis_client,
@@ -511,7 +920,12 @@ class TestSTTWorker:
         worker.logger = MagicMock()
         worker.stt_settings = STTSettings()
         worker._paused_rooms = set()
-        worker._stt_prompts = {}
+        worker._stt_prompts = {
+            "meeting-1": (
+                "Meeting topic: test. Meeting context: test. "
+                "Terms that may appear in this meeting: architecture, deployment, sprint."
+            )
+        }
         worker._room_languages = {}
 
         worker.model = MagicMock()
@@ -537,20 +951,23 @@ class TestSTTWorker:
 
         await worker.process(b"msg-1", chunk.to_redis())
 
+        assert worker.model.transcribe.await_args.kwargs["prompt"] is None
         # BaseWorker.publish() calls xadd twice: room stream + global stream
         mock_redis_client._redis.xadd.assert_called()
         streams_published = [str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list]
         assert any("stt:results" in s for s in streams_published)
 
-    async def test_process_publishes_early_segments_as_non_final(
+    async def test_process_publishes_only_completed_segments(
         self,
         mock_redis_client,
         worker_settings: WorkerSettings,
         sample_audio_bytes: bytes,
     ) -> None:
-        """Early (mid-chunk) segments must always publish is_final_chunk=False —
-        only the trailing segment(s) returned from transcribe() carry the chunk's
-        real is_final_chunk flag, once the whole chunk is actually done.
+        """Production must not publish unverified Realtime deltas.
+
+        Delta events have no real confidence/no-speech signal and were the source of
+        hallucinated transcript lines. Only the authoritative completed result may be
+        forwarded to translation and the UI.
         """
         worker = STTWorker.__new__(STTWorker)
         worker.settings = worker_settings
@@ -562,10 +979,16 @@ class TestSTTWorker:
         worker._room_languages = {}
 
         async def fake_transcribe(*args, **kwargs):
-            on_early_segment = kwargs["on_early_segment"]
-            await on_early_segment(
+            assert kwargs.get("on_early_segment") is None
+            speculative = kwargs.get("on_speculative_segment")
+            assert speculative is not None
+            await speculative(
                 TranscribedSegment(
-                    text="Hello there.", language="en", confidence=0.0, start_ms=0, end_ms=0
+                    text="How are you?",
+                    language="en",
+                    confidence=0.0,
+                    start_ms=0,
+                    end_ms=0,
                 )
             )
             return [
@@ -592,9 +1015,17 @@ class TestSTTWorker:
             for stream, data in (c.args for c in mock_redis_client._redis.xadd.call_args_list)
             if "stt:results" in str(stream)
         ]
-        by_text = {data["text"]: data["is_final_chunk"] for data in published}
-        assert by_text["Hello there."] == "0"
-        assert by_text["How are you?"] == "1"
+        assert {data["text"] for data in published} == {"How are you?"}
+        assert {data["is_final_chunk"] for data in published} == {"1"}
+        speculative_publish = [
+            call
+            for call in mock_redis_client._redis.publish.call_args_list
+            if call.args[0] == "stt:speculative"
+        ]
+        assert len(speculative_publish) == 1
+        speculative_payload = json.loads(speculative_publish[0].args[1])
+        assert speculative_payload["text"] == "How are you?"
+        assert speculative_payload["meeting_id"] == "meeting-1"
 
     async def test_process_skips_paused_room(
         self,
@@ -655,25 +1086,39 @@ class TestSTTWorker:
         assert any("translationRoom:system_events" in stream for stream in streams_published)
         assert not any("stt:results" in stream for stream in streams_published)
 
-    async def test_get_stt_prompt_returns_generic_base_when_no_glossary(
+    async def test_get_stt_prompt_returns_none_when_no_glossary(
         self, mock_redis_client
     ) -> None:
-        """Every session gets the generic anti-hallucination base prompt even when the
-        room has no glossary published (get() returns None)."""
-        from stt_worker.worker import _GENERIC_STT_BASE_PROMPT
-
+        """Do not seed silence/noise with instruction text that can leak into output."""
         worker = STTWorker.__new__(STTWorker)
         worker.redis = mock_redis_client
         worker.logger = MagicMock()
         worker._stt_prompts = {}
 
         prompt = await worker._get_stt_prompt("m1")
-        assert prompt == _GENERIC_STT_BASE_PROMPT
+        assert prompt is None
 
-    async def test_get_stt_prompt_appends_glossary_to_base(self, mock_redis_client) -> None:
-        """A published glossary is appended AFTER the generic base, not instead of it."""
-        from stt_worker.worker import _GENERIC_STT_BASE_PROMPT
+    async def test_empty_prewarm_lookup_does_not_cache_over_late_meeting_context(
+        self, mock_redis_client
+    ) -> None:
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._stt_prompts = {}
+        mock_redis_client._redis.get.side_effect = [
+            None,
+            b"WarpTalk, Docker, Kubernetes",
+        ]
 
+        assert await worker._get_stt_prompt("m1") is None
+        assert (
+            await worker._get_stt_prompt("m1")
+            == "WarpTalk, Docker, Kubernetes"
+        )
+        assert mock_redis_client._redis.get.await_count == 2
+
+    async def test_get_stt_prompt_returns_only_room_glossary(self, mock_redis_client) -> None:
+        """A real room glossary remains useful bias without generic instruction leakage."""
         worker = STTWorker.__new__(STTWorker)
         worker.redis = mock_redis_client
         worker.logger = MagicMock()
@@ -681,8 +1126,92 @@ class TestSTTWorker:
         mock_redis_client._redis.get.return_value = b"WarpTalk, Kubernetes, gRPC"
 
         prompt = await worker._get_stt_prompt("m1")
-        assert prompt.startswith(_GENERIC_STT_BASE_PROMPT)
-        assert "WarpTalk, Kubernetes, gRPC" in prompt
+        assert prompt == "WarpTalk, Kubernetes, gRPC"
+
+    async def test_get_stt_keywords_uses_structured_mt_glossary(
+        self, mock_redis_client
+    ) -> None:
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._stt_keywords = {}
+        mock_redis_client._redis.get.return_value = json.dumps(
+            [
+                {"source": "Kubernetes", "target": "Kubernetes"},
+                {"source": "pull request", "target": "pull request"},
+                {"source": "gRPC", "target": "gRPC"},
+                {"source": "Kubernetes", "target": "Kubernetes"},
+            ]
+        ).encode()
+
+        keywords = await worker._get_stt_keywords("m1")
+
+        assert keywords == ["Kubernetes", "pull request", "gRPC"]
+        mock_redis_client._redis.get.assert_awaited_once_with(
+            "translationRoom:m1:mt_glossary"
+        )
+
+    def test_declared_language_anchors_realtime_transcription(self) -> None:
+        assert _language_hint_for_stt("vi") == "vi"
+        assert _language_hint_for_stt("en-US") == "en"
+        assert _language_hint_for_stt("auto") is None
+        assert _language_hint_for_stt("ja") == "ja"
+
+    async def test_low_confidence_segment_is_not_reused_as_meeting_context(
+        self,
+        mock_redis_client,
+        worker_settings: WorkerSettings,
+        sample_audio_bytes: bytes,
+    ) -> None:
+        worker = STTWorker.__new__(STTWorker)
+        worker.settings = worker_settings
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker.stt_settings = STTSettings()
+        worker._paused_rooms = set()
+        worker._stt_prompts = {}
+        worker._recent_transcripts = {}
+        worker._room_languages = {}
+        worker.model = MagicMock()
+        worker.model.transcribe = AsyncMock(
+            return_value=[
+                TranscribedSegment(
+                    text="Thi công mà.",
+                    language="vi",
+                    confidence=-0.69,
+                    start_ms=0,
+                    end_ms=1000,
+                )
+            ]
+        )
+        chunk = AudioChunkMessage(
+            meeting_id="meeting-1",
+            speaker_id="speaker-1",
+            chunk_index=0,
+            audio_data=sample_audio_bytes,
+            language="vi",
+        )
+
+        await worker.process(b"msg-1", chunk.to_redis())
+
+        assert "meeting-1" not in worker._recent_transcripts
+
+    async def test_recent_accepted_transcript_is_not_fed_back_into_stt_prompt(
+        self, mock_redis_client
+    ) -> None:
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._stt_prompts = {}
+        worker._recent_transcripts = {}
+        mock_redis_client._redis.get.return_value = b"WarpTalk, Kubernetes, gRPC"
+
+        for index in range(8):
+            worker._remember_transcript("m1", f"Accepted discussion segment {index}")
+
+        prompt = await worker._get_stt_prompt("m1")
+
+        assert prompt == "WarpTalk, Kubernetes, gRPC"
 
     async def test_get_room_languages_derives_distinct_speak_languages(
         self, mock_redis_client
@@ -785,6 +1314,7 @@ class TestConsumeLoopConcurrency:
     async def test_cleanup_room_purges_speaker_locks(self) -> None:
         worker = self._make_worker()
         worker._stt_prompts = {"m1": "glossary"}
+        worker._recent_transcripts = {"m1": deque(["meeting context"])}
         worker._room_languages = {"m1": ({"vi"}, 0.0)}
         worker._route_states = {}
         worker._paused_rooms = set()
@@ -797,6 +1327,7 @@ class TestConsumeLoopConcurrency:
         worker._cleanup_room("m1")
 
         assert "m1" not in worker._stt_prompts
+        assert "m1" not in worker._recent_transcripts
         assert "m1" not in worker._room_languages
         assert ("m1", "speaker-A") not in worker._speaker_locks
         assert ("m2", "speaker-B") in worker._speaker_locks

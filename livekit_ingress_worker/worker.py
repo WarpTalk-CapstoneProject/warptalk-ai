@@ -5,6 +5,7 @@ that contain actual speech, preventing Whisper from seeing silence/noise.
 """
 
 import asyncio
+import copy
 import json
 import time
 from collections import deque
@@ -13,6 +14,7 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 from livekit import api, rtc
+from redis.exceptions import RedisError
 
 from livekit_ingress_worker.near_field_gate import NearFieldGate
 from shared.base_worker import BaseWorker
@@ -24,6 +26,9 @@ except ModuleNotFoundError:
     torch = None
 
 SILERO_VAD_REPOSITORY = "snakers4/silero-vad:v6.2.1"
+MIN_VAD_SPEECH_FRAMES = 3
+VAD_WINDOW_SAMPLES = 512 * MIN_VAD_SPEECH_FRAMES
+VAD_WINDOW_MS = VAD_WINDOW_SAMPLES * 1000 // 16000
 
 # Bot participant identities used elsewhere in this pipeline — this worker's own
 # "AIBot_{room}" (join_room, below) and the TTS publisher's "ai-interpreter-{lang}"
@@ -213,22 +218,30 @@ class LiveKitIngressWorker(BaseWorker):
     def _run_vad_on_window(
         self,
         pcm_f32: npt.NDArray[np.float32],
+        threshold: float,
+        vad_model: Any | None = None,
     ) -> float:
-        """Run Silero VAD on a window of audio, return max speech probability.
+        """Run Silero VAD and reject isolated probability spikes.
 
         Silero requires 512-sample (32ms) frames. We process all frames
-        in the window and return the maximum probability.
+        in the window, but require roughly 96ms of speech evidence before returning
+        the strongest probability. A single noisy frame must not classify the window
+        as speech.
         """
+        model = vad_model or self._require_vad_model()
         max_prob = 0.0
         if torch is None:
             raise RuntimeError("Install the ingress optional dependencies to use Silero VAD.")
+        speech_frames = 0
         for i in range(0, len(pcm_f32) - self.VAD_FRAME_SIZE + 1, self.VAD_FRAME_SIZE):
             frame = pcm_f32[i : i + self.VAD_FRAME_SIZE]
             tensor = torch.from_numpy(frame).unsqueeze(0)
-            prob = self._require_vad_model()(tensor, self.SAMPLE_RATE).item()
+            prob = model(tensor, self.SAMPLE_RATE).item()
             if prob > max_prob:
                 max_prob = prob
-        return max_prob
+            if prob >= threshold:
+                speech_frames += 1
+        return max_prob if speech_frames >= MIN_VAD_SPEECH_FRAMES else 0.0
 
     async def process_audio_track(self, room_name: str, speaker_id: str, track: rtc.Track) -> None:
         """Stream audio from LiveKit, gate with VAD, publish only speech chunks."""
@@ -243,9 +256,16 @@ class LiveKitIngressWorker(BaseWorker):
         max_chunk_ms = self.settings.chunk_duration_ms
 
         # Calculate sizes
-        vad_window_samples = int(sample_rate * 0.5)  # 500ms VAD windows
+        # Three exact Silero frames (~96ms) are the smallest window that can satisfy
+        # MIN_VAD_SPEECH_FRAMES. The old 500ms polling window imposed up to half a second
+        # of avoidable capture latency before STT could even start.
+        vad_window_samples = VAD_WINDOW_SAMPLES
         pre_speech_samples = int(sample_rate * (pre_speech_ms / 1000.0))
-        silence_hangover_windows = int(silence_hangover_ms / 500)  # How many 500ms windows
+        silence_hangover_samples = int(sample_rate * (silence_hangover_ms / 1000.0))
+        silence_hangover_windows = max(
+            1,
+            (silence_hangover_samples + vad_window_samples - 1) // vad_window_samples,
+        )
         min_speech_samples = int(sample_rate * (min_speech_ms / 1000.0))
         max_chunk_samples = int(sample_rate * (max_chunk_ms / 1000.0))
 
@@ -253,6 +273,10 @@ class LiveKitIngressWorker(BaseWorker):
         # peak-amplitude reference from this track's own earlier chunks, so it must live
         # for the whole track lifetime, not be recreated per chunk.
         near_field_gate = NearFieldGate(self.settings)
+        # Silero VAD carries recurrent state. Sharing one model across concurrently
+        # iterated participant tracks interleaves unrelated audio histories and causes
+        # missed/fragmented speech. Each track owns an independent cloned state machine.
+        track_vad_model = copy.deepcopy(self._require_vad_model())
 
         # State
         raw_buffer = bytearray()  # Incoming raw resampled audio
@@ -275,7 +299,7 @@ class LiveKitIngressWorker(BaseWorker):
         )
 
         # Reset VAD model state for this track
-        self._require_vad_model().reset_states()
+        track_vad_model.reset_states()
 
         try:
             async for event in audio_stream:
@@ -311,7 +335,7 @@ class LiveKitIngressWorker(BaseWorker):
 
                     raw_buffer.extend(data)
 
-                # Process in 500ms windows
+                # Process in ~96ms windows (three exact Silero frames).
                 window_bytes = vad_window_samples * 2  # 2 bytes per sample
                 while len(raw_buffer) >= window_bytes:
                     window_data = bytes(raw_buffer[:window_bytes])
@@ -320,7 +344,11 @@ class LiveKitIngressWorker(BaseWorker):
                     # Run VAD on this 500ms window
                     window_pcm = np.frombuffer(window_data, dtype=np.int16)
                     window_f32 = window_pcm.astype(np.float32) / 32768.0
-                    vad_prob = self._run_vad_on_window(window_f32)
+                    vad_prob = self._run_vad_on_window(
+                        window_f32,
+                        threshold=vad_threshold,
+                        vad_model=track_vad_model,
+                    )
 
                     if vad_prob >= vad_threshold:
                         # Speech detected
@@ -383,7 +411,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 is_speaking = False
                                 speech_buffer = bytearray()
                                 silence_counter = 0
-                                self._require_vad_model().reset_states()
+                                track_vad_model.reset_states()
                         else:
                             # Store in pre-speech ring for next onset
                             pre_speech_ring.append(window_data)
@@ -451,22 +479,23 @@ class LiveKitIngressWorker(BaseWorker):
         # Send raw audio (no normalization — Whisper handles natural levels better)
         # Peak normalization was amplifying noise to speech levels, causing hallucinations
 
-        self.logger.info(
-            "speech_chunk_published",
-            chunk_index=chunk_index,
-            duration_ms=duration_ms,
-            raw_rms=round(float(raw_rms), 6),
-            raw_peak=round(float(raw_peak), 6),
-        )
-
         # This speaker's own chosen speak-language — TranslationRoomHub.JoinTranslationRoom
         # persists it (see NormalizeLanguageCode there) keyed by userId, which is the same
         # value LiveKit uses as participant.identity/speaker_id here. Falls back to "auto"
         # (STT's own guess) only if the speaker somehow isn't registered yet.
         language = "auto"
-        raw_language = await self.redis.hget(
-            f"translationRoom:{room_name}:speak_languages", speaker_id
-        )
+        try:
+            raw_language = await self.redis.hget(
+                f"translationRoom:{room_name}:speak_languages", speaker_id
+            )
+        except RedisError:
+            raw_language = None
+            self.logger.warning(
+                "speak_language_lookup_failed",
+                room=room_name,
+                speaker_id=speaker_id,
+                exc_info=True,
+            )
         if raw_language:
             language = raw_language.decode() if isinstance(raw_language, bytes) else raw_language
 
@@ -480,10 +509,54 @@ class LiveKitIngressWorker(BaseWorker):
             timestamp_ms=int(time.time() * 1000),
         )
 
-        await self.publish("audio:chunks", room_name, msg.to_redis())
+        payload = msg.to_redis()
+        for attempt in range(1, 4):
+            try:
+                await self.publish("audio:chunks", room_name, payload)
+                break
+            except RedisError:
+                if attempt == 3:
+                    self.logger.error(
+                        "speech_chunk_publish_failed",
+                        room=room_name,
+                        speaker_id=speaker_id,
+                        chunk_index=chunk_index,
+                        exc_info=True,
+                    )
+                    return
+                self.logger.warning(
+                    "speech_chunk_publish_retry",
+                    room=room_name,
+                    speaker_id=speaker_id,
+                    chunk_index=chunk_index,
+                    attempt=attempt,
+                    exc_info=True,
+                )
+                await asyncio.sleep(0.05 * attempt)
+
+        self.logger.info(
+            "speech_chunk_published",
+            room=room_name,
+            speaker_id=speaker_id,
+            chunk_index=chunk_index,
+            duration_ms=duration_ms,
+            raw_rms=round(float(raw_rms), 6),
+            raw_peak=round(float(raw_peak), 6),
+        )
 
     async def _is_ai_service_suspended(self, room_name: str) -> bool:
-        value = await self.redis.get(f"translationRoom:{room_name}:ai_service_suspended")
+        redis_get = getattr(self.redis, "get", None)
+        if redis_get is None:
+            return False
+        try:
+            value = await redis_get(f"translationRoom:{room_name}:ai_service_suspended")
+        except RedisError:
+            self.logger.warning(
+                "ai_service_suspension_lookup_failed",
+                room=room_name,
+                exc_info=True,
+            )
+            return False
         if value is None:
             return False
         if isinstance(value, bytes):
