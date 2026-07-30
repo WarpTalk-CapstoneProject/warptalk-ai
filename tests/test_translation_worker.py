@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 from shared.config import TranslationSettings, WorkerSettings
+from shared.openai_usage import TokenUsage
 from shared.schemas import STTResultMessage
 from translation_worker.translator import (
     OpenAITranslator,
@@ -313,6 +315,7 @@ class TestOpenAITranslator:
         done.type = "response.done"
         done.response.id = "resp-1"
         done.response.status = "completed"
+        done.response.usage = {"input_tokens": 12, "output_tokens": 3}
         fake_connection.recv = AsyncMock(side_effect=[created, delta, done])
         translator._acquire_realtime_connection = AsyncMock(
             return_value=(0, fake_connection)
@@ -332,6 +335,47 @@ class TestOpenAITranslator:
         assert payload["metadata"] == {"request_id": "request-1"}
         assert payload["input"][0]["content"][0]["text"] == "Translate this"
         translator._release_realtime_connection.assert_awaited_once_with(0, healthy=True)
+
+    async def test_translate_realtime_with_usage_reads_response_usage(self) -> None:
+        translator = OpenAITranslator(
+            api_key="test",
+            realtime_model="gpt-realtime-2.1-mini",
+        )
+        fake_connection = MagicMock()
+        fake_connection.response.create = AsyncMock()
+        created = MagicMock()
+        created.type = "response.created"
+        created.response.id = "resp-1"
+        created.response.metadata = {"request_id": "request-1"}
+        delta = MagicMock()
+        delta.type = "response.output_text.delta"
+        delta.response_id = "resp-1"
+        delta.delta = "Xin chao"
+        done = MagicMock()
+        done.type = "response.done"
+        done.response.id = "resp-1"
+        done.response.status = "completed"
+        done.response.usage = {
+            "input_tokens": 21,
+            "output_tokens": 4,
+            "input_token_details": {"cached_tokens": 5},
+        }
+        fake_connection.recv = AsyncMock(side_effect=[created, delta, done])
+        translator._acquire_realtime_connection = AsyncMock(
+            return_value=(0, fake_connection)
+        )
+        translator._release_realtime_connection = AsyncMock()
+
+        result = await translator._translate_realtime_with_usage(
+            "Translate this", "System instructions", request_id="request-1"
+        )
+
+        assert result.text == "Xin chao"
+        assert result.usage == TokenUsage(
+            prompt_tokens=21,
+            cached_tokens=5,
+            completion_tokens=4,
+        )
 
     async def test_close_releases_all_realtime_connections(self) -> None:
         translator = OpenAITranslator(api_key="test", realtime_pool_size=2)
@@ -469,6 +513,28 @@ class TestTranslationWorker:
         call_kwargs = worker.translator.translate.call_args
         target = call_kwargs.kwargs.get("target_lang") or call_kwargs[1].get("target_lang")
         assert target == "en"
+
+    async def test_uses_room_target_languages_when_no_listener_registered(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """Room target config should still produce en -> vi translation billing."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+
+        mock_redis_client._redis.hgetall.return_value = {}
+
+        async def get_value(key: str):
+            if key == "meeting:m1:target_languages":
+                return json.dumps(["en", "vi"]).encode()
+            return None
+
+        mock_redis_client._redis.get.side_effect = get_value
+
+        await worker.process(b"msg-1", self._make_stt_msg(language="en").to_redis())
+
+        targets = {
+            call.kwargs["target_lang"] for call in worker.translator.translate.await_args_list
+        }
+        assert targets == {"vi"}
 
     async def test_publishes_translation_result(
         self, mock_redis_client, worker_settings: WorkerSettings

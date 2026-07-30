@@ -38,10 +38,18 @@ class TokenUsage:
         if usage is None:
             return cls()
 
-        prompt_tokens = int(_read(usage, "prompt_tokens", 0) or 0)
-        completion_tokens = int(_read(usage, "completion_tokens", 0) or 0)
+        prompt_tokens = int(
+            _read(usage, "prompt_tokens", _read(usage, "input_tokens", 0)) or 0
+        )
+        completion_tokens = int(
+            _read(usage, "completion_tokens", _read(usage, "output_tokens", 0)) or 0
+        )
 
-        details = _read(usage, "prompt_tokens_details")
+        details = _read(
+            usage,
+            "prompt_tokens_details",
+            _read(usage, "input_token_details"),
+        )
         cached_tokens = int(_read(details, "cached_tokens", 0) or 0)
 
         return cls(
@@ -49,4 +57,3 @@ class TokenUsage:
             cached_tokens=cached_tokens,
             completion_tokens=completion_tokens,
         )
-

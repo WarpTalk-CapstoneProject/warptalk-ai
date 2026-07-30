@@ -702,7 +702,45 @@ class TranslationWorker(BaseWorker):
                 targets.add(lang)
 
         # No other participant registered yet — avoid assuming Vietnamese for all users.
+        room_target_languages = await self._get_room_target_languages(meeting_id)
+        if room_target_languages:
+            targets.update(room_target_languages)
+
+        # No participant or room target language registered yet. Keep English as the
+        # conservative compatibility fallback instead of assuming one locale globally.
         return targets or {"en"}
+
+    async def _get_room_target_languages(self, meeting_id: str) -> set[str]:
+        """Room-level target languages configured at room creation time."""
+        try:
+            raw = await self.redis.get(f"meeting:{meeting_id}:target_languages")
+        except Exception:
+            self.logger.warning(
+                "failed_to_read_room_target_languages",
+                meeting_id=meeting_id,
+                exc_info=True,
+            )
+            return set()
+
+        if not raw:
+            return set()
+
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            self.logger.warning(
+                "invalid_room_target_languages",
+                meeting_id=meeting_id,
+            )
+            return set()
+
+        if not isinstance(parsed, list):
+            return set()
+
+        return {str(lang).strip() for lang in parsed if str(lang).strip()}
 
     async def _get_mt_glossary(self, meeting_id: str) -> list[dict[str, str]]:
         """This meeting's workspace glossary, as [{"source": ..., "target": ...}, ...] —

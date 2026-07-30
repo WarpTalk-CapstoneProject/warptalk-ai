@@ -359,6 +359,20 @@ class OpenAITranslator:
         *,
         request_id: str | None = None,
     ) -> str:
+        result = await self._translate_realtime_with_usage(
+            user_message,
+            instructions,
+            request_id=request_id,
+        )
+        return result.text
+
+    async def _translate_realtime_with_usage(
+        self,
+        user_message: str,
+        instructions: str,
+        *,
+        request_id: str | None = None,
+    ) -> TranslationWithUsage:
         """Run one isolated text response on an exclusive hot Realtime connection."""
         request_id = request_id or uuid.uuid4().hex
         index, connection = await self._acquire_realtime_connection()
@@ -410,8 +424,11 @@ class OpenAITranslator:
                         result = "".join(chunks).strip()
                         if not result:
                             raise RuntimeError("Realtime translation returned empty text")
+                        usage = TokenUsage.from_openai_usage(
+                            getattr(event.response, "usage", None)
+                        )
                         healthy = True
-                        return result
+                        return TranslationWithUsage(result, usage)
         finally:
             await self._release_realtime_connection(index, healthy=healthy)
 
@@ -531,7 +548,12 @@ class OpenAITranslator:
             system_prompt += _CONTEXT_RELEVANCE_INSTRUCTION
         if getattr(self, "realtime_model", ""):
             try:
-                result = await self._translate_realtime(user_message, system_prompt)
+                realtime_result = await self._translate_realtime_with_usage(
+                    user_message,
+                    system_prompt,
+                )
+                result = realtime_result.text
+                usage = realtime_result.usage
             except Exception as exc:
                 logger.warning(
                     "openai_realtime_translation_failed_using_chat_fallback",
