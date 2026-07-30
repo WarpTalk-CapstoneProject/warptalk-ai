@@ -84,7 +84,7 @@ class LiveKitIngressWorker(BaseWorker):
 
     async def load_model(self) -> None:
         """Load Silero VAD model."""
-        self._vad_model, _ = torch.hub.load(
+        self._vad_model, _ = torch.hub.load(  # type: ignore[no-untyped-call]
             SILERO_VAD_REPOSITORY,
             "silero_vad",
             trust_repo=True,

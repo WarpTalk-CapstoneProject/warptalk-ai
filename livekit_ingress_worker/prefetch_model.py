@@ -6,7 +6,7 @@ from livekit_ingress_worker.worker import SILERO_VAD_REPOSITORY
 
 
 def main() -> None:
-    torch.hub.load(
+    torch.hub.load(  # type: ignore[no-untyped-call]
         SILERO_VAD_REPOSITORY,
         "silero_vad",
         trust_repo=True,
