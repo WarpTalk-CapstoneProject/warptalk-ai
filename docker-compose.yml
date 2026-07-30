@@ -7,9 +7,6 @@
 #
 # IMPORTANT: Requires warptalk-backend stack running first.
 # AI workers connect to the backend's Redis via external network.
-#
-# GPU workers require NVIDIA Container Toolkit:
-#   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
 
 services:
   # ---- STT Worker ----
@@ -19,16 +16,9 @@ services:
       target: stt
     env_file: .env
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     restart: unless-stopped
 
   # ---- Translation Worker ----
@@ -38,16 +28,9 @@ services:
       target: translation
     env_file: .env
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     restart: unless-stopped
 
   # ---- TTS Worker ----
@@ -57,16 +40,9 @@ services:
       target: tts
     env_file: .env
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     restart: unless-stopped
 
   # ---- AI Assistant Worker ----
@@ -76,20 +52,81 @@ services:
       target: assistant
     env_file: .env
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@warptalk-redis:6379
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+    networks:
+      - warptalk-infrastructure_warptalk-net
+    restart: unless-stopped
+
+  # ---- Embedding Worker ----
+  embedding:
+    build:
+      context: .
+      target: embedding
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - VECTOR_DB_URL=http://qdrant:6333
+    networks:
+      - warptalk-infrastructure_warptalk-net
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+  # ---- Billing Settlement Worker ----
+  # Only AI worker that talks to Postgres — settles STT/TRANSLATION/AUDIO_DUBBING usage
+  # into subscription.usage_records + subscription.credit_transactions after the fact.
+  billing:
+    build:
+      context: .
+      target: billing
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - BILLING_DB_DSN=${BILLING_DB_DSN}
+    networks:
+      - warptalk-infrastructure_warptalk-net
+    restart: unless-stopped
+
+  # ---- LiveKit Ingress Worker ----
+  # Joins the LiveKit room paired 1:1 with a translation room (MeetingRoom.ProviderRoomName
+  # == translationRoomId), gates audio with Silero VAD, publishes only real speech chunks
+  # to audio:chunks — VAD-triggered chunk boundaries instead of the fixed chunk_duration_ms
+  # window the SignalR audio path uses.
+  livekit-ingress:
+    build:
+      context: .
+      target: livekit-ingress
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - LIVEKIT_URL=${LIVEKIT_URL}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
     networks:
       - warptalk-infrastructure_warptalk-net
     restart: unless-stopped
 
   # ---- Qdrant Vector DB ----
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.15.3@sha256:31407c0e8e32eb771b71718f1a4772e2ad47a07557917b21ac96792f40eb8007
     container_name: warptalk-qdrant
     ports:
       - "6333:6333"
       - "6334:6334"
     volumes:
       - qdrantdata:/qdrant/storage
+    networks:
+      - warptalk-infrastructure_warptalk-net
+    restart: unless-stopped
+
+  # ---- Security Worker ----
+  security:
+    build:
+      context: .
+      target: security
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
     networks:
       - warptalk-infrastructure_warptalk-net
     restart: unless-stopped

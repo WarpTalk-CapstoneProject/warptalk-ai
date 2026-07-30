@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["shared*", "stt_worker*", "translation_worker*", "tts_worker*", "ai_assistant_worker*"]
+include = ["shared*", "stt_worker*", "translation_worker*", "tts_worker*", "ai_assistant_worker*", "embedding_worker*", "billing_worker*", "security_worker*", "livekit_ingress_worker*", "metrics_exporter*"]
 
 [project]
 name = "warptalk-ai"
@@ -15,34 +15,50 @@ license = { text = "MIT" }
 dependencies = [
     # Redis
     "redis>=5.0",
-    # Audio processing
+    # Lightweight audio helpers
     "numpy>=1.26",
     "soundfile>=0.12",
-    "librosa>=0.10",
-    # AI/ML base
-    "torch>=2.1",
-    "transformers>=4.36",
     # Utilities
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
     "structlog>=24.1",
     "python-dotenv>=1.0",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    # OpenAI SDK backs STT, translation, assistant, and embeddings per DECISIONS.md.
+    # STT uses the Realtime API (gpt-realtime-whisper over WebSocket) — needs the
+    # openai[realtime] extra's websockets dependency.
+    "openai>=2.45",
+    "websockets>=13",
+    # LiveKit
+    "livekit>=0.11",
+    "livekit-api>=0.11",
 ]
 
 [project.optional-dependencies]
 stt = [
-    "faster-whisper>=1.0",
 ]
 translation = [
-    "sentencepiece>=0.1.99",
-    "deep-translator>=1.11.4",
 ]
 tts = [
-    "TTS>=0.22",
-    "edge-tts>=6.1",
+    "cartesia>=3.2.0",
+]
+billing = [
+    "asyncpg>=0.29",
 ]
 assistant = [
-    "openai>=1.6",
+]
+embeddings = [
+    "qdrant-client>=1.9",
+]
+ingress = [
+    # Optional local VAD path for livekit_ingress_worker; not installed in API-backed Docker workers.
+    # torchaudio and packaging are runtime imports inside silero-vad's hubconf,
+    # not declared by torch.hub.load() itself — omitting either fails at model-load time.
+    # TorchAudio binary compatibility requires the same PyTorch release.
+    "packaging>=24.0",
+    "torch==2.11.0",
+    "torchaudio==2.11.0",
 ]
 dev = [
     "pytest>=7.4",
@@ -51,7 +67,23 @@ dev = [
     "fakeredis[lua]>=2.20",
     "ruff>=0.1",
     "mypy>=1.8",
+    "asyncpg-stubs>=0.30.2",
 ]
+
+# Production App VMs have no GPU. Pin Linux Torch packages to the official
+# CPU-only index so the ingress image never carries CUDA/NVIDIA runtimes.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.ruff]
 target-version = "py311"
@@ -67,3 +99,20 @@ asyncio_mode = "auto"
 [tool.mypy]
 python_version = "3.11"
 strict = true
+explicit_package_bases = true
+files = [
+    "shared",
+    "stt_worker",
+    "translation_worker",
+    "tts_worker",
+    "ai_assistant_worker",
+    "embedding_worker",
+    "billing_worker",
+    "security_worker",
+    "livekit_ingress_worker",
+    "metrics_exporter",
+]
+
+[[tool.mypy.overrides]]
+module = ["soundfile", "torch", "torchaudio", "TTS", "TTS.*"]
+ignore_missing_imports = true
