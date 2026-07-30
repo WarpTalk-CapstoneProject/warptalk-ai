@@ -36,6 +36,7 @@ from shared.config import WorkerSettings
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
+_BASELINE_PEAK_CAP = 0.5
 
 
 class NearFieldGate:
@@ -82,12 +83,22 @@ class NearFieldGate:
         return True
 
     def _update_baseline(self, raw_peak: float) -> None:
+        # Browser AGC can clip the first turn near full scale while it converges. A peak
+        # is also sensitive to one impulsive sample, so never let values above 0.5 anchor
+        # the long-lived relative floor. Acceptance still compares the actual raw peak.
+        baseline_sample = min(raw_peak, _BASELINE_PEAK_CAP)
         if self._baseline_peak is None:
-            self._baseline_peak = raw_peak
+            self._baseline_peak = baseline_sample
         else:
             # Move toward a louder peak quickly (a new, higher "true near-field" level
             # just got confirmed) but toward a quieter one slowly (ordinary volume dip,
             # not a signal to lower the bar for what still counts as "close enough").
-            alpha = self._ema_alpha if raw_peak >= self._baseline_peak else self._ema_alpha / 4
-            self._baseline_peak = (1 - alpha) * self._baseline_peak + alpha * raw_peak
+            alpha = (
+                self._ema_alpha
+                if baseline_sample >= self._baseline_peak
+                else self._ema_alpha / 4
+            )
+            self._baseline_peak = (
+                (1 - alpha) * self._baseline_peak + alpha * baseline_sample
+            )
         self._baseline_count += 1

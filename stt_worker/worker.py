@@ -2,22 +2,25 @@
 
 Pipeline:
     Redis Stream (audio:chunks:{meetingId})
-    → OpenAI gpt-4o-mini-transcribe (async API call)
+    → OpenAI gpt-transcribe (persistent Realtime transcription session)
     → Redis Stream (stt:results:{meetingId})
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
+from collections import deque
 from collections.abc import Mapping
 from typing import Any
 
 from shared.base_worker import BaseWorker
 from shared.config import STTSettings, resolve_openai_api_key
 from shared.schemas import AudioChunkMessage, STTResultMessage
-from stt_worker.model import OpenAISTT, TranscribedSegment, _normalize_language
+from shared.text_utils import split_into_sentences
+from stt_worker.model import OpenAISTT, _normalize_language
 
 
 def _decode_field(data: Mapping[Any, Any], key: str) -> str:
@@ -44,39 +47,23 @@ def _extract_speaker_key(
     return meeting_id, speaker_id
 
 
-# Generic, domain-neutral biasing prompt fed to every STT session even when the room has
-# no glossary configured. transcription.prompt (gpt-4o-transcribe) conditions the model
-# on representative in-domain text, steering it toward normal meeting speech and away
-# from the caption-style hallucinations Whisper-family models emit on silence/noise
-# ("thanks for watching", "subscribe", etc. — see model._HALLUCINATIONS). It is
-# deliberately generic so it never fabricates specifics: no names, no product terms, just
-# the register of a real work meeting. Any room glossary is appended AFTER this base.
-#
-# The code-switching sentence exists because session.audio.input.transcription.language is
-# pinned to the speaker's declared language (see _session_payload in model.py) — a real,
-# necessary fix for a different bug (cross-script hallucination), but it means the model
-# decodes the WHOLE utterance in that one language's phoneme space. An English word dropped
-# into a Vietnamese sentence (e.g. "architect") then gets forced into the nearest
-# Vietnamese-sounding syllables instead of transcribed as English (e.g. "hai kiên thách") —
-# see docs/code-switching-research.md for the full diagnosis. This sentence doesn't fix
-# recognition on its own (that's what the glossary prompt from GlossaryStartedEventConsumer
-# is for — see _get_stt_prompt below); it only stops a correctly-recognized English word
-# from being re-spelled phonetically once the model does catch it.
-_GENERIC_STT_BASE_PROMPT = (
-    "This is a live professional work meeting. Participants discuss projects, tasks, "
-    "schedules, decisions, requirements, features, and technical details in clear, "
-    "conversational speech. Transcribe exactly what is said, verbatim. Do not add "
-    "greetings, sign-offs, video captions, channel/subscribe phrases, or any words that "
-    "were not spoken. Speakers often mix in English words or phrases (e.g. product, "
-    "technical, or business terms) mid-sentence even when speaking another language — "
-    "write those words in their original English spelling, never phonetically "
-    "transliterated into another script or language."
-)
-
 # The room language set is derived from participants' declared speak-languages, which
 # change as people join/leave. Cache it briefly rather than per room-lifetime (unlike the
 # prompt) so a newly joined speaker's language is picked up within a few seconds.
 _ROOM_LANGUAGES_TTL_S = 15.0
+
+_RECENT_CONTEXT_SEGMENTS = 4
+_MAX_STT_PROMPT_CHARS = 600
+_MAX_GLOSSARY_CHARS = 240
+_MAX_STT_KEYWORDS = 100
+_CONTEXT_MIN_CONFIDENCE = -0.35
+
+
+def _language_hint_for_stt(language: str) -> str | None:
+    normalized = language.strip().lower().split("-", 1)[0]
+    if not normalized or normalized == "auto":
+        return None
+    return normalized
 
 
 def _build_segment_id(
@@ -94,7 +81,7 @@ def _build_segment_id(
 
 
 class STTWorker(BaseWorker):
-    """Speech-to-Text worker using OpenAI gpt-4o-mini-transcribe."""
+    """Speech-to-Text worker using OpenAI gpt-transcribe."""
 
     worker_name = "stt"
     input_stream = "audio:chunks"
@@ -108,27 +95,120 @@ class STTWorker(BaseWorker):
         super().__init__(**kwargs)
         self.stt_settings = stt_settings or STTSettings()
         self.model: OpenAISTT | None = None
-        # meeting_id -> contextual-biasing prompt (glossary/key terms), published to
-        # Redis by the backend when the room starts. Cached for the room's lifetime so
-        # we don't hit Redis on every chunk; the STT session is created once per speaker
-        # and reuses the prompt fetched here, so a mid-room glossary change won't apply
-        # until that speaker's session is swept for idleness — acceptable, glossaries
-        # are configured before a meeting, not during.
+        # Retained only for backward-compatible prompt parsing/filter tests. Production
+        # sessions do NOT receive this prose: gpt-transcribe can recite or translate the
+        # prompt itself on marginal audio. Structured `_stt_keywords` below is the safe
+        # provider-side vocabulary bias; translation owns the full meeting context.
         self._stt_prompts: dict[str, str] = {}
+        # Structured source/target terms from the existing MT glossary Redis contract.
+        # Unlike prose prompts, provider keyword hints cannot be echoed as instructions.
+        self._stt_keywords: dict[str, list[str]] = {}
+        # Retain accepted completed transcripts only for defensive echo detection.
+        # Never feed them back into the transcription prompt: marginal audio can cause
+        # Realtime STT to copy prior transcript verbatim instead of transcribing speech.
+        self._recent_transcripts: dict[str, deque[str]] = {}
         # meeting_id -> (set of declared language codes, monotonic timestamp fetched).
         # Refreshed every _ROOM_LANGUAGES_TTL_S so late joiners' languages are picked up.
         self._room_languages: dict[str, tuple[set[str], float]] = {}
         # (meeting_id, speaker_id) -> lock serializing THAT speaker's own chunks — see
         # _consume_loop for why.
         self._speaker_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._prewarm_listener_task: asyncio.Task[None] | None = None
 
     async def load_model(self) -> None:
         self.model = OpenAISTT(
             api_key=resolve_openai_api_key(self.stt_settings.api_key),
             model=self.stt_settings.model,
             noise_reduction=self.stt_settings.noise_reduction,
+            min_avg_logprob=self.stt_settings.min_avg_logprob,
         )
         await self.model.load()
+        await self.model.warm_up(pool_size=self.stt_settings.realtime_pool_size)
+        self._prewarm_listener_task = asyncio.create_task(self._listen_for_track_prewarm())
+
+    async def _listen_for_track_prewarm(self) -> None:
+        """Prepare the speaker's Realtime socket during room join, before first speech."""
+        pubsub = self.redis.redis.pubsub()
+        try:
+            await pubsub.subscribe("meeting.track_published")
+            while not self._shutdown_event.is_set():
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=1.0,
+                )
+                if message:
+                    await self._prewarm_from_track_event(message["data"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.exception("stt_prewarm_listener_failed")
+        finally:
+            try:
+                await pubsub.close()
+            except Exception:
+                self.logger.warning("stt_prewarm_listener_close_failed")
+
+    async def _prewarm_from_track_event(self, serialized_event: bytes | str) -> None:
+        try:
+            envelope = json.loads(serialized_event)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            return
+        if (
+            envelope.get("event_type") != "meeting.track_published"
+            or envelope.get("schema_version") != 1
+            or envelope.get("producer") != "meeting-service"
+        ):
+            return
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict):
+            return
+        meeting_id = payload.get("room_name")
+        speaker_id = payload.get("participant_identity")
+        if not isinstance(meeting_id, str) or not meeting_id:
+            return
+        if not isinstance(speaker_id, str) or not speaker_id:
+            return
+
+        # Gateway normally persists the selected speak language immediately after join.
+        # Give that write a brief chance to land so the prepared session is language-pinned
+        # and will not be discarded/reopened on the first audio chunk.
+        raw_language: bytes | str | None = None
+        for attempt in range(3):
+            raw_language = await self.redis.hget(
+                f"translationRoom:{meeting_id}:speak_languages",
+                speaker_id,
+            )
+            if raw_language:
+                break
+            if attempt < 2:
+                await asyncio.sleep(0.25)
+        if not raw_language:
+            self.logger.debug(
+                "stt_prewarm_skipped_without_language",
+                meeting_id=meeting_id,
+                speaker_id=speaker_id,
+            )
+            return
+
+        declared_language = (
+            raw_language.decode() if isinstance(raw_language, bytes) else raw_language
+        )
+        allowed_languages = await self._get_room_languages(meeting_id)
+        keywords = await self._get_stt_keywords(meeting_id)
+        await self._require_model().prepare_session(
+            meeting_id,
+            speaker_id,
+            language=_language_hint_for_stt(declared_language),
+            prompt=None,
+            allowed_languages=allowed_languages,
+            keywords=keywords,
+        )
+        self.logger.info(
+            "stt_session_prewarmed",
+            meeting_id=meeting_id,
+            speaker_id=speaker_id,
+            language=declared_language,
+        )
 
     async def _consume_loop(self) -> None:
         """Dispatch process() concurrently across DIFFERENT speakers, while keeping
@@ -190,10 +270,23 @@ class STTWorker(BaseWorker):
         # entry per meeting (+ per speaker for locks) ever seen. Room-ended is the one
         # reliable signal we get that a meeting is truly done.
         self._stt_prompts.pop(room_id, None)
+        getattr(self, "_stt_keywords", {}).pop(room_id, None)
+        getattr(self, "_recent_transcripts", {}).pop(room_id, None)
         self._room_languages.pop(room_id, None)
         stale_speakers = [key for key in self._speaker_locks if key[0] == room_id]
         for key in stale_speakers:
             self._speaker_locks.pop(key, None)
+
+    async def _cleanup(self) -> None:
+        task = getattr(self, "_prewarm_listener_task", None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if self.model is not None:
+            await self.model.close()
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Process one audio chunk: transcribe and publish results."""
@@ -216,47 +309,46 @@ class STTWorker(BaseWorker):
         )
 
         chunk_offset_ms = chunk.chunk_index * self.settings.chunk_duration_ms
-        language_hint = chunk.language if chunk.language != "auto" else None
-        prompt = await self._get_stt_prompt(chunk.meeting_id)
+        language_hint = _language_hint_for_stt(chunk.language)
         allowed_languages = await self._get_room_languages(chunk.meeting_id)
-
-        async def publish_early(segment: TranscribedSegment) -> None:
-            # Never final — the chunk's real is_final_chunk flag belongs to whichever
-            # trailing segment(s) come back from transcribe() below, once the whole
-            # chunk is done. This is published the moment a complete sentence shows up
-            # in the Realtime API's incremental delta stream, so translation/TTS can
-            # start on it without waiting for the rest of the chunk to transcribe.
-            result = STTResultMessage(
-                segment_id=_build_segment_id(
-                    chunk.meeting_id,
-                    chunk.speaker_id,
-                    message_id,
-                    segment.start_ms,
-                    segment.end_ms,
-                    segment.text,
-                ),
-                meeting_id=chunk.meeting_id,
-                speaker_id=chunk.speaker_id,
-                text=segment.text,
-                language=segment.language,
-                confidence=segment.confidence,
-                start_ms=segment.start_ms,
-                end_ms=segment.end_ms,
-                chunk_index=chunk.chunk_index,
-                is_final_chunk=False,
-                timestamp_ms=chunk.timestamp_ms,
-            )
-            await self.publish("stt:results", chunk.meeting_id, result.to_redis())
-            self.logger.info(
-                "segment_transcribed_early",
-                meeting_id=chunk.meeting_id,
-                text=segment.text[:80],
-                language=segment.language,
-            )
+        keywords = await self._get_stt_keywords(chunk.meeting_id)
 
         t0 = time.monotonic()
         try:
             model = self._require_model()
+
+            async def publish_speculative(segment: Any) -> None:
+                """Warm translation on a complete delta sentence without exposing it.
+
+                This Pub/Sub hint is deliberately ephemeral. Translation may cache the
+                result, but only the later completed STT segment (with real logprobs)
+                can cause a durable translate:results/UI publish.
+                """
+                text = " ".join(segment.text.split())
+                if not text:
+                    return
+                await self.redis.redis.publish(
+                    "stt:speculative",
+                    json.dumps(
+                        {
+                            "meeting_id": chunk.meeting_id,
+                            "speaker_id": chunk.speaker_id,
+                            "text": text,
+                            "language": segment.language or chunk.language,
+                            "chunk_index": chunk.chunk_index,
+                            "timestamp_ms": chunk.timestamp_ms,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                self.logger.info(
+                    "stt_speculative_sentence",
+                    meeting_id=chunk.meeting_id,
+                    chunk_index=chunk.chunk_index,
+                    chars=len(text),
+                    inference_offset_ms=int((time.monotonic() - t0) * 1000),
+                )
+
             segments = await model.transcribe(
                 chunk.audio_data,
                 sample_rate=chunk.sample_rate,
@@ -264,9 +356,18 @@ class STTWorker(BaseWorker):
                 chunk_offset_ms=chunk_offset_ms,
                 meeting_id=chunk.meeting_id,
                 speaker_id=chunk.speaker_id,
-                prompt=prompt,
+                # Never send title/description/instruction prose to STT. A production
+                # failure transcribed and translated that prose verbatim. Keywords retain
+                # vocabulary bias without giving the model a sentence it can recite.
+                prompt=None,
                 allowed_languages=allowed_languages,
-                on_early_segment=publish_early,
+                keywords=keywords,
+                # Realtime delta events carry neither confidence nor no-speech
+                # probability. Publishing them allowed hallucinated partials to reach
+                # translation/UI before the completed event could be validated. They
+                # may only warm the private speculative translation cache below.
+                on_early_segment=None,
+                on_speculative_segment=publish_speculative,
             )
         except Exception as exc:
             await self.redis.publish_system_event(
@@ -297,6 +398,8 @@ class STTWorker(BaseWorker):
         )
 
         for segment in segments:
+            if segment.confidence >= _CONTEXT_MIN_CONFIDENCE:
+                self._remember_transcript(chunk.meeting_id, segment.text)
             result = STTResultMessage(
                 segment_id=_build_segment_id(
                     chunk.meeting_id,
@@ -354,15 +457,13 @@ class STTWorker(BaseWorker):
         return self.model
 
     async def _get_stt_prompt(self, meeting_id: str) -> str | None:
-        """Contextual-biasing prompt for this room: a generic anti-hallucination base
-        (always present) plus this room's glossary/key terms if the backend has published
-        any to `translationRoom:{meeting_id}:stt_prompt`.
+        """Return the bounded room glossary used for contextual vocabulary biasing.
 
         The room glossary is cached for the room's lifetime — the value is stable per
         meeting and the STT session (created once per speaker) reuses whatever it was
-        first given. Even when no glossary is configured, the generic base is returned so
-        the session still opens with hallucination-reducing context, not just a language
-        hint.
+        first given. Generic instruction prose is deliberately omitted because Realtime
+        transcription can echo prompt text into output on silence or marginal audio.
+        Accepted transcript is deliberately excluded for the same reason.
         """
         cached = self._stt_prompts.get(meeting_id)
         if cached is None:
@@ -370,15 +471,82 @@ class STTWorker(BaseWorker):
             glossary = ""
             if raw:
                 glossary = (raw.decode() if isinstance(raw, bytes) else raw).strip()
-            self._stt_prompts[meeting_id] = glossary
             if glossary:
+                # Track publication/prewarm can race the backend's meeting.started
+                # consumer. Cache only a real value; caching "" permanently removed
+                # context from every later utterance in that room.
+                self._stt_prompts[meeting_id] = glossary
                 self.logger.info("stt_prompt_loaded", meeting_id=meeting_id, chars=len(glossary))
         else:
             glossary = cached
 
-        if glossary:
-            return f"{_GENERIC_STT_BASE_PROMPT}\n\n{glossary}"
-        return _GENERIC_STT_BASE_PROMPT
+        return glossary[:_MAX_GLOSSARY_CHARS] or None
+
+    async def _get_stt_keywords(self, meeting_id: str) -> list[str]:
+        """Return structured glossary terms for the provider's keyword-bias field."""
+        caches: dict[str, list[str]] | None = getattr(self, "_stt_keywords", None)
+        if caches is None:
+            caches = {}
+            self._stt_keywords = caches
+        cached = caches.get(meeting_id)
+        if cached is not None:
+            return cached
+
+        raw = await self.redis.get(f"translationRoom:{meeting_id}:mt_glossary")
+        if not raw:
+            return []
+        serialized = raw.decode() if isinstance(raw, bytes) else raw
+        try:
+            entries = json.loads(serialized)
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+            self.logger.warning("stt_keywords_invalid_json", meeting_id=meeting_id)
+            return []
+        if not isinstance(entries, list):
+            return []
+
+        keywords: list[str] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            for field in ("source", "target"):
+                value = entry.get(field)
+                if not isinstance(value, str):
+                    continue
+                cleaned = " ".join(value.split())[:100]
+                normalized = cleaned.casefold()
+                if not cleaned or normalized in seen:
+                    continue
+                seen.add(normalized)
+                keywords.append(cleaned)
+                if len(keywords) >= _MAX_STT_KEYWORDS:
+                    break
+            if len(keywords) >= _MAX_STT_KEYWORDS:
+                break
+
+        # As with the prompt, avoid permanently caching a race-time empty value.
+        if keywords:
+            caches[meeting_id] = keywords
+            self.logger.info(
+                "stt_keywords_loaded",
+                meeting_id=meeting_id,
+                count=len(keywords),
+            )
+        return keywords
+
+    def _remember_transcript(self, meeting_id: str, text: str) -> None:
+        contexts = getattr(self, "_recent_transcripts", None)
+        if contexts is None:
+            contexts = {}
+            self._recent_transcripts = contexts
+        window = contexts.setdefault(meeting_id, deque(maxlen=_RECENT_CONTEXT_SEGMENTS))
+        # Realtime completed events return one flat chunk. Store its sentences
+        # independently so the next chunk's prompt-echo filter can recognize one
+        # repeated background lyric instead of seeing an opaque multi-sentence blob.
+        for sentence in split_into_sentences(text):
+            cleaned = " ".join(sentence.split())
+            if cleaned:
+                window.append(cleaned)
 
     async def _get_room_languages(self, meeting_id: str) -> set[str]:
         """The set of languages this meeting is allowed to produce — the distinct

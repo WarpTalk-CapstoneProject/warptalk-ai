@@ -1,13 +1,9 @@
-"""OpenAI Realtime API (gpt-realtime-whisper) STT wrapper.
+"""OpenAI Realtime transcription STT wrapper.
 
-Replaces the old gpt-4o-mini-transcribe REST-per-chunk call (~2.1-2.6s/chunk incl. a
-full HTTP round-trip) with a persistent WebSocket "transcription" session per
+Uses a persistent WebSocket transcription session per
 (meeting_id, speaker_id), reused across every chunk from that speaker for the life of
-the room. Paying the ~1s connection handshake once per speaker instead of once per
-chunk, plus the Realtime API's own lower per-chunk transcription latency, is where the
-latency win comes from — confirmed empirically (not from docs, which disagreed with
-the real wire protocol in several places): commit -> first partial delta ~0.8s,
-commit -> completed transcript ~1.8s, on a ~4s utterance.
+the room. Production defaults to the accuracy-first gpt-transcribe model and supplies
+the room's expected languages, glossary keywords, and bounded meeting context.
 """
 
 from __future__ import annotations
@@ -16,7 +12,7 @@ import asyncio
 import base64
 import re
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -36,7 +32,7 @@ logger = get_logger(__name__)
 # config.py without anyone having to remember to update both places.
 _DEFAULTS = STTSettings()
 
-# gpt-realtime-whisper rejects session.audio.input.format.rate below this.
+# Realtime transcription PCM input uses 24 kHz.
 REALTIME_SAMPLE_RATE = 24000
 
 # Realtime sessions are per (meeting_id, speaker_id) and outlive a single chunk, but
@@ -48,7 +44,7 @@ SESSION_IDLE_TIMEOUT_S = 300.0
 # Guard against OpenAI never sending a completed/error event for a commit.
 TRANSCRIBE_EVENT_TIMEOUT_S = 15.0
 
-# Vietnamese diacritical corrections — gpt-4o-mini-transcribe also makes these
+# Conservative Vietnamese diacritical corrections for recurrent model errors.
 _VI_CORRECTIONS: dict[str, str] = {
     "lu trữ": "lưu trữ",
     "luu trữ": "lưu trữ",
@@ -259,6 +255,16 @@ _HALLUCINATION_SUBSTRINGS = [
     "video hấp dẫn",
 ]
 
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _normalized_sentences(text: str) -> list[str]:
+    return [
+        " ".join(sentence.casefold().split()).rstrip(".!?,")
+        for sentence in _SENTENCE_BOUNDARY_RE.split(text.strip())
+        if sentence.strip()
+    ]
+
 
 def _pcm16_duration_seconds(audio_bytes: bytes, sample_rate: int) -> float:
     """Duration of raw 16-bit mono PCM — the Realtime API's completed event
@@ -293,12 +299,55 @@ def _normalize_language(lang: str) -> str:
     return _LANG_NAME_TO_CODE.get(lower, lower[:2] if len(lower) > 2 else lower)
 
 
+def _expected_languages(
+    primary_language: str | None,
+    allowed_languages: set[str] | None,
+) -> list[str]:
+    """Build a stable Realtime language hint without suppressing English code-switching."""
+    ordered: list[str] = []
+
+    def add(language: str | None) -> None:
+        if not language or language == "auto":
+            return
+        normalized = _normalize_language(language)
+        if normalized and normalized not in ordered:
+            ordered.append(normalized)
+
+    add(primary_language)
+    for language in sorted(allowed_languages or ()):
+        add(language)
+    # Product meetings frequently embed English product and engineering terms in an
+    # otherwise non-English utterance. Advertising English as expected prevents the
+    # model from forcing those terms into a phonetic translation of the primary language.
+    if ordered:
+        add("en")
+    return ordered
+
+
+def _normalized_keywords(keywords: list[str] | None) -> list[str]:
+    """Bound and de-duplicate provider keyword hints while preserving display casing."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for keyword in keywords or ():
+        cleaned = " ".join(keyword.split())[:100]
+        key = cleaned.casefold()
+        if not cleaned or key in seen:
+            continue
+        seen.add(key)
+        result.append(cleaned)
+        if len(result) >= 100:
+            break
+    return result
+
+
 def _filter_segments(
     segments_raw: list[dict[str, Any]],
     detected_language: str,
     chunk_offset_ms: int,
     allowed_languages: set[str] | None = None,
     real_duration_s: float | None = None,
+    context_prompt: str | None = None,
+    min_avg_logprob: float = -0.7,
 ) -> list[TranscribedSegment]:
     language_known = detected_language != "unknown"
     lang_code = _normalize_language(detected_language) if language_known else None
@@ -347,6 +396,11 @@ def _filter_segments(
 
     results: list[TranscribedSegment] = []
     seen_texts: set[str] = set()
+    prompt_lines = {
+        " ".join(line.casefold().split()).rstrip(".!?,")
+        for line in (context_prompt or "").splitlines()
+        if len(" ".join(line.split())) >= 12
+    }
 
     for seg in segments_raw:
         text = seg.get("text", "").strip()
@@ -362,20 +416,39 @@ def _filter_segments(
             logger.debug("filtered_foreign_script", text=text)
             continue
 
-        # gpt-realtime-whisper's completed event carries neither field (unlike the old
-        # REST Whisper response this replaced), so transcribe() always passes 0.0/-1.0
-        # placeholders here — these two checks are permanently inert until there's a
-        # real per-segment confidence signal to feed them. The repetition/hallucination
-        # checks below are what actually catches bad output now.
-        avg_logprob = seg.get("avg_logprob", -1.0) or -1.0
+        # Realtime completed events expose token logprobs when explicitly requested in
+        # the session include list. transcribe() averages those into avg_logprob; -1.0
+        # remains the compatibility fallback for an older event with no logprobs.
+        avg_logprob = float(seg.get("avg_logprob", -1.0))
         no_speech = seg.get("no_speech_prob", 0.0) or 0.0
         text_lower = text.lower().rstrip(".!,")
+
+        # Realtime transcription can repeat contextual prompt text on silence/noise.
+        # Reject an exact long-line echo regardless of confidence. Also reject a long
+        # partial prompt phrase only when its confidence is marginal: production copied
+        # "WarpTalk transcript engineering" out of a longer title at -0.6066. A clear
+        # speaker genuinely saying the title remains valid, and short glossary terms
+        # ("backend", "gRPC") are never treated as prompt fragments.
+        normalized_text = " ".join(text.casefold().split()).rstrip(".!?,")
+        is_exact_prompt_echo = normalized_text in prompt_lines
+        is_marginal_prompt_fragment = (
+            len(normalized_text) >= 18
+            and avg_logprob < -0.35
+            and any(normalized_text in prompt_line for prompt_line in prompt_lines)
+        )
+        if is_exact_prompt_echo or is_marginal_prompt_fragment:
+            logger.debug("filtered_prompt_echo", text=text[:80])
+            continue
 
         if no_speech > 0.6:
             logger.debug("filtered_no_speech", text=text, no_speech_prob=round(no_speech, 2))
             continue
 
-        if avg_logprob < -1.0:
+        # -1.0 is the compatibility sentinel for old completed events that lacked
+        # logprobs. Current sessions request real token logprobs; a real value below
+        # the calibrated boundary is marginal audio and must not become an off-topic
+        # plausible-looking caption.
+        if avg_logprob != -1.0 and avg_logprob < min_avg_logprob:
             logger.debug("filtered_low_confidence", text=text, logprob=round(avg_logprob, 2))
             continue
 
@@ -404,6 +477,27 @@ def _filter_segments(
         if any(sub in text_lower for sub in _HALLUCINATION_SUBSTRINGS):
             logger.debug("filtered_hallucination_substring", text=text)
             continue
+
+        # A real production failure returned a high-confidence collage made by copying
+        # the same three previous utterances over and over. Token logprob cannot catch
+        # clear background vocals, so reject repeated *sentences* before they recursively
+        # enter the prompt and grow on every following chunk.
+        normalized_sentences = _normalized_sentences(text)
+        substantial_sentences = [
+            sentence for sentence in normalized_sentences if len(sentence) >= 8
+        ]
+        if len(substantial_sentences) >= 3:
+            sentence_counts = Counter(substantial_sentences)
+            repeated_sentence_count = sum(
+                count - 1 for count in sentence_counts.values() if count > 1
+            )
+            if repeated_sentence_count >= 2:
+                logger.debug(
+                    "filtered_repeated_sentence_collage",
+                    text=text[:80],
+                    repeated_sentences=repeated_sentence_count,
+                )
+                continue
 
         # Whisper-family hallucination on marginal/noisy audio tends to loop a
         # word or short phrase rather than collapsing to 1-2 distinct words total
@@ -445,7 +539,7 @@ def _filter_segments(
 
 
 class OpenAISTT:
-    """OpenAI Realtime API (gpt-realtime-whisper) wrapper.
+    """OpenAI Realtime transcription wrapper.
 
     Fully async — call `await transcribe()` directly, no asyncio.to_thread needed.
     Keeps one WebSocket "transcription" session open per (meeting_id, speaker_id),
@@ -458,13 +552,16 @@ class OpenAISTT:
         api_key: str = "",
         model: str = _DEFAULTS.model,
         noise_reduction: str = _DEFAULTS.noise_reduction,
+        min_avg_logprob: float = _DEFAULTS.min_avg_logprob,
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.noise_reduction = noise_reduction
+        self.min_avg_logprob = min_avg_logprob
         self._client: AsyncOpenAI | None = None
         # (meeting_id, speaker_id) -> {"manager": ..., "conn": ..., "last_used": float}
         self._sessions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._warm_sessions: deque[dict[str, Any]] = deque()
 
     async def load(self) -> None:
         if not self.api_key:
@@ -472,6 +569,61 @@ class OpenAISTT:
 
         self._client = AsyncOpenAI(api_key=self.api_key)
         logger.info("openai_stt_ready", model=self.model)
+
+    async def warm_up(self, pool_size: int = 4) -> None:
+        """Open reusable transcription sockets before the first participant speaks."""
+        client = self._client
+        if client is None:
+            raise RuntimeError("OpenAI STT is not loaded")
+
+        async def _open() -> dict[str, Any]:
+            manager = client.realtime.connect(extra_query={"intent": "transcription"})
+            conn = await manager.__aenter__()
+            return {"manager": manager, "conn": conn}
+
+        opened = await asyncio.gather(
+            *(_open() for _ in range(max(0, pool_size))),
+            return_exceptions=True,
+        )
+        warm_sessions = getattr(self, "_warm_sessions", None)
+        if warm_sessions is None:
+            warm_sessions = deque()
+            self._warm_sessions = warm_sessions
+        for result in opened:
+            if isinstance(result, Exception):
+                logger.warning("stt_warm_session_failed", error=str(result))
+            else:
+                warm_sessions.append(result)
+        logger.info("stt_realtime_pool_warmed", connections=len(warm_sessions))
+
+    async def close(self) -> None:
+        sessions = list(getattr(self, "_sessions", {}).values())
+        getattr(self, "_sessions", {}).clear()
+        warm_sessions = list(getattr(self, "_warm_sessions", ()))
+        getattr(self, "_warm_sessions", deque()).clear()
+        await asyncio.gather(
+            *(self._close_session(session) for session in sessions + warm_sessions),
+            return_exceptions=True,
+        )
+
+    async def prepare_session(
+        self,
+        meeting_id: str,
+        speaker_id: str,
+        *,
+        language: str | None,
+        prompt: str | None,
+        allowed_languages: set[str] | None = None,
+        keywords: list[str] | None = None,
+    ) -> None:
+        """Claim/configure a warm socket when a participant publishes their mic track."""
+        await self._get_or_create_session(
+            (meeting_id, speaker_id),
+            language=language,
+            prompt=prompt,
+            allowed_languages=allowed_languages,
+            keywords=keywords,
+        )
 
     async def transcribe(
         self,
@@ -483,7 +635,9 @@ class OpenAISTT:
         speaker_id: str = "",
         prompt: str | None = None,
         allowed_languages: set[str] | None = None,
+        keywords: list[str] | None = None,
         on_early_segment: Callable[[TranscribedSegment], Awaitable[None]] | None = None,
+        on_speculative_segment: Callable[[TranscribedSegment], Awaitable[None]] | None = None,
     ) -> list[TranscribedSegment]:
         """Transcribe raw audio bytes via the OpenAI Realtime API.
 
@@ -509,6 +663,9 @@ class OpenAISTT:
                 this way are excluded from the returned list (they've already been
                 handed off); only the still-incomplete trailing fragment comes back
                 normally once the `.completed` event arrives.
+            on_speculative_segment: called at the same early sentence boundary but never
+                removes text from the final return. The callback may warm a downstream
+                translation cache; only the completed-event result is published.
 
         Returns:
             Filtered list of transcribed segments (the trailing fragment not already
@@ -536,23 +693,71 @@ class OpenAISTT:
                 detected_language,
                 chunk_offset_ms,
                 allowed_languages,
+                context_prompt=prompt,
+                min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
             )
             for seg in segs:
                 await on_early_segment(seg)
 
-        on_sentence = _emit_early if on_early_segment is not None else None
+        async def _emit_speculative(sentence_text: str) -> None:
+            if on_speculative_segment is None:
+                return
+            segs = _filter_segments(
+                [
+                    {
+                        "text": sentence_text,
+                        "start": 0.0,
+                        "end": 0.0,
+                        "avg_logprob": 0.0,
+                        "no_speech_prob": 0.0,
+                    }
+                ],
+                detected_language,
+                chunk_offset_ms,
+                allowed_languages,
+                context_prompt=prompt,
+                min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
+            )
+            for seg in segs:
+                await on_speculative_segment(seg)
+
+        if on_early_segment is not None:
+            on_sentence = _emit_early
+            exclude_emitted_from_final = True
+        elif on_speculative_segment is not None:
+            on_sentence = _emit_speculative
+            exclude_emitted_from_final = False
+        else:
+            on_sentence = None
+            exclude_emitted_from_final = True
 
         pcm_24k = _resample_pcm16(audio_bytes, sample_rate, REALTIME_SAMPLE_RATE)
 
         key = (meeting_id, speaker_id)
         try:
-            text = await self._transcribe_via_session(key, pcm_24k, on_sentence, lang_arg, prompt)
+            text, avg_logprob = await self._transcribe_via_session(
+                key,
+                pcm_24k,
+                on_sentence,
+                lang_arg,
+                prompt,
+                allowed_languages,
+                keywords,
+                exclude_emitted_from_final=exclude_emitted_from_final,
+            )
         except Exception:
             logger.warning("realtime_session_retry", meeting_id=meeting_id, speaker_id=speaker_id)
             self._sessions.pop(key, None)
             try:
-                text = await self._transcribe_via_session(
-                    key, pcm_24k, on_sentence, lang_arg, prompt
+                text, avg_logprob = await self._transcribe_via_session(
+                    key,
+                    pcm_24k,
+                    on_sentence,
+                    lang_arg,
+                    prompt,
+                    allowed_languages,
+                    keywords,
+                    exclude_emitted_from_final=exclude_emitted_from_final,
                 )
             except Exception as e:
                 logger.error("openai_stt_error", error=str(e))
@@ -567,7 +772,7 @@ class OpenAISTT:
                 "text": text.strip(),
                 "start": 0.0,
                 "end": duration_s,
-                "avg_logprob": 0.0,
+                "avg_logprob": avg_logprob,
                 "no_speech_prob": 0.0,
             }
         ]
@@ -583,6 +788,8 @@ class OpenAISTT:
             chunk_offset_ms,
             allowed_languages,
             real_duration_s=duration_s,
+            context_prompt=prompt,
+            min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
         )
 
     async def _transcribe_via_session(
@@ -592,21 +799,33 @@ class OpenAISTT:
         on_sentence: Callable[[str], Awaitable[None]] | None = None,
         language: str | None = None,
         prompt: str | None = None,
-    ) -> str:
-        session = await self._get_or_create_session(key, language, prompt)
+        allowed_languages: set[str] | None = None,
+        keywords: list[str] | None = None,
+        *,
+        exclude_emitted_from_final: bool = True,
+    ) -> tuple[str, float]:
+        session = await self._get_or_create_session(
+            key,
+            language,
+            prompt,
+            allowed_languages,
+            keywords,
+        )
         conn = session["conn"]
 
-        # ~100ms frames — matches how a real streaming producer would feed audio in;
-        # a single huge append also works, this is just a conservative message size.
-        frame_bytes = REALTIME_SAMPLE_RATE * 2 // 10
-        for i in range(0, len(pcm_24k), frame_bytes):
-            frame = pcm_24k[i : i + frame_bytes]
+        # Ingress has already assembled a VAD-bounded speech utterance.
+        # Sending that as ten-to-fifteen separately awaited 100ms websocket messages
+        # added pure transport overhead before the model could start. Keep a conservative
+        # 2s raw-PCM cap for unusually long replay/test chunks; production uses one append.
+        append_bytes = REALTIME_SAMPLE_RATE * 2 * 2
+        for i in range(0, len(pcm_24k), append_bytes):
+            frame = pcm_24k[i : i + append_bytes]
             await conn.input_audio_buffer.append(audio=base64.b64encode(frame).decode())
 
         await conn.input_audio_buffer.commit()
         session["last_used"] = time.monotonic()
 
-        async def _collect() -> str:
+        async def _collect() -> tuple[str, float]:
             buffer = ""
             flushed = ""
             # gpt-realtime-whisper occasionally gets stuck on trailing silence/noise and
@@ -646,11 +865,26 @@ class OpenAISTT:
                         buffer = "" if ends_clean else sentences[-1]
                 elif etype == "conversation.item.input_audio_transcription.completed":
                     final_text = (getattr(event, "transcript", "") or "").strip()
+                    token_logprobs = [
+                        float(value)
+                        for item in (getattr(event, "logprobs", None) or [])
+                        if (value := (
+                            item.get("logprob")
+                            if isinstance(item, dict)
+                            else getattr(item, "logprob", None)
+                        ))
+                        is not None
+                    ]
+                    avg_logprob = (
+                        sum(token_logprobs) / len(token_logprobs) if token_logprobs else -1.0
+                    )
+                    if not exclude_emitted_from_final:
+                        return final_text, avg_logprob
                     flushed_stripped = flushed.strip()
                     if not flushed_stripped:
-                        return final_text
+                        return final_text, avg_logprob
                     if final_text.startswith(flushed_stripped):
-                        return final_text[len(flushed_stripped) :].strip()
+                        return final_text[len(flushed_stripped) :].strip(), avg_logprob
                     # Model revised something inside the already-flushed prefix — we
                     # can't safely recompute the diff (would risk re-publishing text
                     # that was already billed/translated). Drop the trailing part
@@ -660,7 +894,7 @@ class OpenAISTT:
                         flushed=flushed_stripped[:60],
                         final=final_text[:60],
                     )
-                    return ""
+                    return "", avg_logprob
                 elif etype == "error":
                     raise RuntimeError(f"realtime_transcription_error: {event}")
             raise RuntimeError("realtime_connection_closed_before_completed")
@@ -671,6 +905,8 @@ class OpenAISTT:
         self,
         language: str | None,
         prompt: str | None,
+        allowed_languages: set[str] | None = None,
+        keywords: list[str] | None = None,
     ) -> dict[str, Any]:
         # input_audio_transcription.language is a real, documented field (ISO-639-1
         # hint): "improves accuracy and latency". Telling the model the speaker's
@@ -684,7 +920,18 @@ class OpenAISTT:
         # the expected domain vocabulary — the research-backed hallucination-reduction
         # lever (arXiv 2410.18363).
         transcription_config: dict[str, Any] = {"model": self.model}
-        if language:
+        is_next_generation_transcribe = self.model in {
+            "gpt-transcribe",
+            "gpt-live-transcribe",
+        }
+        if is_next_generation_transcribe:
+            languages = _expected_languages(language, allowed_languages)
+            if languages:
+                transcription_config["languages"] = languages
+            normalized_keywords = _normalized_keywords(keywords)
+            if normalized_keywords:
+                transcription_config["keywords"] = normalized_keywords
+        elif language:
             transcription_config["language"] = language
         if prompt:
             transcription_config["prompt"] = prompt
@@ -701,25 +948,39 @@ class OpenAISTT:
         if self.noise_reduction and self.noise_reduction != "off":
             input_config["noise_reduction"] = {"type": self.noise_reduction}
 
-        return {
+        payload: dict[str, Any] = {
             "type": "transcription",
             "audio": {"input": input_config},
         }
+        # The earlier 4o transcription models expose token logprobs. The newer
+        # gpt-transcribe family currently does not expose confidence scores, and sending
+        # this include selector makes some Realtime API versions reject the session.
+        if not is_next_generation_transcribe:
+            payload["include"] = ["item.input_audio_transcription.logprobs"]
+        return payload
 
     async def _get_or_create_session(
-        self, key: tuple[str, str], language: str | None = None, prompt: str | None = None
+        self,
+        key: tuple[str, str],
+        language: str | None = None,
+        prompt: str | None = None,
+        allowed_languages: set[str] | None = None,
+        keywords: list[str] | None = None,
     ) -> dict[str, Any]:
         self._sweep_idle_sessions()
 
+        languages = tuple(_expected_languages(language, allowed_languages))
+        normalized_keywords = tuple(_normalized_keywords(keywords))
         cached = self._sessions.get(key)
-        if cached is not None:
-            if cached.get("language") == language:
-                return cached
-            # The speaker's registered language changed mid-meeting (e.g. via the live
-            # speak-language control — TranslationRoomHub.SetSpeakLanguage). The Realtime
-            # API has no live way to re-pin an already-open session's
-            # input_audio_transcription.language, so close this one and fall through to
-            # open a fresh session pinned to the new language for the next chunk.
+        is_next_generation_transcribe = self.model in {
+            "gpt-transcribe",
+            "gpt-live-transcribe",
+        }
+        if (
+            cached is not None
+            and not is_next_generation_transcribe
+            and cached.get("language") != language
+        ):
             logger.info(
                 "stt_session_language_changed",
                 meeting_id=key[0],
@@ -736,17 +997,60 @@ class OpenAISTT:
                     speaker_id=key[1],
                 )
             self._sessions.pop(key, None)
+            cached = None
+        if cached is not None:
+            config_changed = (
+                cached.get("language") != language
+                or cached.get("prompt") != prompt
+                or cached.get("languages") != languages
+                or cached.get("keywords") != normalized_keywords
+            )
+            if config_changed:
+                await cached["conn"].session.update(
+                    session=cast(
+                        Any,
+                        self._session_payload(
+                            language,
+                            prompt,
+                            allowed_languages,
+                            list(normalized_keywords),
+                        ),
+                    )
+                )
+                cached.update(
+                    language=language,
+                    prompt=prompt,
+                    languages=languages,
+                    keywords=normalized_keywords,
+                )
+            return cached
 
         client = self._client
         if client is None:
             raise RuntimeError("OpenAI STT is not loaded")
-        manager = client.realtime.connect(extra_query={"intent": "transcription"})
-        conn = await manager.__aenter__()
+        warm_sessions = getattr(self, "_warm_sessions", None)
+        if warm_sessions:
+            warm = warm_sessions.popleft()
+            manager = warm["manager"]
+            conn = warm["conn"]
+        else:
+            manager = client.realtime.connect(extra_query={"intent": "transcription"})
+            conn = await manager.__aenter__()
 
         try:
-            await conn.session.update(session=cast(Any, self._session_payload(language, prompt)))
+            await conn.session.update(
+                session=cast(
+                    Any,
+                    self._session_payload(
+                        language,
+                        prompt,
+                        allowed_languages,
+                        list(normalized_keywords),
+                    ),
+                )
+            )
         except Exception:
-            if not language and not prompt:
+            if not language and not prompt and not normalized_keywords:
                 raise
             # Fail safe to a bare config rather than losing the session entirely if
             # this API version rejects the language or prompt field for some reason.
@@ -754,6 +1058,7 @@ class OpenAISTT:
                 "session_optional_fields_rejected",
                 has_language=bool(language),
                 has_prompt=bool(prompt),
+                has_keywords=bool(normalized_keywords),
             )
             await conn.session.update(session=cast(Any, self._session_payload(None, None)))
 
@@ -762,6 +1067,9 @@ class OpenAISTT:
             "conn": conn,
             "last_used": time.monotonic(),
             "language": language,
+            "prompt": prompt,
+            "languages": languages,
+            "keywords": normalized_keywords,
         }
         self._sessions[key] = session
         logger.info(
@@ -770,6 +1078,7 @@ class OpenAISTT:
             speaker_id=key[1],
             language=language or "auto",
             has_prompt=bool(prompt),
+            keyword_count=len(normalized_keywords),
         )
         return session
 
