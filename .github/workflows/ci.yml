@@ -64,6 +64,7 @@ jobs:
           --extra billing
           --extra tts
           --extra embeddings
+          --extra ingress
       - run: uv run ruff format --check .
       - run: uv run ruff check .
       - run: uv run mypy
