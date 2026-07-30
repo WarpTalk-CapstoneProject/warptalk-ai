@@ -26,6 +26,7 @@ async def test_health_probe_uses_shared_sentinel_aware_client(monkeypatch) -> No
             json.dumps(
                 {
                     "worker": "stt",
+                    "timestamp_unix_ms": 1_000_000,
                     "last_progress_unix_ms": 1_000_000,
                 }
             ).encode()
@@ -46,16 +47,44 @@ async def test_health_probe_uses_shared_sentinel_aware_client(monkeypatch) -> No
     client.disconnect.assert_awaited_once()
 
 
-async def test_health_probe_fails_when_worker_progress_is_stale(monkeypatch) -> None:
+async def test_health_probe_stays_healthy_when_idle_worker_heartbeat_is_fresh(monkeypatch) -> None:
     monkeypatch.setenv("WORKER_HEALTH_NAME", "tts")
-    monkeypatch.setenv("WORKER_HEALTH_MAX_STALL_SECONDS", "180")
+    monkeypatch.setenv("WORKER_HEALTH_MAX_HEARTBEAT_AGE_SECONDS", "30")
     redis = AsyncMock()
     redis.mget = AsyncMock(
         return_value=[
             json.dumps(
                 {
                     "worker": "tts",
+                    "timestamp_unix_ms": 1_000_000,
                     "last_progress_unix_ms": 700_000,
+                }
+            ).encode()
+        ]
+    )
+    client = MagicMock()
+    client.redis = redis
+    client.connect = AsyncMock()
+    client.disconnect = AsyncMock()
+
+    with (
+        patch("shared.health_probe.RedisStreamClient", return_value=client),
+        patch("shared.health_probe.time.time", return_value=1000),
+    ):
+        assert await check_worker() is True
+
+
+async def test_health_probe_fails_when_heartbeat_is_stale(monkeypatch) -> None:
+    monkeypatch.setenv("WORKER_HEALTH_NAME", "tts")
+    monkeypatch.setenv("WORKER_HEALTH_MAX_HEARTBEAT_AGE_SECONDS", "30")
+    redis = AsyncMock()
+    redis.mget = AsyncMock(
+        return_value=[
+            json.dumps(
+                {
+                    "worker": "tts",
+                    "timestamp_unix_ms": 900_000,
+                    "last_progress_unix_ms": 900_000,
                 }
             ).encode()
         ]
