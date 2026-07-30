@@ -256,6 +256,9 @@ _HALLUCINATION_SUBSTRINGS = [
 ]
 
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+_KEYWORD_ENUMERATION_SPLIT_RE = re.compile(r"[,;\n]+")
+_MIN_KEYWORD_ECHO_TERMS = 6
+_MIN_KEYWORD_ECHO_RATIO = 0.75
 
 
 def _normalized_sentences(text: str) -> list[str]:
@@ -340,6 +343,36 @@ def _normalized_keywords(keywords: list[str] | None) -> list[str]:
     return result
 
 
+def _is_keyword_enumeration_echo(text: str, keywords: list[str] | None) -> bool:
+    """Detect the provider reciting structured vocabulary hints as spoken content.
+
+    Keep ordinary speech that happens to mention glossary terms. The production failure
+    was structurally different: a long comma-separated enumeration where nearly every
+    item was one of the exact provider keywords.
+    """
+    normalized_keywords = {
+        " ".join(keyword.casefold().split()).strip(" .!?:;,")
+        for keyword in (keywords or ())
+        if keyword.strip()
+    }
+    if len(normalized_keywords) < _MIN_KEYWORD_ECHO_TERMS:
+        return False
+
+    items = [
+        " ".join(item.casefold().split()).strip(" .!?:;,")
+        for item in _KEYWORD_ENUMERATION_SPLIT_RE.split(text)
+        if item.strip(" .!?:;,")
+    ]
+    if len(items) < _MIN_KEYWORD_ECHO_TERMS:
+        return False
+
+    matched = sum(item in normalized_keywords for item in items)
+    return (
+        matched >= _MIN_KEYWORD_ECHO_TERMS
+        and matched / len(items) >= _MIN_KEYWORD_ECHO_RATIO
+    )
+
+
 def _filter_segments(
     segments_raw: list[dict[str, Any]],
     detected_language: str,
@@ -347,6 +380,7 @@ def _filter_segments(
     allowed_languages: set[str] | None = None,
     real_duration_s: float | None = None,
     context_prompt: str | None = None,
+    keywords: list[str] | None = None,
     min_avg_logprob: float = -0.7,
 ) -> list[TranscribedSegment]:
     language_known = detected_language != "unknown"
@@ -438,6 +472,19 @@ def _filter_segments(
         )
         if is_exact_prompt_echo or is_marginal_prompt_fragment:
             logger.debug("filtered_prompt_echo", text=text[:80])
+            continue
+
+        # gpt-transcribe accepts structured keyword hints but does not currently expose
+        # token confidence. On marginal audio it can recite the entire comma-separated
+        # glossary verbatim, yielding the -1.0 compatibility sentinel and bypassing the
+        # confidence gate below. Match the *enumeration structure*, not isolated terms,
+        # so natural code-switched speech such as "deploy the backend API" remains valid.
+        if _is_keyword_enumeration_echo(text, keywords):
+            logger.warning(
+                "filtered_keyword_enumeration_echo",
+                text=text[:80],
+                keyword_count=len(keywords or ()),
+            )
             continue
 
         if no_speech > 0.6:
@@ -694,6 +741,7 @@ class OpenAISTT:
                 chunk_offset_ms,
                 allowed_languages,
                 context_prompt=prompt,
+                keywords=keywords,
                 min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
             )
             for seg in segs:
@@ -716,6 +764,7 @@ class OpenAISTT:
                 chunk_offset_ms,
                 allowed_languages,
                 context_prompt=prompt,
+                keywords=keywords,
                 min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
             )
             for seg in segs:
@@ -789,6 +838,7 @@ class OpenAISTT:
             allowed_languages,
             real_duration_s=duration_s,
             context_prompt=prompt,
+            keywords=keywords,
             min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
         )
 

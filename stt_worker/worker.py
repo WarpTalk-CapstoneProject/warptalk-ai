@@ -57,6 +57,7 @@ _MAX_STT_PROMPT_CHARS = 600
 _MAX_GLOSSARY_CHARS = 240
 _MAX_STT_KEYWORDS = 100
 _CONTEXT_MIN_CONFIDENCE = -0.35
+_ACTIVE_TRANSLATION_STATES = {"IN_PROGRESS", "AUDIO_ROUTING_ACTIVE"}
 
 
 def _language_hint_for_stt(language: str) -> str | None:
@@ -292,6 +293,14 @@ class STTWorker(BaseWorker):
         """Process one audio chunk: transcribe and publish results."""
         chunk = AudioChunkMessage.from_redis(data)
 
+        if not await self._translation_state_allows_stt(chunk.meeting_id):
+            self.logger.info(
+                "skipping_inactive_room",
+                meeting_id=chunk.meeting_id,
+                route_state=getattr(self, "_route_states", {}).get(chunk.meeting_id),
+            )
+            return
+
         if chunk.meeting_id in self._paused_rooms:
             self.logger.debug("skipping_paused_room", meeting_id=chunk.meeting_id)
             return
@@ -451,6 +460,38 @@ class STTWorker(BaseWorker):
             )
             await self.publish("stt:results", chunk.meeting_id, result.to_redis())
 
+    async def _translation_state_allows_stt(self, meeting_id: str) -> bool:
+        """Reject queued audio when the authoritative room state is known inactive.
+
+        LiveKit ingress is the primary capture gate. This second gate prevents a stale
+        Redis chunk (or a producer regression) from creating transcript before Start.
+        Unknown legacy state remains fail-open so an unavailable cache cannot erase valid
+        live speech; current rooms persist ``audio_routes`` before publishing audio.
+        """
+        route_states = getattr(self, "_route_states", None)
+        if route_states is None:
+            route_states = {}
+            self._route_states = route_states
+        state = route_states.get(meeting_id)
+        if state is None:
+            try:
+                raw = await self.redis.get(f"translationRoom:{meeting_id}:audio_routes")
+                if raw:
+                    serialized = raw.decode() if isinstance(raw, bytes) else raw
+                    payload = json.loads(serialized)
+                    persisted_state = payload.get("room_status")
+                    if isinstance(persisted_state, str) and persisted_state:
+                        state = persisted_state
+                        route_states[meeting_id] = state
+            except Exception:
+                self.logger.warning(
+                    "stt_room_status_hydration_failed",
+                    meeting_id=meeting_id,
+                    exc_info=True,
+                )
+
+        return state is None or state in _ACTIVE_TRANSLATION_STATES
+
     def _require_model(self) -> OpenAISTT:
         if self.model is None:
             raise RuntimeError("STT model is not loaded")
@@ -492,7 +533,7 @@ class STTWorker(BaseWorker):
         if cached is not None:
             return cached
 
-        raw = await self.redis.get(f"translationRoom:{meeting_id}:mt_glossary")
+        raw = await self.redis.get(f"translationRoom:{meeting_id}:stt_keywords")
         if not raw:
             return []
         serialized = raw.decode() if isinstance(raw, bytes) else raw
@@ -507,10 +548,12 @@ class STTWorker(BaseWorker):
         keywords: list[str] = []
         seen: set[str] = set()
         for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            for field in ("source", "target"):
-                value = entry.get(field)
+            values = [entry] if isinstance(entry, str) else []
+            # Be tolerant of an object payload during rolling upgrades, while the
+            # dedicated key's canonical contract remains a compact string array.
+            if isinstance(entry, dict):
+                values = [entry.get("source"), entry.get("target")]
+            for value in values:
                 if not isinstance(value, str):
                     continue
                 cleaned = " ".join(value.split())[:100]
