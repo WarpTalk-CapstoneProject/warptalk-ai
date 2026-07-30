@@ -519,8 +519,7 @@ class TestOpenAISTT:
         self, sample_audio_bytes: bytes
     ) -> None:
         speech = (
-            "Chúng ta kiểm tra validator. Sau đó review pull request. "
-            "Cuối cùng mới merge backend."
+            "Chúng ta kiểm tra validator. Sau đó review pull request. Cuối cùng mới merge backend."
         )
         events = [
             SimpleNamespace(
@@ -1182,9 +1181,7 @@ class TestSTTWorker:
         assert any("translationRoom:system_events" in stream for stream in streams_published)
         assert not any("stt:results" in stream for stream in streams_published)
 
-    async def test_get_stt_prompt_returns_none_when_no_glossary(
-        self, mock_redis_client
-    ) -> None:
+    async def test_get_stt_prompt_returns_none_when_no_glossary(self, mock_redis_client) -> None:
         """Do not seed silence/noise with instruction text that can leak into output."""
         worker = STTWorker.__new__(STTWorker)
         worker.redis = mock_redis_client
@@ -1207,10 +1204,7 @@ class TestSTTWorker:
         ]
 
         assert await worker._get_stt_prompt("m1") is None
-        assert (
-            await worker._get_stt_prompt("m1")
-            == "WarpTalk, Docker, Kubernetes"
-        )
+        assert await worker._get_stt_prompt("m1") == "WarpTalk, Docker, Kubernetes"
         assert mock_redis_client._redis.get.await_count == 2
 
     async def test_get_stt_prompt_returns_only_room_glossary(self, mock_redis_client) -> None:
@@ -1243,9 +1237,7 @@ class TestSTTWorker:
         keywords = await worker._get_stt_keywords("m1")
 
         assert keywords == ["Kubernetes", "pull request", "gRPC"]
-        mock_redis_client._redis.get.assert_awaited_once_with(
-            "translationRoom:m1:stt_keywords"
-        )
+        mock_redis_client._redis.get.assert_awaited_once_with("translationRoom:m1:stt_keywords")
 
     def test_declared_language_anchors_realtime_transcription(self) -> None:
         assert _language_hint_for_stt("vi") == "vi"

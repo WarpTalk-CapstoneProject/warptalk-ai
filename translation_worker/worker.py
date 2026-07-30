@@ -76,9 +76,7 @@ def _select_relevance_context(text: str, meeting_context: list[str] | None) -> l
     """
     if not meeting_context:
         return []
-    normalized = " ".join(
-        re.findall(r"[^\W_]+", text.casefold(), flags=re.UNICODE)
-    )
+    normalized = " ".join(re.findall(r"[^\W_]+", text.casefold(), flags=re.UNICODE))
     if normalized in _CONTEXT_FREE_SHORT_TURNS:
         return []
     utterance_tokens = _content_tokens(text)
@@ -200,9 +198,7 @@ class TranslationWorker(BaseWorker):
 
         target_langs = await self._get_target_languages(meeting_id, speaker_id)
         glossary_terms = await self._get_mt_glossary(meeting_id)
-        recent_context = list(
-            getattr(self, "_recent_source_contexts", {}).get(meeting_id, ())
-        )
+        recent_context = list(getattr(self, "_recent_source_contexts", {}).get(meeting_id, ()))
         static_context = await self._get_meeting_context(meeting_id)
         meeting_context = recent_context[-3:] + static_context
         translator = self._require_translator()
@@ -259,9 +255,7 @@ class TranslationWorker(BaseWorker):
                             )
                             return ""
 
-                task = asyncio.create_task(
-                    run_speculative()
-                )
+                task = asyncio.create_task(run_speculative())
                 cache[key] = (task, now)
                 tasks.append(task)
 

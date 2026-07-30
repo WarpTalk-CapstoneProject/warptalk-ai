@@ -32,9 +32,7 @@ async def benchmark(args: argparse.Namespace) -> list[dict[str, object]]:
         raw_context = await redis.get(f"translationRoom:{args.room}:meeting_context")
     finally:
         await redis.aclose()
-    static_context = (
-        raw_context.decode() if isinstance(raw_context, bytes) else raw_context
-    )
+    static_context = raw_context.decode() if isinstance(raw_context, bytes) else raw_context
 
     translation = TranslationSettings()
     translator = OpenAITranslator(

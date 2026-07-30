@@ -367,10 +367,7 @@ def _is_keyword_enumeration_echo(text: str, keywords: list[str] | None) -> bool:
         return False
 
     matched = sum(item in normalized_keywords for item in items)
-    return (
-        matched >= _MIN_KEYWORD_ECHO_TERMS
-        and matched / len(items) >= _MIN_KEYWORD_ECHO_RATIO
-    )
+    return matched >= _MIN_KEYWORD_ECHO_TERMS and matched / len(items) >= _MIN_KEYWORD_ECHO_RATIO
 
 
 def _filter_segments(
@@ -918,11 +915,13 @@ class OpenAISTT:
                     token_logprobs = [
                         float(value)
                         for item in (getattr(event, "logprobs", None) or [])
-                        if (value := (
-                            item.get("logprob")
-                            if isinstance(item, dict)
-                            else getattr(item, "logprob", None)
-                        ))
+                        if (
+                            value := (
+                                item.get("logprob")
+                                if isinstance(item, dict)
+                                else getattr(item, "logprob", None)
+                            )
+                        )
                         is not None
                     ]
                     avg_logprob = (

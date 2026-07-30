@@ -51,10 +51,7 @@ async def check_worker() -> bool:
                 raw_value = raw_value.decode("utf-8")
             payload = json.loads(raw_value)
             heartbeat_unix_ms = int(payload.get("timestamp_unix_ms", 0))
-            if (
-                heartbeat_unix_ms <= 0
-                or now_unix_ms - heartbeat_unix_ms > max_heartbeat_age_ms
-            ):
+            if heartbeat_unix_ms <= 0 or now_unix_ms - heartbeat_unix_ms > max_heartbeat_age_ms:
                 return False
 
         return True

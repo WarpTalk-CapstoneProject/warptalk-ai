@@ -312,9 +312,7 @@ class TestOpenAITranslator:
         done.response.id = "resp-1"
         done.response.status = "completed"
         fake_connection.recv = AsyncMock(side_effect=[created, delta, done])
-        translator._acquire_realtime_connection = AsyncMock(
-            return_value=(0, fake_connection)
-        )
+        translator._acquire_realtime_connection = AsyncMock(return_value=(0, fake_connection))
         translator._release_realtime_connection = AsyncMock()
 
         result = await translator._translate_realtime(
@@ -545,9 +543,9 @@ class TestTranslationWorker:
             if "translate:results" in str(call.args[0])
         ]
         assert published
-        assert {
-            item["translated_text"] for item in published
-        } == {"Today we deploy Docker on Kubernetes."}
+        assert {item["translated_text"] for item in published} == {
+            "Today we deploy Docker on Kubernetes."
+        }
 
     def test_speculation_timeout_allows_observed_warm_provider_tail(self) -> None:
         # A real warm Realtime translation completed at 1.015s. Cancelling at 1.0s
@@ -650,11 +648,9 @@ class TestTranslationWorker:
 
         worker = self._make_worker(mock_redis_client, worker_settings)
         mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
-        glossary_value = json.dumps(
-            [{"source": "architect", "target": "architect"}]
-        ).encode()
-        mock_redis_client._redis.get.side_effect = (
-            lambda key: glossary_value if key.endswith(":mt_glossary") else None
+        glossary_value = json.dumps([{"source": "architect", "target": "architect"}]).encode()
+        mock_redis_client._redis.get.side_effect = lambda key: (
+            glossary_value if key.endswith(":mt_glossary") else None
         )
 
         msg = self._make_stt_msg(language="en", text="Hello there.")
@@ -718,13 +714,9 @@ class TestTranslationWorker:
         mock_redis_client._redis.get.return_value = b"changed"
         second = await worker._get_meeting_context("m1")
 
-        assert first == [
-            "Meeting topic: Sprint planning. Meeting context: Review WarpTalk."
-        ]
+        assert first == ["Meeting topic: Sprint planning. Meeting context: Review WarpTalk."]
         assert second == first
-        mock_redis_client._redis.get.assert_called_once_with(
-            "translationRoom:m1:meeting_context"
-        )
+        mock_redis_client._redis.get.assert_called_once_with("translationRoom:m1:meeting_context")
 
     async def test_process_includes_static_meeting_context_before_recent_utterances(
         self, mock_redis_client, worker_settings: WorkerSettings
