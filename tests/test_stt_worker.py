@@ -362,6 +362,73 @@ class TestOpenAISTT:
 
         assert result == []
 
+    async def test_transcribe_filters_provider_keyword_enumeration_echo_without_logprobs(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        """Production regression: gpt-transcribe recited the room glossary on marginal
+        audio. The next-generation completed event has no logprobs, so content matching
+        must reject the enumeration instead of trusting the -1 compatibility sentinel."""
+        keywords = [
+            "architecture",
+            "deployment",
+            "sprint",
+            "API",
+            "backlog",
+            "roadmap",
+            "staging",
+            "frontend",
+            "backend",
+            "KPI",
+            "ROI",
+            "UX",
+            "UI",
+            "production",
+            "framework",
+            "full-stack",
+        ]
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript=", ".join(keywords) + ".",
+            )
+        ]
+        stt, _ = _make_stt_with_conn(events)
+        stt.model = "gpt-transcribe"
+
+        result = await stt.transcribe(
+            sample_audio_bytes,
+            language="vi",
+            meeting_id="m1",
+            speaker_id="s1",
+            keywords=keywords,
+        )
+
+        assert result == []
+
+    async def test_transcribe_keeps_natural_speech_with_glossary_terms(
+        self, sample_audio_bytes: bytes
+    ) -> None:
+        keywords = ["architecture", "deployment", "sprint", "API", "backend"]
+        speech = "Sprint này chúng ta sẽ deployment backend API."
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                transcript=speech,
+            )
+        ]
+        stt, _ = _make_stt_with_conn(events)
+        stt.model = "gpt-transcribe"
+
+        result = await stt.transcribe(
+            sample_audio_bytes,
+            language="vi",
+            meeting_id="m1",
+            speaker_id="s1",
+            keywords=keywords,
+        )
+
+        assert [segment.text for segment in result] == [speech]
+
     async def test_transcribe_filters_low_confidence_partial_prompt_echo(
         self, sample_audio_bytes: bytes
     ) -> None:
@@ -1053,6 +1120,35 @@ class TestSTTWorker:
 
         mock_redis_client._redis.xadd.assert_not_called()
 
+    async def test_process_skips_ready_room_before_translation_starts(
+        self,
+        mock_redis_client,
+        worker_settings: WorkerSettings,
+        sample_audio_bytes: bytes,
+    ) -> None:
+        """A stale or rogue audio chunk must not bypass the ingress lifecycle gate."""
+        worker = STTWorker.__new__(STTWorker)
+        worker.settings = worker_settings
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker.stt_settings = STTSettings()
+        worker._paused_rooms = set()
+        worker._route_states = {"meeting-1": "READY"}
+        worker.model = MagicMock()
+        worker.model.transcribe = AsyncMock()
+
+        chunk = AudioChunkMessage(
+            meeting_id="meeting-1",
+            speaker_id="speaker-1",
+            chunk_index=0,
+            audio_data=sample_audio_bytes,
+        )
+
+        await worker.process(b"msg-1", chunk.to_redis())
+
+        worker.model.transcribe.assert_not_awaited()
+        mock_redis_client._redis.xadd.assert_not_called()
+
     async def test_process_publishes_system_event_on_stt_error(
         self,
         mock_redis_client,
@@ -1128,7 +1224,7 @@ class TestSTTWorker:
         prompt = await worker._get_stt_prompt("m1")
         assert prompt == "WarpTalk, Kubernetes, gRPC"
 
-    async def test_get_stt_keywords_uses_structured_mt_glossary(
+    async def test_get_stt_keywords_uses_dedicated_workspace_keyword_list(
         self, mock_redis_client
     ) -> None:
         worker = STTWorker.__new__(STTWorker)
@@ -1137,10 +1233,10 @@ class TestSTTWorker:
         worker._stt_keywords = {}
         mock_redis_client._redis.get.return_value = json.dumps(
             [
-                {"source": "Kubernetes", "target": "Kubernetes"},
-                {"source": "pull request", "target": "pull request"},
-                {"source": "gRPC", "target": "gRPC"},
-                {"source": "Kubernetes", "target": "Kubernetes"},
+                "Kubernetes",
+                "pull request",
+                "gRPC",
+                "Kubernetes",
             ]
         ).encode()
 
@@ -1148,7 +1244,7 @@ class TestSTTWorker:
 
         assert keywords == ["Kubernetes", "pull request", "gRPC"]
         mock_redis_client._redis.get.assert_awaited_once_with(
-            "translationRoom:m1:mt_glossary"
+            "translationRoom:m1:stt_keywords"
         )
 
     def test_declared_language_anchors_realtime_transcription(self) -> None:

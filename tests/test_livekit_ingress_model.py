@@ -110,6 +110,7 @@ def test_vad_window_uses_the_track_specific_model_state() -> None:
 async def test_transient_language_lookup_timeout_does_not_kill_mic_track() -> None:
     worker = LiveKitIngressWorker.__new__(LiveKitIngressWorker)
     worker.logger = MagicMock()
+    worker._route_states = {"room-1": "IN_PROGRESS"}
     worker.redis = SimpleNamespace(hget=AsyncMock(side_effect=RedisTimeoutError()))
     worker.publish = AsyncMock()
 
@@ -133,6 +134,7 @@ async def test_transient_language_lookup_timeout_does_not_kill_mic_track() -> No
 async def test_transient_chunk_publish_timeout_retries_without_killing_mic_track() -> None:
     worker = LiveKitIngressWorker.__new__(LiveKitIngressWorker)
     worker.logger = MagicMock()
+    worker._route_states = {"room-1": "IN_PROGRESS"}
     worker.redis = SimpleNamespace(hget=AsyncMock(return_value=b"vi"))
     worker.publish = AsyncMock(side_effect=[RedisTimeoutError(), None])
 
@@ -155,3 +157,22 @@ async def test_transient_chunk_publish_timeout_retries_without_killing_mic_track
         raw_rms=round(3000 / 32768, 6),
         raw_peak=round(3000 / 32768, 6),
     )
+
+
+async def test_ingress_discards_speech_before_translation_is_started() -> None:
+    worker = LiveKitIngressWorker.__new__(LiveKitIngressWorker)
+    worker.logger = MagicMock()
+    worker._route_states = {}
+    worker.redis = SimpleNamespace(hget=AsyncMock(return_value=b"vi"))
+    worker.publish = AsyncMock()
+
+    await worker._publish_speech_chunk(
+        "room-1",
+        "speaker-1",
+        bytearray(np.full(16000, 3000, dtype=np.int16).tobytes()),
+        0,
+        16000,
+    )
+
+    worker.redis.hget.assert_not_awaited()
+    worker.publish.assert_not_awaited()

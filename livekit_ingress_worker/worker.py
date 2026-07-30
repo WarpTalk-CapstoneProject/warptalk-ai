@@ -138,6 +138,7 @@ class LiveKitIngressWorker(BaseWorker):
             self.logger.warning("invalid_track_published_event")
             return
         room_name, participant_identity, track_id = parsed
+        await self._hydrate_room_status(room_name)
 
         self.logger.info(
             "received_track_published",
@@ -159,6 +160,33 @@ class LiveKitIngressWorker(BaseWorker):
         room = await self.join_room(room_name)
         if room:
             self.rooms[room_name] = room
+
+    def _is_translation_active(self, room_name: str) -> bool:
+        return self._route_states.get(room_name) in {
+            "IN_PROGRESS",
+            "AUDIO_ROUTING_ACTIVE",
+        }
+
+    async def _hydrate_room_status(self, room_name: str) -> None:
+        """Restore the last persisted room lifecycle after an ingress-worker restart."""
+        try:
+            cached = await self.redis.get(
+                f"translationRoom:{room_name}:audio_routes"
+            )
+            if not cached:
+                return
+            if isinstance(cached, bytes):
+                cached = cached.decode("utf-8")
+            payload = json.loads(cached)
+            status = payload.get("room_status")
+            if isinstance(status, str) and status:
+                self._route_states[room_name] = status
+        except Exception:
+            self.logger.warning(
+                "room_status_hydration_failed",
+                room=room_name,
+                exc_info=True,
+            )
 
     async def join_room(self, room_name: str) -> rtc.Room | None:
         """Generate a token and connect an anonymous Bot to the LiveKit room."""
@@ -305,6 +333,17 @@ class LiveKitIngressWorker(BaseWorker):
             async for event in audio_stream:
                 if self._shutdown_event.is_set():
                     break
+                if not self._is_translation_active(room_name):
+                    # The meeting microphone is allowed to remain published before the host
+                    # starts translation and while translation is paused. Discard those frames
+                    # completely so pre-start speech cannot leak into the first active chunk.
+                    raw_buffer = bytearray()
+                    speech_buffer = bytearray()
+                    pre_speech_ring.clear()
+                    is_speaking = False
+                    silence_counter = 0
+                    track_vad_model.reset_states()
+                    continue
 
                 frame = event.frame
                 if not first_frame_logged:
@@ -445,6 +484,14 @@ class LiveKitIngressWorker(BaseWorker):
         sample_rate: int,
         near_field_gate: NearFieldGate | None = None,
     ) -> None:
+        if not self._is_translation_active(room_name):
+            self.logger.debug(
+                "speech_chunk_discarded_translation_inactive",
+                room=room_name,
+                speaker_id=speaker_id,
+            )
+            return
+
         """Normalize and publish a speech chunk to Redis."""
         if await self._is_ai_service_suspended(room_name):
             self.logger.warning("ai_service_suspended_skip_audio_chunk", room=room_name)
