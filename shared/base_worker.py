@@ -469,7 +469,10 @@ class BaseWorker(ABC):
         """Register SIGTERM and SIGINT for graceful shutdown."""
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, self._handle_signal, sig)
+            try:
+                loop.add_signal_handler(sig, self._handle_signal, sig)
+            except NotImplementedError:
+                pass
 
     def _handle_signal(self, sig: signal.Signals) -> None:
         self.logger.info("signal_received", signal=sig.name)

@@ -938,4 +938,7 @@ class BillingSettlementWorker:
     def _register_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, self._shutdown_event.set)
+            try:
+                loop.add_signal_handler(sig, self._shutdown_event.set)
+            except NotImplementedError:
+                pass
