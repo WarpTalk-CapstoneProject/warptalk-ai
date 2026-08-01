@@ -7,8 +7,9 @@ is only found if the cap is above their position.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
