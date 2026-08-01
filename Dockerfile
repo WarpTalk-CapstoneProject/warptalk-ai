@@ -120,6 +120,7 @@ RUN groupadd -r worker && useradd -r -g worker -d /app worker
 ENV TORCH_HOME=/app/.cache/torch
 RUN mkdir -p /app/.cache \
     && uv run python -m livekit_ingress_worker.prefetch_model \
+    && find /app/.cache/torch/hub -type d -name examples -prune -exec rm -rf '{}' + \
     && chown -R worker:worker /app
 USER worker
 
