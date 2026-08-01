@@ -45,6 +45,7 @@ async def test_silero_model_uses_an_immutable_release() -> None:
         "snakers4/silero-vad:v6.2.1",
         "silero_vad",
         trust_repo=True,
+        skip_validation=True,
     )
 
 

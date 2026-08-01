@@ -88,6 +88,7 @@ class LiveKitIngressWorker(BaseWorker):
             SILERO_VAD_REPOSITORY,
             "silero_vad",
             trust_repo=True,
+            skip_validation=True,
         )
         self.logger.info("silero_vad_loaded")
 

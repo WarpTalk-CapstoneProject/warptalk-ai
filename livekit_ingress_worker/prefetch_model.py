@@ -10,6 +10,7 @@ def main() -> None:
         SILERO_VAD_REPOSITORY,
         "silero_vad",
         trust_repo=True,
+        skip_validation=True,
     )
 
 
