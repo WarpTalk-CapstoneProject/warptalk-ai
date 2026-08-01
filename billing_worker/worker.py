@@ -502,28 +502,54 @@ class BillingSettlementWorker:
             )
             return
 
-        await self._accumulate_and_maybe_flush(BillingEvent(
-            subscription_id=subscription_id,
-            workspace_id=workspace_id,
-            translation_room_id=msg.room_id,
-            usage_type=msg.charge_type,
-            charge_type=msg.charge_type,
-            quantity=msg.quantity,
-            unit=msg.unit,
-            credits_event=msg.quantity * rate.unit_price,
-            event_idempotency_key=msg.idempotency_key,
-            provider=rate.provider,
-            model=rate.model,
-            pricing_rate_card_id=rate.id,
-            unit_price_snapshot=rate.unit_price,
-            source_language_code=None,
-            target_language_code=None,
-            force_flush=True,
-            details={
-                "event_source": "provider_usage",
-                "user_id": msg.user_id,
-            },
-        ))
+        if msg.charge_type == "VOICE_CLONE_ENROLLMENT":
+            credits_consumed = int((msg.quantity * rate.unit_price).to_integral_value(rounding=ROUND_CEILING))
+            await self.db.record_usage_and_charge(
+                subscription_id=subscription_id,
+                user_id=msg.user_id,
+                workspace_id=workspace_id,
+                translation_room_id=msg.room_id,
+                usage_type=msg.charge_type,
+                charge_type=msg.charge_type,
+                reference_id=None,
+                reference_type="voice_clone",
+                quantity=float(msg.quantity),
+                unit=msg.unit,
+                credits_consumed=credits_consumed,
+                transcript_segment_id=None,
+                idempotency_key=msg.idempotency_key,
+                pricing_rate_card_id=rate.id,
+                unit_price_snapshot=rate.unit_price,
+                provider=rate.provider,
+                model=rate.model,
+                details={
+                    "event_source": "provider_usage",
+                    "user_id": msg.user_id,
+                },
+            )
+        else:
+            await self._accumulate_and_maybe_flush(BillingEvent(
+                subscription_id=subscription_id,
+                workspace_id=workspace_id,
+                translation_room_id=msg.room_id,
+                usage_type=msg.charge_type,
+                charge_type=msg.charge_type,
+                quantity=msg.quantity,
+                unit=msg.unit,
+                credits_event=msg.quantity * rate.unit_price,
+                event_idempotency_key=msg.idempotency_key,
+                provider=rate.provider,
+                model=rate.model,
+                pricing_rate_card_id=rate.id,
+                unit_price_snapshot=rate.unit_price,
+                source_language_code=None,
+                target_language_code=None,
+                force_flush=True,
+                details={
+                    "event_source": "provider_usage",
+                    "user_id": msg.user_id,
+                },
+            ))
 
     async def _handle_tts(self, data: Mapping[Any, Any]) -> None:
         msg = TTSResultMessage.from_redis(data)

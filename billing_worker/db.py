@@ -281,15 +281,10 @@ class BillingRepository:
         Returns True if a new charge was recorded, False if this idempotency_key was
         already settled (safe on Redis Streams redelivery / worker restart / retry).
 
-        transcript_segment_id should be the real transcript.transcript_segments.id GUID —
-        callers must extract it from any composite segment_id (translation_worker mints
-        "{stt-segment-guid}-c{idx}") before passing it in; this function does not do that
-        extraction itself, it only converts a valid GUID string/UUID for binding.
-
-        reference_id is also converted to a UUID before binding: previously it was passed
-        straight through as a raw string, which silently failed (and dropped the charge)
-        for translation/TTS events whose segment_id is the composite string above, not a
-        bare GUID. Callers must pass an already-extracted, valid GUID string here too.
+        NOTE: For accumulated charges, transcript_segment_id and reference_id are passed as None
+        because the events are aggregated across the 10-second window.
+        For 1-time events (e.g. VOICE_CLONE_ENROLLMENT), reference_id or transcript_segment_id
+        should be valid GUIDs if provided. They are converted to a UUID before binding.
         """
         assert self._pool is not None and self._redis is not None, "call connect() first"
         user_uuid = _as_uuid(user_id) if user_id else None

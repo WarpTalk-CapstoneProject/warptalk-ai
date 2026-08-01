@@ -11,10 +11,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from billing_worker.db import BillingRepository
+from billing_worker.db import BillingRepository, UsageRate
 from billing_worker.worker import BillingSettlementWorker, _extract_underlying_segment_id
 from shared.config import DatabaseSettings, RedisSettings
 from shared.health_probe import check_worker
+from shared.schemas import ProviderUsageMessage
 
 
 class FakeBillingRepository(BillingRepository):
@@ -421,6 +422,59 @@ async def test_settlement_error_propagates_so_message_remains_pending() -> None:
         assert str(error) == "database unavailable"
     else:
         raise AssertionError("settlement failure was swallowed")
+
+
+async def test_voice_clone_enrollment_provider_usage_records_immediate_charge() -> None:
+    subscription_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    rate_id = uuid.uuid4()
+    user_id = str(uuid.uuid4())
+    worker = BillingSettlementWorker.__new__(BillingSettlementWorker)
+    worker._resolve_subscription = AsyncMock(return_value=(subscription_id, workspace_id))
+    worker._accumulate_and_maybe_flush = AsyncMock()
+    worker.db = MagicMock()
+    worker.db.resolve_usage_rate = AsyncMock(
+        return_value=UsageRate(
+            id=rate_id,
+            unit_price=Decimal("2.4"),
+            provider="cartesia",
+            model="cartesia-localizing-voice",
+        )
+    )
+    worker.db.record_usage_and_charge = AsyncMock(return_value=True)
+    message = ProviderUsageMessage(
+        room_id=str(uuid.uuid4()),
+        user_id=user_id,
+        charge_type="VOICE_CLONE_ENROLLMENT",
+        provider="cartesia",
+        model="cartesia-localizing-voice",
+        quantity=Decimal("1"),
+        unit="profile",
+        idempotency_key="VOICE_CLONE_ENROLLMENT:room-1:user-1",
+    )
+
+    await worker._handle_provider_usage(message.to_redis())
+
+    worker._resolve_subscription.assert_awaited_once_with(message.room_id)
+    worker.db.resolve_usage_rate.assert_awaited_once_with(
+        charge_type="VOICE_CLONE_ENROLLMENT",
+        unit="profile",
+        provider="cartesia",
+        model="cartesia-localizing-voice",
+    )
+    worker._accumulate_and_maybe_flush.assert_not_awaited()
+    worker.db.record_usage_and_charge.assert_awaited_once()
+    kwargs = worker.db.record_usage_and_charge.await_args.kwargs
+    assert kwargs["subscription_id"] == subscription_id
+    assert kwargs["user_id"] == user_id
+    assert kwargs["workspace_id"] == workspace_id
+    assert kwargs["translation_room_id"] == message.room_id
+    assert kwargs["reference_id"] is None
+    assert kwargs["reference_type"] == "voice_clone"
+    assert kwargs["credits_consumed"] == 3
+    assert kwargs["idempotency_key"] == message.idempotency_key
+    assert kwargs["pricing_rate_card_id"] == rate_id
+    assert kwargs["unit_price_snapshot"] == Decimal("2.4")
 
 
 async def test_billing_heartbeat_satisfies_shared_health_probe(monkeypatch) -> None:
