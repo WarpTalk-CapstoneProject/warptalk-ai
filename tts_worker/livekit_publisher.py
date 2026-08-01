@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import suppress
 from typing import Any
 
 import numpy as np
@@ -44,6 +45,16 @@ _PUBLISH_SETTLE_S = 0.2
 # participant minutes. One minute retains the handshake-reuse benefit without leaving
 # unused speaker/language/voice variants connected for five extra minutes.
 SESSION_IDLE_TIMEOUT_S = 60.0
+
+# Sweeping only from _get_or_create_bot is not enough on its own: that is the one place a
+# NEW bot is created, so as soon as synthesis stops — translation switched off, or simply
+# nobody speaking — there is no next creation left to trigger the sweep and every bot stays
+# connected for the rest of the process's life. That also has a user-visible cost beyond the
+# leaked participant minutes: the web client treats a present ai-interpreter track as "this
+# speaker already has a dub" (see FilteredRoomAudio), so a bot nobody swept keeps a real
+# speaker's microphone muted for cross-language listeners. Reap on a timer as well, so idle
+# bots leave whether or not anything else in the pipeline is still running.
+_REAP_INTERVAL_S = 15.0
 
 # Each STT chunk's translated text is synthesized as its own independent Cartesia call,
 # so every clip starts/ends at whatever sample amplitude Cartesia happened to render —
@@ -115,6 +126,9 @@ class LiveKitTTSPublisher:
         # fully in parallel — this is what actually lets concurrent speakers be dubbed
         # in parallel end-to-end.
         self._locks: dict[_BotKey, asyncio.Lock] = {}
+        # Started lazily by the first bot creation (see _ensure_reaper) rather than in
+        # __init__, which runs outside any event loop.
+        self._reaper: asyncio.Task[None] | None = None
 
     async def publish_pcm(
         self,
@@ -203,6 +217,7 @@ class LiveKitTTSPublisher:
         """Caller (publish_pcm) already holds this key's lock for its whole call, so no
         locking is needed here — only one task can ever be inside this method for a
         given key at a time."""
+        self._ensure_reaper()
         self._sweep_idle_bots()
 
         key: _BotKey = (meeting_id, speaker_id, target_lang, voice_key)
@@ -253,9 +268,28 @@ class LiveKitTTSPublisher:
         )
         return bot
 
+    def _ensure_reaper(self) -> None:
+        """Start the idle-bot reaper once, from whichever coroutine first creates a bot."""
+        if self._reaper is None or self._reaper.done():
+            self._reaper = asyncio.create_task(self._reap_loop())
+
+    async def _reap_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_REAP_INTERVAL_S)
+            try:
+                self._sweep_idle_bots()
+            except Exception:
+                # A single bad sweep must not silently end the loop and quietly restore the
+                # leak this exists to prevent.
+                logger.exception("livekit_tts_reaper_error")
+
     def _sweep_idle_bots(self) -> None:
         now = time.monotonic()
-        stale = [k for k, b in self._bots.items() if now - b["last_used"] > SESSION_IDLE_TIMEOUT_S]
+        stale = [
+            k
+            for k, b in self._bots.items()
+            if now - b["last_used"] > SESSION_IDLE_TIMEOUT_S and not self._is_publishing(k)
+        ]
         for k in stale:
             bot = self._bots.pop(k)
             self._locks.pop(k, None)
@@ -268,6 +302,17 @@ class LiveKitTTSPublisher:
                 voice_key=k[3],
             )
 
+    def _is_publishing(self, key: _BotKey) -> bool:
+        """Whether publish_pcm currently holds this key's lock.
+
+        The inline sweep could only ever run for a DIFFERENT key than the caller's, but the
+        reaper runs on its own schedule and would otherwise be free to disconnect a bot
+        mid-sentence. `last_used` is stamped before synthesis is captured, so a clip that
+        somehow outran SESSION_IDLE_TIMEOUT_S would be cut off in the middle.
+        """
+        lock = self._locks.get(key)
+        return lock is not None and lock.locked()
+
     @staticmethod
     async def _close_bot(bot: dict[str, Any]) -> None:
         try:
@@ -276,6 +321,11 @@ class LiveKitTTSPublisher:
             logger.exception("livekit_tts_bot_close_error")
 
     async def close_all(self) -> None:
+        if self._reaper is not None:
+            self._reaper.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._reaper
+            self._reaper = None
         for bot in self._bots.values():
             try:
                 await bot["room"].disconnect()
