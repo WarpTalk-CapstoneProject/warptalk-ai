@@ -13,7 +13,7 @@
 # =============================================================
 
 # ---- Base: Python + system deps ----
-FROM python:3.11.13-slim-bookworm@sha256:86adf8dbadc3d6e82ee5dd2c74bec2e1c2467cdad47886280501df722372d2e1 AS base
+FROM python:3.11-slim-bookworm@sha256:28255a3ace7eb4c48bc1b57b90af29e1bc82b4fd6c60614a8e3dce61b87ff941 AS base
 COPY --from=ghcr.io/astral-sh/uv:0.9.18 /uv /uvx /bin/
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -22,8 +22,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/app/.venv/bin:$PATH \
     UV_HTTP_TIMEOUT=120
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
         libsndfile1 \
+    && python -m pip install --no-cache-dir --upgrade \
+        setuptools==83.0.0 \
+        wheel==0.47.0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
