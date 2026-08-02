@@ -215,6 +215,64 @@ class ChatAssistantSettings(BaseSettings):
     translation_room_service_url: str = "http://localhost:5102"
 
 
+class SuggestionSettings(BaseSettings):
+    """Inline transcript-suggestion worker settings.
+
+    A third, distinct assistant surface: AssistantSettings summarizes a finished
+    meeting, ChatAssistantSettings answers explicit questions, and this one decides
+    — unprompted, mid-meeting — whether a just-transcribed segment deserves a short
+    inline hint. Nothing here triggers on a user action, so every default below is
+    tuned to stay silent rather than to be helpful.
+    """
+
+    model_config = {"env_prefix": "SUGGESTION_"}
+
+    # Ships disabled. The worker consumes stt:results in its own consumer group, so it
+    # can be rolled out to production and verified healthy while producing nothing at
+    # all; flipping this is the only step that changes user-visible behaviour.
+    enabled: bool = False
+    api_key: str = ""
+
+    # Two-stage models. Nearly every segment stops at the decide stage, so that call has
+    # to be cheap enough to run ~150 times per meeting; only the few that pass reach the
+    # larger generate model.
+    decide_model: str = "gpt-4o-mini"
+    generate_model: str = "gpt-4.1"
+    decide_max_tokens: int = 64  # a {should_suggest, category, confidence, reason} object
+    generate_max_tokens: int = 200
+    temperature: float = 0.2
+    # A hung request would stall this consumer's whole loop, and a suggestion that arrives
+    # after the conversation has moved on is worse than none — fail fast and stay quiet.
+    request_timeout_seconds: float = 8.0
+
+    # Stage-1 gate. The decide prompt is instructed to default to false, and anything it
+    # is not clearly confident about is dropped rather than shown.
+    min_confidence: float = 0.7
+
+    # Spam control. These are enforced in Redis, not in worker memory: the production
+    # chart runs AI workers with replicas >= 2 (see deploy/k3s/chart/values.yaml), and
+    # segments from one room are spread across replicas by the consumer group — so a
+    # per-process counter would let each replica spend the full budget independently and
+    # multiply the real cap by the replica count.
+    cooldown_seconds: int = 45
+    max_per_meeting: int = 15
+    # Bounds the cap counter's lifetime — longer than any realistic meeting, so a room
+    # can never silently regain budget mid-session, and short enough that keys expire on
+    # their own for rooms that end without a cleanup signal.
+    state_ttl_seconds: int = 14400  # 4h
+
+    # Stage-0 heuristics — reject before spending a single token.
+    min_words: int = 5
+    min_stt_confidence: float = 0.6
+
+    # Rolling transcript window handed to the decide stage. Enough to tell a genuine
+    # open question from a mid-sentence fragment without resending the whole meeting.
+    window_size: int = 8
+    # A suggestion renders as a one-line strip above a transcript bubble; anything longer
+    # is truncated by the UI anyway, so bound it at the source.
+    max_suggestion_chars: int = 140
+
+
 class EmbeddingSettings(BaseSettings):
     """Knowledge embedding settings for WarpBot RAG."""
 

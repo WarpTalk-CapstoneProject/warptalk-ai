@@ -37,6 +37,7 @@ COPY stt_worker/ stt_worker/
 COPY translation_worker/ translation_worker/
 COPY tts_worker/ tts_worker/
 COPY ai_assistant_worker/ ai_assistant_worker/
+COPY suggestion_worker/ suggestion_worker/
 COPY embedding_worker/ embedding_worker/
 COPY billing_worker/ billing_worker/
 COPY livekit_ingress_worker/ livekit_ingress_worker/
@@ -81,6 +82,15 @@ USER worker
 
 ENV PYTHONPATH=/app
 CMD ["python", "-m", "ai_assistant_worker"]
+
+# ---- Inline Transcript Suggestion Worker ----
+FROM builder AS suggestion
+
+RUN groupadd -r worker && useradd -r -g worker -d /app worker
+USER worker
+
+ENV PYTHONPATH=/app
+CMD ["python", "-m", "suggestion_worker"]
 
 # ---- Embedding Worker ----
 FROM builder AS embedding

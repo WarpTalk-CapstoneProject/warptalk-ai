@@ -90,6 +90,7 @@ jobs:
           - translation
           - tts
           - assistant
+          - suggestion
           - embedding
           - billing
           - livekit-ingress
