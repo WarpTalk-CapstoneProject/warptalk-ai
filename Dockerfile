@@ -13,7 +13,11 @@
 # =============================================================
 
 # ---- Base: Python + system deps ----
-FROM python:3.11.13-slim-bookworm@sha256:86adf8dbadc3d6e82ee5dd2c74bec2e1c2467cdad47886280501df722372d2e1 AS base
+# Pinned by digest so a rebuild is reproducible. Bumping it is a security action, not
+# housekeeping: the previous digest carried openssl 3.0.x, and the CVEs published against
+# it (CVE-2026-45447 and the CVE-2026-283xx set) began failing the release Trivy gate the
+# moment its vulnerability database picked them up — with the image itself unchanged.
+FROM python:3.11.13-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba AS base
 COPY --from=ghcr.io/astral-sh/uv:0.9.18 /uv /uvx /bin/
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -25,6 +29,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
+
+# setuptools ships its own vendored copies of jaraco.context and wheel, and the versions
+# baked into the base image are the two remaining HIGH findings after the digest bump.
+# Neither is used at runtime — the workers run from .venv — but Trivy scans the whole
+# filesystem, so upgrading setuptools (which replaces what it vendors) is what actually
+# clears them.
+RUN pip install --no-cache-dir --upgrade \
+        "setuptools>=80.9.0" \
+        "wheel>=0.46.2" \
+    && rm -rf /root/.cache/pip
 
 WORKDIR /app
 
