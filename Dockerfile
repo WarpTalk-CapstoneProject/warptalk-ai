@@ -137,8 +137,14 @@ RUN groupadd -r worker && useradd -r -g worker -d /app worker
 # Pin and fetch the model during the image build. A production restart must not
 # depend on GitHub or silently receive a different model from a mutable branch.
 ENV TORCH_HOME=/app/.cache/torch
+# torch.hub clones the whole silero-vad repository, not just the weights, and its
+# examples/ tree carries a sample Rust project whose Cargo.lock pins a vulnerable
+# rust-openssl. Nothing there is ever compiled or executed — but it is still shipped, and
+# Trivy reads the lockfile, so the release gate fails on code the image has no reason to
+# contain. Dropping it removes real dead weight rather than silencing the scanner.
 RUN mkdir -p /app/.cache \
     && uv run python -m livekit_ingress_worker.prefetch_model \
+    && find /app/.cache/torch/hub -type d -name examples -prune -exec rm -rf {} + \
     && chown -R worker:worker /app
 USER worker
 
