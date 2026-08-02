@@ -37,12 +37,22 @@ from shared.config import BillingSettings, RedisSettings, WorkerSettings
 from shared.health_probe import heartbeat_key
 from shared.logger import get_logger
 from shared.redis_client import RedisStreamClient
-from shared.schemas import STTResultMessage, TranslationResultMessage, TTSResultMessage
+from shared.schemas import (
+    STTResultMessage,
+    SuggestionResultMessage,
+    TranslationResultMessage,
+    TTSResultMessage,
+)
 
 logger = get_logger("worker.billing")
 
 STT_CHARGE_TYPE = "STT"
 TRANSLATION_CHARGE_TYPE = "TRANSLATION"
+# Inline transcript suggestions settle against the existing AI_ASSISTANT charge type
+# rather than a new one — it is already declared in migration 017 and already has rate
+# card rows from migration 039, so suggestions draw down the same assistant budget a
+# workspace has always had instead of introducing a second one to reason about.
+SUGGESTION_CHARGE_TYPE = "AI_ASSISTANT"
 SettlementHandler = Callable[[Mapping[Any, Any]], Awaitable[None]]
 
 
@@ -110,6 +120,11 @@ class BillingSettlementWorker:
                     "translate:results", "billing-translation-workers", self._handle_translation
                 ),
                 self._consume_loop("tts:results", "billing-tts-workers", self._handle_tts),
+                self._consume_loop(
+                    "ai_assistant:results",
+                    "billing-suggestion-workers",
+                    self._handle_suggestion,
+                ),
             )
         except asyncio.CancelledError:
             pass
@@ -435,6 +450,74 @@ class BillingSettlementWorker:
             idempotency_key=f"{charge_type}:{msg.segment_id}:{msg.target_lang}",
             details={"clone_provider": msg.clone_provider, "voice_mode": msg.voice_mode},
         )
+
+    async def _handle_suggestion(self, data: Mapping[Any, Any]) -> None:
+        """Settle one inline transcript suggestion against the AI_ASSISTANT budget.
+
+        Shares the ai_assistant:results stream with meeting summaries and action items, so
+        anything that is not a suggestion is skipped here — the summary path predates this
+        worker and is not metered per message.
+
+        Unlike the three real-time handlers above, this one NEVER re-raises. A settlement
+        failure there is worth retrying because the user already received a caption they
+        must be charged for; here the alternative is a suggestion — an optional aside —
+        wedging this consumer group into an endless redelivery loop over one un-priced
+        message. The charge is dropped with a loud log instead.
+        """
+        if data.get(b"type", data.get("type")) not in (b"suggestion", "suggestion"):
+            return
+
+        msg = SuggestionResultMessage.from_redis(data)
+        if msg.token_count <= 0:
+            # Nothing was actually spent (or the producer did not report it) — recording a
+            # zero-quantity charge would only add noise to the usage ledger.
+            return
+
+        try:
+            resolved = await self._resolve_subscription(msg.meeting_id)
+        except Exception:
+            self.logger.exception("suggestion_subscription_lookup_failed", room=msg.meeting_id)
+            return
+
+        if resolved is None:
+            self.logger.warning("no_subscription_for_room", translation_room_id=msg.meeting_id)
+            return
+        subscription_id, workspace_id = resolved
+
+        # Unlike translation/TTS, this segment id is the STT segment's own GUID carried
+        # through untouched by suggestion_worker — no composite suffix to strip.
+        segment_id = _extract_underlying_segment_id(msg.segment_id)
+
+        try:
+            await self.db.record_usage_and_charge(
+                subscription_id=subscription_id,
+                # A suggestion is authored by the assistant, not by a participant — there is
+                # no user to attribute the spend to beyond the room and workspace.
+                user_id=None,
+                workspace_id=workspace_id,
+                translation_room_id=msg.meeting_id,
+                usage_type=SUGGESTION_CHARGE_TYPE,
+                charge_type=SUGGESTION_CHARGE_TYPE,
+                reference_id=segment_id,
+                reference_type="transcript_segment",
+                # Tokens across BOTH model calls (decide + generate) for this suggestion.
+                quantity=float(msg.token_count),
+                unit="token",
+                source_language_code=msg.language or None,
+                transcript_segment_id=segment_id,
+                # suggestion_worker takes a one-shot Redis slot per suggestion and never
+                # republishes one for the same segment, so the segment id alone is a stable
+                # key across a Redis Streams redelivery of this message.
+                idempotency_key=f"{SUGGESTION_CHARGE_TYPE}:{msg.segment_id}",
+                details={"category": msg.category, "confidence": msg.confidence},
+            )
+        except Exception:
+            self.logger.exception(
+                "suggestion_settlement_failed",
+                room=msg.meeting_id,
+                segment_id=msg.segment_id,
+                tokens=msg.token_count,
+            )
 
     # ------------------------------------------------------------------
     # Signal handling

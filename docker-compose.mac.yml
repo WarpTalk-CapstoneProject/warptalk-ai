@@ -7,5 +7,7 @@ services:
     platform: linux/amd64
   assistant:
     platform: linux/amd64
+  suggestion:
+    platform: linux/amd64
   embedding:
     platform: linux/amd64
