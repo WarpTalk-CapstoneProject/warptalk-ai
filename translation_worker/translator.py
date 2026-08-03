@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -424,9 +424,7 @@ class OpenAITranslator:
                         result = "".join(chunks).strip()
                         if not result:
                             raise RuntimeError("Realtime translation returned empty text")
-                        usage = TokenUsage.from_openai_usage(
-                            getattr(event.response, "usage", None)
-                        )
+                        usage = TokenUsage.from_openai_usage(getattr(event.response, "usage", None))
                         healthy = True
                         return TranslationWithUsage(result, usage)
         finally:

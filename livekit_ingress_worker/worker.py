@@ -170,9 +170,7 @@ class LiveKitIngressWorker(BaseWorker):
     async def _hydrate_room_status(self, room_name: str) -> None:
         """Restore the last persisted room lifecycle after an ingress-worker restart."""
         try:
-            cached = await self.redis.get(
-                f"translationRoom:{room_name}:audio_routes"
-            )
+            cached = await self.redis.get(f"translationRoom:{room_name}:audio_routes")
             if not cached:
                 return
             if isinstance(cached, bytes):

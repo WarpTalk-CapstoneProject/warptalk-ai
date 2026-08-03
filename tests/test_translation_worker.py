@@ -11,6 +11,7 @@ from shared.openai_usage import TokenUsage
 from shared.schemas import STTResultMessage
 from translation_worker.translator import (
     OpenAITranslator,
+    TranslationWithUsage,
     _build_glossary_block,
     _exception_clause,
     _lang_name,
@@ -103,7 +104,11 @@ class TestGlossaryBlock:
 class TestOpenAITranslator:
     """OpenAITranslator unit tests."""
 
-    def test_latency_optimized_model_is_the_default(self) -> None:
+    def test_latency_optimized_model_is_the_default(self, monkeypatch) -> None:
+        monkeypatch.delenv("TRANSLATION_MODEL", raising=False)
+        monkeypatch.delenv("TRANSLATION_REALTIME_MODEL", raising=False)
+        monkeypatch.delenv("TRANSLATION_REALTIME_MAX_OUTPUT_TOKENS", raising=False)
+
         assert TranslationSettings().model == "gpt-5.4-nano"
         assert TranslationSettings().realtime_model == "gpt-realtime-2.1-mini"
         assert TranslationSettings().realtime_max_output_tokens == 128
@@ -230,7 +235,9 @@ class TestOpenAITranslator:
             model="gpt-5.4-nano",
             realtime_model="gpt-realtime-2.1-mini",
         )
-        translator._translate_realtime = AsyncMock(return_value="That's a validator.")
+        translator._translate_realtime_with_usage = AsyncMock(
+            return_value=TranslationWithUsage("That's a validator.")
+        )
         translator._create_with_retry = AsyncMock()
 
         result = await translator.translate(
@@ -243,13 +250,13 @@ class TestOpenAITranslator:
 
         assert result == "That's a validator."
         translator._create_with_retry.assert_not_awaited()
-        realtime_prompt = translator._translate_realtime.await_args.args[0]
+        realtime_prompt = translator._translate_realtime_with_usage.await_args.args[0]
         assert "Đó là validator." in realtime_prompt
         assert "Chúng ta đang review pull request." in realtime_prompt
         assert "validator" in realtime_prompt
         assert "[OUT_OF_MEETING_SCOPE]" in realtime_prompt
         assert "short acknowledgements" in realtime_prompt
-        realtime_instructions = translator._translate_realtime.await_args.args[1]
+        realtime_instructions = translator._translate_realtime_with_usage.await_args.args[1]
         assert "[OUT_OF_MEETING_SCOPE]" in realtime_instructions
         assert "decide whether" in realtime_instructions
 
@@ -261,7 +268,9 @@ class TestOpenAITranslator:
             model="gpt-5.4-nano",
             realtime_model="gpt-realtime-2.1-mini",
         )
-        translator._translate_realtime = AsyncMock(return_value="Deploy Docker.")
+        translator._translate_realtime_with_usage = AsyncMock(
+            return_value=TranslationWithUsage("Deploy Docker.")
+        )
         translator._create_with_retry = AsyncMock()
 
         await translator.translate(
@@ -275,7 +284,7 @@ class TestOpenAITranslator:
             ],
         )
 
-        realtime_prompt = translator._translate_realtime.await_args.args[0]
+        realtime_prompt = translator._translate_realtime_with_usage.await_args.args[0]
         assert '"Docker"' in realtime_prompt
         assert "marketing plan" not in realtime_prompt
         assert '"UI"' not in realtime_prompt
@@ -286,7 +295,7 @@ class TestOpenAITranslator:
             model="gpt-5.4-nano",
             realtime_model="gpt-realtime-2.1-mini",
         )
-        translator._translate_realtime = AsyncMock(side_effect=TimeoutError("slow"))
+        translator._translate_realtime_with_usage = AsyncMock(side_effect=TimeoutError("slow"))
         mock_response = MagicMock()
         mock_response.choices[0].message.content = "That's a validator."
         translator._create_with_retry = AsyncMock(return_value=mock_response)
@@ -317,9 +326,7 @@ class TestOpenAITranslator:
         done.response.status = "completed"
         done.response.usage = {"input_tokens": 12, "output_tokens": 3}
         fake_connection.recv = AsyncMock(side_effect=[created, delta, done])
-        translator._acquire_realtime_connection = AsyncMock(
-            return_value=(0, fake_connection)
-        )
+        translator._acquire_realtime_connection = AsyncMock(return_value=(0, fake_connection))
         translator._release_realtime_connection = AsyncMock()
 
         result = await translator._translate_realtime(
@@ -361,9 +368,7 @@ class TestOpenAITranslator:
             "input_token_details": {"cached_tokens": 5},
         }
         fake_connection.recv = AsyncMock(side_effect=[created, delta, done])
-        translator._acquire_realtime_connection = AsyncMock(
-            return_value=(0, fake_connection)
-        )
+        translator._acquire_realtime_connection = AsyncMock(return_value=(0, fake_connection))
         translator._release_realtime_connection = AsyncMock()
 
         result = await translator._translate_realtime_with_usage(
@@ -613,9 +618,9 @@ class TestTranslationWorker:
             if "translate:results" in str(call.args[0])
         ]
         assert published
-        assert {
-            item["translated_text"] for item in published
-        } == {"Today we deploy Docker on Kubernetes."}
+        assert {item["translated_text"] for item in published} == {
+            "Today we deploy Docker on Kubernetes."
+        }
 
     def test_speculation_timeout_allows_observed_warm_provider_tail(self) -> None:
         # A real warm Realtime translation completed at 1.015s. Cancelling at 1.0s
@@ -631,9 +636,7 @@ class TestTranslationWorker:
         worker = self._make_worker(mock_redis_client, worker_settings)
         mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
         worker.translator.translate = AsyncMock(return_value="Xin chào")
-        worker.translator.translate_batch = AsyncMock(
-            return_value=["Bạn khỏe không"]
-        )
+        worker.translator.translate_batch = AsyncMock(return_value=["Bạn khỏe không"])
 
         msg = self._make_stt_msg(language="en", text="Hello there. How are you?")
         await worker.process(b"msg-1", msg.to_redis())
@@ -717,11 +720,9 @@ class TestTranslationWorker:
 
         worker = self._make_worker(mock_redis_client, worker_settings)
         mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
-        glossary_value = json.dumps(
-            [{"source": "architect", "target": "architect"}]
-        ).encode()
-        mock_redis_client._redis.get.side_effect = (
-            lambda key: glossary_value if key.endswith(":mt_glossary") else None
+        glossary_value = json.dumps([{"source": "architect", "target": "architect"}]).encode()
+        mock_redis_client._redis.get.side_effect = lambda key: (
+            glossary_value if key.endswith(":mt_glossary") else None
         )
 
         msg = self._make_stt_msg(language="en", text="Hello there.")
@@ -785,13 +786,9 @@ class TestTranslationWorker:
         mock_redis_client._redis.get.return_value = b"changed"
         second = await worker._get_meeting_context("m1")
 
-        assert first == [
-            "Meeting topic: Sprint planning. Meeting context: Review WarpTalk."
-        ]
+        assert first == ["Meeting topic: Sprint planning. Meeting context: Review WarpTalk."]
         assert second == first
-        mock_redis_client._redis.get.assert_called_once_with(
-            "translationRoom:m1:meeting_context"
-        )
+        mock_redis_client._redis.get.assert_called_once_with("translationRoom:m1:meeting_context")
 
     async def test_process_includes_static_meeting_context_before_recent_utterances(
         self, mock_redis_client, worker_settings: WorkerSettings

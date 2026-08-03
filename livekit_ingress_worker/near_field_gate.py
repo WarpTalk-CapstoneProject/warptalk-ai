@@ -94,11 +94,7 @@ class NearFieldGate:
             # just got confirmed) but toward a quieter one slowly (ordinary volume dip,
             # not a signal to lower the bar for what still counts as "close enough").
             alpha = (
-                self._ema_alpha
-                if baseline_sample >= self._baseline_peak
-                else self._ema_alpha / 4
+                self._ema_alpha if baseline_sample >= self._baseline_peak else self._ema_alpha / 4
             )
-            self._baseline_peak = (
-                (1 - alpha) * self._baseline_peak + alpha * baseline_sample
-            )
+            self._baseline_peak = (1 - alpha) * self._baseline_peak + alpha * baseline_sample
         self._baseline_count += 1

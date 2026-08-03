@@ -128,7 +128,6 @@ class AIAssistantWorker(BaseWorker):
         summary = summary_result.text
         usage_total = summary_result.usage
 
-
         # Store summary in Redis Hash for persistent retrieval
         await self.redis.hset(
             f"meeting:{meeting_id}:summary",
@@ -149,7 +148,6 @@ class AIAssistantWorker(BaseWorker):
 
         # Generate action items
         action_items_result = await assistant.extract_action_items_with_usage(
-
             transcript_text,
             context_snapshot=context_snapshot,
         )
@@ -177,7 +175,6 @@ class AIAssistantWorker(BaseWorker):
         # artifact's inline Content, so the frontend can render an overview, a decisions
         # list, and an owner/task action-item checklist instead of parsing markdown.
         structured_result = await assistant.generate_structured_summary_with_usage(
-
             transcript_text,
             target_languages=target_languages,
             context_snapshot=context_snapshot,

@@ -338,7 +338,3 @@ class BillingRepository:
             credits_consumed=credits_consumed,
         )
         return True
-
-
-def _to_jsonb(data: dict[str, Any]) -> str:
-    return json.dumps(data)

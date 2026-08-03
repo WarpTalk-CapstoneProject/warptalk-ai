@@ -31,7 +31,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 from typing import Any
 
 from billing_worker.db import BillingRepository
@@ -310,7 +310,11 @@ class BillingSettlementWorker:
     async def _resolve_subscription(
         self,
         translation_room_id: str,
+        workspace_id: str | None = None,
     ) -> tuple[uuid.UUID, uuid.UUID] | None:
+        if workspace_id:
+            return await self.db.resolve_subscription(workspace_id)
+
         cached = self._subscription_cache.get(translation_room_id)
         now = time.monotonic()
         if cached and now - cached[2] < self.settings.subscription_cache_ttl_seconds:
@@ -382,32 +386,34 @@ class BillingSettlementWorker:
             )
             return
 
-        await self._accumulate_and_maybe_flush(BillingEvent(
-            subscription_id=subscription_id,
-            workspace_id=workspace_id,
-            translation_room_id=msg.meeting_id,
-            usage_type=STT_CHARGE_TYPE,
-            charge_type=STT_CHARGE_TYPE,
-            quantity=audio_seconds,
-            unit="second",
-            credits_event=audio_seconds * rate.unit_price,
-            event_idempotency_key=f"{STT_CHARGE_TYPE}:{msg.meeting_id}:{msg.speaker_id}:{msg.chunk_index}",
-            provider=rate.provider,
-            model=rate.model,
-            pricing_rate_card_id=rate.id,
-            unit_price_snapshot=rate.unit_price,
-            source_language_code=None,
-            target_language_code=None,
-            force_flush=msg.is_final_chunk,
-            details={"event_source": "audio_chunks", "sample_rate": msg.sample_rate},
-        ))
+        await self._accumulate_and_maybe_flush(
+            BillingEvent(
+                subscription_id=subscription_id,
+                workspace_id=workspace_id,
+                translation_room_id=msg.meeting_id,
+                usage_type=STT_CHARGE_TYPE,
+                charge_type=STT_CHARGE_TYPE,
+                quantity=audio_seconds,
+                unit="second",
+                credits_event=audio_seconds * rate.unit_price,
+                event_idempotency_key=f"{STT_CHARGE_TYPE}:{msg.meeting_id}:{msg.speaker_id}:{msg.chunk_index}",
+                provider=rate.provider,
+                model=rate.model,
+                pricing_rate_card_id=rate.id,
+                unit_price_snapshot=rate.unit_price,
+                source_language_code=None,
+                target_language_code=None,
+                force_flush=msg.is_final_chunk,
+                details={"event_source": "audio_chunks", "sample_rate": msg.sample_rate},
+            )
+        )
 
     async def _handle_ai_usage(self, data: Mapping[Any, Any]) -> None:
         msg = AIUsageMessage.from_redis(data)
         if msg.prompt_tokens <= 0 and msg.cached_tokens <= 0 and msg.completion_tokens <= 0:
             return
 
-        resolved = await self._resolve_subscription(msg.room_id)
+        resolved = await self._resolve_subscription(msg.room_id, msg.workspace_id or None)
         if resolved is None:
             self.logger.warning("no_subscription_for_room", translation_room_id=msg.room_id)
             return
@@ -446,40 +452,42 @@ class BillingSettlementWorker:
                 continue
 
             quantity_decimal = Decimal(quantity)
-            await self._accumulate_and_maybe_flush(BillingEvent(
-                subscription_id=subscription_id,
-                workspace_id=workspace_id,
-                translation_room_id=msg.room_id,
-                usage_type=msg.charge_type,
-                charge_type=msg.charge_type,
-                quantity=quantity_decimal,
-                unit=unit,
-                credits_event=quantity_decimal * rate.unit_price,
-                event_idempotency_key=f"{msg.idempotency_key}:{unit}",
-                provider=rate.provider,
-                model=rate.model,
-                pricing_rate_card_id=rate.id,
-                unit_price_snapshot=rate.unit_price,
-                source_language_code=msg.source_lang or None,
-                target_language_code=msg.target_lang or None,
-                force_flush=True,
-                details={
-                    "event_source": "ai_usage",
-                    "source_lang": msg.source_lang,
-                    "target_lang": msg.target_lang,
-                    "prompt_tokens": msg.prompt_tokens,
-                    "cached_tokens": msg.cached_tokens,
-                    "completion_tokens": msg.completion_tokens,
-                    "token_component": unit,
-                },
-            ))
+            await self._accumulate_and_maybe_flush(
+                BillingEvent(
+                    subscription_id=subscription_id,
+                    workspace_id=workspace_id,
+                    translation_room_id=msg.room_id,
+                    usage_type=msg.charge_type,
+                    charge_type=msg.charge_type,
+                    quantity=quantity_decimal,
+                    unit=unit,
+                    credits_event=quantity_decimal * rate.unit_price,
+                    event_idempotency_key=f"{msg.idempotency_key}:{unit}",
+                    provider=rate.provider,
+                    model=rate.model,
+                    pricing_rate_card_id=rate.id,
+                    unit_price_snapshot=rate.unit_price,
+                    source_language_code=msg.source_lang or None,
+                    target_language_code=msg.target_lang or None,
+                    force_flush=True,
+                    details={
+                        "event_source": "ai_usage",
+                        "source_lang": msg.source_lang,
+                        "target_lang": msg.target_lang,
+                        "prompt_tokens": msg.prompt_tokens,
+                        "cached_tokens": msg.cached_tokens,
+                        "completion_tokens": msg.completion_tokens,
+                        "token_component": unit,
+                    },
+                )
+            )
 
     async def _handle_provider_usage(self, data: Mapping[Any, Any]) -> None:
         msg = ProviderUsageMessage.from_redis(data)
         if msg.quantity <= 0:
             return
 
-        resolved = await self._resolve_subscription(msg.room_id)
+        resolved = await self._resolve_subscription(msg.room_id, msg.workspace_id or None)
         if resolved is None:
             self.logger.warning("no_subscription_for_room", translation_room_id=msg.room_id)
             return
@@ -503,7 +511,9 @@ class BillingSettlementWorker:
             return
 
         if msg.charge_type == "VOICE_CLONE_ENROLLMENT":
-            credits_consumed = int((msg.quantity * rate.unit_price).to_integral_value(rounding=ROUND_CEILING))
+            credits_consumed = int(
+                (msg.quantity * rate.unit_price).to_integral_value(rounding=ROUND_CEILING)
+            )
             await self.db.record_usage_and_charge(
                 subscription_id=subscription_id,
                 user_id=msg.user_id,
@@ -528,28 +538,30 @@ class BillingSettlementWorker:
                 },
             )
         else:
-            await self._accumulate_and_maybe_flush(BillingEvent(
-                subscription_id=subscription_id,
-                workspace_id=workspace_id,
-                translation_room_id=msg.room_id,
-                usage_type=msg.charge_type,
-                charge_type=msg.charge_type,
-                quantity=msg.quantity,
-                unit=msg.unit,
-                credits_event=msg.quantity * rate.unit_price,
-                event_idempotency_key=msg.idempotency_key,
-                provider=rate.provider,
-                model=rate.model,
-                pricing_rate_card_id=rate.id,
-                unit_price_snapshot=rate.unit_price,
-                source_language_code=None,
-                target_language_code=None,
-                force_flush=True,
-                details={
-                    "event_source": "provider_usage",
-                    "user_id": msg.user_id,
-                },
-            ))
+            await self._accumulate_and_maybe_flush(
+                BillingEvent(
+                    subscription_id=subscription_id,
+                    workspace_id=workspace_id,
+                    translation_room_id=msg.room_id,
+                    usage_type=msg.charge_type,
+                    charge_type=msg.charge_type,
+                    quantity=msg.quantity,
+                    unit=msg.unit,
+                    credits_event=msg.quantity * rate.unit_price,
+                    event_idempotency_key=msg.idempotency_key,
+                    provider=rate.provider,
+                    model=rate.model,
+                    pricing_rate_card_id=rate.id,
+                    unit_price_snapshot=rate.unit_price,
+                    source_language_code=None,
+                    target_language_code=None,
+                    force_flush=True,
+                    details={
+                        "event_source": "provider_usage",
+                        "user_id": msg.user_id,
+                    },
+                )
+            )
 
     async def _handle_tts(self, data: Mapping[Any, Any]) -> None:
         msg = TTSResultMessage.from_redis(data)
@@ -568,18 +580,14 @@ class BillingSettlementWorker:
             TTS_VOICE_CLONE_CHARGE_TYPE if msg.voice_type == "cloned" else TTS_STANDARD_CHARGE_TYPE
         )
         model = (
-            DEFAULT_TTS_VOICE_CLONE_MODEL
-            if msg.voice_type == "cloned"
-            else self.tts_settings.model
+            DEFAULT_TTS_VOICE_CLONE_MODEL if msg.voice_type == "cloned" else self.tts_settings.model
         )
 
         # Same composite-segment-id situation as _handle_translation above — extract the
         # real TranscriptSegment.Id before using it as a UUID column value.
         underlying_segment_id = _extract_underlying_segment_id(msg.segment_id)
         if underlying_segment_id is None:
-            self.logger.warning(
-                "segment_id_extraction_failed", raw_segment_id=msg.segment_id
-            )
+            self.logger.warning("segment_id_extraction_failed", raw_segment_id=msg.segment_id)
 
         quantity_chars = Decimal(msg.char_count)
         if quantity_chars <= 0:
@@ -607,32 +615,34 @@ class BillingSettlementWorker:
             )
             return
 
-        await self._accumulate_and_maybe_flush(BillingEvent(
-            subscription_id=subscription_id,
-            workspace_id=workspace_id,
-            translation_room_id=msg.meeting_id,
-            usage_type=charge_type,
-            charge_type=charge_type,
-            quantity=quantity_chars,
-            unit="character",
-            credits_event=quantity_chars * rate.unit_price,
-            event_idempotency_key=f"{charge_type}:{msg.segment_id}:{msg.target_lang}",
-            provider=rate.provider,
-            model=rate.model,
-            pricing_rate_card_id=rate.id,
-            unit_price_snapshot=rate.unit_price,
-            source_language_code=None,
-            target_language_code=msg.target_lang or None,
-            force_flush=msg.is_final_chunk,
-            details={
-                "event_source": "tts_results",
-                "clone_provider": msg.clone_provider,
-                "voice_mode": msg.voice_mode,
-                "char_count": msg.char_count,
-                "duration_ms": msg.duration_ms,
-                "transcript_segment_id": underlying_segment_id,
-            },
-        ))
+        await self._accumulate_and_maybe_flush(
+            BillingEvent(
+                subscription_id=subscription_id,
+                workspace_id=workspace_id,
+                translation_room_id=msg.meeting_id,
+                usage_type=charge_type,
+                charge_type=charge_type,
+                quantity=quantity_chars,
+                unit="character",
+                credits_event=quantity_chars * rate.unit_price,
+                event_idempotency_key=f"{charge_type}:{msg.segment_id}:{msg.target_lang}",
+                provider=rate.provider,
+                model=rate.model,
+                pricing_rate_card_id=rate.id,
+                unit_price_snapshot=rate.unit_price,
+                source_language_code=None,
+                target_language_code=msg.target_lang or None,
+                force_flush=msg.is_final_chunk,
+                details={
+                    "event_source": "tts_results",
+                    "clone_provider": msg.clone_provider,
+                    "voice_mode": msg.voice_mode,
+                    "char_count": msg.char_count,
+                    "duration_ms": msg.duration_ms,
+                    "transcript_segment_id": underlying_segment_id,
+                },
+            )
+        )
 
     # ------------------------------------------------------------------
     # Redis accumulator + flush
@@ -864,10 +874,7 @@ class BillingSettlementWorker:
             source_language_code,
             target_language_code,
         )
-        return (
-            f"{ACCUMULATOR_KEY_PREFIX}:{subscription_id}:{room_id}:{charge_type}:"
-            f"{pricing_scope}"
-        )
+        return f"{ACCUMULATOR_KEY_PREFIX}:{subscription_id}:{room_id}:{charge_type}:{pricing_scope}"
 
     @staticmethod
     def _pricing_scope(source_language_code: str | None, target_language_code: str | None) -> str:
@@ -897,9 +904,7 @@ class BillingSettlementWorker:
             quantity = self._from_micro(snapshot[f"quantity_micro_{unit}"])
             if quantity <= 0:
                 continue
-            unit_price_snapshot = self._from_micro(
-                snapshot.get(f"rate_{unit}_price_micro", "0")
-            )
+            unit_price_snapshot = self._from_micro(snapshot.get(f"rate_{unit}_price_micro", "0"))
             pricing_rate_card_id = snapshot.get(f"rate_{unit}_id")
             item = {
                 "unit": unit,
@@ -938,18 +943,9 @@ class BillingSettlementWorker:
     @staticmethod
     def _decode_hash(data: dict) -> dict[str, str]:
         return {
-            (k.decode() if isinstance(k, bytes) else k): (
-                v.decode() if isinstance(v, bytes) else v
-            )
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
             for k, v in (data or {}).items()
         }
-
-    @staticmethod
-    def _decimal_from_snapshot(snapshot: dict[str, str], key: str) -> Decimal:
-        try:
-            return Decimal(str(snapshot.get(key, "0")))
-        except (InvalidOperation, ValueError):
-            return Decimal(0)
 
     @staticmethod
     def _json_details(details: dict) -> str:

@@ -144,9 +144,7 @@ def read_master_plan_inputs(path: Path = MASTER_PLAN_PATH) -> MasterPlanInputs:
         vad_padding=parse_vn_decimal(find(r"`VAD_PADDING`\s*\|\s*\*\*([\d,]+)×\*\*")),
         segment_chars=parse_vn_decimal(find(r"`SEGMENT_CHARS`\s*\|\s*([\d,]+)")),
         chars_per_token=parse_vn_decimal(find(r"`CHARS_PER_TOKEN`\s*\|\s*([\d,]+)")),
-        glossary_overhead_tokens=parse_vn_decimal(
-            find(r"`GLOSSARY_OVERHEAD`\s*\|\s*~([\d,]+)")
-        ),
+        glossary_overhead_tokens=parse_vn_decimal(find(r"`GLOSSARY_OVERHEAD`\s*\|\s*~([\d,]+)")),
     )
 
 
@@ -254,8 +252,11 @@ def workload_row(
         tts_credits = credits("AUDIO_DUBBING_VOICE_CLONE", "character", tts_chars)
         tts_provider = provider_vnd("AUDIO_DUBBING_VOICE_CLONE", "character", tts_chars)
 
-    provider_cost = stt_provider + translation_provider + tts_provider + (
-        SUMMARY_CREDITS_PER_HOUR * CREDIT_VALUE_VND / D("2.50")
+    provider_cost = (
+        stt_provider
+        + translation_provider
+        + tts_provider
+        + (SUMMARY_CREDITS_PER_HOUR * CREDIT_VALUE_VND / D("2.50"))
     )
     total_credits = stt_credits + translation_credits + tts_credits + SUMMARY_CREDITS_PER_HOUR
     return (

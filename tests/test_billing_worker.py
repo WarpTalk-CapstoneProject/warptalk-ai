@@ -15,7 +15,7 @@ from billing_worker.db import BillingRepository, UsageRate
 from billing_worker.worker import BillingSettlementWorker, _extract_underlying_segment_id
 from shared.config import DatabaseSettings, RedisSettings
 from shared.health_probe import check_worker
-from shared.schemas import ProviderUsageMessage
+from shared.schemas import AIUsageMessage, ProviderUsageMessage
 
 
 class FakeBillingRepository(BillingRepository):
@@ -88,7 +88,6 @@ def _rate_row(unit_price: str = "0.006575") -> dict[str, Any]:
     }
 
 
-
 class TestExtractUnderlyingSegmentId:
     """Byte-for-byte port of TranscriptRedisConsumerService.ExtractUnderlyingSegmentId (C#)."""
 
@@ -114,7 +113,6 @@ class TestExtractUnderlyingSegmentId:
 
     def test_none_like_falsy_returns_none(self) -> None:
         assert _extract_underlying_segment_id(None) is None  # type: ignore[arg-type]
-
 
 
 class TestResolveUsageRate:
@@ -389,6 +387,28 @@ async def test_subscription_resolution_uses_redis_room_projection_not_foreign_da
     worker.db.resolve_subscription.assert_awaited_once_with(workspace_id)
 
 
+async def test_subscription_resolution_uses_event_workspace_without_room_projection() -> None:
+    room_id = "assistant-conversation-1"
+    workspace_id = str(uuid.uuid4())
+    subscription_id = uuid.uuid4()
+    worker = BillingSettlementWorker.__new__(BillingSettlementWorker)
+    worker._subscription_cache = {}
+    worker.settings = MagicMock()
+    worker.settings.subscription_cache_ttl_seconds = 300
+    worker.redis = MagicMock()
+    worker.redis.get = AsyncMock()
+    worker.db = MagicMock()
+    worker.db.resolve_subscription = AsyncMock(
+        return_value=(subscription_id, uuid.UUID(workspace_id))
+    )
+
+    resolved = await worker._resolve_subscription(room_id, workspace_id)
+
+    assert resolved == (subscription_id, uuid.UUID(workspace_id))
+    worker.redis.get.assert_not_awaited()
+    worker.db.resolve_subscription.assert_awaited_once_with(workspace_id)
+
+
 async def test_subscription_resolution_fails_when_room_projection_is_missing() -> None:
     room_id = str(uuid.uuid4())
     worker = BillingSettlementWorker.__new__(BillingSettlementWorker)
@@ -455,7 +475,7 @@ async def test_voice_clone_enrollment_provider_usage_records_immediate_charge() 
 
     await worker._handle_provider_usage(message.to_redis())
 
-    worker._resolve_subscription.assert_awaited_once_with(message.room_id)
+    worker._resolve_subscription.assert_awaited_once_with(message.room_id, None)
     worker.db.resolve_usage_rate.assert_awaited_once_with(
         charge_type="VOICE_CLONE_ENROLLMENT",
         unit="profile",
@@ -475,6 +495,43 @@ async def test_voice_clone_enrollment_provider_usage_records_immediate_charge() 
     assert kwargs["idempotency_key"] == message.idempotency_key
     assert kwargs["pricing_rate_card_id"] == rate_id
     assert kwargs["unit_price_snapshot"] == Decimal("2.4")
+
+
+async def test_ai_usage_with_workspace_id_does_not_require_room_projection() -> None:
+    subscription_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    rate_id = uuid.uuid4()
+    worker = BillingSettlementWorker.__new__(BillingSettlementWorker)
+    worker._resolve_subscription = AsyncMock(return_value=(subscription_id, workspace_id))
+    worker._accumulate_and_maybe_flush = AsyncMock()
+    worker.db = MagicMock()
+    worker.db.resolve_usage_rate = AsyncMock(
+        return_value=UsageRate(
+            id=rate_id,
+            unit_price=Decimal("0.01"),
+            provider="openai",
+            model="gpt-4.1",
+        )
+    )
+    message = AIUsageMessage(
+        workspace_id=str(workspace_id),
+        room_id="assistant-conversation-1",
+        user_id=str(uuid.uuid4()),
+        charge_type="AI_ASSISTANT",
+        model="gpt-4.1",
+        prompt_tokens=0,
+        cached_tokens=0,
+        completion_tokens=10,
+        idempotency_key="AI_ASSISTANT:req-1",
+    )
+
+    await worker._handle_ai_usage(message.to_redis())
+
+    worker._resolve_subscription.assert_awaited_once_with(
+        message.room_id,
+        message.workspace_id,
+    )
+    worker._accumulate_and_maybe_flush.assert_awaited_once()
 
 
 async def test_billing_heartbeat_satisfies_shared_health_probe(monkeypatch) -> None:

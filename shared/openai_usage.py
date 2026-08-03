@@ -38,9 +38,7 @@ class TokenUsage:
         if usage is None:
             return cls()
 
-        prompt_tokens = int(
-            _read(usage, "prompt_tokens", _read(usage, "input_tokens", 0)) or 0
-        )
+        prompt_tokens = int(_read(usage, "prompt_tokens", _read(usage, "input_tokens", 0)) or 0)
         completion_tokens = int(
             _read(usage, "completion_tokens", _read(usage, "output_tokens", 0)) or 0
         )

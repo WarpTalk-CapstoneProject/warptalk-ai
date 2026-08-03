@@ -51,9 +51,7 @@ def test_estimated_provider_cost_uses_rate_card_baseline() -> None:
     assert audit.BASELINE_FX_RATE_USD_VND == Decimal("26300")
     assert "usage_rate_card" in audit.ESTIMATED_PROVIDER_COST_SQL
     assert "provider_unit_cost" in audit.ESTIMATED_PROVIDER_COST_SQL
-    assert "jsonb_array_elements(" in (
-        audit.ESTIMATED_PROVIDER_COST_SQL
-    )
+    assert "jsonb_array_elements(" in (audit.ESTIMATED_PROVIDER_COST_SQL)
     assert "ur.details->'unit_breakdown'" in audit.ESTIMATED_PROVIDER_COST_SQL
     assert "ELSE '[]'::jsonb" in audit.ESTIMATED_PROVIDER_COST_SQL
     assert "(item->>'quantity')::numeric * urc.provider_unit_cost * $5::numeric" in (

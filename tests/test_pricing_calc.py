@@ -34,9 +34,7 @@ def test_pricing_calc_generates_core_rate_card_values() -> None:
     pricing_calc = _load_pricing_calc()
 
     assert pricing_calc.rate("STT", "second").unit_price == pricing_calc.D("1.643750")
-    assert pricing_calc.rate("TRANSLATION", "token_in").unit_price == pricing_calc.D(
-        "0.006575"
-    )
+    assert pricing_calc.rate("TRANSLATION", "token_in").unit_price == pricing_calc.D("0.006575")
     assert pricing_calc.rate("AUDIO_DUBBING_STANDARD", "character").unit_price == (
         pricing_calc.D("0.773220")
     )

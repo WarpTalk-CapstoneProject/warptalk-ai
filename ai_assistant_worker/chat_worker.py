@@ -275,7 +275,6 @@ class ChatAssistantWorker(BaseWorker):
                         acc = tool_calls_acc.setdefault(
                             tc.index,
                             {"id": None, "name": None, "arguments": ""},
-
                         )
                         if tc.id:
                             acc["id"] = tc.id
@@ -337,7 +336,6 @@ class ChatAssistantWorker(BaseWorker):
                     type_="tool_call_completed",
                     tool_name=tool_name,
                     tool_status=status,
-
                 )
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": result_json})
                 tool_call_log.append(
@@ -352,7 +350,6 @@ class ChatAssistantWorker(BaseWorker):
             # Hit max_tool_iterations without a non-tool-call finish.
             final_text = final_text or (
                 "I wasn't able to finish looking that up ? please try rephrasing your question."
-
             )
 
         return final_text, tool_call_log, usage_total
