@@ -171,6 +171,10 @@ class ChatAssistantWorker(BaseWorker):
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         request = ChatRequestMessage.from_redis(data)
+        assert self._workspace_client is not None
+        assert self._transcript_client is not None
+        assert self._translation_room_client is not None
+        assert self._openai is not None
 
         try:
             history: list[dict[str, str]] = (
@@ -234,6 +238,8 @@ class ChatAssistantWorker(BaseWorker):
         tool_call_log: list[dict[str, Any]] = []
         final_text = ""
         usage_total = TokenUsage()
+        openai_client = self._openai
+        assert openai_client is not None
 
         for _ in range(self.chat_settings.max_tool_iterations):
             buffer = ""
@@ -241,7 +247,7 @@ class ChatAssistantWorker(BaseWorker):
             tool_calls_acc: dict[int, dict[str, Any]] = {}
             finish_reason: str | None = None
 
-            stream = await self._openai.chat.completions.create(
+            stream = await openai_client.chat.completions.create(
                 model=self.chat_settings.model,
                 temperature=self.chat_settings.temperature,
                 max_tokens=self.chat_settings.max_tokens,

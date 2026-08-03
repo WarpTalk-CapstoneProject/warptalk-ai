@@ -15,7 +15,7 @@ from pathlib import Path
 
 D = Decimal
 
-MASTER_PLAN_PATH = Path(__file__).resolve().parents[2] / "credit-billing-master-plan.md"
+MASTER_PLAN_PATH = Path(__file__).resolve().parents[1] / "credit-billing-master-plan.md"
 
 FX_RATE_USD_VND = D("26300")
 CREDIT_VALUE_VND = D("4")
@@ -129,6 +129,17 @@ def parse_vn_decimal(value: str) -> Decimal:
 
 
 def read_master_plan_inputs(path: Path = MASTER_PLAN_PATH) -> MasterPlanInputs:
+    if not path.exists():
+        return MasterPlanInputs(
+            fx_rate_usd_vnd=FX_RATE_USD_VND,
+            chars_per_sec=CHARS_PER_SEC,
+            talk_density=TALK_DENSITY,
+            vad_padding=VAD_PADDING,
+            segment_chars=SEGMENT_CHARS,
+            chars_per_token=CHARS_PER_TOKEN,
+            glossary_overhead_tokens=GLOSSARY_OVERHEAD_TOKENS,
+        )
+
     text = path.read_text(encoding="utf-8")
 
     def find(pattern: str) -> str:

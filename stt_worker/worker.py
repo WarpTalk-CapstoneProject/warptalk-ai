@@ -552,7 +552,11 @@ class STTWorker(BaseWorker):
             # Be tolerant of an object payload during rolling upgrades, while the
             # dedicated key's canonical contract remains a compact string array.
             if isinstance(entry, dict):
-                values = [entry.get("source"), entry.get("target")]
+                values = [
+                    value
+                    for value in (entry.get("source"), entry.get("target"))
+                    if isinstance(value, str)
+                ]
             for value in values:
                 if not isinstance(value, str):
                     continue

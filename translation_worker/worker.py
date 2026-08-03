@@ -595,11 +595,13 @@ class TranslationWorker(BaseWorker):
         *,
         source_lang: str,
         target_lang: str,
-        glossary_terms: list[dict] | None,
+        glossary_terms: list[dict[str, str]] | None,
         meeting_context: list[str] | None = None,
     ) -> TranslationWithUsage:
-        if "translate_with_usage" in type(self.translator).__dict__:
-            return await self.translator.translate_with_usage(
+        translator = self.translator
+        assert translator is not None
+        if "translate_with_usage" in type(translator).__dict__:
+            return await translator.translate_with_usage(
                 text,
                 source_lang=source_lang,
                 target_lang=target_lang,
@@ -607,7 +609,7 @@ class TranslationWorker(BaseWorker):
                 meeting_context=meeting_context,
             )
 
-        translated = await self.translator.translate(
+        translated = await translator.translate(
             text,
             source_lang=source_lang,
             target_lang=target_lang,
@@ -622,11 +624,13 @@ class TranslationWorker(BaseWorker):
         *,
         source_lang: str,
         target_lang: str,
-        glossary_terms: list[dict] | None,
+        glossary_terms: list[dict[str, str]] | None,
         meeting_context: list[str] | None = None,
     ) -> TranslationBatchWithUsage:
-        if "translate_batch_with_usage" in type(self.translator).__dict__:
-            return await self.translator.translate_batch_with_usage(
+        translator = self.translator
+        assert translator is not None
+        if "translate_batch_with_usage" in type(translator).__dict__:
+            return await translator.translate_batch_with_usage(
                 texts,
                 source_lang=source_lang,
                 target_lang=target_lang,
@@ -634,7 +638,7 @@ class TranslationWorker(BaseWorker):
                 meeting_context=meeting_context,
             )
 
-        translated = await self.translator.translate_batch(
+        translated = await translator.translate_batch(
             texts,
             source_lang=source_lang,
             target_lang=target_lang,
@@ -653,12 +657,14 @@ class TranslationWorker(BaseWorker):
     ) -> None:
         if not usage.has_tokens:
             return
+        translator = self.translator
+        assert translator is not None
 
         message = AIUsageMessage(
             room_id=stt_result.meeting_id,
             user_id=stt_result.speaker_id,
             charge_type=TRANSLATION_CHARGE_TYPE,
-            model=self.translator.model,
+            model=translator.model,
             prompt_tokens=usage.prompt_tokens,
             cached_tokens=usage.cached_tokens,
             completion_tokens=usage.completion_tokens,

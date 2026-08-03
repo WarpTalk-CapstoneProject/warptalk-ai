@@ -32,7 +32,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
-from typing import Any
+from typing import Any, TypeAlias, TypedDict, cast
 
 from billing_worker.db import BillingRepository
 from shared.config import BillingSettings, RedisSettings, STTSettings, TTSSettings, WorkerSettings
@@ -53,6 +53,20 @@ ACCUMULATOR_SEQUENCE_PREFIX = "billing:accseq"
 CHARGE_DEDUPE_PREFIX = "billing:charge"
 EVENT_DEDUPE_PREFIX = "billing:event"
 MICRO_SCALE = Decimal("1000000")
+
+RedisHash: TypeAlias = dict[bytes | str, bytes | str]
+UnitBreakdownItem: TypeAlias = dict[str, str | None]
+
+
+class PrimaryBreakdownUnit(TypedDict):
+    unit: str
+    quantity: Decimal
+    pricing_rate_card_id: uuid.UUID | None
+    unit_price_snapshot: Decimal | None
+    provider: str | None
+    model: str | None
+
+
 SettlementHandler = Callable[[Mapping[Any, Any]], Awaitable[None]]
 
 
@@ -74,7 +88,7 @@ class BillingEvent:
     source_language_code: str | None = None
     target_language_code: str | None = None
     force_flush: bool = False
-    details: dict | None = None
+    details: dict[str, Any] | None = None
 
 
 def _extract_underlying_segment_id(raw_segment_id: str) -> str | None:
@@ -332,8 +346,8 @@ class BillingSettlementWorker:
         if isinstance(raw_room, bytes):
             raw_room = raw_room.decode("utf-8")
         room_projection = json.loads(raw_room)
-        workspace_id = room_projection.get("WorkspaceId") or room_projection.get("workspaceId")
-        if not workspace_id:
+        workspace_id_raw = room_projection.get("WorkspaceId") or room_projection.get("workspaceId")
+        if not workspace_id_raw:
             self.logger.warning(
                 "room_projection_missing_workspace",
                 translation_room_id=translation_room_id,
@@ -343,13 +357,18 @@ class BillingSettlementWorker:
                 "workspace id is missing"
             )
 
+        workspace_id = str(workspace_id_raw)
         resolved = await self.db.resolve_subscription(workspace_id)
         if resolved is None:
             return None
 
-        subscription_id, workspace_id = resolved
-        self._subscription_cache[translation_room_id] = (subscription_id, workspace_id, now)
-        return subscription_id, workspace_id
+        subscription_id, resolved_workspace_id = resolved
+        self._subscription_cache[translation_room_id] = (
+            subscription_id,
+            resolved_workspace_id,
+            now,
+        )
+        return subscription_id, resolved_workspace_id
 
     # ------------------------------------------------------------------
     # Per-stream handlers
@@ -409,7 +428,7 @@ class BillingSettlementWorker:
         )
 
     async def _handle_ai_usage(self, data: Mapping[Any, Any]) -> None:
-        msg = AIUsageMessage.from_redis(data)
+        msg = AIUsageMessage.from_redis(cast(RedisHash, data))
         if msg.prompt_tokens <= 0 and msg.cached_tokens <= 0 and msg.completion_tokens <= 0:
             return
 
@@ -483,7 +502,7 @@ class BillingSettlementWorker:
             )
 
     async def _handle_provider_usage(self, data: Mapping[Any, Any]) -> None:
-        msg = ProviderUsageMessage.from_redis(data)
+        msg = ProviderUsageMessage.from_redis(cast(RedisHash, data))
         if msg.quantity <= 0:
             return
 
@@ -893,13 +912,13 @@ class BillingSettlementWorker:
     def _micro_decimal_from_snapshot(self, snapshot: dict[str, str], key: str) -> Decimal:
         return self._from_micro(snapshot.get(key, "0"))
 
-    def _unit_breakdown(self, snapshot: dict[str, str]) -> list[dict]:
+    def _unit_breakdown(self, snapshot: dict[str, str]) -> list[UnitBreakdownItem]:
         units = sorted(
             key.removeprefix("quantity_micro_")
             for key in snapshot
             if key.startswith("quantity_micro_")
         )
-        breakdown: list[dict] = []
+        breakdown: list[UnitBreakdownItem] = []
         for unit in units:
             quantity = self._from_micro(snapshot[f"quantity_micro_{unit}"])
             if quantity <= 0:
@@ -918,7 +937,7 @@ class BillingSettlementWorker:
         return breakdown
 
     @staticmethod
-    def _primary_breakdown_unit(breakdown: list[dict]) -> dict:
+    def _primary_breakdown_unit(breakdown: list[UnitBreakdownItem]) -> PrimaryBreakdownUnit:
         if not breakdown:
             return {
                 "unit": "unknown",
@@ -928,27 +947,30 @@ class BillingSettlementWorker:
                 "provider": None,
                 "model": None,
             }
-        primary = max(breakdown, key=lambda item: Decimal(item["quantity"]))
+        primary = max(breakdown, key=lambda item: Decimal(item["quantity"] or "0"))
+        quantity = Decimal(primary["quantity"] or "0")
+        unit_price_snapshot = Decimal(primary["unit_price_snapshot"] or "0")
+        pricing_rate_card_id_raw = primary.get("pricing_rate_card_id")
         return {
-            **primary,
-            "quantity": Decimal(primary["quantity"]),
+            "unit": primary["unit"] or "unknown",
+            "quantity": quantity,
             "pricing_rate_card_id": (
-                uuid.UUID(primary["pricing_rate_card_id"])
-                if primary.get("pricing_rate_card_id")
-                else None
+                uuid.UUID(pricing_rate_card_id_raw) if pricing_rate_card_id_raw else None
             ),
-            "unit_price_snapshot": Decimal(primary["unit_price_snapshot"]),
+            "unit_price_snapshot": unit_price_snapshot,
+            "provider": primary.get("provider"),
+            "model": primary.get("model"),
         }
 
     @staticmethod
-    def _decode_hash(data: dict) -> dict[str, str]:
+    def _decode_hash(data: Mapping[Any, Any]) -> dict[str, str]:
         return {
             (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
             for k, v in (data or {}).items()
         }
 
     @staticmethod
-    def _json_details(details: dict) -> str:
+    def _json_details(details: Mapping[str, Any]) -> str:
         import json
 
         return json.dumps(details, separators=(",", ":"), sort_keys=True)

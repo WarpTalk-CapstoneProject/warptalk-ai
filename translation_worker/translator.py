@@ -502,7 +502,7 @@ class OpenAITranslator:
         text: str,
         source_lang: str,
         target_lang: str,
-        glossary_terms: list[dict] | None = None,
+        glossary_terms: list[dict[str, str]] | None = None,
         meeting_context: list[str] | None = None,
     ) -> TranslationWithUsage:
         if not text.strip():
@@ -618,7 +618,7 @@ class OpenAITranslator:
         texts: list[str],
         source_lang: str,
         target_lang: str,
-        glossary_terms: list[dict] | None = None,
+        glossary_terms: list[dict[str, str]] | None = None,
         meeting_context: list[str] | None = None,
         *,
         fallback_uses_legacy_translate: bool = False,

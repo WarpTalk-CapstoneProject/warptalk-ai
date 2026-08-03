@@ -188,6 +188,7 @@ class AIAssistantWorker(BaseWorker):
         )
 
         if usage_total.has_tokens:
+            assert self.assistant is not None
             usage_message = AIUsageMessage(
                 room_id=meeting_id,
                 charge_type=AI_SUMMARY_CHARGE_TYPE,

@@ -34,7 +34,7 @@ class TextWithUsage:
 
 @dataclass(frozen=True)
 class DictWithUsage:
-    data: dict
+    data: dict[str, Any]
     usage: TokenUsage = TokenUsage()
 
 
