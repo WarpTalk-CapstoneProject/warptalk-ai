@@ -41,15 +41,17 @@ async def check_worker() -> bool:
             return False
 
         now_unix_ms = int(time.time() * 1000)
-        max_stall_ms = int(os.environ.get("WORKER_HEALTH_MAX_STALL_SECONDS", "180")) * 1000
+        max_heartbeat_age_ms = (
+            int(os.environ.get("WORKER_HEALTH_MAX_HEARTBEAT_AGE_SECONDS", "30")) * 1000
+        )
         for raw_value in heartbeat_values:
             if raw_value is None:
                 return False
             if isinstance(raw_value, bytes):
                 raw_value = raw_value.decode("utf-8")
             payload = json.loads(raw_value)
-            last_progress_unix_ms = int(payload.get("last_progress_unix_ms", 0))
-            if last_progress_unix_ms <= 0 or now_unix_ms - last_progress_unix_ms > max_stall_ms:
+            heartbeat_unix_ms = int(payload.get("timestamp_unix_ms", 0))
+            if heartbeat_unix_ms <= 0 or now_unix_ms - heartbeat_unix_ms > max_heartbeat_age_ms:
                 return False
 
         return True

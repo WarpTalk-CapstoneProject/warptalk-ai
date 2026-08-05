@@ -580,3 +580,101 @@ async def test_billing_heartbeat_loop_recovers_after_transient_redis_failure() -
 
     assert worker._publish_heartbeat.await_count == 2
     worker.logger.exception.assert_called_once_with("billing_heartbeat_failed")
+
+
+class TestSuggestionSettlement:
+    """Inline suggestions settle against the existing AI_ASSISTANT budget."""
+
+    @staticmethod
+    def _worker() -> BillingSettlementWorker:
+        room_id = str(uuid.uuid4())
+        worker = BillingSettlementWorker.__new__(BillingSettlementWorker)
+        worker.logger = MagicMock()
+        worker._subscription_cache = {}
+        worker.settings = MagicMock()
+        worker.settings.subscription_cache_ttl_seconds = 300
+        worker.db = MagicMock()
+        worker.db.record_usage_and_charge = AsyncMock(return_value=True)
+        worker._resolve_subscription = AsyncMock(  # type: ignore[method-assign]
+            return_value=(uuid.uuid4(), uuid.uuid4())
+        )
+        worker._room_id = room_id  # type: ignore[attr-defined]
+        return worker
+
+    @staticmethod
+    def _entry(**overrides: object) -> dict[bytes, bytes]:
+        from shared.schemas import SuggestionResultMessage
+
+        fields: dict[str, object] = {
+            "meeting_id": str(uuid.uuid4()),
+            "segment_id": str(uuid.uuid4()),
+            "category": "action",
+            "content": "Chưa có ai nhận phần này.",
+            "confidence": 0.86,
+            "language": "vi",
+            "token_count": 150,
+            **overrides,
+        }
+        payload = SuggestionResultMessage(**fields).to_redis()  # type: ignore[arg-type]
+        return {key.encode(): value.encode() for key, value in payload.items()}
+
+    async def test_charges_combined_tokens_against_ai_assistant(self) -> None:
+        worker = self._worker()
+
+        await worker._handle_suggestion(self._entry())
+
+        worker.db.record_usage_and_charge.assert_awaited_once()
+        call = worker.db.record_usage_and_charge.await_args.kwargs
+        assert call["charge_type"] == "AI_ASSISTANT"
+        assert call["usage_type"] == "AI_ASSISTANT"
+        assert call["quantity"] == 150.0
+        assert call["unit"] == "token"
+        assert call["user_id"] is None, "a suggestion has no participant author"
+        assert call["idempotency_key"].startswith("AI_ASSISTANT:")
+        assert call["details"]["category"] == "action"
+
+    async def test_ignores_summaries_sharing_the_same_stream(self) -> None:
+        worker = self._worker()
+
+        await worker._handle_suggestion(
+            {b"type": b"summary", b"meeting_id": b"room-1", b"content": "Tổng kết...".encode()}
+        )
+
+        worker.db.record_usage_and_charge.assert_not_awaited()
+
+    async def test_skips_when_no_tokens_were_reported(self) -> None:
+        worker = self._worker()
+
+        await worker._handle_suggestion(self._entry(token_count=0))
+
+        worker.db.record_usage_and_charge.assert_not_awaited()
+
+    async def test_settlement_failure_does_not_wedge_the_consumer_group(self) -> None:
+        """Re-raising would redeliver this message forever over one optional aside."""
+        worker = self._worker()
+        worker.db.record_usage_and_charge = AsyncMock(
+            side_effect=RuntimeError("No active usage rate card for AI_ASSISTANT")
+        )
+
+        await worker._handle_suggestion(self._entry())
+
+        worker.logger.exception.assert_called_once()
+
+    async def test_missing_subscription_is_skipped_not_retried(self) -> None:
+        worker = self._worker()
+        worker._resolve_subscription = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        await worker._handle_suggestion(self._entry())
+
+        worker.db.record_usage_and_charge.assert_not_awaited()
+
+    async def test_room_projection_lookup_failure_is_contained(self) -> None:
+        worker = self._worker()
+        worker._resolve_subscription = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("Room projection is unavailable")
+        )
+
+        await worker._handle_suggestion(self._entry())
+
+        worker.db.record_usage_and_charge.assert_not_awaited()
+        worker.logger.exception.assert_called_once()

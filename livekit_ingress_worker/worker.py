@@ -90,7 +90,7 @@ class LiveKitIngressWorker(BaseWorker):
         """Load Silero VAD model."""
         if torch is None:
             raise RuntimeError("Install the ingress optional dependencies to use Silero VAD.")
-        self._vad_model, _ = torch.hub.load(
+        self._vad_model, _ = torch.hub.load(  # type: ignore[no-untyped-call]
             SILERO_VAD_REPOSITORY,
             "silero_vad",
             trust_repo=True,

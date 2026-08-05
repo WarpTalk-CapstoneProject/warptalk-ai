@@ -548,7 +548,7 @@ class STTWorker(BaseWorker):
         keywords: list[str] = []
         seen: set[str] = set()
         for entry in entries:
-            values = [entry] if isinstance(entry, str) else []
+            values: list[object] = [entry] if isinstance(entry, str) else []
             # Be tolerant of an object payload during rolling upgrades, while the
             # dedicated key's canonical contract remains a compact string array.
             if isinstance(entry, dict):

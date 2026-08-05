@@ -1,0 +1,301 @@
+"""Suggestion Worker — decides, unprompted, whether a live transcript segment deserves
+a short inline hint, and publishes it for the gateway to push at the meeting.
+
+Pipeline:
+    Redis Stream (stt:results) — its OWN consumer group, parallel to translation
+    → stage 0: local heuristics (no tokens spent)
+    → cross-replica cooldown / per-meeting budget (Redis)
+    → stage 1: decide (cheap model)
+    → stage 2: generate (full model + meeting context)
+    → ai_assistant:results with type="suggestion"
+
+This runs beside the realtime STT → Translation → TTS path, never inside it: it reads the
+same stream under a separate group, so a slow or failing suggestion never delays a
+caption. Nothing here is persisted — suggestions are ephemeral by design.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from collections import deque
+from typing import Any
+
+from shared.base_worker import BaseWorker
+from shared.config import SuggestionSettings
+from shared.schemas import STTResultMessage, SuggestionResultMessage
+from suggestion_worker.suggester import (
+    SUGGESTION_CATEGORIES,
+    NullSuggester,
+    Suggester,
+    TranscriptTurn,
+)
+
+# Route states in which a room is not actively translating. Segments can still arrive
+# briefly after a pause/end (already-published stream entries), and suggesting into a
+# meeting nobody is watching is pure waste.
+_INACTIVE_ROUTE_STATES = frozenset({"PAUSED", "ENDED", "FAILED", "CANCELLED", "TIMEOUT"})
+
+# How long a room's consent decision is trusted before re-reading it from Redis. Short
+# enough that revoking external-LLM consent takes effect within a meeting, long enough that
+# the common path is not one extra Redis round trip per transcript segment.
+_POLICY_REFRESH_SECONDS = 60.0
+
+
+class SuggestionWorker(BaseWorker):
+    """Inline transcript suggestions — non-blocking, budget-capped, silent by default."""
+
+    worker_name = "suggestion"
+    input_stream = "stt:results"
+    consumer_group = "suggestion-workers"  # Separate from translate/assistant/billing
+
+    def __init__(
+        self,
+        suggestion_settings: SuggestionSettings | None = None,
+        suggester: Suggester | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.suggestion_settings = suggestion_settings or SuggestionSettings()
+        self.suggester: Suggester = suggester or NullSuggester()
+        # Rolling per-room context handed to the decide stage. Bounded by window_size, so
+        # this cannot grow with meeting length — only with the number of live rooms, and
+        # _cleanup_room drops each one when its room ends.
+        self._windows: dict[str, deque[TranscriptTurn]] = {}
+        # room_id -> (allow_external_llm, fetched_at_monotonic). Re-read periodically so a
+        # workspace that revokes external-LLM consent mid-meeting takes effect without a
+        # restart.
+        self._policies: dict[str, tuple[bool, float]] = {}
+
+    async def load_model(self) -> None:
+        await self.suggester.load()
+
+    def _cleanup_room(self, room_id: str) -> None:
+        super()._cleanup_room(room_id)
+        # Without this, every room ever seen keeps its window alive for the life of the
+        # process — the same unbounded-dict leak stt_worker._cleanup_room exists to avoid.
+        # The Redis cooldown/budget keys are left to expire on their own TTL: a room can
+        # emit late segments after its end event, and re-granting it a fresh budget here
+        # would be worse than letting the keys lapse.
+        self._windows.pop(room_id, None)
+        self._policies.pop(room_id, None)
+
+    async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        if not self.suggestion_settings.enabled:
+            return
+
+        stt_result = STTResultMessage.from_redis(data)
+        room_id = stt_result.meeting_id
+        turn = TranscriptTurn(
+            speaker_id=stt_result.speaker_id,
+            text=" ".join(stt_result.text.split()),
+            language=stt_result.language,
+        )
+
+        if not self._is_room_active(room_id):
+            return
+
+        # Context first, gating second: a segment too short to be worth suggesting on is
+        # still worth remembering, because it may be what makes the NEXT one meaningful.
+        window = self._windows.setdefault(
+            room_id, deque(maxlen=self.suggestion_settings.window_size)
+        )
+        if turn.text:
+            window.append(turn)
+
+        if not self._passes_local_heuristics(turn, stt_result.confidence):
+            return
+
+        # Consent gate, before any transcript text leaves this process.
+        if not await self._external_llm_allowed(room_id):
+            return
+
+        # Read-only cooldown probe. The authoritative claim happens after the decide
+        # stage — claiming here would burn a 45s slot on a segment the model then
+        # declines, silencing the room for no reason.
+        if await self._cooldown_active(room_id):
+            return
+
+        # The current segment is the subject, not part of its own context.
+        context = [entry for entry in window if entry is not turn]
+        decision = await self.suggester.decide(context, turn)
+
+        if not decision.should_suggest:
+            return
+        if decision.confidence < self.suggestion_settings.min_confidence:
+            self.logger.debug(
+                "suggestion_below_confidence_gate",
+                meeting_id=room_id,
+                confidence=decision.confidence,
+            )
+            return
+        if decision.category not in SUGGESTION_CATEGORIES:
+            self.logger.warning(
+                "suggestion_unknown_category",
+                meeting_id=room_id,
+                category=decision.category,
+            )
+            return
+
+        if not await self._claim_slot(room_id):
+            return
+
+        suggestion = await self.suggester.generate(
+            context,
+            turn,
+            decision,
+            context_snapshot=await self._context_snapshot(room_id),
+        )
+        if suggestion is None or not suggestion.content.strip():
+            return
+
+        await self._publish(stt_result, decision, suggestion)
+
+    # ------------------------------------------------------------------
+    # Stage 0 — local, no I/O and no tokens
+    # ------------------------------------------------------------------
+
+    def _is_room_active(self, room_id: str) -> bool:
+        if room_id in self._paused_rooms:
+            return False
+        return self._route_states.get(room_id, "") not in _INACTIVE_ROUTE_STATES
+
+    def _passes_local_heuristics(self, turn: TranscriptTurn, confidence: float) -> bool:
+        """Reject before spending a token.
+
+        Note what is NOT checked here: `is_final_chunk`. On this stream that flag marks
+        stt_worker's trailing end-of-audio-chunk marker, which carries text="" — the
+        segments with actual content have it set to false. Gating on it would discard
+        every real segment and keep only the empty markers. The empty-text check below is
+        what filters those markers out.
+        """
+        if not turn.text:
+            return False
+        if len(turn.text.split()) < self.suggestion_settings.min_words:
+            return False
+        return confidence >= self.suggestion_settings.min_stt_confidence
+
+    # ------------------------------------------------------------------
+    # Workspace consent
+    # ------------------------------------------------------------------
+
+    async def _external_llm_allowed(self, room_id: str) -> bool:
+        """Whether this room's workspace permits sending transcript text to an external LLM.
+
+        The policy is projected into Redis by the gateway
+        (AiResultConsumerService.ResolveRoomPolicyAsync), which already resolves the same
+        workspace settings for profanity masking — this worker has no gRPC client or
+        service credentials to ask WorkspaceService itself.
+
+        FAIL CLOSED. A missing or unreadable key means "we do not know whether this
+        workspace consented", and the cost of guessing wrong is sending meeting speech to a
+        third-party provider a workspace explicitly opted out of. The gateway writes the key
+        on a room's very first AI result, well before enough transcript has accumulated for
+        a suggestion to be worth making, so this costs nothing in practice.
+        """
+        cached = self._policies.get(room_id)
+        if cached is not None and time.monotonic() - cached[1] < _POLICY_REFRESH_SECONDS:
+            return cached[0]
+
+        allowed = False
+        try:
+            raw = await self.redis.get(f"translationRoom:{room_id}:ai_policy")
+            if raw is not None:
+                payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+                allowed = bool(payload.get("allow_external_llm"))
+            else:
+                self.logger.debug("suggestion_policy_not_published_yet", meeting_id=room_id)
+        except Exception:
+            self.logger.warning("suggestion_policy_unreadable", meeting_id=room_id)
+
+        self._policies[room_id] = (allowed, time.monotonic())
+        return allowed
+
+    # ------------------------------------------------------------------
+    # Rate limiting — Redis, so it holds across replicas
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cooldown_key(room_id: str) -> str:
+        return f"suggest:cd:{room_id}"
+
+    @staticmethod
+    def _budget_key(room_id: str) -> str:
+        return f"suggest:n:{room_id}"
+
+    async def _cooldown_active(self, room_id: str) -> bool:
+        return await self.redis.get(self._cooldown_key(room_id)) is not None
+
+    async def _claim_slot(self, room_id: str) -> bool:
+        """Atomically take this room's next suggestion slot. False means don't suggest.
+
+        Both limits live in Redis rather than worker memory because the production chart
+        runs these workers at replicas >= 2, and the consumer group hands one room's
+        segments to whichever replica is free — per-process counters would multiply the
+        real budget by the replica count and make the cooldown ineffective.
+        """
+        claimed = await self.redis.set_if_absent(
+            self._cooldown_key(room_id),
+            "1",
+            self.suggestion_settings.cooldown_seconds,
+        )
+        if not claimed:
+            return False
+
+        used = await self.redis.incr_with_ttl(
+            self._budget_key(room_id),
+            self.suggestion_settings.state_ttl_seconds,
+        )
+        if used > self.suggestion_settings.max_per_meeting:
+            self.logger.info("suggestion_budget_exhausted", meeting_id=room_id, used=used)
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Stage 2 support + publish
+    # ------------------------------------------------------------------
+
+    async def _context_snapshot(self, room_id: str) -> str:
+        """RAG document text the meeting was started with, if any.
+
+        Written by the same key ai_assistant_worker reads for summaries. Only fetched
+        once a suggestion has already cleared every gate, so the cost is per-suggestion,
+        not per-segment.
+        """
+        raw = await self.redis.get(f"meeting:{room_id}:context_snapshot")
+        if raw is None:
+            return ""
+        return raw.decode("utf-8") if isinstance(raw, bytes) else raw
+
+    async def _publish(
+        self,
+        stt_result: STTResultMessage,
+        decision: Any,
+        suggestion: Any,
+    ) -> None:
+        content = " ".join(suggestion.content.split())
+        limit = self.suggestion_settings.max_suggestion_chars
+        if len(content) > limit:
+            content = content[:limit].rstrip()
+
+        message = SuggestionResultMessage(
+            meeting_id=stt_result.meeting_id,
+            segment_id=stt_result.segment_id,
+            category=suggestion.category or decision.category,
+            content=content,
+            detail=suggestion.detail,
+            confidence=decision.confidence,
+            language=stt_result.language,
+            token_count=decision.token_count + suggestion.token_count,
+        )
+
+        await self.publish("ai_assistant:results", stt_result.meeting_id, message.to_redis())
+
+        self.logger.info(
+            "suggestion_published",
+            meeting_id=stt_result.meeting_id,
+            segment_id=stt_result.segment_id,
+            category=message.category,
+            confidence=decision.confidence,
+            tokens=message.token_count,
+        )

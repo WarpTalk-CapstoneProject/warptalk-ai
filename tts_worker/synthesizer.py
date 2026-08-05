@@ -143,14 +143,21 @@ class CartesiaSynthesizer:
         return defaults.get(language, defaults["en"])
 
     async def list_voices(
-        self, language: str, limit: int = 12, max_scanned: int = 300
+        self, language: str, limit: int = 12, max_scanned: int = 2000
     ) -> list[dict[str, Any]]:
         """Public library voices for `language`, from Cartesia's real /voices API.
 
         The SDK's voices.list() has no `language` filter param — it returns Cartesia's
-        whole public library (600+ voices across 40+ languages), so this scans pages
-        client-side and keeps only matches, capped at `max_scanned` total items looked
-        at so a rare language can't force an unbounded scan of the whole catalog.
+        whole public library, so this scans pages client-side and keeps only matches.
+
+        `max_scanned` is a runaway guard, NOT a budget: it must stay comfortably above
+        the real library size or it silently starves whole languages. It used to be 300
+        against a library of ~843 voices ordered with English first (417 of them), and
+        the first Vietnamese voice sits at position 459 — so `vi` was unreachable, the
+        control bar's picker stayed empty in Vietnamese, and _hashed_default_voice_id
+        always fell back to the single hardcoded `vi` id (every speaker got one voice).
+        Scanning the whole library costs ~9 pages of 100 and the result is cached in
+        Redis for 6h (see tts_worker._get_voice_catalog), so the walk is rare.
 
         Best-effort: any failure (network, auth, SDK shape change) returns [] rather
         than raising — every caller must treat an empty result as "fall back to
@@ -173,6 +180,12 @@ class CartesiaSynthesizer:
                     if len(voices) >= limit:
                         break
                 if scanned >= max_scanned:
+                    logger.warning(
+                        "cartesia_list_voices_scan_capped",
+                        language=language,
+                        scanned=scanned,
+                        found=len(voices),
+                    )
                     break
         except Exception:
             logger.exception("cartesia_list_voices_failed", language=language)

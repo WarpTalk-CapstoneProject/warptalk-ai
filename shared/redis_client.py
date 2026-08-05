@@ -445,6 +445,29 @@ class RedisStreamClient:
         """Get a key value."""
         return await self.redis.get(key)
 
+    async def set_if_absent(self, key: str, value: bytes | str, ttl_seconds: int) -> bool:
+        """SET NX EX — returns True only for the caller that created the key.
+
+        The atomic building block for rate limits that must hold across replicas: AI
+        workers run with replicas >= 2 and a consumer group spreads one room's messages
+        over all of them, so a per-process timestamp would let every replica grant
+        itself the same slot independently.
+        """
+        created = await self._retry(self.redis.set, key, value, nx=True, ex=ttl_seconds)
+        return bool(created)
+
+    async def incr_with_ttl(self, key: str, ttl_seconds: int) -> int:
+        """INCR a counter, bounding its lifetime the first time it is created.
+
+        The TTL is applied only on the 1 -> counter's first increment, so a long-running
+        budget is not silently extended by later activity. Two replicas racing the very
+        first INCR is harmless: exactly one of them observes 1 and sets the TTL.
+        """
+        value = int(await self._retry(self.redis.incr, key))
+        if value == 1:
+            await self.expire(key, ttl_seconds)
+        return value
+
     # ------------------------------------------------------------------
     # Retry logic
     # ------------------------------------------------------------------

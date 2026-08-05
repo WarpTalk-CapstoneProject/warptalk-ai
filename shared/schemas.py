@@ -513,6 +513,71 @@ class ChatResultMessage(BaseModel):
         )
 
 
+class SuggestionResultMessage(BaseModel):
+    """SuggestionWorker → Gateway (.NET) → SignalR "AiSuggestionReceived".
+
+    Published onto the existing `ai_assistant:results` stream rather than a new one, so
+    it shares the gateway consumer group already draining that stream. `type` is what
+    lets AiResultConsumerService route it: anything other than "suggestion" keeps
+    flowing to the legacy "AiAssistantResult" event untouched.
+
+    `content` (not "text") deliberately matches the field name the gateway already reads
+    off this stream for summaries and action items, so both branches parse the same key.
+
+    `segment_id` is the STT segment that provoked the suggestion — the frontend anchors
+    the strip to the transcript bubble containing that id. Note the bubble may have
+    merged several segments into one utterance, so the id here is not necessarily the
+    bubble's own id; resolving that is the client's job.
+    """
+
+    __slots__ = ()
+
+    meeting_id: str
+    segment_id: str
+    category: str  # "clarification" | "term" | "action" | "correction" | "fact"
+    content: str
+    type: str = "suggestion"
+    detail: str = ""
+    confidence: float = 0.0
+    language: str = ""
+    # Tokens spent across BOTH the decide and generate calls for this suggestion.
+    # billing_worker charges it as one AI_ASSISTANT usage record — see migration
+    # 017-15-07-2026-translation-cluster-finalize.sql, which already lists AI_ASSISTANT
+    # among the valid charge types, so no new charge type is introduced here.
+    token_count: int = 0
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_redis(self) -> dict[str, str]:
+        return {
+            "meeting_id": self.meeting_id,
+            "segment_id": self.segment_id,
+            "category": self.category,
+            "content": self.content,
+            "type": self.type,
+            "detail": self.detail,
+            "confidence": str(self.confidence),
+            "language": self.language,
+            "token_count": str(self.token_count),
+            "timestamp_ms": str(self.timestamp_ms),
+        }
+
+    @classmethod
+    def from_redis(cls, data: Mapping[Any, Any]) -> SuggestionResultMessage:
+        d = _decode_dict(data)
+        return cls(
+            meeting_id=d["meeting_id"],
+            segment_id=d["segment_id"],
+            category=d["category"],
+            content=d["content"],
+            type=d.get("type", "suggestion"),
+            detail=d.get("detail", ""),
+            confidence=float(d.get("confidence", "0.0")),
+            language=d.get("language", ""),
+            token_count=int(d.get("token_count", "0")),
+            timestamp_ms=int(d.get("timestamp_ms", "0")),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

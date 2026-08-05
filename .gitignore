@@ -52,3 +52,6 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Test/report output produced by local runs, not source.
+artifacts/

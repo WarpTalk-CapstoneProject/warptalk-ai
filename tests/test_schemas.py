@@ -13,6 +13,7 @@ from shared.schemas import (
     ChatResultMessage,
     ProviderUsageMessage,
     STTResultMessage,
+    SuggestionResultMessage,
     TranslationResultMessage,
     TTSResultMessage,
 )
@@ -43,6 +44,82 @@ def test_chat_result_origin_roundtrip() -> None:
     restored = ChatResultMessage.from_redis(result.to_redis())
 
     assert restored.origin == "meeting_chat"
+
+
+class TestSuggestionResultMessage:
+    """SuggestionResultMessage serialize/deserialize tests."""
+
+    def test_roundtrip(self) -> None:
+        original = SuggestionResultMessage(
+            meeting_id="room-1",
+            segment_id="segment-1",
+            category="term",
+            content="RAG = Retrieval Augmented Generation",
+            detail="Nobody has defined the acronym yet in this meeting.",
+            confidence=0.82,
+            language="vi",
+            token_count=145,
+        )
+
+        restored = SuggestionResultMessage.from_redis(original.to_redis())
+
+        assert restored.meeting_id == "room-1"
+        assert restored.segment_id == "segment-1"
+        assert restored.category == "term"
+        assert restored.content == "RAG = Retrieval Augmented Generation"
+        assert restored.detail == "Nobody has defined the acronym yet in this meeting."
+        assert restored.confidence == pytest.approx(0.82)
+        assert restored.language == "vi"
+        assert restored.token_count == 145
+        assert restored.timestamp_ms == original.timestamp_ms
+
+    def test_type_defaults_to_suggestion(self) -> None:
+        """The gateway routes on `type` — it must be on the wire without being set."""
+        message = SuggestionResultMessage(
+            meeting_id="room-1",
+            segment_id="segment-1",
+            category="action",
+            content="Ai chốt deadline cho phần này?",
+        )
+
+        assert message.to_redis()["type"] == "suggestion"
+
+    def test_roundtrip_from_redis_bytes(self) -> None:
+        """Redis hands back bytes, not str — from_redis must decode both keys and values."""
+        encoded = {
+            key.encode(): value.encode()
+            for key, value in SuggestionResultMessage(
+                meeting_id="room-1",
+                segment_id="segment-1",
+                category="clarification",
+                content="Câu hỏi này chưa được trả lời.",
+                confidence=0.75,
+            )
+            .to_redis()
+            .items()
+        }
+
+        restored = SuggestionResultMessage.from_redis(encoded)
+
+        assert restored.meeting_id == "room-1"
+        assert restored.category == "clarification"
+        assert restored.confidence == pytest.approx(0.75)
+
+    def test_optional_fields_absent_on_the_wire(self) -> None:
+        """An older/partial producer must not crash the consumer."""
+        restored = SuggestionResultMessage.from_redis(
+            {
+                "meeting_id": "room-1",
+                "segment_id": "segment-1",
+                "category": "fact",
+                "content": "Doanh thu Q2 là 1.2 tỷ.",
+            }
+        )
+
+        assert restored.type == "suggestion"
+        assert restored.detail == ""
+        assert restored.confidence == 0.0
+        assert restored.token_count == 0
 
 
 class TestAudioChunkMessage:

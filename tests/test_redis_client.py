@@ -364,3 +364,54 @@ class TestPendingRecovery:
         )
 
         assert attempts == 5
+
+
+class TestRateLimitPrimitives:
+    """SET NX / INCR helpers backing the cross-replica suggestion budget."""
+
+    async def test_set_if_absent_returns_true_when_it_creates_the_key(
+        self,
+        client: RedisStreamClient,
+    ) -> None:
+        client._redis.set = AsyncMock(return_value=True)
+
+        claimed = await client.set_if_absent("suggest:cd:room-1", "1", 45)
+
+        assert claimed is True
+        client._redis.set.assert_awaited_once_with(
+            "suggest:cd:room-1",
+            "1",
+            nx=True,
+            ex=45,
+        )
+
+    async def test_set_if_absent_returns_false_when_the_key_exists(
+        self,
+        client: RedisStreamClient,
+    ) -> None:
+        """Redis returns None, not False, when NX declines — it must not read as truthy."""
+        client._redis.set = AsyncMock(return_value=None)
+
+        assert await client.set_if_absent("suggest:cd:room-1", "1", 45) is False
+
+    async def test_incr_with_ttl_bounds_the_counter_on_first_increment(
+        self,
+        client: RedisStreamClient,
+    ) -> None:
+        client._redis.incr = AsyncMock(return_value=1)
+        client._redis.expire = AsyncMock()
+
+        assert await client.incr_with_ttl("suggest:n:room-1", 14400) == 1
+        client._redis.expire.assert_awaited_once_with("suggest:n:room-1", 14400)
+
+    async def test_incr_with_ttl_does_not_extend_an_existing_counter(
+        self,
+        client: RedisStreamClient,
+    ) -> None:
+        """Re-applying the TTL on every increment would let a busy room hold its budget
+        key alive indefinitely instead of expiring with the meeting."""
+        client._redis.incr = AsyncMock(return_value=7)
+        client._redis.expire = AsyncMock()
+
+        assert await client.incr_with_ttl("suggest:n:room-1", 14400) == 7
+        client._redis.expire.assert_not_awaited()

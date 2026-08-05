@@ -13,17 +13,32 @@
 # =============================================================
 
 # ---- Base: Python + system deps ----
-FROM python:3.11.13-slim-bookworm@sha256:86adf8dbadc3d6e82ee5dd2c74bec2e1c2467cdad47886280501df722372d2e1 AS base
+# Pinned by digest so a rebuild is reproducible. Bumping it is a security action, not
+# housekeeping: the previous digest carried openssl 3.0.x, and the CVEs published against
+# it (CVE-2026-45447 and the CVE-2026-283xx set) began failing the release Trivy gate the
+# moment its vulnerability database picked them up — with the image itself unchanged.
+FROM python:3.11.13-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba AS base
 COPY --from=ghcr.io/astral-sh/uv:0.9.18 /uv /uvx /bin/
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PATH=/app/.venv/bin:$PATH
+    PATH=/app/.venv/bin:$PATH \
+    UV_HTTP_TIMEOUT=120
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
+
+# setuptools ships its own vendored copies of jaraco.context and wheel, and the versions
+# baked into the base image are the two remaining HIGH findings after the digest bump.
+# Neither is used at runtime — the workers run from .venv — but Trivy scans the whole
+# filesystem, so upgrading setuptools (which replaces what it vendors) is what actually
+# clears them.
+RUN pip install --no-cache-dir --upgrade \
+        "setuptools>=80.9.0" \
+        "wheel>=0.46.2" \
+    && rm -rf /root/.cache/pip
 
 WORKDIR /app
 
@@ -36,6 +51,7 @@ COPY stt_worker/ stt_worker/
 COPY translation_worker/ translation_worker/
 COPY tts_worker/ tts_worker/
 COPY ai_assistant_worker/ ai_assistant_worker/
+COPY suggestion_worker/ suggestion_worker/
 COPY embedding_worker/ embedding_worker/
 COPY billing_worker/ billing_worker/
 COPY livekit_ingress_worker/ livekit_ingress_worker/
@@ -81,6 +97,15 @@ USER worker
 ENV PYTHONPATH=/app
 CMD ["python", "-m", "ai_assistant_worker"]
 
+# ---- Inline Transcript Suggestion Worker ----
+FROM builder AS suggestion
+
+RUN groupadd -r worker && useradd -r -g worker -d /app worker
+USER worker
+
+ENV PYTHONPATH=/app
+CMD ["python", "-m", "suggestion_worker"]
+
 # ---- Embedding Worker ----
 FROM builder AS embedding
 
@@ -112,8 +137,14 @@ RUN groupadd -r worker && useradd -r -g worker -d /app worker
 # Pin and fetch the model during the image build. A production restart must not
 # depend on GitHub or silently receive a different model from a mutable branch.
 ENV TORCH_HOME=/app/.cache/torch
+# torch.hub clones the whole silero-vad repository, not just the weights, and its
+# examples/ tree carries a sample Rust project whose Cargo.lock pins a vulnerable
+# rust-openssl. Nothing there is ever compiled or executed — but it is still shipped, and
+# Trivy reads the lockfile, so the release gate fails on code the image has no reason to
+# contain. Dropping it removes real dead weight rather than silencing the scanner.
 RUN mkdir -p /app/.cache \
     && uv run python -m livekit_ingress_worker.prefetch_model \
+    && find /app/.cache/torch/hub -type d -name examples -prune -exec rm -rf {} + \
     && chown -R worker:worker /app
 USER worker
 
