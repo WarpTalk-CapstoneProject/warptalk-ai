@@ -156,7 +156,17 @@ class TranslationResultMessage(BaseModel):
     translated_text: str
     source_lang: str  # e.g. 'en'
     target_lang: str  # e.g. 'vi'
-    confidence: float = 0.0
+    # WT-278: NOT a translation quality score — this field was called `confidence` and carried the
+    # upstream STT segment's avg_logprob, a measurement of how clearly the *audio* was heard.
+    # OpenAITranslator returns no score of its own, so there is nothing here that describes the
+    # translation. Renamed so no consumer (TranscriptService persists it; the gateway/frontend read
+    # this stream) can mistake it for one. If a real translation quality signal is ever built
+    # (back-translation, COMET), it gets its own field; do not reuse this one.
+    #
+    # WT-277: Optional, and omitted from to_redis() when None, so "the source segment had no usable
+    # confidence" travels as an absent field rather than as a fabricated number. Consumers store
+    # NULL for it.
+    source_stt_confidence: float | None = None
     start_ms: int = 0
     end_ms: int = 0
     is_final_chunk: bool = False
@@ -177,7 +187,7 @@ class TranslationResultMessage(BaseModel):
     chunk_index: int = 0
 
     def to_redis(self) -> dict[str, str]:
-        return {
+        payload = {
             "segment_id": self.segment_id,
             "meeting_id": self.meeting_id,
             "speaker_id": self.speaker_id,
@@ -185,7 +195,6 @@ class TranslationResultMessage(BaseModel):
             "translated_text": self.translated_text,
             "source_lang": self.source_lang,
             "target_lang": self.target_lang,
-            "confidence": str(self.confidence),
             "start_ms": str(self.start_ms),
             "end_ms": str(self.end_ms),
             "is_final_chunk": "1" if self.is_final_chunk else "0",
@@ -194,6 +203,12 @@ class TranslationResultMessage(BaseModel):
             "source_segment_id": self.source_segment_id,
             "chunk_index": str(self.chunk_index),
         }
+        # Redis stream fields are strings, so "unknown" cannot be encoded as a value — omit the
+        # field entirely. Consumers treat an absent field as NULL (WT-277); writing "None" or a
+        # placeholder number here is exactly the failure this ticket removed.
+        if self.source_stt_confidence is not None:
+            payload["source_stt_confidence"] = str(self.source_stt_confidence)
+        return payload
 
     @classmethod
     def from_redis(
@@ -209,7 +224,7 @@ class TranslationResultMessage(BaseModel):
             translated_text=d["translated_text"],
             source_lang=d["source_lang"],
             target_lang=d["target_lang"],
-            confidence=float(d.get("confidence", "0.0")),
+            source_stt_confidence=optional_confidence(d.get("source_stt_confidence")),
             start_ms=int(d.get("start_ms", "0")),
             end_ms=int(d.get("end_ms", "0")),
             is_final_chunk=d.get("is_final_chunk") == "1",

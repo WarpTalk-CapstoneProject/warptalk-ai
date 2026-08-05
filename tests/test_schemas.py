@@ -242,7 +242,7 @@ class TestTranslationResultMessage:
             translated_text="Xin chào",
             source_lang="en",
             target_lang="vi",
-            confidence=0.9,
+            source_stt_confidence=-0.3421,
         )
 
         redis_data = original.to_redis()
@@ -252,6 +252,40 @@ class TestTranslationResultMessage:
         assert restored.translated_text == original.translated_text
         assert restored.source_lang == original.source_lang
         assert restored.target_lang == original.target_lang
+        assert restored.source_stt_confidence == pytest.approx(-0.3421)
+
+    def test_carries_no_field_named_confidence(self) -> None:
+        """WT-278: the translator produces no quality score, so nothing on a translation may be
+        called `confidence`. The only number available is the SOURCE segment's STT avg_logprob."""
+        payload = TranslationResultMessage(
+            segment_id="seg-123",
+            meeting_id="meeting-123",
+            speaker_id="speaker-1",
+            original_text="Hello",
+            translated_text="Xin chào",
+            source_lang="en",
+            target_lang="vi",
+            source_stt_confidence=-0.3421,
+        ).to_redis()
+
+        assert "confidence" not in payload
+        assert payload["source_stt_confidence"] == "-0.3421"
+
+    def test_unknown_source_confidence_is_omitted_from_the_wire(self) -> None:
+        """WT-277: a Redis stream field is a string, so "unknown" cannot be a value — the field is
+        left out entirely and consumers store NULL. It must not become 0.0, 1.0 or "None"."""
+        payload = TranslationResultMessage(
+            segment_id="seg-123",
+            meeting_id="meeting-123",
+            speaker_id="speaker-1",
+            original_text="Hello",
+            translated_text="Xin chào",
+            source_lang="en",
+            target_lang="vi",
+        ).to_redis()
+
+        assert "source_stt_confidence" not in payload
+        assert TranslationResultMessage.from_redis(payload).source_stt_confidence is None
 
 
 class TestOptionalConfidence:
