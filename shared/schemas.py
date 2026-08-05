@@ -7,12 +7,19 @@ serialization. Field names align with backend TranscriptSegmentDto.
 from __future__ import annotations
 
 import base64
+import math
 import time
 import uuid
 from collections.abc import Mapping
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+# stt_worker/model.py's explicit fallback for a realtime event that exposed no token logprobs
+# (`float(seg.get("avg_logprob", -1.0))`). It is a sentinel meaning "no confidence was reported",
+# not a measurement — WT-277: every consumer must turn it into unknown/NULL rather than storing it
+# as ordinary data. Mirrored in the backend by WarpTalk.Shared.ModelConfidence.UnknownSentinel.
+STT_UNKNOWN_CONFIDENCE = -1.0
 
 
 class AudioChunkMessage(BaseModel):
@@ -469,6 +476,24 @@ class SuggestionResultMessage(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def optional_confidence(raw: str | None) -> float | None:
+    """Parse a confidence field, returning None for every flavour of "not reported".
+
+    WT-277: absent, blank, unparsable, non-finite, or the STT_UNKNOWN_CONFIDENCE sentinel all mean
+    the producer told us nothing. They must stay distinguishable from a real score all the way to
+    the database, so they collapse to None here rather than to a default number.
+    """
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value == STT_UNKNOWN_CONFIDENCE:
+        return None
+    return value
 
 
 def _decode_dict(data: Mapping[Any, Any]) -> dict[str, str]:

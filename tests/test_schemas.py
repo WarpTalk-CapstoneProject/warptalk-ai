@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from shared.schemas import (
+    STT_UNKNOWN_CONFIDENCE,
     AudioChunkMessage,
     ChatRequestMessage,
     ChatResultMessage,
@@ -12,6 +13,7 @@ from shared.schemas import (
     SuggestionResultMessage,
     TranslationResultMessage,
     TTSResultMessage,
+    optional_confidence,
 )
 
 
@@ -250,6 +252,29 @@ class TestTranslationResultMessage:
         assert restored.translated_text == original.translated_text
         assert restored.source_lang == original.source_lang
         assert restored.target_lang == original.target_lang
+
+
+class TestOptionalConfidence:
+    """WT-277: every flavour of "the producer told us nothing" must collapse to None."""
+
+    def test_absent_or_blank_is_unknown(self) -> None:
+        assert optional_confidence(None) is None
+        assert optional_confidence("") is None
+        assert optional_confidence("   ") is None
+
+    def test_unparsable_is_unknown(self) -> None:
+        assert optional_confidence("not-a-number") is None
+
+    def test_non_finite_is_unknown(self) -> None:
+        assert optional_confidence("nan") is None
+        assert optional_confidence("inf") is None
+
+    def test_stt_sentinel_is_unknown(self) -> None:
+        """stt_worker/model.py uses -1.0 for "this event exposed no token logprobs"."""
+        assert optional_confidence(str(STT_UNKNOWN_CONFIDENCE)) is None
+
+    def test_genuine_measurement_survives(self) -> None:
+        assert optional_confidence("-0.3421") == pytest.approx(-0.3421)
 
 
 class TestTTSResultMessage:
