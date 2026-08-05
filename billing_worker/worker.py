@@ -43,9 +43,7 @@ from shared.schemas import (
     AIUsageMessage,
     AudioChunkMessage,
     ProviderUsageMessage,
-    STTResultMessage,
     SuggestionResultMessage,
-    TranslationResultMessage,
     TTSResultMessage,
 )
 
