@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from shared.schemas import (
+    STT_UNKNOWN_CONFIDENCE,
     AudioChunkMessage,
     ChatRequestMessage,
     ChatResultMessage,
@@ -12,6 +13,7 @@ from shared.schemas import (
     SuggestionResultMessage,
     TranslationResultMessage,
     TTSResultMessage,
+    optional_confidence,
 )
 
 
@@ -240,7 +242,7 @@ class TestTranslationResultMessage:
             translated_text="Xin chào",
             source_lang="en",
             target_lang="vi",
-            confidence=0.9,
+            source_stt_confidence=-0.3421,
         )
 
         redis_data = original.to_redis()
@@ -250,6 +252,63 @@ class TestTranslationResultMessage:
         assert restored.translated_text == original.translated_text
         assert restored.source_lang == original.source_lang
         assert restored.target_lang == original.target_lang
+        assert restored.source_stt_confidence == pytest.approx(-0.3421)
+
+    def test_carries_no_field_named_confidence(self) -> None:
+        """WT-278: the translator produces no quality score, so nothing on a translation may be
+        called `confidence`. The only number available is the SOURCE segment's STT avg_logprob."""
+        payload = TranslationResultMessage(
+            segment_id="seg-123",
+            meeting_id="meeting-123",
+            speaker_id="speaker-1",
+            original_text="Hello",
+            translated_text="Xin chào",
+            source_lang="en",
+            target_lang="vi",
+            source_stt_confidence=-0.3421,
+        ).to_redis()
+
+        assert "confidence" not in payload
+        assert payload["source_stt_confidence"] == "-0.3421"
+
+    def test_unknown_source_confidence_is_omitted_from_the_wire(self) -> None:
+        """WT-277: a Redis stream field is a string, so "unknown" cannot be a value — the field is
+        left out entirely and consumers store NULL. It must not become 0.0, 1.0 or "None"."""
+        payload = TranslationResultMessage(
+            segment_id="seg-123",
+            meeting_id="meeting-123",
+            speaker_id="speaker-1",
+            original_text="Hello",
+            translated_text="Xin chào",
+            source_lang="en",
+            target_lang="vi",
+        ).to_redis()
+
+        assert "source_stt_confidence" not in payload
+        assert TranslationResultMessage.from_redis(payload).source_stt_confidence is None
+
+
+class TestOptionalConfidence:
+    """WT-277: every flavour of "the producer told us nothing" must collapse to None."""
+
+    def test_absent_or_blank_is_unknown(self) -> None:
+        assert optional_confidence(None) is None
+        assert optional_confidence("") is None
+        assert optional_confidence("   ") is None
+
+    def test_unparsable_is_unknown(self) -> None:
+        assert optional_confidence("not-a-number") is None
+
+    def test_non_finite_is_unknown(self) -> None:
+        assert optional_confidence("nan") is None
+        assert optional_confidence("inf") is None
+
+    def test_stt_sentinel_is_unknown(self) -> None:
+        """stt_worker/model.py uses -1.0 for "this event exposed no token logprobs"."""
+        assert optional_confidence(str(STT_UNKNOWN_CONFIDENCE)) is None
+
+    def test_genuine_measurement_survives(self) -> None:
+        assert optional_confidence("-0.3421") == pytest.approx(-0.3421)
 
 
 class TestTTSResultMessage:

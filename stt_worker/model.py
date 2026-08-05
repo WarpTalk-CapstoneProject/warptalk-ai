@@ -22,6 +22,7 @@ from openai import AsyncOpenAI
 
 from shared.config import STTSettings
 from shared.logger import get_logger
+from shared.schemas import STT_UNKNOWN_CONFIDENCE
 from shared.text_utils import split_into_sentences
 
 logger = get_logger(__name__)
@@ -448,9 +449,13 @@ def _filter_segments(
             continue
 
         # Realtime completed events expose token logprobs when explicitly requested in
-        # the session include list. transcribe() averages those into avg_logprob; -1.0
-        # remains the compatibility fallback for an older event with no logprobs.
-        avg_logprob = float(seg.get("avg_logprob", -1.0))
+        # the session include list. transcribe() averages those into avg_logprob;
+        # STT_UNKNOWN_CONFIDENCE (-1.0) remains the compatibility fallback for an older
+        # event with no logprobs. WT-277: it is a sentinel, not a score — consumers map it
+        # back to NULL rather than persisting it. It is still used as a real number by the
+        # local quality gates below (a segment with no logprobs is treated as marginal),
+        # which is why it is not None here.
+        avg_logprob = float(seg.get("avg_logprob", STT_UNKNOWN_CONFIDENCE))
         no_speech = seg.get("no_speech_prob", 0.0) or 0.0
         text_lower = text.lower().rstrip(".!,")
 

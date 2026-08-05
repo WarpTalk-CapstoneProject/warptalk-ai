@@ -19,7 +19,7 @@ from typing import Any, cast
 
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
-from shared.schemas import STTResultMessage, TranslationResultMessage
+from shared.schemas import STTResultMessage, TranslationResultMessage, optional_confidence
 from shared.text_utils import split_into_sentences
 from translation_worker.translator import OUT_OF_MEETING_SCOPE, OpenAITranslator
 
@@ -525,7 +525,11 @@ class TranslationWorker(BaseWorker):
                 translated_text=translated_text,
                 source_lang=stt_result.language,
                 target_lang=target_lang,
-                confidence=stt_result.confidence,
+                # WT-278: explicitly the SOURCE segment's STT confidence, carried for diagnostics
+                # only. The translator returns no quality score, so this must never be presented as
+                # one — see TranslationResultMessage.source_stt_confidence. The -1.0 "no logprobs"
+                # sentinel collapses to None here so it is never persisted as data (WT-277).
+                source_stt_confidence=optional_confidence(str(stt_result.confidence)),
                 start_ms=stt_result.start_ms,
                 end_ms=stt_result.end_ms,
                 is_final_chunk=is_final,
