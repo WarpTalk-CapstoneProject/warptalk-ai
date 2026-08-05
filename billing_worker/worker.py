@@ -1044,6 +1044,7 @@ class BillingSettlementWorker:
                 # Tokens across BOTH model calls (decide + generate) for this suggestion.
                 quantity=float(msg.token_count),
                 unit="token",
+                credits_consumed=0,
                 source_language_code=msg.language or None,
                 transcript_segment_id=segment_id,
                 # suggestion_worker takes a one-shot Redis slot per suggestion and never

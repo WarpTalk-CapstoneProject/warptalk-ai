@@ -23,7 +23,7 @@ from shared.schemas import AudioChunkMessage
 try:
     import torch
 except ModuleNotFoundError:
-    torch = None
+    torch = None  # type: ignore[assignment]
 
 SILERO_VAD_REPOSITORY = "snakers4/silero-vad:v6.2.1"
 MIN_VAD_SPEECH_FRAMES = 3
