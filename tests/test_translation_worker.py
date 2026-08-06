@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from shared.config import TranslationSettings, WorkerSettings
-from shared.schemas import STTResultMessage
+from shared.schemas import STT_UNKNOWN_CONFIDENCE, STTResultMessage
 from translation_worker.translator import (
     OpenAITranslator,
     _build_glossary_block,
@@ -624,6 +626,54 @@ class TestTranslationWorker:
         ]
         assert published
         assert {int(data["chunk_index"]) for data in published} == {37}
+
+    async def test_published_translation_carries_no_field_named_confidence(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """WT-278: the translator emits no quality score. What used to be published as
+        `confidence` was the SOURCE segment's STT avg_logprob — a measurement of the audio —
+        and TranscriptService persisted it into translation_contents.confidence as if it
+        described the translation. It is now named for what it is, and nothing on a
+        translation is called `confidence`."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
+        msg = self._make_stt_msg(language="en", text="Hello world")
+        msg.confidence = -0.3421
+
+        await worker.process(b"msg-1", msg.to_redis())
+
+        published = [
+            c.args[1]
+            for c in mock_redis_client._redis.xadd.call_args_list
+            if "translate:results" in str(c.args[0])
+        ]
+        assert published
+        for data in published:
+            assert "confidence" not in data
+            assert float(data["source_stt_confidence"]) == pytest.approx(-0.3421)
+
+    async def test_unknown_source_confidence_is_not_published_as_a_number(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """WT-277: stt_worker's -1.0 "this event exposed no token logprobs" sentinel is not a
+        measurement. It must not travel onwards as data — the field is omitted so consumers
+        store NULL instead of a fabricated score."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
+        msg = self._make_stt_msg(language="en", text="Hello world")
+        msg.confidence = STT_UNKNOWN_CONFIDENCE
+
+        await worker.process(b"msg-1", msg.to_redis())
+
+        published = [
+            c.args[1]
+            for c in mock_redis_client._redis.xadd.call_args_list
+            if "translate:results" in str(c.args[0])
+        ]
+        assert published
+        for data in published:
+            assert "confidence" not in data
+            assert "source_stt_confidence" not in data
 
     async def test_skips_paused_room(
         self, mock_redis_client, worker_settings: WorkerSettings
