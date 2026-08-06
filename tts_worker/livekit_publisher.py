@@ -184,7 +184,14 @@ class LiveKitTTSPublisher:
                     voice_key=voice_key,
                     attempt=attempt,
                 )
-                self._bots.pop(key, None)
+                # Drop the connection, not just our handle on it. WT-269: a bot left
+                # connected here keeps holding this identity in the room, so the retry's
+                # connect() below can only be resolved by LiveKit evicting the old
+                # participant — an extra, invisible reconnect per failure on a project
+                # that is already rate-limit sensitive.
+                stale = self._bots.pop(key, None)
+                if stale is not None:
+                    await self._close_bot(stale)
 
     async def _capture_all(
         self, source: rtc.AudioSource, pcm_s16le: bytes, sample_rate: int
