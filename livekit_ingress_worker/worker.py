@@ -10,6 +10,7 @@ import json
 import random
 import time
 from collections import deque
+from contextlib import suppress
 from typing import Any
 
 import numpy as np
@@ -59,6 +60,43 @@ _RECONNECT_JITTER_RATIO = 0.25
 # said "I am reconnecting again".
 _RECONNECT_STORM_WINDOW_S = 60.0
 _RECONNECT_STORM_THRESHOLD = 5
+
+
+# WT-314 — idle-room governance.
+#
+# MeetingRoomService publishes a synthetic meeting.track_published on every
+# JoinMeetingAsync, so every human join summons "AIBot_{room}" into the LiveKit room
+# whether or not anyone ever presses Start Translation. Until now the ONLY way that bot
+# ever left was _cleanup_room(), which fires only when the backend publishes an
+# AUDIO_ROUTES_UPDATED carrying a terminal room status — and the backend suppressed that
+# publish for a room that never had any audio routes. A meeting where nobody started
+# translation therefore left the bot connected for the rest of the process's life,
+# billing LiveKit connection minutes forever. Because the bot itself is a participant,
+# LiveKit's own empty_timeout never fires either: the room is never empty.
+#
+# The fix is not to plug that one hole (see the backend half of WT-314 for that) but to
+# stop depending on another service's message for the release at all. This worker now
+# checks its own rooms on a timer and leaves any room that has had no human participant
+# for a bounded interval. Every future missed door becomes a bounded delay instead of a
+# permanent leak.
+#
+# 15s matches tts_worker/livekit_publisher.py's _REAP_INTERVAL_S — one reap cadence
+# across the pipeline — and bounds the overshoot past the grace period to one tick.
+_IDLE_SWEEP_INTERVAL_S = 15.0
+# How long a room may hold zero HUMAN remote participants before the bot leaves.
+#
+# The bot legitimately sits alone twice: between its own connect and the joining human's
+# SFU handshake completing, and — after a rate-limited failure — for up to
+# _RATE_LIMITED_DELAY_S (120s) while that human's client is backing off before it
+# reconnects. 120s clears both. It deliberately does NOT try to cover a silent lull:
+# idleness is measured in *participants*, not tracks or speech, and a connected human who
+# has published nothing (or nothing yet) still keeps the room alive, so an unstarted
+# meeting or a long pause never trips this.
+#
+# Erring short is cheap and self-healing — the next JoinMeetingAsync or LiveKit
+# track_published webhook summons the bot straight back. Erring long is what WT-314 is.
+# Worst case leak is now ~135s of connection minutes per orphan instead of unbounded.
+_IDLE_ROOM_GRACE_S = 120.0
 
 
 def _is_ai_bot_identity(identity: str) -> bool:
@@ -133,6 +171,11 @@ class LiveKitIngressWorker(BaseWorker):
         self._connect_not_before: dict[str, float] = {}
         self._connect_history: dict[str, deque[float]] = {}
         self._connects_total = 0
+        # WT-314. Monotonic timestamp of the last moment each connected room held at least
+        # one human remote participant (stamped at connect time to open the grace window).
+        self._room_last_occupied: dict[str, float] = {}
+        self._idle_sweeper: asyncio.Task[None] | None = None
+        self._idle_releases_total = 0
 
     async def load_model(self) -> None:
         """Load Silero VAD model."""
@@ -189,6 +232,10 @@ class LiveKitIngressWorker(BaseWorker):
             self.logger.warning("invalid_track_published_event")
             return
         room_name, participant_identity, track_id = parsed
+        # WT-314: re-checked on every event, not just on connect. This fires on each human
+        # join and each published track, so a sweeper that somehow stopped while rooms were
+        # still live is picked back up by ordinary meeting traffic.
+        self._ensure_idle_sweeper()
         await self._hydrate_room_status(room_name)
 
         self.logger.info(
@@ -248,6 +295,10 @@ class LiveKitIngressWorker(BaseWorker):
             self.rooms[room_name] = room
             self._connect_failures.pop(room_name, None)
             self._connect_not_before.pop(room_name, None)
+            # WT-314: open this room's idle grace window from the moment we joined, and make
+            # sure something is actually watching it.
+            self._room_last_occupied[room_name] = self._now()
+            self._ensure_idle_sweeper()
 
     def _record_connect_attempt(self, room_name: str) -> None:
         """Log every LiveKit dial, and shout when one room is dialling far too often."""
@@ -353,12 +404,152 @@ class LiveKitIngressWorker(BaseWorker):
         self._connect_failures.pop(room_id, None)
         self._connect_not_before.pop(room_id, None)
         self._connect_history.pop(room_id, None)
+        self._room_last_occupied.pop(room_id, None)
         room = self.rooms.pop(room_id, None)
         if room is not None:
             self.logger.info("disconnecting_finished_room", room=room_id)
             task = asyncio.create_task(self._disconnect_quietly(room_id, room))
             self._event_tasks.add(task)
             task.add_done_callback(self._event_tasks.discard)
+
+    # ------------------------------------------------------------------
+    # WT-314 — idle-room sweep
+    # ------------------------------------------------------------------
+
+    def _now(self) -> float:
+        """Monotonic clock, isolated so tests can drive the sweep without sleeping."""
+        return time.monotonic()
+
+    def _ensure_idle_sweeper(self) -> None:
+        """Start the idle sweep once, and restart it if it ever died.
+
+        Started lazily rather than in __init__ (which runs outside any event loop), and
+        re-checked from every track_published and every connect — a sweeper that stopped is
+        indistinguishable from no sweeper at all, and silently restores the exact leak this
+        exists to prevent. No room can enter self.rooms without passing _connect_room, so
+        there is never a live room the sweeper has not been offered a chance to watch.
+        """
+        if self._idle_sweeper is None or self._idle_sweeper.done():
+            self._idle_sweeper = asyncio.create_task(self._idle_sweep_loop())
+
+    async def _idle_sweep_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(_IDLE_SWEEP_INTERVAL_S)
+            try:
+                await self._sweep_idle_rooms()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # One bad sweep must not end the loop and quietly hand the rooms back to
+                # "connected until the process dies".
+                self.logger.exception("livekit_idle_sweep_error")
+
+    def _human_participant_count(self, room: rtc.Room) -> int:
+        """Remote participants that are not one of our own bots.
+
+        The TTS publisher's "ai-interpreter-*" bots are remote participants in this same
+        room. Counting them would mean a room holding nothing but our own machinery looks
+        occupied, which is precisely the state WT-314 leaks.
+        """
+        return sum(
+            1
+            for participant in room.remote_participants.values()
+            if not _is_ai_bot_identity(participant.identity)
+        )
+
+    async def _sweep_idle_rooms(self) -> None:
+        """Release the bot from every room that has had no human in it for too long."""
+        now = self._now()
+        idle_rooms: list[str] = []
+        occupied = 0
+        humans = 0
+
+        for room_name, room in list(self.rooms.items()):
+            try:
+                # A handle we hold on a room LiveKit already dropped bills nothing, but it
+                # is not occupied either — let the same grace window retire it.
+                count = self._human_participant_count(room) if room.isconnected() else 0
+            except Exception:
+                self.logger.warning("idle_sweep_room_probe_failed", room=room_name, exc_info=True)
+                continue
+
+            if count > 0:
+                self._room_last_occupied[room_name] = now
+                occupied += 1
+                humans += count
+                continue
+
+            last_occupied = self._room_last_occupied.setdefault(room_name, now)
+            if now - last_occupied >= _IDLE_ROOM_GRACE_S:
+                idle_rooms.append(room_name)
+
+        # The reason WT-314 ran undetected is that a leaked bot is completely silent. This
+        # is the gauge that makes a recurrence visible in logs instead of on the invoice.
+        if self.rooms or idle_rooms:
+            self.logger.info(
+                "livekit_ingress_room_census",
+                connected_rooms=len(self.rooms),
+                occupied_rooms=occupied,
+                human_participants=humans,
+                releasing_idle_rooms=len(idle_rooms),
+                idle_releases_total=self._idle_releases_total,
+            )
+
+        for room_name in idle_rooms:
+            # Strong reference held for the task's whole life. asyncio keeps only a weak
+            # reference to a running task, so a bare create_task() can be collected
+            # mid-await — and a disconnect that never ran is a leak that reports itself as
+            # fixed. (tts_worker/livekit_publisher.py:_sweep_idle_bots still has this
+            # hazard; it is a separate bug, not a pattern to copy.)
+            task = asyncio.create_task(self._release_idle_room(room_name))
+            self._event_tasks.add(task)
+            task.add_done_callback(self._event_tasks.discard)
+
+    async def _release_idle_room(self, room_name: str) -> None:
+        """Disconnect one idle room, under its own lock so a concurrent join cannot race."""
+        async with self._room_lock(room_name):
+            room = self.rooms.get(room_name)
+            if room is None:
+                return
+            # Re-check under the lock: a track_published may have landed while this task was
+            # waiting, and disconnecting a room somebody just joined is a real outage.
+            try:
+                if room.isconnected() and self._human_participant_count(room) > 0:
+                    self._room_last_occupied[room_name] = self._now()
+                    return
+            except Exception:
+                self.logger.warning("idle_sweep_room_probe_failed", room=room_name, exc_info=True)
+                return
+
+            self.rooms.pop(room_name, None)
+            self._room_last_occupied.pop(room_name, None)
+            self._cancel_room_audio_tasks(room_name)
+            self._idle_releases_total += 1
+            # Warning, not info: every sweep-driven release means some upstream path failed
+            # to tell us the room was over. It should be rare enough to be worth reading.
+            self.logger.warning(
+                "livekit_idle_room_released",
+                room=room_name,
+                grace_s=_IDLE_ROOM_GRACE_S,
+                translation_state=self._route_states.get(room_name),
+                connected_rooms=len(self.rooms),
+                idle_releases_total=self._idle_releases_total,
+            )
+            await self._disconnect_quietly(room_name, room)
+
+    async def _cleanup(self) -> None:
+        """Stop the sweeper and hand every room back to LiveKit before the process exits."""
+        if self._idle_sweeper is not None:
+            self._idle_sweeper.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._idle_sweeper
+            self._idle_sweeper = None
+
+        for room_name, room in list(self.rooms.items()):
+            self.rooms.pop(room_name, None)
+            self._room_last_occupied.pop(room_name, None)
+            self._cancel_room_audio_tasks(room_name)
+            await self._disconnect_quietly(room_name, room)
 
     def _is_translation_active(self, room_name: str) -> bool:
         return self._route_states.get(room_name) in {
