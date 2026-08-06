@@ -24,6 +24,19 @@ from shared.health_probe import heartbeat_key
 from shared.logger import get_logger
 from shared.redis_client import RedisStreamClient
 
+# WT-314. The room lifecycle states after which a worker must release everything it holds
+# for that room — for livekit_ingress_worker that is the bot's LiveKit connection, and
+# therefore billed connection minutes.
+#
+# This must stay in step with the backend's RoomStatus enum
+# (translation-room/.../Domain/Enums/RoomStatus.cs), which is what
+# AudioRouteCacheService.PublishRoutesUpdateAsync puts on the wire as room_status. It had
+# drifted in both directions: "EXPIRED" is a real terminal status (set by
+# TranslationRoomService.ExpireTranslationRoomAsync and by IdleRoomMonitoringWorker) and
+# was missing here, so an expired room's bot was never released; "TIMEOUT" is not a status
+# the backend has ever published, so that entry never matched anything.
+TERMINAL_ROOM_STATUSES = frozenset({"FAILED", "ENDED", "CANCELLED", "EXPIRED"})
+
 
 class BaseWorker(ABC):
     """Abstract base for all AI pipeline workers.
@@ -251,7 +264,7 @@ class BaseWorker(ABC):
 
                 await self._on_route_status_changed(room_id, status)
 
-                if status in ["FAILED", "ENDED", "CANCELLED", "TIMEOUT"]:
+                if status in TERMINAL_ROOM_STATUSES:
                     self._cleanup_room(room_id)
         except Exception as error:
             self.logger.warning("failed_to_parse_route_event", error=str(error))
