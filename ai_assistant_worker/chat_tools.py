@@ -358,12 +358,91 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     return json.dumps({"matches": merged})
 
 
+async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> str | None:
+    """None if this caller may read this meeting's derived data, else a tool-visible error.
+
+    S2. `meeting_id` is a MODEL-SUPPLIED tool argument — the assistant will pass whatever id
+    appears in the conversation, including one a user simply typed. Tools that answer out of
+    a sibling service inherit that service's authorization for free by forwarding the
+    caller's own bearer token (see this module's docstring); tools that answer straight out
+    of Redis inherit nothing, because Redis has no notion of who is asking. Every such tool
+    has to re-establish the check that the HTTP call would have made.
+
+    Two things are checked, and both are needed:
+
+    - The room is fetched with the caller's own bearer token. That is what proves the token
+      is presently valid: this worker performs no signature verification and no expiry check
+      of its own, so an unauthenticated (or expired) request must be refused by the .NET
+      service, not by us.
+    - The room's workspace must be the workspace this chat turn is scoped to.
+      GET /api/v1/translation-rooms/{id} is [Authorize] but performs no workspace or
+      participant check of its own, so a 200 alone only proves the room EXISTS — any
+      authenticated user in any workspace gets one. Without the workspace comparison this
+      gate would still hand a user another workspace's meeting summary, which is the bug.
+    """
+    try:
+        uuid.UUID(meeting_id)
+    except ValueError:
+        # Not merely tidiness: the id is interpolated into a Redis key, so an unvalidated
+        # value lets a crafted argument name a key that is not a meeting summary at all.
+        return json.dumps({"error": "That does not look like a valid meeting id."})
+
+    if not ctx.bearer_token:
+        logger.warning("meeting_summary_denied_no_token", meeting_id=meeting_id)
+        return json.dumps({"error": "You are not signed in to view that meeting."})
+
+    try:
+        response = await ctx.translation_room_client.get(
+            f"/api/v1/translation-rooms/{meeting_id}",
+            headers=_auth_headers(ctx),
+        )
+    except Exception:
+        logger.exception("meeting_summary_authorization_error", meeting_id=meeting_id)
+        return json.dumps({"error": "Could not look up the meeting summary right now."})
+
+    if response.status_code in (401, 403, 404):
+        # One indistinguishable answer for "no such meeting" and "not yours" — telling them
+        # apart turns this tool into an oracle for which meeting ids exist elsewhere.
+        logger.warning(
+            "meeting_summary_denied",
+            meeting_id=meeting_id,
+            user_id=ctx.user_id,
+            status=response.status_code,
+        )
+        return json.dumps({"error": "No meeting found with that id."})
+
+    if response.status_code != 200:
+        logger.warning("meeting_summary_authorization_failed", status=response.status_code)
+        return json.dumps({"error": "Could not look up the meeting summary right now."})
+
+    try:
+        room_workspace_id = str(response.json().get("workspaceId") or "")
+    except ValueError:
+        logger.warning("meeting_summary_authorization_unreadable", meeting_id=meeting_id)
+        return json.dumps({"error": "Could not look up the meeting summary right now."})
+
+    # Fail closed: a room whose workspace we cannot read is a room we cannot clear.
+    if not room_workspace_id or room_workspace_id.lower() != (ctx.workspace_id or "").lower():
+        logger.warning(
+            "meeting_summary_denied_cross_workspace",
+            meeting_id=meeting_id,
+            user_id=ctx.user_id,
+        )
+        return json.dumps({"error": "No meeting found with that id."})
+
+    return None
+
+
 async def _get_meeting_summary(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     meeting_id = ((arguments or {}).get("meeting_id") or "").strip()
     if not meeting_id:
         return json.dumps(
             {"error": "A meeting_id is required — call list_recent_meetings first to find one."}
         )
+
+    denial = await _authorize_meeting_access(ctx, meeting_id)
+    if denial is not None:
+        return denial
 
     try:
         summary_hash = await ctx.redis.hgetall(f"meeting:{meeting_id}:summary")

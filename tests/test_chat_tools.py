@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 from ai_assistant_worker.chat_tools import (
     TERMINOLOGY_CONTEXT_CHAR_LIMIT,
     ToolContext,
+    _get_meeting_summary,
     _search_terminology,
     _truncate_terminology_context,
 )
@@ -210,3 +211,106 @@ class TestSearchTerminologyGlobalFallback:
         # Rough per-match ceiling: context (300) + term/translation/domain/glossary label
         # overhead (~100 chars) + JSON punctuation/keys (~100 chars) = ~500 chars/match.
         assert len(raw) < 8 * 500
+
+
+class TestGetMeetingSummaryAuthorization:
+    """S2 — get_meeting_summary read Redis with a model-supplied meeting_id and no checks.
+
+    Every other tool answers out of a sibling .NET service and inherits that service's
+    authorization by forwarding the caller's bearer token. This one answered straight out of
+    `meeting:{meeting_id}:summary` in Redis, which knows nothing about who is asking — so a
+    user could ask the assistant for another workspace's meeting summary and get it.
+    """
+
+    OTHER_WORKSPACE_MEETING = "019fd60a-e5f3-7342-804a-4366e3214786"
+    OWN_MEETING = "019fd60a-e5f3-7342-804a-000000000002"
+
+    @staticmethod
+    def _ctx(room_response: MagicMock, *, bearer: str = "Bearer test-token") -> ToolContext:
+        redis = MagicMock()
+        redis.hgetall = AsyncMock(
+            return_value={b"content": b"CONFIDENTIAL SUMMARY", b"action_items": b"[]"}
+        )
+        room_client = AsyncMock()
+        room_client.get.return_value = room_response
+        return ToolContext(
+            workspace_id="ws-1",
+            user_id="user-1",
+            bearer_token=bearer,
+            workspace_client=AsyncMock(),
+            transcript_client=AsyncMock(),
+            translation_room_client=room_client,
+            openai_client=None,
+            model="gpt-4.1",
+            redis=redis,
+        )
+
+    async def test_another_workspaces_summary_is_refused(self) -> None:
+        """THE BUG. The room exists and the token is valid — it is simply not ours.
+
+        GET /api/v1/translation-rooms/{id} is [Authorize] but does NO workspace or
+        participant check, so it answers 200 to any authenticated user. A gate that only
+        looked at the status code would still leak the summary.
+        """
+        ctx = self._ctx(_response(200, {"id": self.OTHER_WORKSPACE_MEETING, "workspaceId": "ws-2"}))
+
+        result = json.loads(
+            await _get_meeting_summary(ctx, {"meeting_id": self.OTHER_WORKSPACE_MEETING})
+        )
+
+        assert result == {"error": "No meeting found with that id."}
+        ctx.redis.hgetall.assert_not_awaited()
+
+    async def test_own_workspaces_summary_is_returned(self) -> None:
+        ctx = self._ctx(_response(200, {"id": self.OWN_MEETING, "workspaceId": "ws-1"}))
+
+        result = json.loads(await _get_meeting_summary(ctx, {"meeting_id": self.OWN_MEETING}))
+
+        assert result["summary"] == "CONFIDENTIAL SUMMARY"
+        ctx.redis.hgetall.assert_awaited_once_with(f"meeting:{self.OWN_MEETING}:summary")
+
+    async def test_the_callers_own_token_is_what_is_presented(self) -> None:
+        """Not an internal/service bypass — the check must be the caller's own identity."""
+        ctx = self._ctx(_response(200, {"id": self.OWN_MEETING, "workspaceId": "ws-1"}))
+
+        await _get_meeting_summary(ctx, {"meeting_id": self.OWN_MEETING})
+
+        _args, kwargs = ctx.translation_room_client.get.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer test-token"}
+
+    async def test_rejected_token_is_refused(self) -> None:
+        """This worker verifies no signature and no expiry of its own — a 401 from the
+        service is the only thing that establishes the token is still good."""
+        ctx = self._ctx(_response(401, {}))
+
+        result = json.loads(await _get_meeting_summary(ctx, {"meeting_id": self.OWN_MEETING}))
+
+        assert result == {"error": "No meeting found with that id."}
+        ctx.redis.hgetall.assert_not_awaited()
+
+    async def test_missing_token_never_reaches_redis(self) -> None:
+        ctx = self._ctx(_response(200, {"workspaceId": "ws-1"}), bearer="")
+
+        result = json.loads(await _get_meeting_summary(ctx, {"meeting_id": self.OWN_MEETING}))
+
+        assert "not signed in" in result["error"]
+        ctx.redis.hgetall.assert_not_awaited()
+        ctx.translation_room_client.get.assert_not_awaited()
+
+    async def test_a_non_uuid_id_never_reaches_the_redis_key(self) -> None:
+        """The argument is interpolated into a Redis key, so it must not be free-form."""
+        ctx = self._ctx(_response(200, {"workspaceId": "ws-1"}))
+
+        result = json.loads(await _get_meeting_summary(ctx, {"meeting_id": "*"}))
+
+        assert "valid meeting id" in result["error"]
+        ctx.redis.hgetall.assert_not_awaited()
+        ctx.translation_room_client.get.assert_not_awaited()
+
+    async def test_a_room_with_no_readable_workspace_is_refused(self) -> None:
+        ctx = self._ctx(_response(200, {"id": self.OWN_MEETING}))
+
+        result = json.loads(await _get_meeting_summary(ctx, {"meeting_id": self.OWN_MEETING}))
+
+        assert result == {"error": "No meeting found with that id."}
+        ctx.redis.hgetall.assert_not_awaited()

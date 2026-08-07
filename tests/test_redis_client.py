@@ -415,3 +415,54 @@ class TestRateLimitPrimitives:
 
         assert await client.incr_with_ttl("suggest:n:room-1", 14400) == 7
         client._redis.expire.assert_not_awaited()
+
+
+class TestLeasePrimitives:
+    """S1 — compare-and-extend / compare-and-delete, run against a real Lua interpreter.
+
+    These back the ingress worker's per-room ownership lease. Mocking the eval away would
+    test nothing that matters here: the whole property is that the read and the write
+    cannot be separated, and that is expressed entirely in the script.
+    """
+
+    @pytest.fixture
+    def real_client(self, redis_settings: RedisSettings) -> RedisStreamClient:
+        import fakeredis.aioredis
+
+        client = RedisStreamClient.__new__(RedisStreamClient)
+        client._settings = redis_settings
+        client._pool = None
+        client._redis = fakeredis.aioredis.FakeRedis()
+        return client
+
+    async def test_extend_refreshes_only_the_holders_own_lease(
+        self,
+        real_client: RedisStreamClient,
+    ) -> None:
+        assert await real_client.set_if_absent("room-owner:r1", "replica-a", 45) is True
+
+        assert await real_client.extend_if_value("room-owner:r1", "replica-a", 90) is True
+        assert await real_client.redis.ttl("room-owner:r1") > 45
+
+        assert await real_client.extend_if_value("room-owner:r1", "replica-b", 900) is False
+        assert await real_client.redis.ttl("room-owner:r1") <= 90
+
+    async def test_extend_declines_a_lease_that_already_lapsed(
+        self,
+        real_client: RedisStreamClient,
+    ) -> None:
+        """A replica whose claim expired must not be able to resurrect it with EXPIRE."""
+        assert await real_client.extend_if_value("room-owner:gone", "replica-a", 45) is False
+        assert await real_client.get("room-owner:gone") is None
+
+    async def test_delete_cannot_drop_another_replicas_claim(
+        self,
+        real_client: RedisStreamClient,
+    ) -> None:
+        await real_client.set_if_absent("room-owner:r1", "replica-a", 45)
+
+        assert await real_client.delete_if_value("room-owner:r1", "replica-b") is False
+        assert await real_client.get("room-owner:r1") == b"replica-a"
+
+        assert await real_client.delete_if_value("room-owner:r1", "replica-a") is True
+        assert await real_client.get("room-owner:r1") is None

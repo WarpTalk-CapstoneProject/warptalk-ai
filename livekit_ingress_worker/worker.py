@@ -62,6 +62,49 @@ _RECONNECT_STORM_WINDOW_S = 60.0
 _RECONNECT_STORM_THRESHOLD = 5
 
 
+# WT-3xx (S1) — one ingress bot per room, across replicas.
+#
+# meeting.track_published arrives over Redis Pub/Sub, which FANS OUT: every replica of this
+# deployment (chart: replicas: 2) receives every message. The bot identity is
+# "AIBot_{room_name}" with no replica discriminator, so both replicas dialled the same room
+# under the same identity and LiveKit resolved it the only way it can — by evicting one of
+# them. The per-room asyncio.Lock and the reuse check above are per-PROCESS and cannot see
+# the other replica at all.
+#
+# Giving each replica a unique identity would remove the eviction and replace it with
+# something worse: both bots would stay connected, both would subscribe to every human audio
+# track, and every utterance would be published TWICE to audio:chunks — double STT, double
+# translation, double TTS, double cost, and duplicated captions. Eviction is the symptom;
+# the invariant we actually need is "exactly one ingress bot per room".
+#
+# So ownership is elected in Redis, which every replica already shares. A replica claims
+# "livekit:ingress:room-owner:{room}" with SET NX EX before it dials, renews it while it
+# holds the room, and drops it when it leaves. A replica that does not hold the claim does
+# nothing but remember the room, so it can take over if the owner dies.
+#
+# Why a lease rather than moving the event onto a Redis Stream with a consumer group: the
+# producer is the backend meeting-service (MeetingRoomService.PublishTrackPublishedAsync ->
+# IRedisService.PublishEventAsync) and LiveKit's own webhook (MeetingWebhookService), both
+# PUBLISH. Converting the transport means a coordinated two-repo, two-service deploy where
+# either half shipping alone drops every event on the floor. And a consumer group would only
+# make the MESSAGE single-delivery, while the resource that must be single-owner is the
+# LiveKit room — a room survives many messages and outlives all of them, so the claim
+# belongs on the room. The lease also preserves failover, which the eviction behaviour
+# accidentally provided: whichever replica lost the race used to pick the room back up.
+_ROOM_OWNER_KEY_PREFIX = "livekit:ingress:room-owner:"
+# Three sweep intervals. Long enough that an ordinary renew miss (one slow Redis round trip)
+# does not hand the room away; short enough that a replica killed mid-meeting frees the room
+# inside one grace window rather than stranding it until the meeting ends.
+_ROOM_LEASE_TTL_S = 45
+
+# The storm alarm above counted connects in a per-process deque, so with replicas: 2 each
+# replica saw only its own half and the threshold could be missed while the project as a
+# whole was being rate-limited — the alarm could not fire for the very failure mode it was
+# added to catch. The count now lives in Redis, keyed by room and by fixed window, so every
+# replica's dials are added together.
+_STORM_COUNTER_KEY_PREFIX = "livekit:ingress:connects:"
+
+
 # WT-314 — idle-room governance.
 #
 # MeetingRoomService publishes a synthetic meeting.track_published on every
@@ -176,6 +219,13 @@ class LiveKitIngressWorker(BaseWorker):
         self._room_last_occupied: dict[str, float] = {}
         self._idle_sweeper: asyncio.Task[None] | None = None
         self._idle_releases_total = 0
+        # S1. Rooms another replica currently owns. We hold no connection for these, but we
+        # remember them so the sweeper can retry the claim — otherwise a replica dying
+        # mid-meeting would silently end audio ingestion for its rooms until the next
+        # track_published happened to arrive, which in a room where everyone has already
+        # published is never.
+        self._deferred_rooms: set[str] = set()
+        self._owned_rooms: set[str] = set()
 
     async def load_model(self) -> None:
         """Load Silero VAD model."""
@@ -246,6 +296,17 @@ class LiveKitIngressWorker(BaseWorker):
         )
 
         async with self._room_lock(room_name):
+            # S1: fan-out means the other replica is running this exact handler for this
+            # exact room right now. Exactly one of us may hold "AIBot_{room_name}".
+            if not await self._claim_room_ownership(room_name):
+                self._deferred_rooms.add(room_name)
+                self.logger.info(
+                    "track_published_room_owned_by_other_replica",
+                    room=room_name,
+                    track=track_id,
+                )
+                return
+
             room = self.rooms.get(room_name)
             if room is not None and room.isconnected():
                 # WT-269: a newly published track arrives on the connection we already
@@ -276,6 +337,68 @@ class LiveKitIngressWorker(BaseWorker):
     def _room_lock(self, room_name: str) -> asyncio.Lock:
         return self._room_locks.setdefault(room_name, asyncio.Lock())
 
+    # ------------------------------------------------------------------
+    # S1 — cross-replica room ownership
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _room_owner_key(room_name: str) -> str:
+        return f"{_ROOM_OWNER_KEY_PREFIX}{room_name}"
+
+    @staticmethod
+    def _as_text(value: Any) -> str:
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return "" if value is None else str(value)
+
+    async def _claim_room_ownership(self, room_name: str) -> bool:
+        """Whether this replica may hold this room's bot, taking the claim if it is free.
+
+        Fails CLOSED when Redis is unreachable. Joining a room we cannot coordinate over is
+        not a degraded mode that still works: every audio chunk this worker extracts is
+        published to Redis, so a bot connected without Redis transcribes nothing and does
+        nothing except bill LiveKit connection minutes and race the other replica for the
+        identity. Declining costs a bounded delay — the next track_published, or the next
+        sweep, retries once Redis is back.
+        """
+        key = self._room_owner_key(room_name)
+        try:
+            if await self.redis.set_if_absent(key, self._consumer_name, _ROOM_LEASE_TTL_S):
+                self._owned_rooms.add(room_name)
+                self._deferred_rooms.discard(room_name)
+                self.logger.info("livekit_room_ownership_acquired", room=room_name)
+                return True
+
+            # Already claimed — ours to renew, or somebody else's to leave alone.
+            if await self.redis.extend_if_value(key, self._consumer_name, _ROOM_LEASE_TTL_S):
+                self._owned_rooms.add(room_name)
+                self._deferred_rooms.discard(room_name)
+                return True
+
+            self._owned_rooms.discard(room_name)
+            return False
+        except (RedisError, OSError):
+            self.logger.warning(
+                "livekit_room_ownership_unavailable",
+                room=room_name,
+                exc_info=True,
+            )
+            return False
+
+    async def _release_room_ownership(self, room_name: str) -> None:
+        """Hand the room back so another replica can pick it up immediately."""
+        self._owned_rooms.discard(room_name)
+        try:
+            await self.redis.delete_if_value(self._room_owner_key(room_name), self._consumer_name)
+        except (RedisError, OSError):
+            # The lease expires on its own; losing the explicit release only costs the next
+            # owner a wait of at most _ROOM_LEASE_TTL_S.
+            self.logger.warning(
+                "livekit_room_ownership_release_failed",
+                room=room_name,
+                exc_info=True,
+            )
+
     async def _connect_room(self, room_name: str) -> None:
         """Join this room's bot, honouring any backoff a previous failure imposed."""
         now = asyncio.get_running_loop().time()
@@ -289,7 +412,7 @@ class LiveKitIngressWorker(BaseWorker):
             )
             return
 
-        self._record_connect_attempt(room_name)
+        await self._record_connect_attempt(room_name)
         room = await self.join_room(room_name)
         if room is not None:
             self.rooms[room_name] = room
@@ -300,8 +423,16 @@ class LiveKitIngressWorker(BaseWorker):
             self._room_last_occupied[room_name] = self._now()
             self._ensure_idle_sweeper()
 
-    def _record_connect_attempt(self, room_name: str) -> None:
-        """Log every LiveKit dial, and shout when one room is dialling far too often."""
+    async def _record_connect_attempt(self, room_name: str) -> None:
+        """Log every LiveKit dial, and shout when one room is dialling far too often.
+
+        The window count is kept in Redis as well as in the local deque. LiveKit rate-limits
+        the PROJECT, not one process, so a threshold evaluated against one replica's own
+        dials undercounts by exactly the number of replicas — the alarm added to catch
+        WT-269 could stay silent through a storm made of both replicas' traffic. The deque
+        remains as the fallback the alarm falls back to when Redis is unavailable, which is
+        the one moment we least want to lose the signal.
+        """
         now = asyncio.get_running_loop().time()
         self._connects_total += 1
         history = self._connect_history.setdefault(room_name, deque())
@@ -309,20 +440,39 @@ class LiveKitIngressWorker(BaseWorker):
         while history and now - history[0] > _RECONNECT_STORM_WINDOW_S:
             history.popleft()
 
+        connects_in_window = max(len(history), await self._fleet_connects_in_window(room_name))
+
         self.logger.info(
             "livekit_room_connect_attempt",
             room=room_name,
-            connects_in_window=len(history),
+            connects_in_window=connects_in_window,
+            connects_this_replica=len(history),
             connects_total=self._connects_total,
         )
-        if len(history) >= _RECONNECT_STORM_THRESHOLD:
+        if connects_in_window >= _RECONNECT_STORM_THRESHOLD:
             self.logger.error(
                 "livekit_reconnect_storm_suspected",
                 room=room_name,
-                connects_in_window=len(history),
+                connects_in_window=connects_in_window,
+                connects_this_replica=len(history),
                 window_s=_RECONNECT_STORM_WINDOW_S,
                 connects_total=self._connects_total,
             )
+
+    async def _fleet_connects_in_window(self, room_name: str) -> int:
+        """Dials against this room by EVERY replica in the current fixed window.
+
+        A fixed window (not the sliding deque) because it needs one shared key that any
+        replica can INCR without coordination. It can under-report by at most a window
+        boundary; the deque covers the local half either way.
+        """
+        bucket = int(time.time() // _RECONNECT_STORM_WINDOW_S)
+        key = f"{_STORM_COUNTER_KEY_PREFIX}{room_name}:{bucket}"
+        try:
+            return int(await self.redis.incr_with_ttl(key, int(_RECONNECT_STORM_WINDOW_S) * 2))
+        except (RedisError, OSError):
+            self.logger.warning("livekit_storm_counter_unavailable", room=room_name)
+            return 0
 
     def _note_connect_failure(self, room_name: str, error: BaseException) -> None:
         failures = self._connect_failures.get(room_name, 0) + 1
@@ -405,7 +555,13 @@ class LiveKitIngressWorker(BaseWorker):
         self._connect_not_before.pop(room_id, None)
         self._connect_history.pop(room_id, None)
         self._room_last_occupied.pop(room_id, None)
+        # The room is over for everyone, so no replica should keep chasing it.
+        self._deferred_rooms.discard(room_id)
         room = self.rooms.pop(room_id, None)
+        # Compare-and-delete, so this is a harmless no-op on a replica that never owned it.
+        release = asyncio.create_task(self._release_room_ownership(room_id))
+        self._event_tasks.add(release)
+        release.add_done_callback(self._event_tasks.discard)
         if room is not None:
             self.logger.info("disconnecting_finished_room", room=room_id)
             task = asyncio.create_task(self._disconnect_quietly(room_id, room))
@@ -436,13 +592,73 @@ class LiveKitIngressWorker(BaseWorker):
         while not self._shutdown_event.is_set():
             await asyncio.sleep(_IDLE_SWEEP_INTERVAL_S)
             try:
+                await self._renew_room_ownership()
                 await self._sweep_idle_rooms()
+                await self._claim_deferred_rooms()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 # One bad sweep must not end the loop and quietly hand the rooms back to
                 # "connected until the process dies".
                 self.logger.exception("livekit_idle_sweep_error")
+
+    async def _renew_room_ownership(self) -> None:
+        """Keep this replica's claim on every room it is actually holding.
+
+        A claim that lapses while we are still connected is worse than no claim: the other
+        replica takes it, dials the same "AIBot_{room}" identity, and we are back to the
+        eviction S1 exists to stop. If the extend fails the claim is already gone, so we
+        stand down and let the new owner have the room rather than fight for the identity.
+        """
+        for room_name in list(self.rooms):
+            try:
+                still_ours = await self.redis.extend_if_value(
+                    self._room_owner_key(room_name),
+                    self._consumer_name,
+                    _ROOM_LEASE_TTL_S,
+                )
+            except (RedisError, OSError):
+                self.logger.warning("livekit_room_lease_renew_failed", room=room_name)
+                continue
+
+            if still_ours:
+                self._owned_rooms.add(room_name)
+                continue
+
+            self.logger.warning("livekit_room_ownership_lost", room=room_name)
+            self._owned_rooms.discard(room_name)
+            self._deferred_rooms.add(room_name)
+            await self._yield_room(room_name)
+
+    async def _yield_room(self, room_name: str) -> None:
+        """Drop a room whose claim now belongs to another replica."""
+        async with self._room_lock(room_name):
+            room = self.rooms.pop(room_name, None)
+            self._room_last_occupied.pop(room_name, None)
+            self._cancel_room_audio_tasks(room_name)
+            if room is not None:
+                await self._disconnect_quietly(room_name, room)
+
+    async def _claim_deferred_rooms(self) -> None:
+        """Take over rooms whose owning replica went away.
+
+        Without this, electing an owner would remove the accidental failover the old
+        eviction behaviour provided: the loser used to reconnect and carry on. A room only
+        leaves this set when it is claimed or reaches a terminal status, so a replica killed
+        mid-meeting costs at most one lease TTL plus one sweep of lost audio, not the rest
+        of the meeting.
+        """
+        for room_name in list(self._deferred_rooms):
+            if room_name in self.rooms:
+                self._deferred_rooms.discard(room_name)
+                continue
+            async with self._room_lock(room_name):
+                if room_name in self.rooms:
+                    continue
+                if not await self._claim_room_ownership(room_name):
+                    continue
+                self.logger.info("livekit_room_ownership_taken_over", room=room_name)
+                await self._connect_room(room_name)
 
     def _human_participant_count(self, room: rtc.Room) -> int:
         """Remote participants that are not one of our own bots.
@@ -524,6 +740,11 @@ class LiveKitIngressWorker(BaseWorker):
             self.rooms.pop(room_name, None)
             self._room_last_occupied.pop(room_name, None)
             self._cancel_room_audio_tasks(room_name)
+            # Nobody is in this room, so nobody should be chasing it either: drop the claim
+            # and forget it, rather than leaving a lease the sweeper keeps renewing for a
+            # room we are no longer connected to.
+            self._deferred_rooms.discard(room_name)
+            await self._release_room_ownership(room_name)
             self._idle_releases_total += 1
             # Warning, not info: every sweep-driven release means some upstream path failed
             # to tell us the room was over. It should be rare enough to be worth reading.
@@ -549,6 +770,9 @@ class LiveKitIngressWorker(BaseWorker):
             self.rooms.pop(room_name, None)
             self._room_last_occupied.pop(room_name, None)
             self._cancel_room_audio_tasks(room_name)
+            # Drop the claim on the way out so a rolling restart hands each room to the
+            # surviving replica on its next sweep instead of after a full lease TTL.
+            await self._release_room_ownership(room_name)
             await self._disconnect_quietly(room_name, room)
 
     def _is_translation_active(self, room_name: str) -> bool:

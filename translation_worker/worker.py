@@ -19,6 +19,7 @@ from typing import Any, cast
 
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
+from shared.lang import is_same_language
 from shared.schemas import STTResultMessage, TranslationResultMessage, optional_confidence
 from shared.text_utils import split_into_sentences
 from translation_worker.translator import OUT_OF_MEETING_SCOPE, OpenAITranslator
@@ -196,7 +197,7 @@ class TranslationWorker(BaseWorker):
         if not sentences:
             return
 
-        target_langs = await self._get_target_languages(meeting_id, speaker_id)
+        target_langs = await self._get_target_languages(meeting_id, speaker_id, source_lang)
         glossary_terms = await self._get_mt_glossary(meeting_id)
         recent_context = list(getattr(self, "_recent_source_contexts", {}).get(meeting_id, ()))
         static_context = await self._get_meeting_context(meeting_id)
@@ -214,7 +215,9 @@ class TranslationWorker(BaseWorker):
             semaphore = asyncio.Semaphore(1)
             self._speculative_semaphore = semaphore
         for target_lang in target_langs:
-            if source_lang.split("-", 1)[0] == target_lang.split("-", 1)[0]:
+            # Redundant since _get_target_languages started filtering these out, and kept
+            # anyway: speculation is the one path that must never pay for an echo.
+            if is_same_language(source_lang, target_lang):
                 continue
             for sentence in sentences:
                 key = (
@@ -364,7 +367,7 @@ class TranslationWorker(BaseWorker):
         await self.redis.publish_telemetry(stt_result.meeting_id, self.worker_name, e2e_latency_ms)
 
         target_langs = await self._get_target_languages(
-            stt_result.meeting_id, stt_result.speaker_id
+            stt_result.meeting_id, stt_result.speaker_id, stt_result.language
         )
         glossary_terms = await self._get_mt_glossary(stt_result.meeting_id)
         recent_context = list(
@@ -557,8 +560,11 @@ class TranslationWorker(BaseWorker):
             )
         return published_any
 
-    async def _get_target_languages(self, meeting_id: str, speaker_id: str) -> set[str]:
-        """Every DISTINCT listen-language among the OTHER participants in this meeting.
+    async def _get_target_languages(
+        self, meeting_id: str, speaker_id: str, source_lang: str = ""
+    ) -> set[str]:
+        """Every DISTINCT listen-language among the OTHER participants in this meeting,
+        minus the language the speaker is already speaking.
 
         Reads from a Redis hash set by the backend when a user joins and selects their
         preferred output language: `translationRoom:{translationRoomId}:languages`,
@@ -584,7 +590,40 @@ class TranslationWorker(BaseWorker):
                 targets.add(lang)
 
         # No other participant registered yet — avoid assuming Vietnamese for all users.
-        return targets or {"en"}
+        targets = targets or {"en"}
+
+        # S6. The speaker's OWN language is not a translation target, and this is the only
+        # place that can say so — the set excluded the speaker's user id but never their
+        # language, so a listener who chose the room's source language got a full
+        # TranslationResultMessage. Nothing downstream stopped it: `passthrough` only
+        # skipped the LLM call (the message was still built and published), and
+        # TTSWorker.process had no language comparison at all, so it synthesized the
+        # speaker's own words and published them on an ai-interpreter LiveKit track. The
+        # listener is already subscribed to that speaker's raw mic, so they heard the real
+        # voice and a synthetic echo of the same sentence at once.
+        #
+        # Deliberately NOT relying on the backend to have filtered this out. The AI never
+        # reads TranslationRoomAudioRouteService's route table; it reads the
+        # translationRoom:{id}:languages hash, and TranslationRoomHub.SetListenLanguage
+        # writes that hash with no policy validation at all. LanguagePolicy also explicitly
+        # permits listening in the room's source language. Both are legitimate ways for a
+        # same-language pair to exist, so this must hold on its own.
+        #
+        # This also disarms the `targets or {"en"}` fallback above: a lone English speaker
+        # used to be given "en" as a target and hear an English echo of themselves.
+        if source_lang:
+            echoes = {lang for lang in targets if is_same_language(lang, source_lang)}
+            if echoes:
+                self.logger.info(
+                    "same_language_targets_dropped",
+                    meeting_id=meeting_id,
+                    speaker_id=speaker_id,
+                    source_lang=source_lang,
+                    dropped=sorted(echoes),
+                )
+                targets -= echoes
+
+        return targets
 
     async def _get_mt_glossary(self, meeting_id: str) -> list[dict[str, str]]:
         """This meeting's workspace glossary, as [{"source": ..., "target": ...}, ...] —

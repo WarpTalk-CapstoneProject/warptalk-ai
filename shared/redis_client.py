@@ -27,6 +27,22 @@ logger = get_logger(__name__)
 P = ParamSpec("P")
 R = TypeVar("R")
 
+# Compare-and-act lease scripts. Both take the key as KEYS[1] and the expected holder as
+# ARGV[1], so a replica can only ever extend or drop a claim that is still its own.
+_EXTEND_IF_VALUE_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('expire', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+_DELETE_IF_VALUE_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
 
 def _redact_redis_url(url: str) -> str:
     """Return a log-safe endpoint without credentials or query parameters."""
@@ -455,6 +471,40 @@ class RedisStreamClient:
         """
         created = await self._retry(self.redis.set, key, value, nx=True, ex=ttl_seconds)
         return bool(created)
+
+    async def extend_if_value(self, key: str, expected: str, ttl_seconds: int) -> bool:
+        """Refresh a key's TTL only while it still holds `expected`.
+
+        The renew half of a lease. A bare EXPIRE would let a replica that lost its lease
+        (Redis blip, long GC pause, its own TTL elapsing) keep pushing the deadline out on
+        a key that now names somebody else — two owners, which is the exact state a lease
+        exists to make impossible. Compare-and-extend in one Lua step so no other replica
+        can slip between the read and the write.
+        """
+        result = await self._retry(
+            self.redis.eval,
+            _EXTEND_IF_VALUE_LUA,
+            1,
+            key,
+            expected,
+            str(int(ttl_seconds)),
+        )
+        return bool(result)
+
+    async def delete_if_value(self, key: str, expected: str) -> bool:
+        """Delete a key only while it still holds `expected`.
+
+        The release half of a lease. An unconditional DEL would let a replica whose lease
+        already expired and was taken over delete the *new* owner's claim on its way out.
+        """
+        result = await self._retry(
+            self.redis.eval,
+            _DELETE_IF_VALUE_LUA,
+            1,
+            key,
+            expected,
+        )
+        return bool(result)
 
     async def incr_with_ttl(self, key: str, ttl_seconds: int) -> int:
         """INCR a counter, bounding its lifetime the first time it is created.
