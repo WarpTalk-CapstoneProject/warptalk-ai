@@ -267,6 +267,77 @@ class TestTTSWorker:
         worker.livekit_publisher.publish_pcm.assert_awaited_once()
 
 
+class TestSameLanguageIsNeverDubbed:
+    """S6 — this worker is the last place the echo can be stopped.
+
+    TTSWorker.process had no source_lang/target_lang comparison at all, so a
+    same-language TranslationResultMessage was synthesized and pushed onto an
+    ai-interpreter LiveKit track. The listener is already subscribed to the speaker's raw
+    mic, so they heard the real voice and a synthetic copy of the same words together.
+
+    translation_worker no longer produces these messages, but translate:results is a Redis
+    stream that outlives a deploy — messages built by the previous revision are replayed
+    into this one.
+    """
+
+    async def test_same_language_message_is_not_synthesized_or_published(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = _make_worker(mock_redis_client, worker_settings)
+
+        message = _make_msg(text="Hello there", target_lang="en")  # source_lang is "en"
+
+        await worker.process(b"msg-1", message.to_redis())
+
+        worker.cartesia.synthesize.assert_not_called()
+        worker.livekit_publisher.publish_pcm.assert_not_awaited()
+
+    async def test_regional_variant_is_also_an_echo(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """en -> en-GB: translator.translate returns the text verbatim for matching base
+        tags, so an exact-match guard would still dub the speaker's own words back."""
+        worker = _make_worker(mock_redis_client, worker_settings)
+
+        await worker.process(b"msg-1", _make_msg(target_lang="en-GB").to_redis())
+
+        worker.cartesia.synthesize.assert_not_called()
+        worker.livekit_publisher.publish_pcm.assert_not_awaited()
+
+    async def test_final_chunk_bookkeeping_still_fires(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """billing_worker and TranscriptRedisConsumerService key off this event — dropping
+        it on a skipped segment would stall them, not just mute one dub."""
+        worker = _make_worker(mock_redis_client, worker_settings)
+
+        await worker.process(b"msg-1", _make_msg(target_lang="en", is_final=True).to_redis())
+
+        system_events = [
+            call.args[1]
+            for call in mock_redis_client._redis.xadd.call_args_list
+            if "system_events" in str(call.args[0])
+        ]
+        assert [event["event_type"] for event in system_events] == ["final_chunk_processed"]
+        assert json.loads(system_events[0]["payload"]) == {"segmentId": "seg-1"}
+        worker.cartesia.synthesize.assert_not_called()
+
+    async def test_a_real_translation_is_untouched(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = _make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
+        worker.cartesia.synthesize = AsyncMock(
+            return_value=((b"R" * 44) + (b"\x03\x04" * 50), 1000, "resolved-voice-id")
+        )
+
+        await worker.process(b"msg-1", _make_msg(target_lang="vi").to_redis())
+
+        worker.cartesia.synthesize.assert_called_once()
+        worker.livekit_publisher.publish_pcm.assert_awaited_once()
+
+
 class TestGetVoiceId:
     """_get_voice_id Redis lookup tests."""
 
