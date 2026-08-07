@@ -13,6 +13,48 @@ from shared.config import RedisSettings, WorkerSettings
 from shared.redis_client import RedisStreamClient
 
 
+class FakeSharedRedis:
+    """A minimal stand-in for the ONE Redis every worker replica shares.
+
+    Enough of RedisStreamClient to exercise the cross-replica primitives: the lease
+    (set_if_absent / extend_if_value / delete_if_value) and the fleet-wide counter
+    (incr_with_ttl). Deliberately has no TTL clock — expiry is simulated by calling
+    expire_lease(), which is what a replica dying looks like from the other replica's
+    side. Two workers constructed with the SAME instance are two replicas of one
+    deployment; that is the whole point.
+    """
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.counters: dict[str, int] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def set_if_absent(self, key: str, value: str, ttl_seconds: int) -> bool:
+        if key in self.values:
+            return False
+        self.values[key] = value
+        return True
+
+    async def extend_if_value(self, key: str, expected: str, ttl_seconds: int) -> bool:
+        return self.values.get(key) == expected
+
+    async def delete_if_value(self, key: str, expected: str) -> bool:
+        if self.values.get(key) == expected:
+            del self.values[key]
+            return True
+        return False
+
+    async def incr_with_ttl(self, key: str, ttl_seconds: int) -> int:
+        self.counters[key] = self.counters.get(key, 0) + 1
+        return self.counters[key]
+
+    def expire_lease(self, key: str) -> None:
+        """Simulate the TTL elapsing — i.e. the holder stopped renewing it."""
+        self.values.pop(key, None)
+
+
 @pytest.fixture
 def redis_settings() -> RedisSettings:
     """Redis settings for tests."""
