@@ -423,21 +423,73 @@ class TestTranslationWorker:
             confidence=0.95,
         )
 
-    async def test_passthrough_same_language(
+    async def test_same_language_listener_gets_nothing_published(
         self, mock_redis_client, worker_settings: WorkerSettings
     ) -> None:
-        """Should forward text unchanged if source == target language."""
+        """S6 — this used to publish, and the publish is the bug.
+
+        The old behaviour ("passthrough": skip the LLM but publish anyway) sent a
+        TranslationResultMessage whose translated_text was the speaker's own words in the
+        speaker's own language. TTSWorker had no language guard, so it synthesized that and
+        published an ai-interpreter LiveKit track — and the listener, who is already
+        subscribed to that speaker's raw mic, heard the real voice and a synthetic echo of
+        the same sentence at once.
+        """
         worker = self._make_worker(mock_redis_client, worker_settings)
 
-        # Target lang = source lang (both "en") — some other participant listens in "en"
+        # The only other participant listens in the language the speaker is speaking.
         mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"en"}
 
-        await worker.process(b"msg-1", self._make_stt_msg().to_redis())
+        await worker.process(b"msg-1", self._make_stt_msg(language="en").to_redis())
 
-        # Translator should NOT be called (passthrough)
         worker.translator.translate.assert_not_called()
-        # Result should still be published (BaseWorker.publish calls xadd twice)
-        mock_redis_client._redis.xadd.assert_called()
+        streams = [str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list]
+        assert not any("translate:results" in s for s in streams)
+
+    async def test_same_language_does_not_suppress_the_other_listeners(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """Only the echoing target is dropped — a real listener must still be served."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+
+        mock_redis_client._redis.hgetall.return_value = {
+            b"listener-1": b"en",  # same as the speaker: echo, must be dropped
+            b"listener-2": b"vi",  # a real translation target
+        }
+
+        await worker.process(b"msg-1", self._make_stt_msg(language="en").to_redis())
+
+        published = [
+            c.kwargs.get("target_lang") for c in worker.translator.translate.call_args_list
+        ]
+        assert published == ["vi"]
+
+    async def test_regional_variant_of_the_speakers_language_is_still_an_echo(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """en-US -> en-GB is an echo: translator.translate returns the text verbatim for
+        matching BASE tags, so an exact-match test would let a perfect echo through."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"en-GB"}
+
+        await worker.process(b"msg-1", self._make_stt_msg(language="en-US").to_redis())
+
+        streams = [str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list]
+        assert not any("translate:results" in s for s in streams)
+
+    async def test_lone_english_speaker_does_not_get_an_echo_of_themselves(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """The `targets or {"en"}` fallback made a solo English speaker their own target."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+
+        mock_redis_client._redis.hgetall.return_value = {}  # nobody else registered yet
+
+        await worker.process(b"msg-1", self._make_stt_msg(language="en").to_redis())
+
+        streams = [str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list]
+        assert not any("translate:results" in s for s in streams)
 
     async def test_calls_translator_for_different_language(
         self, mock_redis_client, worker_settings: WorkerSettings

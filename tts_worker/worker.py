@@ -23,6 +23,7 @@ from typing import Any, cast
 
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
+from shared.lang import is_same_language
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
 from tts_worker.livekit_publisher import LiveKitTTSPublisher
 from tts_worker.synthesizer import CartesiaSynthesizer
@@ -219,6 +220,36 @@ class TTSWorker(BaseWorker):
         current_timestamp_ms = int(time.time() * 1000)
         e2e_latency_ms = current_timestamp_ms - translation.timestamp_ms
         await self.redis.publish_telemetry(translation.meeting_id, self.worker_name, e2e_latency_ms)
+
+        # S6. Never dub a listener back into the language the speaker is already speaking.
+        # The listener is subscribed to BOTH the ai-interpreter track this would publish and
+        # that speaker's raw mic, so synthesizing here plays the real voice and a synthetic
+        # echo of the same sentence over each other.
+        #
+        # The producing side (translation_worker._get_target_languages) no longer builds
+        # these messages, so in a healthy pipeline this never fires. It stays because this
+        # worker is where the LiveKit track is actually published, and that is the last
+        # place the echo can still be stopped: translate:results is a Redis stream that
+        # outlives a deploy, so messages built by the previous revision are replayed into
+        # this one, and any future producer inherits the guard for free rather than having
+        # to remember it. Placed above the empty-text check so the final-chunk bookkeeping
+        # below still runs — billing_worker and TranscriptRedisConsumerService key off
+        # final_chunk_processed, and swallowing it would stall them on a silent segment.
+        if is_same_language(translation.source_lang, translation.target_lang):
+            self.logger.info(
+                "same_language_synthesis_skipped",
+                meeting_id=translation.meeting_id,
+                speaker_id=translation.speaker_id,
+                segment_id=translation.segment_id,
+                lang=translation.target_lang,
+            )
+            if translation.is_final_chunk:
+                await self.redis.publish_system_event(
+                    room_id=translation.meeting_id,
+                    event_type="final_chunk_processed",
+                    payload={"segmentId": translation.segment_id},
+                )
+            return
 
         if route_status == "TEXT_ONLY_MODE" or not text.strip():
             if translation.is_final_chunk:

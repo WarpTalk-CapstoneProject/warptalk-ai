@@ -23,6 +23,7 @@ from livekit_ingress_worker.worker import (
     _is_rate_limited_error,
 )
 from shared.config import LiveKitSettings, WorkerSettings
+from tests.conftest import FakeSharedRedis
 
 ROOM = "019f6a39-a32c-7745-886e-1fe622c1f747"
 OTHER_ROOM = "019f6a39-a32c-7745-886e-000000000002"
@@ -71,14 +72,19 @@ def mock_livekit_sdk():
         yield {"rtc": mock_rtc, "api": mock_api, "rooms": rooms}
 
 
-def _worker() -> LiveKitIngressWorker:
+def _worker(
+    shared: FakeSharedRedis | None = None,
+    consumer_name: str = "livekit_ingress-replica-a",
+) -> LiveKitIngressWorker:
     settings = WorkerSettings(
         livekit=LiveKitSettings(url="ws://livekit:7880", api_key="key", api_secret="secret")
     )
     worker = LiveKitIngressWorker(settings=settings)
-    # _hydrate_room_status is the only Redis touch on this path.
-    worker.redis = MagicMock()
-    worker.redis.get = AsyncMock(return_value=None)
+    # Redis is touched by _hydrate_room_status, by the S1 room-ownership lease, and by the
+    # fleet-wide storm counter. One FakeSharedRedis shared between two workers models two
+    # replicas of this deployment against the one Redis they actually share.
+    worker.redis = shared or FakeSharedRedis()
+    worker._consumer_name = consumer_name
     return worker
 
 
@@ -244,12 +250,38 @@ class TestReconnectVisibility:
         worker.logger = MagicMock()
 
         for _ in range(_RECONNECT_STORM_THRESHOLD):
-            worker._record_connect_attempt(ROOM)
+            await worker._record_connect_attempt(ROOM)
 
         logged = [call.args[0] for call in worker.logger.error.call_args_list]
         assert "livekit_reconnect_storm_suspected" in logged
         attempts = [call.args[0] for call in worker.logger.info.call_args_list]
         assert attempts.count("livekit_room_connect_attempt") == _RECONNECT_STORM_THRESHOLD
+
+    async def test_storm_alarm_sums_dials_across_replicas(self, mock_livekit_sdk) -> None:
+        """S1: the alarm used to count only this process's dials.
+
+        With replicas: 2 the project can be dialled _RECONNECT_STORM_THRESHOLD times while
+        neither replica individually reaches the threshold — and LiveKit rate-limits the
+        project. Split the same storm evenly over two replicas and it must still be named.
+        """
+        shared = FakeSharedRedis()
+        replica_a = _worker(shared, consumer_name="livekit_ingress-replica-a")
+        replica_b = _worker(shared, consumer_name="livekit_ingress-replica-b")
+        replica_a.logger = MagicMock()
+        replica_b.logger = MagicMock()
+
+        for index in range(_RECONNECT_STORM_THRESHOLD):
+            replica = replica_a if index % 2 == 0 else replica_b
+            await replica._record_connect_attempt(ROOM)
+
+        # Neither replica dialled enough times on its own to trip a per-process counter.
+        assert len(replica_a._connect_history[ROOM]) < _RECONNECT_STORM_THRESHOLD
+        assert len(replica_b._connect_history[ROOM]) < _RECONNECT_STORM_THRESHOLD
+
+        errors = [call.args[0] for call in replica_a.logger.error.call_args_list] + [
+            call.args[0] for call in replica_b.logger.error.call_args_list
+        ]
+        assert "livekit_reconnect_storm_suspected" in errors
 
     async def test_reused_connection_is_logged_as_such(self, mock_livekit_sdk) -> None:
         worker = _worker()

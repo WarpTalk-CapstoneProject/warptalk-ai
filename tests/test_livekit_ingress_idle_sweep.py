@@ -25,18 +25,19 @@ from livekit_ingress_worker.worker import (
 )
 from shared.base_worker import TERMINAL_ROOM_STATUSES
 from shared.config import LiveKitSettings, WorkerSettings
+from tests.conftest import FakeSharedRedis
 
 ROOM = "019fd60a-e5f3-7342-804a-4366e3214786"
 OTHER_ROOM = "019fd60a-e5f3-7342-804a-000000000002"
 
 
-def _worker() -> LiveKitIngressWorker:
+def _worker(shared: FakeSharedRedis | None = None) -> LiveKitIngressWorker:
     settings = WorkerSettings(
         livekit=LiveKitSettings(url="ws://livekit:7880", api_key="key", api_secret="secret")
     )
     worker = LiveKitIngressWorker(settings=settings)
-    worker.redis = MagicMock()
-    worker.redis.get = AsyncMock(return_value=None)
+    worker.redis = shared or FakeSharedRedis()
+    worker._consumer_name = "livekit_ingress-replica-a"
     return worker
 
 
