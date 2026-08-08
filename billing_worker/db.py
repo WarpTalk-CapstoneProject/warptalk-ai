@@ -88,10 +88,10 @@ class BillingRepository:
         target_language_code: str | None = None,
         currency: str = "CRD",
         details: dict[str, Any] | None = None,
-    ) -> bool:
+    ) -> int:
         """Insert usage_records + credit_transactions, idempotent on idempotency_key.
 
-        Returns True if a new charge was recorded, False if this idempotency_key was
+        Returns credits_consumed if a new charge was recorded, 0 if this idempotency_key was
         already settled (safe on Redis Streams redelivery / worker restart / retry).
 
         transcript_segment_id should be the real transcript.transcript_segments.id GUID —
@@ -123,7 +123,7 @@ class BillingRepository:
                     idempotency_key,
                 )
                 if existing is not None:
-                    return False
+                    return 0
 
                 rate = await conn.fetchrow(
                     """
@@ -223,7 +223,7 @@ class BillingRepository:
             transcript_segment_id=str(segment_uuid) if segment_uuid else None,
             credits_consumed=credits_consumed,
         )
-        return True
+        return credits_consumed
 
 
 def _to_jsonb(data: dict[str, Any]) -> str:

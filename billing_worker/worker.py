@@ -101,6 +101,7 @@ class BillingSettlementWorker:
         self._last_progress_unix_ms = int(time.time() * 1000)
         # translation_room_id -> (subscription_id, workspace_id, cached_at_monotonic)
         self._subscription_cache: dict[str, tuple[uuid.UUID, uuid.UUID, float]] = {}
+        self._pending_charges = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -125,6 +126,7 @@ class BillingSettlementWorker:
                     "billing-suggestion-workers",
                     self._handle_suggestion,
                 ),
+                self._flush_charges_loop(),
             )
         except asyncio.CancelledError:
             pass
@@ -278,6 +280,48 @@ class BillingSettlementWorker:
             except Exception:
                 self.logger.exception("billing_heartbeat_failed")
 
+    async def _flush_charges_loop(self) -> None:
+        """Batch process charges every 10 seconds to avoid DB spam (Demo Requirement)."""
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(10)
+            if not self._pending_charges:
+                continue
+
+            batch = self._pending_charges
+            self._pending_charges = []
+            
+            # Aggregate tokens deducted per room
+            tokens_per_room: dict[str, int] = {}
+            
+            for kwargs in batch:
+                room_id = kwargs.get("translation_room_id")
+                try:
+                    credits = await self.db.record_usage_and_charge(**kwargs)
+                    if room_id and credits > 0:
+                        tokens_per_room[room_id] = tokens_per_room.get(room_id, 0) + credits
+                except RuntimeError as e:
+                    if "Insufficient credits" in str(e):
+                        self.logger.warning("meeting_credit_exhausted", room_id=room_id)
+                        if room_id:
+                            await self.redis.publish("warptalk:translation-room:commands", json.dumps({
+                                "Command": "MeetingCreditExhausted",
+                                "RoomId": str(room_id)
+                            }))
+                except Exception:
+                    self.logger.exception("batch_charge_failed")
+
+            # Publish TokenUsageUpdated for each room
+            for room_id, tokens in tokens_per_room.items():
+                if tokens > 0:
+                    try:
+                        await self.redis.publish("warptalk:translation-room:commands", json.dumps({
+                            "Command": "TokenUsageUpdated",
+                            "RoomId": str(room_id),
+                            "TokensDeducted": tokens
+                        }))
+                    except Exception:
+                        self.logger.exception("failed_to_publish_token_usage", room_id=room_id)
+
     # ------------------------------------------------------------------
     # Subscription resolution (cached per translation_room_id)
     # ------------------------------------------------------------------
@@ -340,7 +384,7 @@ class BillingSettlementWorker:
         quantity_s = (
             max((msg.end_ms - msg.start_ms) / 1000.0, 0.1) if msg.end_ms > msg.start_ms else 1.0
         )
-        await self.db.record_usage_and_charge(
+        self._pending_charges.append(dict(
             subscription_id=subscription_id,
             user_id=msg.speaker_id,
             workspace_id=workspace_id,
@@ -352,18 +396,9 @@ class BillingSettlementWorker:
             quantity=quantity_s,
             unit="second",
             source_language_code=msg.language,
-            # msg.segment_id IS the real TranscriptSegment.Id for STT events (unlike
-            # translation/TTS, which carry a composite "{guid}-c{idx}" string) — no
-            # extraction needed here.
             transcript_segment_id=msg.segment_id,
-            # NOTE: msg.segment_id is randomly generated per STTResultMessage
-            # (Field(default_factory=uuid4) in shared/schemas.py) — it is NOT stable
-            # across a Redis Streams redelivery of the *upstream* audio chunk, since
-            # stt_worker.process() would mint a fresh one on retry. This idempotency
-            # key only protects against redelivery/retry at THIS worker's own consumer
-            # group, not against stt_worker re-processing the same audio chunk twice.
             idempotency_key=f"{STT_CHARGE_TYPE}:{msg.segment_id}:NA",
-        )
+        ))
 
     async def _handle_translation(self, data: Mapping[Any, Any]) -> None:
         msg = TranslationResultMessage.from_redis(data)
@@ -388,7 +423,7 @@ class BillingSettlementWorker:
         quantity_s = (
             max((msg.end_ms - msg.start_ms) / 1000.0, 0.1) if msg.end_ms > msg.start_ms else 1.0
         )
-        await self.db.record_usage_and_charge(
+        self._pending_charges.append(dict(
             subscription_id=subscription_id,
             user_id=msg.speaker_id,
             workspace_id=workspace_id,
@@ -402,13 +437,8 @@ class BillingSettlementWorker:
             source_language_code=msg.source_lang,
             target_language_code=msg.target_lang,
             transcript_segment_id=underlying_segment_id,
-            # msg.segment_id here IS deterministic (translation_worker builds it as
-            # f"{stt_result.segment_id}-{target_lang}-c{idx}"), so this key is redelivery-safe. The
-            # idempotency key keeps using the raw composite msg.segment_id, unaffected by
-            # the extraction above (which only changes what's stored in reference_id /
-            # transcript_segment_id).
             idempotency_key=f"{TRANSLATION_CHARGE_TYPE}:{msg.segment_id}:{msg.target_lang}",
-        )
+        ))
 
     async def _handle_tts(self, data: Mapping[Any, Any]) -> None:
         msg = TTSResultMessage.from_redis(data)
@@ -434,7 +464,7 @@ class BillingSettlementWorker:
             self.logger.warning("segment_id_extraction_failed", raw_segment_id=msg.segment_id)
 
         quantity_s = max(msg.duration_ms / 1000.0, 0.1)
-        await self.db.record_usage_and_charge(
+        self._pending_charges.append(dict(
             subscription_id=subscription_id,
             user_id=msg.speaker_id,
             workspace_id=workspace_id,
@@ -449,7 +479,7 @@ class BillingSettlementWorker:
             transcript_segment_id=underlying_segment_id,
             idempotency_key=f"{charge_type}:{msg.segment_id}:{msg.target_lang}",
             details={"clone_provider": msg.clone_provider, "voice_mode": msg.voice_mode},
-        )
+        ))
 
     async def _handle_suggestion(self, data: Mapping[Any, Any]) -> None:
         """Settle one inline transcript suggestion against the AI_ASSISTANT budget.
@@ -489,10 +519,8 @@ class BillingSettlementWorker:
         segment_id = _extract_underlying_segment_id(msg.segment_id)
 
         try:
-            await self.db.record_usage_and_charge(
+            self._pending_charges.append(dict(
                 subscription_id=subscription_id,
-                # A suggestion is authored by the assistant, not by a participant — there is
-                # no user to attribute the spend to beyond the room and workspace.
                 user_id=None,
                 workspace_id=workspace_id,
                 translation_room_id=msg.meeting_id,
@@ -500,17 +528,13 @@ class BillingSettlementWorker:
                 charge_type=SUGGESTION_CHARGE_TYPE,
                 reference_id=segment_id,
                 reference_type="transcript_segment",
-                # Tokens across BOTH model calls (decide + generate) for this suggestion.
                 quantity=float(msg.token_count),
                 unit="token",
                 source_language_code=msg.language or None,
                 transcript_segment_id=segment_id,
-                # suggestion_worker takes a one-shot Redis slot per suggestion and never
-                # republishes one for the same segment, so the segment id alone is a stable
-                # key across a Redis Streams redelivery of this message.
                 idempotency_key=f"{SUGGESTION_CHARGE_TYPE}:{msg.segment_id}",
                 details={"category": msg.category, "confidence": msg.confidence},
-            )
+            ))
         except Exception:
             self.logger.exception(
                 "suggestion_settlement_failed",
