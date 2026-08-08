@@ -67,13 +67,29 @@ class WorkerSettings(BaseSettings):
     redis: RedisSettings = RedisSettings()
     livekit: LiveKitSettings = LiveKitSettings()
 
-    # VAD gating settings (used by ingress worker). 0.5 matches Silero/OpenAI's own
-    # documented default and guidance ("a higher threshold ... might perform better in
-    # noisy environments") — raised from an earlier, more permissive 0.3 that let
-    # distant/muffled speech and ambiguous noise trip VAD too easily, reaching the STT
-    # model (which has no confidence signal of its own to reject them — see
-    # STTSettings.model) and getting hallucinated into a full sentence.
-    vad_threshold: float = 0.5  # Speech detection threshold
+    # VAD gating settings (used by ingress worker).
+    #
+    # This number has now been moved in both directions, and the trade-off is real either
+    # way: too low and distant or ambiguous sound reaches an STT model with no confidence
+    # signal of its own, which hallucinates it into a fluent sentence; too high and the
+    # speaker has to lean into the microphone to be heard at all.
+    #
+    # It was 0.3, raised to 0.5 to stop the hallucinations. In a room — a lecture hall, a
+    # meeting room with the laptop on the far side of a table — 0.5 silently drops most of
+    # what is said: a speaker at any distance reports having to shout to register. That is
+    # the worse failure of the two for this product. A sentence transcribed imperfectly can
+    # still be read and corrected; a sentence that never existed cannot, and the person
+    # speaking has no way to tell it happened.
+    #
+    # 0.35 sits between the two previous values rather than returning to 0.3, because the
+    # earlier hallucination reports came from a pipeline that was also feeding STT the same
+    # audio two or three times over (the ingress reader was keyed on track sid, not on the
+    # speaker). With that fixed, the model sees each utterance once, and some of what was
+    # blamed on a permissive gate was volume.
+    #
+    # Overridable per deployment as VAD_THRESHOLD, with no rebuild: a close-mic studio can
+    # raise it, a hall can lower it further, and neither needs this default to move again.
+    vad_threshold: float = 0.35  # Speech detection threshold
     vad_pre_speech_ms: int = 192  # Two ~96ms windows preserve word onsets
     # Four ~96ms windows retain quiet final syllables and natural micro-pauses. A
     # two-window production replay cut "Kubernetes" to "Kuber".
