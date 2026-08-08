@@ -18,8 +18,7 @@ from shared.config import WorkerSettings
 def test_the_gate_is_open_enough_for_someone_across_a_room() -> None:
     settings = WorkerSettings()
     assert settings.vad_threshold <= 0.4, (
-        "0.5 made a speaker at any distance shout to be transcribed; "
-        f"got {settings.vad_threshold}"
+        f"0.5 made a speaker at any distance shout to be transcribed; got {settings.vad_threshold}"
     )
 
 
