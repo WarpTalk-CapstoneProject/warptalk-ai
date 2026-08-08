@@ -198,10 +198,23 @@ class LiveKitIngressWorker(BaseWorker):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.rooms: dict[str, rtc.Room] = {}
-        # Keyed by (room_name, track_sid). The old key was the bare track sid, and the
-        # teardown path then cancelled the whole dict — a track published in one room
-        # silently killed transcription in every other live room.
+        # Keyed by (room_name, speaker_id) — one reader per HUMAN, not per track.
+        #
+        # This key has been widened twice. It was the bare track sid, and teardown then
+        # cancelled the whole dict, so a track published in one room silently killed
+        # transcription in every other live room. Adding the room fixed that but left the
+        # track sid in the key, which is the bug this pass removes: LiveKit issues a NEW sid
+        # every time a participant republishes their mic — a reconnect, a device change, a
+        # momentary network drop — so the guard saw an unfamiliar key and started a SECOND
+        # reader for a speaker who already had one, while the first stayed alive. In
+        # production that reached three concurrent readers on one microphone, each with its
+        # own chunk counter, and the meeting transcribed every sentence three times. Because
+        # each copy travelled the whole pipeline, the dubbed voice spoke it three times too.
+        #
+        # The sid is kept beside the task so a genuinely new track can replace a stale reader
+        # rather than being refused as a duplicate of it.
         self.audio_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self.audio_task_tracks: dict[tuple[str, str], str] = {}
         self._vad_model: Any | None = None
         # One lock per room, held across the whole handler. Events arrive as independent
         # tasks (see _consume_loop), so without this two events for the same room could
@@ -500,19 +513,38 @@ class LiveKitIngressWorker(BaseWorker):
             self.logger.warning("room_disconnect_failed", room=room_name, exc_info=True)
 
     def _start_audio_task(self, room_name: str, speaker_id: str, track: rtc.Track) -> bool:
-        """Start this track's VAD pipeline unless one is already running for it."""
-        key = (room_name, track.sid)
+        """Start this speaker's VAD pipeline, replacing any reader left on a stale track."""
+        key = (room_name, speaker_id)
         existing = self.audio_tasks.get(key)
+
         if existing is not None and not existing.done():
-            return False
+            if self.audio_task_tracks.get(key) == track.sid:
+                # Same microphone, already being read. Nothing to do.
+                return False
+            # A new sid for a speaker who already has a live reader means they republished:
+            # the old track is stale and its reader must go, or both will publish the same
+            # speech under two chunk counters.
+            self.logger.info(
+                "replacing_stale_audio_reader",
+                room=room_name,
+                speaker_id=speaker_id,
+                previous_track=self.audio_task_tracks.get(key),
+                new_track=track.sid,
+            )
+            existing.cancel()
+
         task = asyncio.create_task(self.process_audio_track(room_name, speaker_id, track))
         self.audio_tasks[key] = task
+        self.audio_task_tracks[key] = track.sid
         task.add_done_callback(lambda finished: self._forget_audio_task(key, finished))
         return True
 
     def _forget_audio_task(self, key: tuple[str, str], task: asyncio.Task[None]) -> None:
+        # Only if it is still OURS: a cancelled reader finishes after its replacement has
+        # already registered, and deleting unconditionally would drop the live one.
         if self.audio_tasks.get(key) is task:
             del self.audio_tasks[key]
+            self.audio_task_tracks.pop(key, None)
 
     def _start_pending_audio_tasks(self, room_name: str, room: rtc.Room) -> int:
         """Attach to every already-published human audio track we are not reading yet."""
@@ -541,6 +573,7 @@ class LiveKitIngressWorker(BaseWorker):
                 continue
             task.cancel()
             self.audio_tasks.pop(key, None)
+            self.audio_task_tracks.pop(key, None)
 
     def _cleanup_room(self, room_id: str) -> None:
         """Release the bot when the translation room reaches a terminal state.
