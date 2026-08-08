@@ -292,20 +292,24 @@ class BillingSettlementWorker:
             
             # Aggregate tokens deducted per room
             tokens_per_room: dict[str, int] = {}
+            workspace_per_room: dict[str, str] = {}
             
             for kwargs in batch:
                 room_id = kwargs.get("translation_room_id")
+                ws_id = kwargs.get("workspace_id")
                 try:
                     credits = await self.db.record_usage_and_charge(**kwargs)
                     if room_id and credits > 0:
                         tokens_per_room[room_id] = tokens_per_room.get(room_id, 0) + credits
+                        workspace_per_room[room_id] = str(ws_id)
                 except RuntimeError as e:
                     if "Insufficient credits" in str(e):
                         self.logger.warning("meeting_credit_exhausted", room_id=room_id)
                         if room_id:
                             await self.redis.publish("warptalk:translation-room:commands", json.dumps({
                                 "Command": "MeetingCreditExhausted",
-                                "RoomId": str(room_id)
+                                "RoomId": str(room_id),
+                                "WorkspaceId": str(ws_id) if ws_id else None
                             }))
                 except Exception:
                     self.logger.exception("batch_charge_failed")
@@ -317,6 +321,7 @@ class BillingSettlementWorker:
                         await self.redis.publish("warptalk:translation-room:commands", json.dumps({
                             "Command": "TokenUsageUpdated",
                             "RoomId": str(room_id),
+                            "WorkspaceId": workspace_per_room.get(room_id),
                             "TokensDeducted": tokens
                         }))
                     except Exception:
