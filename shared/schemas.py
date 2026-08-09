@@ -375,6 +375,88 @@ class ChatRequestMessage(BaseModel):
         )
 
 
+class SummaryRequestMessage(BaseModel):
+    """Backend → SummaryTemplateWorker: re-summarise a finished meeting.
+
+    Carries no transcript. The worker fetches the SAVED transcript itself, because the
+    in-memory accumulator AIAssistantWorker summarises from is gone once the meeting ends —
+    and gone again on every restart. Re-reading the stored segments is also what makes the
+    citations line up: they are the same segments the meeting page renders.
+    """
+
+    __slots__ = ()
+
+    request_id: str
+    room_id: str
+    workspace_id: str
+    template_key: str = "general"
+    bearer_token: str = ""
+    target_languages_json: str = "[]"
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_redis(self) -> dict[str, str]:
+        return {
+            "request_id": self.request_id,
+            "room_id": self.room_id,
+            "workspace_id": self.workspace_id,
+            "template_key": self.template_key,
+            "bearer_token": self.bearer_token,
+            "target_languages_json": self.target_languages_json,
+            "timestamp_ms": str(self.timestamp_ms),
+        }
+
+    @classmethod
+    def from_redis(cls, data: Mapping[Any, Any]) -> SummaryRequestMessage:
+        d = _decode_dict(data)
+        return cls(
+            request_id=d["request_id"],
+            room_id=d["room_id"],
+            workspace_id=d.get("workspace_id", ""),
+            template_key=d.get("template_key", "general"),
+            bearer_token=d.get("bearer_token", ""),
+            target_languages_json=d.get("target_languages_json", "[]"),
+            timestamp_ms=int(d.get("timestamp_ms", 0) or 0),
+        )
+
+
+class SummaryResultMessage(BaseModel):
+    """SummaryTemplateWorker → backend: the regenerated summary, or why there is none."""
+
+    __slots__ = ()
+
+    request_id: str
+    room_id: str
+    template_key: str
+    status: str  # "completed" | "failed"
+    content_json: str = ""
+    error: str = ""
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_redis(self) -> dict[str, str]:
+        return {
+            "request_id": self.request_id,
+            "room_id": self.room_id,
+            "template_key": self.template_key,
+            "status": self.status,
+            "content_json": self.content_json,
+            "error": self.error,
+            "timestamp_ms": str(self.timestamp_ms),
+        }
+
+    @classmethod
+    def from_redis(cls, data: Mapping[Any, Any]) -> SummaryResultMessage:
+        d = _decode_dict(data)
+        return cls(
+            request_id=d["request_id"],
+            room_id=d["room_id"],
+            template_key=d.get("template_key", "general"),
+            status=d.get("status", "failed"),
+            content_json=d.get("content_json", ""),
+            error=d.get("error", ""),
+            timestamp_ms=int(d.get("timestamp_ms", 0) or 0),
+        )
+
+
 class ChatResultMessage(BaseModel):
     """ChatAssistantWorker → AssistantService (.NET).
 
