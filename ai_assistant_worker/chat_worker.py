@@ -176,6 +176,15 @@ class ChatAssistantWorker(BaseWorker):
             or self._translation_room_client is None
             or self._openai is None
         ):
+            # Answer before raising. This check sits OUTSIDE the try/except below, so raising
+            # here published nothing at all — and a caller who mentions @WarpBot and receives
+            # complete silence cannot tell "the assistant is misconfigured" from "the mention
+            # was never seen". Every exit from process() must leave an answer behind.
+            await self._publish_result(
+                request,
+                type_="failed",
+                content="WarpBot is not available right now.",
+            )
             raise RuntimeError("ChatAssistantWorker is not initialized — call load_model() first")
 
         try:

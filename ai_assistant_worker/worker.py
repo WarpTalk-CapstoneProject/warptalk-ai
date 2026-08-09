@@ -17,6 +17,7 @@ import time
 from typing import Any, cast
 
 from ai_assistant_worker.assistant import MeetingAssistant
+from ai_assistant_worker.summary_templates import format_transcript_line
 from shared.base_worker import BaseWorker
 from shared.config import AssistantSettings, resolve_openai_api_key
 from shared.schemas import STTResultMessage
@@ -80,8 +81,15 @@ class AIAssistantWorker(BaseWorker):
         if not segments:
             return
 
-        # Format transcript
-        transcript_lines = [f"[{speaker}] {text}" for speaker, text, _ in segments]
+        # Format transcript WITH the moment each line was spoken. The timestamp was
+        # already here and was being discarded by that `_` — the model was asked not to
+        # invent things while being given nothing it could point at. Offsets are relative
+        # to the first segment so a cited atMs resolves against the stored transcript,
+        # which is rendered the same way: a base time plus a per-segment offset.
+        base_ms = min(ts for _, _, ts in segments)
+        transcript_lines = [
+            format_transcript_line(ts - base_ms, speaker, text) for speaker, text, ts in segments
+        ]
         transcript_text = "\n".join(transcript_lines)
 
         self.logger.info(
