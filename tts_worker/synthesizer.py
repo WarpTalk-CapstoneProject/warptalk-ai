@@ -32,10 +32,21 @@ class CartesiaSynthesizer:
         api_key: str,
         model: str = "sonic-3.5",
         sample_rate: int = 44100,
+        speed: str = "fast",
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.sample_rate = sample_rate
+        # "fast" by default, not "normal".
+        #
+        # A dub is not a narration: it has to fit inside the gap the original speaker left,
+        # and the listener is waiting on it before the conversation can move. At "normal" the
+        # translated line consistently finished well after the speaker had moved on, which
+        # reads as the system being slow even when the pipeline latency is fine.
+        #
+        # Cartesia accepts only "slow" | "normal" | "fast" (cartesia.types.ModelSpeed), so
+        # this is the whole of the available range, not a tuned number.
+        self.speed = speed
         self._client: AsyncCartesia | None = None
 
     async def load(self) -> None:
@@ -120,6 +131,7 @@ class CartesiaSynthesizer:
                 },
             ),
             language=language,
+            speed=cast(Any, self.speed),
         )
         chunks: list[bytes] = [chunk async for chunk in stream]
         audio_bytes: bytes = b"".join(chunks)
