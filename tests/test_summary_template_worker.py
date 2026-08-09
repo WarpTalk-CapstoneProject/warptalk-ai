@@ -143,3 +143,34 @@ def test_the_worker_reads_and_writes_the_streams_the_backend_uses() -> None:
     # Renaming either side silently is how a request ends up with no consumer.
     assert SummaryTemplateWorker.input_stream == "assistant:summary_requests"
     assert SummaryTemplateWorker.consumer_group == "summary-template-workers"
+
+
+@pytest.mark.asyncio
+async def test_an_uninitialised_chat_worker_still_answers_before_it_raises() -> None:
+    """Silence is the one outcome a mention must never produce.
+
+    This check sits outside the try/except that publishes failures, so raising here used to
+    publish nothing at all — and somebody who types @WarpBot and gets complete silence cannot
+    tell "the assistant is misconfigured" from "my mention was never seen". That ambiguity is
+    what made this bug take two rounds of investigation to place.
+    """
+    from ai_assistant_worker.chat_worker import ChatAssistantWorker
+    from shared.schemas import ChatRequestMessage
+
+    worker = ChatAssistantWorker()
+    worker._publish_result = AsyncMock()  # type: ignore[method-assign]
+
+    message = ChatRequestMessage(
+        request_id="req-1",
+        conversation_id=ROOM,
+        workspace_id="ws-1",
+        user_id="u-1",
+        origin="meeting_chat",
+    )
+    payload = {k.encode(): v.encode() for k, v in message.to_redis().items()}
+
+    with pytest.raises(RuntimeError):
+        await worker.process(b"1", payload)
+
+    worker._publish_result.assert_awaited_once()
+    assert worker._publish_result.await_args.kwargs["type_"] == "failed"
