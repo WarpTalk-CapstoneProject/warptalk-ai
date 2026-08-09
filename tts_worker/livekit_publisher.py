@@ -177,9 +177,7 @@ class LiveKitTTSPublisher:
                     )
                     return
 
-                sent += await self._capture_from(
-                    bot["source"], pcm_s16le[sent:], sample_rate
-                )
+                sent += await self._capture_from(bot["source"], pcm_s16le[sent:], sample_rate)
                 if sent >= len(pcm_s16le):
                     return
 
