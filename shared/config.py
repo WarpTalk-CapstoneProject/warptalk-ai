@@ -180,6 +180,10 @@ class TTSSettings(BaseSettings):
     # target languages it actually needs, not just English.
     model: str = "sonic-3.5"
     sample_rate: int = 44100
+    # "slow" | "normal" | "fast" — the whole of Cartesia's range (cartesia.types.ModelSpeed).
+    # Defaults to fast: a dub has to land inside the gap the speaker left, and at normal it
+    # consistently finished after they had already moved on. Overridable as TTS_SPEED.
+    speed: str = "fast"
     voice_clone_min_seconds: float = 10.0  # Buffer threshold before calling /voices/clone
     min_clone_chars: int = 8
     cache_enabled: bool = True

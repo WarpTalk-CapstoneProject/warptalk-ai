@@ -156,6 +156,10 @@ class LiveKitTTSPublisher:
 
         key: _BotKey = (meeting_id, speaker_id, target_lang, voice_key)
         lock = self._locks.setdefault(key, asyncio.Lock())
+        # Faded once, here, rather than inside each attempt: a retry resumes partway through
+        # this buffer, and re-fading a slice would put a fade-in in the middle of a word.
+        pcm_s16le = _apply_fade(pcm_s16le, sample_rate)
+        sent = 0
         async with lock:
             for attempt in range(2):
                 try:
@@ -173,7 +177,8 @@ class LiveKitTTSPublisher:
                     )
                     return
 
-                if await self._capture_all(bot["source"], pcm_s16le, sample_rate):
+                sent += await self._capture_from(bot["source"], pcm_s16le[sent:], sample_rate)
+                if sent >= len(pcm_s16le):
                     return
 
                 logger.warning(
@@ -183,6 +188,8 @@ class LiveKitTTSPublisher:
                     target_lang=target_lang,
                     voice_key=voice_key,
                     attempt=attempt,
+                    resume_byte=sent,
+                    total_bytes=len(pcm_s16le),
                 )
                 # Drop the connection, not just our handle on it. WT-269: a bot left
                 # connected here keeps holding this identity in the room, so the retry's
@@ -193,16 +200,26 @@ class LiveKitTTSPublisher:
                 if stale is not None:
                     await self._close_bot(stale)
 
-    async def _capture_all(
+    async def _capture_from(
         self, source: rtc.AudioSource, pcm_s16le: bytes, sample_rate: int
-    ) -> bool:
-        """Push all frames; returns False (and logs) on the first capture_frame failure."""
+    ) -> int:
+        """Push frames; return how many bytes actually made it onto the track.
+
+        This used to answer True/False, and the caller answered a False by replaying the
+        WHOLE sentence on a fresh connection. capture_frame() fails sporadically with
+        InvalidState, so a failure at nine tenths of a line meant the listener heard nine
+        tenths of it and then the entire line again — which is worse than the truncation it
+        was trying to repair, because a dub that repeats is a dub you have to think about.
+
+        Returning progress lets the retry resume from the break instead. Nothing is spoken
+        twice, and nothing is lost unless BOTH attempts fail at the same point.
+        """
         frame_bytes = int(sample_rate * FRAME_MS / 1000) * 2  # 16-bit mono
         if frame_bytes <= 0:
-            return True
+            return len(pcm_s16le)
 
-        pcm_s16le = _apply_fade(pcm_s16le, sample_rate)
         usable_len = len(pcm_s16le) - (len(pcm_s16le) % frame_bytes)
+        sent = 0
         try:
             for i in range(0, usable_len, frame_bytes):
                 chunk = pcm_s16le[i : i + frame_bytes]
@@ -213,10 +230,13 @@ class LiveKitTTSPublisher:
                     samples_per_channel=len(chunk) // 2,
                 )
                 await source.capture_frame(frame)
-            return True
+                sent = i + frame_bytes
         except Exception:
-            logger.exception("livekit_tts_publish_error")
-            return False
+            logger.exception("livekit_tts_publish_error", sent_bytes=sent)
+            return sent
+        # The trailing partial frame is shorter than one frame (< 10ms) and cannot be
+        # captured; counting it keeps "sent >= len" meaning "the line finished".
+        return len(pcm_s16le)
 
     async def _get_or_create_bot(
         self, meeting_id: str, speaker_id: str, target_lang: str, voice_key: str, sample_rate: int

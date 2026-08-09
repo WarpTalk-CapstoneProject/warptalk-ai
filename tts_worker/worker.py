@@ -135,6 +135,7 @@ class TTSWorker(BaseWorker):
             api_key=self.tts_settings.api_key,
             model=self.tts_settings.model,
             sample_rate=self.tts_settings.sample_rate,
+            speed=self.tts_settings.speed,
         )
         await self.cartesia.load()
         self.livekit_publisher = LiveKitTTSPublisher(self.settings.livekit)
