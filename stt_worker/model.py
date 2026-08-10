@@ -46,6 +46,55 @@ SESSION_IDLE_TIMEOUT_S = 300.0
 # Guard against OpenAI never sending a completed/error event for a commit.
 TRANSCRIBE_EVENT_TIMEOUT_S = 15.0
 
+# Which session options each model actually accepts, learned at runtime.
+#
+# These replace a hardcoded model allow-list, and the difference is not cosmetic. The old
+# check was:
+#
+#     is_next_generation_transcribe = self.model in {"gpt-transcribe", "gpt-live-transcribe"}
+#
+# and it decided TWO unrelated things at once: whether to send structured context
+# (`languages` plural + `keywords`) and whether to request token logprobs. Production runs
+# gpt-4o-mini-transcribe, which is in neither family, so it silently received NO keywords
+# at all — a workspace glossary curated specifically to stop "Codex" being transcribed as
+# "cô đích" was published to Redis, read by this worker, and then dropped here. The two
+# capabilities are also genuinely independent: a model may accept both, and folding them
+# into one flag made "send keywords" and "keep confidence scores" look mutually exclusive
+# when nothing says they are.
+#
+# Both default to optimistic. Guessing wrong costs one rejected session update per model
+# per process, which _get_or_create_session catches, records here, and never repeats.
+# Seeded with what this codebase already learned the hard way; everything absent is
+# assumed supported until the API says otherwise. Structured context has NO seed on
+# purpose — the whole point is that an unlisted model should try keywords rather than
+# silently go without them.
+_LOGPROBS_UNSUPPORTED_SEED = {
+    # Sending the logprobs include selector to these makes some Realtime API versions
+    # reject the entire session, so do not spend a failed round trip rediscovering it.
+    "gpt-transcribe": False,
+    "gpt-live-transcribe": False,
+}
+
+_STRUCTURED_CONTEXT_SUPPORT: dict[str, bool] = {}
+_LOGPROBS_SUPPORT: dict[str, bool] = dict(_LOGPROBS_UNSUPPORTED_SEED)
+
+
+def _supports_structured_context(model: str) -> bool:
+    """Whether `model` takes the plural `languages` hint and `keywords`."""
+    return _STRUCTURED_CONTEXT_SUPPORT.get(model, True)
+
+
+def _supports_logprobs(model: str) -> bool:
+    """Whether `model` accepts the transcription-logprobs include selector."""
+    return _LOGPROBS_SUPPORT.get(model, True)
+
+
+def reset_capability_memo() -> None:
+    """Forget everything learned at runtime, back to the seeds. For tests."""
+    _STRUCTURED_CONTEXT_SUPPORT.clear()
+    _LOGPROBS_SUPPORT.clear()
+    _LOGPROBS_SUPPORT.update(_LOGPROBS_UNSUPPORTED_SEED)
+
 # Conservative Vietnamese diacritical corrections for recurrent model errors.
 _VI_CORRECTIONS: dict[str, str] = {
     "lu trữ": "lưu trữ",
@@ -154,10 +203,63 @@ _LATIN_SCRIPT_LANGUAGES = {
     "hu",
 }
 
-_VI_CHAR_RE = re.compile(
-    r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]",
+# Vietnamese-UNIQUE characters only.
+#
+# The previous version of this class listed the whole Vietnamese alphabet, including
+# à á è é ì í ò ó ù ú â ê ô ã õ — which is precisely the accent inventory of Spanish,
+# French, Portuguese and Italian. It was therefore not a Vietnamese detector but a
+# "has a Latin diacritic" detector that claimed every hit for Vietnamese: the Spanish
+# sentence "Deberíamos terminar esta parte" was labelled 'vi' on the strength of its í,
+# and French "regardé" on its é. A wrong language label is not cosmetic — it becomes the
+# translation worker's source_lang and then the dubbed voice's language.
+#
+# What is left is the set no other Latin-script language uses: the horn vowels (ơ ư),
+# breve a (ă), bar d (đ), and every vowel carrying an under-dot or hook-above tone mark,
+# plus the circumflex vowels that carry a Vietnamese tone on top.
+_VI_UNIQUE_CHAR_RE = re.compile(
+    r"[ăằắặẳẵ"  # breve a + tones
+    r"ầấậẩẫ"  # circumflex a + Vietnamese tones
+    r"ềếệểễ"  # circumflex e + tones
+    r"ồốộổỗ"  # circumflex o + tones
+    r"ơờớợởỡ"  # horn o
+    r"ưừứựửữ"  # horn u
+    r"ạảẹẻịỉọỏụủ"  # under-dot / hook-above
+    r"ẽĩũỳỵỷỹ"  # tilde/grave-dot finals not shared with Romance
+    r"đ]",  # bar d
     re.IGNORECASE,
 )
+
+# Per-script character classes. These were already present as one combined regex used
+# only to DROP text; splitting them means the same information can also IDENTIFY it.
+# Script is the strongest language signal available here and it is nearly free: no model
+# call, no ambiguity, and no way to mistake Hangul for French.
+_HANGUL_RE = re.compile(r"[가-힣ᄀ-ᇿ]")
+_KANA_RE = re.compile(r"[぀-ヿ]")
+_HAN_RE = re.compile(r"[一-鿿]")
+_THAI_RE = re.compile(r"[฀-๿]")
+
+
+def _detect_script_language(text: str) -> str | None:
+    """Language implied by the writing system, or None for Latin script.
+
+    Deliberately NOT constrained to the room's declared language set. Script evidence is
+    strong enough to stand on its own: text in Hangul is Korean whatever the room said it
+    would contain, and mislabelling it to fit the declared set is how a Korean speaker
+    ends up tagged as Japanese.
+    """
+    if _HANGUL_RE.search(text):
+        return "ko"
+    if _KANA_RE.search(text):
+        # Japanese mixes kana with kanji; the presence of ANY kana settles it against
+        # Chinese, which uses Han characters alone.
+        return "ja"
+    if _THAI_RE.search(text):
+        return "th"
+    if _HAN_RE.search(text):
+        # Han with no kana. Japanese written purely in kanji exists but is vanishingly
+        # rare in conversational speech, so Chinese is the better call.
+        return "zh"
+    return None
 
 
 def _guess_language_from_text(text: str, allowed: set[str] | None = None) -> str:
@@ -168,12 +270,24 @@ def _guess_language_from_text(text: str, allowed: set[str] | None = None) -> str
     is authoritative and this is never called, which is what stops the per-chunk
     language flip-flop.
 
-    Constrain the guess to the meeting's declared language set so we don't label a
-    segment 'vi' in a room where nobody speaks Vietnamese: diacritics ⇒ 'vi' only if the
-    room actually allows 'vi', else prefer 'en', else any deterministic member of the
-    declared set."""
-    if _VI_CHAR_RE.search(text) and (not allowed or "vi" in allowed):
+    Evidence is used strongest-first:
+
+    1. Writing system. Unambiguous, and not filtered through `allowed` — see
+       _detect_script_language.
+    2. Vietnamese-unique diacritics. Also unambiguous now that the character class no
+       longer collides with the Romance languages.
+    3. Only then the weak fallback, which does respect `allowed`: with no evidence at
+       all, prefer English, else a deterministic member of the declared set.
+
+    Step 3 is a guess and is documented as one. Steps 1 and 2 are not.
+    """
+    script_language = _detect_script_language(text)
+    if script_language:
+        return script_language
+
+    if _VI_UNIQUE_CHAR_RE.search(text):
         return "vi"
+
     if allowed:
         if "en" in allowed:
             return "en"
@@ -194,67 +308,206 @@ _FOREIGN_SCRIPT_RE = re.compile(
 _MIN_SPEECH_SECONDS_FOR_LONG_TEXT = 0.5
 _MAX_CHARS_FOR_SHORT_AUDIO = 20
 
-_HALLUCINATIONS = {
-    "thank you",
+# Two blocklists, not one, because the original single list conflated two very different
+# things and silently deleted meeting speech as a result.
+#
+# _HALLUCINATIONS_ALWAYS is training-data bleed: phrases a Whisper-family model emits
+# because its training corpus is full of video outros, plus echoes of our own session
+# prompt. Nobody says these in a work meeting at any confidence, so text alone is enough.
+_HALLUCINATIONS_ALWAYS = {
     "thanks for watching",
-    "bye",
-    "bye bye",
-    "good night",
-    "oh",
-    "you",
-    "yeah",
-    "okay",
     "thanks for watching!",
-    "thank you.",
-    "good night.",
-    "bye.",
-    "bye-bye.",
-    "oh.",
-    "you.",
-    "yeah.",
-    "okay.",
-    "fuck",
-    "fuck.",
-    "hmm",
-    "hmm.",
-    "i'm",
     "subscribe",
     "like and subscribe",
-    "see you all later",
-    "see you all later.",
-    "cảm ơn mọi người",
     "cảm ơn các bạn đã theo dõi",
     "hãy subscribe cho kênh",
-    "xin chào",
     "cảm ơn các bạn đã xem video",
     "đăng ký kênh",
     "nhấn nút đăng ký",
     "cuộc họp tiếng việt, có thể xen tiếng anh",
     "cuộc họp tiếng anh",
     "đây là cuộc họp bằng tiếng việt",
-    "nói",
-    "ừ",
-    "à",
     "ađe",
     "ade",
     ".",
     "..",
     "...",
+    # The other four meeting-scope languages. Until these were added, ja/ko/fr/es had NO
+    # training-data-bleed protection at all: tools/stt_filter_audit.py --by-language
+    # measured 100% of their hallucinations surviving, against 0% for en/vi. The gap was
+    # not a judgement call about those languages, just the absence of anyone writing the
+    # list — which is exactly why the confidence-based guards matter more than these do.
+    #
+    # Japanese. The first entry is the single most reported Whisper hallucination in any
+    # language; it appears on silence in essentially every long Japanese transcription.
+    "ご視聴ありがとうございました",
+    "ご視聴ありがとうございます",
+    "最後までご視聴いただきありがとうございます",
+    "チャンネル登録お願いします",
+    "チャンネル登録よろしくお願いします",
+    # Korean.
+    "시청해주셔서 감사합니다",
+    "시청해 주셔서 감사합니다",
+    "구독과 좋아요 부탁드립니다",
+    "구독 좋아요 알림설정",
+    # French.
+    "merci d'avoir regardé",
+    "merci d'avoir regardé cette vidéo",
+    "n'oubliez pas de vous abonner",
+    "abonnez-vous à la chaîne",
+    # Spanish.
+    "gracias por ver el video",
+    "gracias por ver este video",
+    "no olvides suscribirte",
+    "suscríbete al canal",
+    # Chinese — not a meeting-scope language, but _detect_script_language can now label a
+    # segment 'zh', so the same bleed can reach a transcript.
+    "感谢观看",
+    "谢谢观看",
+    "请订阅",
 }
 
-_HALLUCINATION_SUBSTRINGS = [
+# _HALLUCINATIONS_IF_MARGINAL is the dangerous half. These strings ARE hallucinated onto
+# silence — but they are also, verbatim, the most common things a person actually says in
+# a meeting: agreement, thinking noises, and the greetings that open and close the call.
+# "okay", "yeah", "ừ", "à", "xin chào" and "cảm ơn mọi người" were all being deleted
+# unconditionally, so a clearly-spoken "Okay." never reached the transcript, and a
+# Vietnamese meeting lost both its opening and its closing line every single time.
+#
+# Text cannot tell the two cases apart; the audio evidence can. Drop these only when the
+# model was unsure (see _BLOCKLIST_MARGINAL_LOGPROB), and keep them when it was confident.
+_HALLUCINATIONS_IF_MARGINAL = {
+    "thank you",
+    "thank you.",
+    "bye",
+    "bye.",
+    "bye bye",
+    "bye-bye.",
+    "good night",
+    "good night.",
+    "oh",
+    "oh.",
+    "you",
+    "you.",
+    "yeah",
+    "yeah.",
+    "okay",
+    "okay.",
+    "hmm",
+    "hmm.",
+    "i'm",
+    "fuck",
+    "fuck.",
+    "see you all later",
+    "see you all later.",
+    "cảm ơn mọi người",
+    "xin chào",
+    "nói",
+    "ừ",
+    "à",
+    # Direct analogues of "okay"/"thank you" above in the other four languages: the model
+    # hallucinates these onto silence AND they are among the commonest things actually
+    # said in a meeting. Kept deliberately SHORT — only bare acknowledgements and bare
+    # thanks. A longer real sentence such as "はい、わかりました。" or "Sí, de acuerdo."
+    # never matches, because this list is exact-match, not substring.
+    "はい",
+    "ええ",
+    "ありがとうございました",
+    "ありがとうございます",
+    "네",
+    "예",
+    "감사합니다",
+    "oui",
+    "merci",
+    "d'accord",
+    "au revoir",
+    "sí",
+    "si",
+    "gracias",
+    "vale",
+    "adiós",
+}
+
+# Kept for compatibility with anything reading the old name, and for tests that assert on
+# the union. Membership alone no longer decides a drop — see the two sets above.
+_HALLUCINATIONS = _HALLUCINATIONS_ALWAYS | _HALLUCINATIONS_IF_MARGINAL
+
+# Above this average token logprob, a blocklisted string is taken as genuinely spoken.
+# Chosen by sweeping tools/stt_filter_audit.py over a corpus built to production's real
+# language mix: it is the point where every clearly-spoken acknowledgement survives while
+# the same strings hallucinated onto near-silence (which land near -0.65) still do not.
+_BLOCKLIST_MARGINAL_LOGPROB = -0.45
+
+# Fallback evidence for models that return NO token logprobs.
+#
+# _session_payload only requests the logprobs include-selector for models outside the
+# gpt-transcribe family, so avg_logprob arrives as the STT_UNKNOWN_CONFIDENCE sentinel on
+# exactly the models worth moving to (they are the ones that accept `keywords` and the
+# plural `languages` hint). Treating the sentinel as "marginal" would hand the blocklist
+# back its old power to delete "Okay", "Ừ" and "Xin chào" the moment the model changed —
+# a fix that silently depends on one model is not a fix.
+#
+# These two signals are independent of the model's confidence AND of the writing system,
+# which the character-count guards are not.
+_BLOCKLIST_NO_SPEECH_MARGINAL = 0.3
+_BLOCKLIST_MIN_SPEECH_SECONDS = 0.4
+
+
+def _is_marginal_for_blocklist(
+    avg_logprob: float,
+    no_speech_prob: float,
+    real_duration_s: float | None,
+) -> bool:
+    """Whether the audio evidence is weak enough to believe a blocklisted string.
+
+    Confidence first when the model gives it. Otherwise fall back to how much speech
+    there was and how likely the frame was silence.
+
+    When a model supplies none of the three, this returns False — the blocklist is left
+    enforcing only _HALLUCINATIONS_ALWAYS. That is deliberate: with no evidence either
+    way, keeping a real "Okay." costs a line a human can see and correct, while dropping
+    it costs meeting content nobody can recover. Production correction data shows content
+    loss is the failure actually happening, so the default leans that way.
+    """
+    if avg_logprob != STT_UNKNOWN_CONFIDENCE:
+        return avg_logprob < _BLOCKLIST_MARGINAL_LOGPROB
+    if no_speech_prob >= _BLOCKLIST_NO_SPEECH_MARGINAL:
+        return True
+    if real_duration_s is not None and real_duration_s < _BLOCKLIST_MIN_SPEECH_SECONDS:
+        return True
+    return False
+
+# Minimum share of DISTINCT words before a segment reads as a repetition loop rather than
+# ordinary speech. Swept in tools/stt_filter_audit.py: real utterances in both languages
+# sit at 0.75 and above (natural doubling included), while genuine loops land at 0.5 and
+# below, so anything in 0.55-0.65 separates them — 0.6 takes the middle.
+_MIN_DISTINCT_WORD_RATIO = 0.6
+
+_HALLUCINATION_SUBSTRINGS_ALWAYS = [
     "subscribe",
     "đăng ký kênh",
     "theo dõi kênh",
     "la la school",
     "xem video",
-    "bỏ lỡ",
     "ủng hộ kênh",
-    "hẹn gặp lại",
-    "chào mừng",
     "ghiền mì gõ",
     "video tiếp theo",
     "video hấp dẫn",
+]
+
+# Same trap as above, at substring level — and worse, because these drop the WHOLE segment
+# for containing the phrase anywhere. "chào mừng" (welcome) and "hẹn gặp lại" (see you
+# again) are ordinary meeting speech: "Chào mừng mọi người đến với buổi họp hôm nay" was
+# being discarded in full.
+_HALLUCINATION_SUBSTRINGS_IF_MARGINAL = [
+    "bỏ lỡ",
+    "hẹn gặp lại",
+    "chào mừng",
+]
+
+_HALLUCINATION_SUBSTRINGS = [
+    *_HALLUCINATION_SUBSTRINGS_ALWAYS,
+    *_HALLUCINATION_SUBSTRINGS_IF_MARGINAL,
 ]
 
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
@@ -381,6 +634,7 @@ def _filter_segments(
     context_prompt: str | None = None,
     keywords: list[str] | None = None,
     min_avg_logprob: float = -0.7,
+    min_avg_logprob_by_language: dict[str, float] | None = None,
 ) -> list[TranscribedSegment]:
     language_known = detected_language != "unknown"
     lang_code = _normalize_language(detected_language) if language_known else None
@@ -390,6 +644,10 @@ def _filter_segments(
     # Redis; see STTWorker._get_room_languages). This replaces the old hard-coded vi/en
     # allow-list, honoring the design where a meeting declares which languages it will
     # contain instead of a single source/target pair.
+    # Whether the room actually TOLD us its languages, as opposed to us assuming vi/en.
+    # The distinction matters for the cross-script guard below: an assumed all-Latin
+    # allow-list is not evidence that the room is all-Latin.
+    languages_declared = bool(allowed_languages)
     allowed = {_normalize_language(lang) for lang in (allowed_languages or ())}
     if not allowed:
         allowed = set(_DEFAULT_ALLOWED_LANGUAGES)
@@ -421,8 +679,17 @@ def _filter_segments(
     # skip the guard here — there's no way to tell whose script is legitimate without a
     # known per-segment language, and dropping could silently eat that speaker's real
     # transcript.
+    #
+    # `languages_declared` is what makes this fail OPEN. Before it, a room that had not
+    # yet published its language set fell back to the assumed vi/en allow-list, both
+    # Latin, and the guard therefore switched itself on — so every Japanese, Korean,
+    # Chinese or Thai utterance in that window was dropped in full, as "foreign script",
+    # in a room that had simply not finished announcing itself. Losing a speaker's entire
+    # transcript is a far worse outcome than letting a rare cross-script hallucination
+    # through, so an ASSUMED allow-list no longer arms the guard; only a declared one does.
     apply_foreign_script_guard = (language_known and lang_code in _LATIN_SCRIPT_LANGUAGES) or (
         not language_known
+        and languages_declared
         and bool(allowed)
         and all(lang in _LATIN_SCRIPT_LANGUAGES for lang in allowed)
     )
@@ -494,12 +761,28 @@ def _filter_segments(
             logger.debug("filtered_no_speech", text=text, no_speech_prob=round(no_speech, 2))
             continue
 
+        # Resolved here, before the confidence gate, because the gate itself is
+        # per-language: models are measurably less confident in some languages than
+        # others at identical audio quality, so one shared floor discards more real
+        # speech from the languages it already handles worst.
+        seg_lang = lang_code or _guess_language_from_text(text, allowed)
+        language_floor = (min_avg_logprob_by_language or {}).get(
+            base_language(seg_lang),
+            min_avg_logprob,
+        )
+
         # -1.0 is the compatibility sentinel for old completed events that lacked
         # logprobs. Current sessions request real token logprobs; a real value below
         # the calibrated boundary is marginal audio and must not become an off-topic
         # plausible-looking caption.
-        if avg_logprob != -1.0 and avg_logprob < min_avg_logprob:
-            logger.debug("filtered_low_confidence", text=text, logprob=round(avg_logprob, 2))
+        if avg_logprob != STT_UNKNOWN_CONFIDENCE and avg_logprob < language_floor:
+            logger.debug(
+                "filtered_low_confidence",
+                text=text,
+                logprob=round(avg_logprob, 2),
+                language=seg_lang,
+                floor=language_floor,
+            )
             continue
 
         # Unlike no_speech/avg_logprob above, this IS a real signal — only passed for the
@@ -520,12 +803,39 @@ def _filter_segments(
             )
             continue
 
-        if text_lower in _HALLUCINATIONS:
+        # A blocklisted string is only evidence of hallucination when the AUDIO evidence
+        # is weak — see _is_marginal_for_blocklist, which falls back to no-speech
+        # probability and speech duration on models that expose no confidence at all.
+        blocklist_is_marginal = _is_marginal_for_blocklist(
+            avg_logprob,
+            no_speech,
+            real_duration_s,
+        )
+
+        if text_lower in _HALLUCINATIONS_ALWAYS:
             logger.debug("filtered_hallucination", text=text)
             continue
 
-        if any(sub in text_lower for sub in _HALLUCINATION_SUBSTRINGS):
+        if blocklist_is_marginal and text_lower in _HALLUCINATIONS_IF_MARGINAL:
+            logger.debug(
+                "filtered_hallucination_marginal",
+                text=text,
+                logprob=round(avg_logprob, 2),
+            )
+            continue
+
+        if any(sub in text_lower for sub in _HALLUCINATION_SUBSTRINGS_ALWAYS):
             logger.debug("filtered_hallucination_substring", text=text)
+            continue
+
+        if blocklist_is_marginal and any(
+            sub in text_lower for sub in _HALLUCINATION_SUBSTRINGS_IF_MARGINAL
+        ):
+            logger.debug(
+                "filtered_hallucination_substring_marginal",
+                text=text,
+                logprob=round(avg_logprob, 2),
+            )
             continue
 
         # A real production failure returned a high-confidence collage made by copying
@@ -549,16 +859,28 @@ def _filter_segments(
                 )
                 continue
 
-        # Whisper-family hallucination on marginal/noisy audio tends to loop a
-        # word or short phrase rather than collapsing to 1-2 distinct words total
-        # (e.g. "Nora, Nuang Nora Va Nuang Nora" — 3 distinct words, still garbage) —
-        # a plain distinct-word-count check misses that, so gate on how dominant the
-        # single most-repeated word is instead.
+        # Whisper-family hallucination on marginal/noisy audio loops a word or short
+        # phrase (e.g. "Nora, Nuang Nora Va Nuang Nora").
+        #
+        # This used to gate on the most-repeated word's count against len(words) // 2,
+        # which was wrong in BOTH directions and measurably so:
+        #   "Ừ ừ đúng rồi"                    -> 4 words, top count 2, threshold 2 -> DROPPED
+        #   "Nora Nuang Nora Va Nuang Nora Va Nuang" -> 8 words, top 3, threshold 4 -> KEPT
+        # Natural doubling ("ừ ừ", "no no", "rất rất") is normal in both Vietnamese and
+        # English and was being deleted, while the actual loop it was written to catch
+        # walked straight through as soon as it ran long enough.
+        #
+        # The separating signal is lexical VARIETY, not the top word's count: real speech
+        # keeps introducing new words, a loop does not.
         words = text_lower.replace(",", "").split()
         if len(words) >= 4:
-            most_common_count = Counter(words).most_common(1)[0][1]
-            if most_common_count >= max(2, len(words) // 2):
-                logger.debug("filtered_repetition", text=text[:50])
+            distinct_ratio = len(set(words)) / len(words)
+            if distinct_ratio < _MIN_DISTINCT_WORD_RATIO:
+                logger.debug(
+                    "filtered_repetition",
+                    text=text[:50],
+                    distinct_ratio=round(distinct_ratio, 2),
+                )
                 continue
 
         if re.search(r"(.)\1{3,}", text_lower):
@@ -570,7 +892,6 @@ def _filter_segments(
             continue
         seen_texts.add(text_lower)
 
-        seg_lang = lang_code or _guess_language_from_text(text, allowed)
         # base_language: the repair is for the Vietnamese language, not for one spelling of
         # its tag. STT returning "vi-VN" skipped it entirely.
         corrected = _fix_vietnamese(text) if base_language(seg_lang) == "vi" else text
@@ -605,11 +926,13 @@ class OpenAISTT:
         model: str = _DEFAULTS.model,
         noise_reduction: str = _DEFAULTS.noise_reduction,
         min_avg_logprob: float = _DEFAULTS.min_avg_logprob,
+        min_avg_logprob_by_language: dict[str, float] | None = None,
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.noise_reduction = noise_reduction
         self.min_avg_logprob = min_avg_logprob
+        self.min_avg_logprob_by_language = dict(min_avg_logprob_by_language or {})
         self._client: AsyncOpenAI | None = None
         # (meeting_id, speaker_id) -> {"manager": ..., "conn": ..., "last_used": float}
         self._sessions: dict[tuple[str, str], dict[str, Any]] = {}
@@ -748,6 +1071,7 @@ class OpenAISTT:
                 context_prompt=prompt,
                 keywords=keywords,
                 min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
+                min_avg_logprob_by_language=getattr(self, "min_avg_logprob_by_language", None),
             )
             for seg in segs:
                 await on_early_segment(seg)
@@ -771,6 +1095,7 @@ class OpenAISTT:
                 context_prompt=prompt,
                 keywords=keywords,
                 min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
+                min_avg_logprob_by_language=getattr(self, "min_avg_logprob_by_language", None),
             )
             for seg in segs:
                 await on_speculative_segment(seg)
@@ -958,12 +1283,89 @@ class OpenAISTT:
 
         return await asyncio.wait_for(_collect(), timeout=TRANSCRIBE_EVENT_TIMEOUT_S)
 
+    async def _degrade_session_config(
+        self,
+        conn: Any,
+        language: str | None,
+        prompt: str | None,
+        allowed_languages: set[str] | None,
+        keywords: list[str],
+    ) -> None:
+        """Find the richest session config this model accepts, and remember it.
+
+        Tried in order, keeping as much context as possible at each rung:
+
+            1. drop structured context (`languages` + `keywords`), keep prompt + logprobs
+            2. also drop the logprobs selector
+            3. bare config — the previous behaviour's only option
+
+        Whatever succeeds is recorded per model, so a process pays this at most once
+        rather than re-deriving it for every speaker in every room.
+        """
+        attempts = [
+            ("structured_context", {"structured_context": False, "logprobs": True}),
+            ("logprobs", {"structured_context": False, "logprobs": False}),
+        ]
+        for rejected, flags in attempts:
+            try:
+                await conn.session.update(
+                    session=cast(
+                        Any,
+                        self._session_payload(
+                            language,
+                            prompt,
+                            allowed_languages,
+                            keywords,
+                            **flags,
+                        ),
+                    )
+                )
+            except Exception:
+                continue
+
+            _STRUCTURED_CONTEXT_SUPPORT[self.model] = bool(flags["structured_context"])
+            _LOGPROBS_SUPPORT[self.model] = bool(flags["logprobs"])
+            logger.warning(
+                "stt_session_capability_downgraded",
+                model=self.model,
+                unsupported=rejected,
+                structured_context=flags["structured_context"],
+                logprobs=flags["logprobs"],
+                keyword_count=len(keywords),
+            )
+            return
+
+        # Nothing optional survived. Keep the session rather than lose the speaker.
+        logger.warning(
+            "session_optional_fields_rejected",
+            model=self.model,
+            has_language=bool(language),
+            has_prompt=bool(prompt),
+            has_keywords=bool(keywords),
+        )
+        _STRUCTURED_CONTEXT_SUPPORT[self.model] = False
+        _LOGPROBS_SUPPORT[self.model] = False
+        await conn.session.update(
+            session=cast(
+                Any,
+                self._session_payload(
+                    None,
+                    None,
+                    structured_context=False,
+                    logprobs=False,
+                ),
+            )
+        )
+
     def _session_payload(
         self,
         language: str | None,
         prompt: str | None,
         allowed_languages: set[str] | None = None,
         keywords: list[str] | None = None,
+        *,
+        structured_context: bool | None = None,
+        logprobs: bool | None = None,
     ) -> dict[str, Any]:
         # input_audio_transcription.language is a real, documented field (ISO-639-1
         # hint): "improves accuracy and latency". Telling the model the speaker's
@@ -977,10 +1379,12 @@ class OpenAISTT:
         # the expected domain vocabulary — the research-backed hallucination-reduction
         # lever (arXiv 2410.18363).
         transcription_config: dict[str, Any] = {"model": self.model}
-        is_next_generation_transcribe = self.model in {
-            "gpt-transcribe",
-            "gpt-live-transcribe",
-        }
+        is_next_generation_transcribe = (
+            _supports_structured_context(self.model)
+            if structured_context is None
+            else structured_context
+        )
+        wants_logprobs = _supports_logprobs(self.model) if logprobs is None else logprobs
         if is_next_generation_transcribe:
             languages = _expected_languages(language, allowed_languages)
             if languages:
@@ -1009,10 +1413,12 @@ class OpenAISTT:
             "type": "transcription",
             "audio": {"input": input_config},
         }
-        # The earlier 4o transcription models expose token logprobs. The newer
-        # gpt-transcribe family currently does not expose confidence scores, and sending
-        # this include selector makes some Realtime API versions reject the session.
-        if not is_next_generation_transcribe:
+        # Independent of structured context above: a model may well accept BOTH the
+        # keyword hints and the logprobs selector, and collapsing the two into one
+        # model-family flag is what made "send keywords" and "keep confidence" look
+        # mutually exclusive. Sending this selector to a model that rejects it fails the
+        # whole session update, which _get_or_create_session degrades and memoises.
+        if wants_logprobs:
             payload["include"] = ["item.input_audio_transcription.logprobs"]
         return payload
 
@@ -1109,15 +1515,17 @@ class OpenAISTT:
         except Exception:
             if not language and not prompt and not normalized_keywords:
                 raise
-            # Fail safe to a bare config rather than losing the session entirely if
-            # this API version rejects the language or prompt field for some reason.
-            logger.warning(
-                "session_optional_fields_rejected",
-                has_language=bool(language),
-                has_prompt=bool(prompt),
-                has_keywords=bool(normalized_keywords),
+            # Step DOWN one capability at a time instead of collapsing straight to a bare
+            # config. The old behaviour threw away the language hint, the prompt and the
+            # keywords together on any rejection, so one unsupported field cost all three
+            # — and it did so on every new session, having learned nothing.
+            await self._degrade_session_config(
+                conn,
+                language,
+                prompt,
+                allowed_languages,
+                list(normalized_keywords),
             )
-            await conn.session.update(session=cast(Any, self._session_payload(None, None)))
 
         session = {
             "manager": manager,

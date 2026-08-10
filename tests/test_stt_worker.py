@@ -11,9 +11,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from shared.config import STTSettings, WorkerSettings
-from shared.schemas import AudioChunkMessage
+from shared.schemas import STT_UNKNOWN_CONFIDENCE, AudioChunkMessage
 from stt_worker import worker as stt_worker_module
-from stt_worker.model import OpenAISTT, TranscribedSegment, _filter_segments, _normalize_language
+from stt_worker.model import (
+    OpenAISTT,
+    TranscribedSegment,
+    _filter_segments,
+    _guess_language_from_text,
+    _normalize_language,
+    reset_capability_memo,
+)
 from stt_worker.worker import STTWorker, _language_hint_for_stt
 
 
@@ -176,6 +183,68 @@ class TestOpenAISTT:
         payload = stt._session_payload(language=None, prompt=None)
 
         assert payload["include"] == ["item.input_audio_transcription.logprobs"]
+
+    def test_unlisted_model_still_receives_glossary_keywords(self) -> None:
+        """The production bug: keywords were gated behind a hardcoded model allow-list.
+
+        gpt-4o-mini-transcribe is in neither known family, so it used to get `language`
+        SINGULAR and no keywords at all — a glossary curated to stop "Codex" becoming
+        "cô đích" reached Redis, reached this worker, and was dropped here. Capability is
+        now assumed until the API refuses it.
+        """
+        reset_capability_memo()
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.model = "gpt-4o-mini-transcribe"
+        stt.noise_reduction = "off"
+
+        payload = stt._session_payload(
+            language="vi",
+            prompt="WarpTalk meeting.",
+            allowed_languages={"vi", "en"},
+            keywords=["Codex", "Kubernetes"],
+        )
+
+        transcription = payload["audio"]["input"]["transcription"]
+        assert transcription["keywords"] == ["Codex", "Kubernetes"]
+        assert transcription["languages"] == ["vi", "en"]
+        # Structured context and confidence are independent — this model should get both.
+        assert "include" in payload
+
+    async def test_rejected_session_degrades_one_rung_and_is_remembered(self) -> None:
+        """Degrading must keep the prompt and the language hint, and learn from it.
+
+        The previous fallback threw language, prompt and keywords away together on any
+        rejection, and did so again for every new session because it recorded nothing.
+        """
+        reset_capability_memo()
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.model = "some-new-model"
+        stt.noise_reduction = "off"
+
+        accepted: list[dict] = []
+
+        async def update(session: dict) -> None:
+            transcription = session["audio"]["input"]["transcription"]
+            if "keywords" in transcription:
+                raise RuntimeError("unknown parameter: keywords")
+            accepted.append(session)
+
+        conn = MagicMock()
+        conn.session.update = AsyncMock(side_effect=update)
+
+        await stt._degrade_session_config(conn, "vi", "WarpTalk meeting.", {"vi", "en"}, ["Codex"])
+
+        assert len(accepted) == 1
+        transcription = accepted[0]["audio"]["input"]["transcription"]
+        assert "keywords" not in transcription
+        assert transcription["language"] == "vi", "language hint lost while degrading"
+        assert transcription["prompt"] == "WarpTalk meeting.", "prompt lost while degrading"
+        assert "include" in accepted[0], "confidence dropped for an unrelated rejection"
+
+        # Learned, so the next session pays nothing.
+        assert stt._session_payload("vi", None, {"vi", "en"}, ["Codex"])["audio"]["input"][
+            "transcription"
+        ].get("keywords") is None
 
     def test_gpt_transcribe_payload_uses_expected_languages_and_keywords(self) -> None:
         stt = OpenAISTT.__new__(OpenAISTT)
@@ -865,10 +934,152 @@ class TestFilterSegments:
         result = _filter_segments(segs, "en", 0)
         assert result == []
 
-    def test_hallucination_filtered(self) -> None:
-        segs = [_segment("thank you")]
-        result = _filter_segments(segs, "en", 0)
-        assert result == []
+    def test_training_data_bleed_filtered_at_any_confidence(self) -> None:
+        """Video-outro phrases are never real meeting speech, however sure the model is."""
+        segs = [_segment("thanks for watching", avg_logprob=-0.02)]
+        assert _filter_segments(segs, "en", 0) == []
+
+    def test_common_speech_on_the_blocklist_survives_when_clearly_spoken(self) -> None:
+        """The regression this pair exists to prevent.
+
+        "thank you", "okay", "ừ" and friends are hallucinated onto silence AND are among
+        the most common things actually said in a meeting. They used to be deleted
+        unconditionally, so a clearly-spoken "Thank you." never reached the transcript and
+        every Vietnamese meeting lost its closing line.
+        """
+        for text in ("thank you", "okay", "ừ", "xin chào", "cảm ơn mọi người"):
+            result = _filter_segments([_segment(text, avg_logprob=-0.1)], "en", 0)
+            assert [seg.text for seg in result] == [text], f"{text} was dropped when clear"
+
+    def test_common_speech_on_the_blocklist_still_filtered_when_marginal(self) -> None:
+        """The other half: the same strings on weak audio are still hallucinations."""
+        for text in ("thank you", "okay", "ừ", "xin chào", "cảm ơn mọi người"):
+            result = _filter_segments([_segment(text, avg_logprob=-0.6)], "en", 0)
+            assert result == [], f"{text} survived at hallucination-grade confidence"
+
+    def test_no_logprob_model_falls_back_to_audio_evidence(self) -> None:
+        """The blocklist fix must not depend on one model exposing confidence.
+
+        _session_payload requests logprobs only for models OUTSIDE the gpt-transcribe
+        family — that is, exactly the models worth moving to, since they are the ones
+        that accept `keywords` and the plural `languages` hint. If the sentinel counted
+        as "marginal", switching model would silently restore the blocklist's power to
+        delete "Okay" and "Ừ". So with no confidence available, fall back to no-speech
+        probability and speech duration instead.
+        """
+        clear = _segment("thank you", avg_logprob=STT_UNKNOWN_CONFIDENCE, no_speech_prob=0.01)
+        assert _filter_segments([clear], "en", 0, real_duration_s=1.5), (
+            "real speech dropped on a model that reports no confidence"
+        )
+
+        on_silence = _segment("thank you", avg_logprob=STT_UNKNOWN_CONFIDENCE, no_speech_prob=0.55)
+        assert _filter_segments([on_silence], "en", 0, real_duration_s=1.5) == []
+
+        too_short = _segment("thank you", avg_logprob=STT_UNKNOWN_CONFIDENCE, no_speech_prob=0.01)
+        assert _filter_segments([too_short], "en", 0, real_duration_s=0.2) == []
+
+    def test_training_data_bleed_ignores_confidence_on_every_model(self) -> None:
+        """_HALLUCINATIONS_ALWAYS must stay absolute whether or not logprobs exist."""
+        for logprob in (-0.02, STT_UNKNOWN_CONFIDENCE):
+            segs = [_segment("thanks for watching", avg_logprob=logprob)]
+            assert _filter_segments(segs, "en", 0, real_duration_s=1.5) == []
+
+    def test_natural_doubling_is_not_a_repetition_loop(self) -> None:
+        """Doubling is ordinary in both languages and used to be deleted as a loop."""
+        for text in ("ừ ừ đúng rồi", "no no that's not what I meant"):
+            result = _filter_segments([_segment(text)], "vi", 0)
+            assert result, f"natural doubling dropped: {text}"
+
+    def test_confidence_floor_can_be_set_per_language(self) -> None:
+        """One global floor is not neutral across languages.
+
+        Published multilingual benchmarks put Vietnamese word error rate near 10% on
+        FLEURS against roughly 6% for Japanese and Korean, so identical audio quality
+        yields a lower average logprob in Vietnamese. A single shared floor therefore
+        discards the most real speech from the languages the model already handles worst.
+        Values stay unset by default — they are meant to be measured, not guessed.
+        """
+        marginal_vietnamese = [_segment("Chúng ta cần chốt phần này", avg_logprob=-0.75)]
+
+        # Default: the global floor of -0.7 rejects it.
+        assert _filter_segments(marginal_vietnamese, "vi", 0) == []
+
+        # With a calibrated Vietnamese floor, the same segment survives...
+        kept = _filter_segments(
+            marginal_vietnamese,
+            "vi",
+            0,
+            min_avg_logprob_by_language={"vi": -0.85},
+        )
+        assert [seg.text for seg in kept] == ["Chúng ta cần chốt phần này"]
+
+        # ...while a language with no override keeps using the global floor.
+        assert (
+            _filter_segments(
+                [_segment("we should finalise this part", avg_logprob=-0.75)],
+                "en",
+                0,
+                min_avg_logprob_by_language={"vi": -0.85},
+            )
+            == []
+        )
+
+    def test_script_identifies_non_latin_languages(self) -> None:
+        """Writing system is decisive and must not be filtered through the allow-list.
+
+        A Korean utterance in a {ja, ko} room used to come back as 'ja' — sorted()[0]
+        picked the label alphabetically — which then became the translation source
+        language and the dubbed voice's language.
+        """
+        cases = {
+            "이 부분은 금요일까지 끝내야 합니다.": "ko",
+            "この部分は金曜日までに終わらせましょう。": "ja",
+            "我们需要在星期五之前完成这个部分": "zh",
+            "เราต้องทำส่วนนี้ให้เสร็จ": "th",
+        }
+        for text, expected in cases.items():
+            assert _guess_language_from_text(text, {"ja", "ko"}) == expected
+            assert _guess_language_from_text(text, None) == expected
+
+    def test_romance_accents_are_not_claimed_as_vietnamese(self) -> None:
+        """The regression that made "Deberíamos" Vietnamese.
+
+        The old character class listed the whole Vietnamese alphabet, so any Spanish,
+        French, Portuguese or Italian accent matched it.
+        """
+        for text in (
+            "Deberíamos terminar esta parte antes del viernes.",
+            "merci d'avoir regardé cette vidéo",
+            "perché non funziona",
+        ):
+            assert _guess_language_from_text(text, {"en", "fr", "es"}) != "vi"
+
+    def test_vietnamese_still_detected_by_its_own_diacritics(self) -> None:
+        """Narrowing the class must not cost real Vietnamese detection."""
+        for text in ("Chúng ta cần chốt deadline tuần này.", "Em đã fix xong phần đó rồi ạ."):
+            assert _guess_language_from_text(text, None) == "vi"
+
+    def test_undeclared_room_keeps_non_latin_speech(self) -> None:
+        """Fail open: an ASSUMED vi/en allow-list must not arm the cross-script guard.
+
+        Before this, a room that had not yet published its language set fell back to
+        vi/en, both Latin, so the guard switched itself on and dropped every Japanese,
+        Korean, Chinese or Thai utterance in full.
+        """
+        for text in ("この部分は金曜日までに", "이 부분은 금요일까지", "我们需要完成这个部分"):
+            segs = [_segment(text, avg_logprob=-0.2)]
+            result = _filter_segments(segs, "unknown", 0, allowed_languages=None)
+            assert result, f"undeclared room dropped non-Latin speech: {text}"
+
+    def test_declared_latin_room_still_guards_against_foreign_script(self) -> None:
+        """The guard must still fire where the room really did declare Latin-only."""
+        segs = [_segment("この部分は金曜日までに", avg_logprob=-0.2)]
+        assert _filter_segments(segs, "unknown", 0, allowed_languages={"en", "vi"}) == []
+
+    def test_long_repetition_loop_is_caught(self) -> None:
+        """The counterpart: a genuine loop used to walk through once it ran long enough."""
+        segs = [_segment("Nora Nuang Nora Va Nuang Nora Va Nuang", avg_logprob=-0.66)]
+        assert _filter_segments(segs, "vi", 0) == []
 
     def test_chunk_offset_applied(self) -> None:
         segs = [
