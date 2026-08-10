@@ -95,6 +95,7 @@ def reset_capability_memo() -> None:
     _LOGPROBS_SUPPORT.clear()
     _LOGPROBS_SUPPORT.update(_LOGPROBS_UNSUPPORTED_SEED)
 
+
 # Conservative Vietnamese diacritical corrections for recurrent model errors.
 _VI_CORRECTIONS: dict[str, str] = {
     "lu trữ": "lưu trữ",
@@ -476,6 +477,7 @@ def _is_marginal_for_blocklist(
     if real_duration_s is not None and real_duration_s < _BLOCKLIST_MIN_SPEECH_SECONDS:
         return True
     return False
+
 
 # Minimum share of DISTINCT words before a segment reads as a repetition loop rather than
 # ordinary speech. Swept in tools/stt_filter_audit.py: real utterances in both languages

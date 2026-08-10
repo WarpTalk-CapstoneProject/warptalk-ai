@@ -63,9 +63,9 @@ from stt_worker.model import OpenAISTT
 # Candidates, in the order the decision actually cares about.
 CANDIDATES = [
     "gpt-4o-mini-transcribe",  # what production runs today
-    "gpt-transcribe",          # what shared/config.py defaults to
-    "gpt-live-transcribe",     # tunable latency, $0.017/min
-    "gpt-realtime-whisper",    # streaming counterpart
+    "gpt-transcribe",  # what shared/config.py defaults to
+    "gpt-live-transcribe",  # tunable latency, $0.017/min
+    "gpt-realtime-whisper",  # streaming counterpart
 ]
 
 # A Vietnamese sentence carrying an English product name — the exact failure the

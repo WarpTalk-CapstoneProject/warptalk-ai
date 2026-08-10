@@ -374,17 +374,13 @@ MULTILINGUAL_ACKS: list[Utterance] = [
         "はい", "ja", DROP, -0.64, duration_s=0.2, note="on silence", tags=("ja", "blocklist")
     ),
     Utterance("네", "ko", KEEP, -0.15, note="clearly spoken yes", tags=("ko", "blocklist")),
-    Utterance(
-        "네", "ko", DROP, -0.62, duration_s=0.2, note="on silence", tags=("ko", "blocklist")
-    ),
+    Utterance("네", "ko", DROP, -0.62, duration_s=0.2, note="on silence", tags=("ko", "blocklist")),
     Utterance("Oui", "fr", KEEP, -0.13, note="clearly spoken yes", tags=("fr", "blocklist")),
     Utterance(
         "Oui", "fr", DROP, -0.63, duration_s=0.2, note="on silence", tags=("fr", "blocklist")
     ),
     Utterance("Sí", "es", KEEP, -0.14, note="clearly spoken yes", tags=("es", "blocklist")),
-    Utterance(
-        "Sí", "es", DROP, -0.61, duration_s=0.2, note="on silence", tags=("es", "blocklist")
-    ),
+    Utterance("Sí", "es", DROP, -0.61, duration_s=0.2, note="on silence", tags=("es", "blocklist")),
     # Longer real sentences that merely BEGIN with a blocklisted token must never match:
     # the list is exact-match, and these are the regression guard for that.
     Utterance("はい、わかりました。", "ja", KEEP, -0.35, tags=("ja", "blocklist")),

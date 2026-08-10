@@ -242,9 +242,12 @@ class TestOpenAISTT:
         assert "include" in accepted[0], "confidence dropped for an unrelated rejection"
 
         # Learned, so the next session pays nothing.
-        assert stt._session_payload("vi", None, {"vi", "en"}, ["Codex"])["audio"]["input"][
-            "transcription"
-        ].get("keywords") is None
+        assert (
+            stt._session_payload("vi", None, {"vi", "en"}, ["Codex"])["audio"]["input"][
+                "transcription"
+            ].get("keywords")
+            is None
+        )
 
     def test_gpt_transcribe_payload_uses_expected_languages_and_keywords(self) -> None:
         stt = OpenAISTT.__new__(OpenAISTT)
