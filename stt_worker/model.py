@@ -14,6 +14,7 @@ import re
 import time
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -939,6 +940,10 @@ class OpenAISTT:
         # (meeting_id, speaker_id) -> {"manager": ..., "conn": ..., "last_used": float}
         self._sessions: dict[tuple[str, str], dict[str, Any]] = {}
         self._warm_sessions: deque[dict[str, Any]] = deque()
+        # How many warm sockets to keep ready. Set by warm_up() and used by
+        # _schedule_warm_refill to replace every socket a speaker claims.
+        self._warm_target = 0
+        self._warm_refill_task: asyncio.Task[None] | None = None
 
     async def load(self) -> None:
         if not self.api_key:
@@ -947,19 +952,25 @@ class OpenAISTT:
         self._client = AsyncOpenAI(api_key=self.api_key)
         logger.info("openai_stt_ready", model=self.model)
 
-    async def warm_up(self, pool_size: int = 4) -> None:
-        """Open reusable transcription sockets before the first participant speaks."""
+    async def _open_warm_socket(self) -> dict[str, Any]:
         client = self._client
         if client is None:
             raise RuntimeError("OpenAI STT is not loaded")
+        manager = client.realtime.connect(extra_query={"intent": "transcription"})
+        conn = await manager.__aenter__()
+        return {"manager": manager, "conn": conn}
 
-        async def _open() -> dict[str, Any]:
-            manager = client.realtime.connect(extra_query={"intent": "transcription"})
-            conn = await manager.__aenter__()
-            return {"manager": manager, "conn": conn}
+    async def warm_up(self, pool_size: int = 4) -> None:
+        """Open reusable transcription sockets before the first participant speaks."""
+        if self._client is None:
+            raise RuntimeError("OpenAI STT is not loaded")
+
+        # Remembered so the pool can be refilled later. Without this the pool was a
+        # one-shot allocation: see _refill_warm_sessions.
+        self._warm_target = max(0, pool_size)
 
         opened = await asyncio.gather(
-            *(_open() for _ in range(max(0, pool_size))),
+            *(self._open_warm_socket() for _ in range(self._warm_target)),
             return_exceptions=True,
         )
         warm_sessions = getattr(self, "_warm_sessions", None)
@@ -973,7 +984,53 @@ class OpenAISTT:
                 warm_sessions.append(result)
         logger.info("stt_realtime_pool_warmed", connections=len(warm_sessions))
 
+    def _schedule_warm_refill(self) -> None:
+        """Top the warm pool back up, off the caller's critical path.
+
+        The pool used to be filled exactly once, at worker startup, and every claimed
+        socket was simply gone: _get_or_create_session popped one and nothing ever put
+        one back. So the first four speakers a process ever saw got an instant session
+        and everyone after them — every later participant, every later meeting, for the
+        rest of the process's life — paid the full ~1-2s Realtime handshake on their
+        FIRST utterance. That is the delay a user feels as "I joined, I spoke, and the
+        transcript took a moment to appear", and it got worse the longer a deployment
+        stayed up.
+
+        Refilling in the background rather than inline keeps the claim itself instant.
+        """
+        if getattr(self, "_warm_target", 0) <= 0 or self._client is None:
+            return
+        existing = getattr(self, "_warm_refill_task", None)
+        if existing is not None and not existing.done():
+            return
+        self._warm_refill_task = asyncio.create_task(self._refill_warm_sessions())
+
+    async def _refill_warm_sessions(self) -> None:
+        warm_sessions = getattr(self, "_warm_sessions", None)
+        if warm_sessions is None:
+            warm_sessions = deque()
+            self._warm_sessions = warm_sessions
+
+        while len(warm_sessions) < self._warm_target:
+            try:
+                warm_sessions.append(await self._open_warm_socket())
+            except Exception as exc:  # noqa: BLE001 - a provider hiccup must not kill the worker
+                # Stop rather than spin: the next claim schedules another attempt, so a
+                # provider outage costs cold handshakes, never a reconnect loop.
+                logger.warning("stt_warm_refill_failed", error=str(exc))
+                return
+        logger.debug("stt_warm_pool_refilled", connections=len(warm_sessions))
+
     async def close(self) -> None:
+        # Stop refilling before draining, or the task races the shutdown and reopens
+        # sockets nobody will ever close.
+        self._warm_target = 0
+        refill = getattr(self, "_warm_refill_task", None)
+        if refill is not None and not refill.done():
+            refill.cancel()
+            with suppress(asyncio.CancelledError):
+                await refill
+
         sessions = list(getattr(self, "_sessions", {}).values())
         getattr(self, "_sessions", {}).clear()
         warm_sessions = list(getattr(self, "_warm_sessions", ()))
@@ -1437,6 +1494,11 @@ class OpenAISTT:
         languages = tuple(_expected_languages(language, allowed_languages))
         normalized_keywords = tuple(_normalized_keywords(keywords))
         cached = self._sessions.get(key)
+        # Deliberately NOT the optimistic capability memo, unlike _session_payload. Being
+        # wrong about keywords costs a hint that does not help; being wrong here leaves a
+        # session pinned to the wrong language for the rest of the meeting, mistranscribing
+        # silently. So this stays on models we have actually confirmed handle several
+        # languages in one session.
         is_next_generation_transcribe = self.model in {
             "gpt-transcribe",
             "gpt-live-transcribe",
@@ -1444,6 +1506,11 @@ class OpenAISTT:
         if (
             cached is not None
             and not is_next_generation_transcribe
+            # A session prepared before the speaker's language was known carries None.
+            # Reopening it would throw away the very handshake the prewarm paid for and
+            # hand the speaker back the delay it existed to remove — the config update
+            # below pins it just as well.
+            and cached.get("language") is not None
             and cached.get("language") != language
         ):
             logger.info(
@@ -1498,9 +1565,15 @@ class OpenAISTT:
             warm = warm_sessions.popleft()
             manager = warm["manager"]
             conn = warm["conn"]
+            # Replace what we just took, in the background, so the NEXT speaker is also
+            # instant. Without this the pool drained permanently after four claims.
+            self._schedule_warm_refill()
         else:
             manager = client.realtime.connect(extra_query={"intent": "transcription"})
             conn = await manager.__aenter__()
+            # Empty pool means the refill has not caught up (or has never run) — ask for
+            # one now so this speaker is the last to pay the handshake.
+            self._schedule_warm_refill()
 
         try:
             await conn.session.update(

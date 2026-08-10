@@ -112,6 +112,74 @@ class TestOpenAISTT:
         assert stt._client.realtime.connect.call_count == 2
         session["conn"].session.update.assert_awaited_once()
 
+    async def test_warm_pool_refills_after_a_speaker_claims_a_socket(self) -> None:
+        """The pool must not be a one-shot allocation.
+
+        warm_up() ran once at startup and _get_or_create_session popped from the pool
+        without ever putting one back, so the first `pool_size` speakers a process saw
+        got an instant session and every speaker after them — later participants, later
+        meetings, for the rest of the deployment's life — paid the full Realtime
+        handshake on their first utterance. That is the delay a user experiences as
+        "I joined, I spoke, and the transcript took a moment to appear".
+        """
+        stt = OpenAISTT(api_key="test", model="gpt-4o-mini-transcribe")
+        connections = [FakeRealtimeConn([]) for _ in range(6)]
+        stt._client = MagicMock()
+        stt._client.realtime.connect = MagicMock(
+            side_effect=[FakeRealtimeManager(conn) for conn in connections]
+        )
+
+        await stt.warm_up(pool_size=2)
+        assert len(stt._warm_sessions) == 2
+
+        await stt._get_or_create_session(("m1", "s1"), language="vi")
+        # The refill runs in the background; let it settle.
+        await asyncio.sleep(0)
+        await stt._warm_refill_task
+
+        assert len(stt._warm_sessions) == 2, "pool did not refill after a claim"
+
+    async def test_warm_refill_stops_on_provider_failure(self) -> None:
+        """A provider outage must cost cold handshakes, never a reconnect loop."""
+        stt = OpenAISTT(api_key="test", model="gpt-4o-mini-transcribe")
+        stt._client = MagicMock()
+        stt._client.realtime.connect = MagicMock(
+            side_effect=[FakeRealtimeManager(FakeRealtimeConn([])), RuntimeError("provider down")]
+        )
+
+        await stt.warm_up(pool_size=1)
+        await stt._get_or_create_session(("m1", "s1"), language="vi")
+        await asyncio.sleep(0)
+        await stt._warm_refill_task
+
+        # Gave up rather than spinning; the pool is simply empty.
+        assert len(stt._warm_sessions) == 0
+
+    async def test_prewarmed_session_without_language_is_not_reopened(self) -> None:
+        """An unpinned prewarm must survive the first chunk.
+
+        stt_worker prewarms on track_published, before the speaker's language has
+        necessarily been written to Redis. Reopening the session when that language
+        finally arrives would discard the very handshake the prewarm paid for and hand
+        the speaker back the delay it existed to remove.
+        """
+        stt = OpenAISTT(api_key="test", model="gpt-4o-mini-transcribe")
+        conn = FakeRealtimeConn([])
+        stt._client = MagicMock()
+        stt._client.realtime.connect = MagicMock(return_value=FakeRealtimeManager(conn))
+
+        # Prewarm with no language known yet.
+        await stt._get_or_create_session(("m1", "s1"), language=None)
+        opened_after_prewarm = stt._client.realtime.connect.call_count
+
+        # First real chunk arrives carrying the speaker's language.
+        await stt._get_or_create_session(("m1", "s1"), language="vi")
+
+        assert stt._client.realtime.connect.call_count == opened_after_prewarm, (
+            "unpinned prewarm was thrown away instead of being configured in place"
+        )
+        assert stt._sessions[("m1", "s1")]["language"] == "vi"
+
     async def test_transcribe_returns_segments(self, sample_audio_bytes: bytes) -> None:
         """transcribe() should return a filtered list of TranscribedSegment.
 

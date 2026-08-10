@@ -184,23 +184,27 @@ class STTWorker(BaseWorker):
                 break
             if attempt < 2:
                 await asyncio.sleep(0.25)
-        if not raw_language:
-            self.logger.debug(
-                "stt_prewarm_skipped_without_language",
+        # Prewarm ANYWAY when the language write has not landed. This used to return, so a
+        # speaker whose gateway write was even half a second late got no prepared socket at
+        # all and paid the full Realtime handshake on their first sentence — exactly the
+        # "I joined, I spoke, and the transcript lagged" complaint. Claiming the socket
+        # unpinned is still most of the win: the handshake is the expensive part, and the
+        # language is applied by an ordinary session.update on the first chunk.
+        declared_language = (
+            raw_language.decode() if isinstance(raw_language, bytes) else raw_language
+        ) or None
+        if declared_language is None:
+            self.logger.info(
+                "stt_prewarm_without_language",
                 meeting_id=meeting_id,
                 speaker_id=speaker_id,
             )
-            return
-
-        declared_language = (
-            raw_language.decode() if isinstance(raw_language, bytes) else raw_language
-        )
         allowed_languages = await self._get_room_languages(meeting_id)
         keywords = await self._get_stt_keywords(meeting_id)
         await self._require_model().prepare_session(
             meeting_id,
             speaker_id,
-            language=_language_hint_for_stt(declared_language),
+            language=_language_hint_for_stt(declared_language) if declared_language else None,
             prompt=None,
             allowed_languages=allowed_languages,
             keywords=keywords,
