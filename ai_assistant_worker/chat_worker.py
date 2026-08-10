@@ -25,6 +25,7 @@ from openai import AsyncOpenAI
 from ai_assistant_worker.chat_tools import TOOLS, TOOLS_BY_NAME, ToolContext
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
+from shared.openai_options import completion_options
 from shared.schemas import ChatRequestMessage, ChatResultMessage
 
 SIBLING_SERVICE_TIMEOUT_SECONDS = 15.0
@@ -252,8 +253,11 @@ class ChatAssistantWorker(BaseWorker):
             assert self._openai is not None, "OpenAI client must be initialized"
             stream = await self._openai.chat.completions.create(
                 model=self.chat_settings.model,
-                temperature=self.chat_settings.temperature,
-                max_tokens=self.chat_settings.max_tokens,
+                **completion_options(
+                    self.chat_settings.model,
+                    self.chat_settings.max_tokens,
+                    self.chat_settings.temperature,
+                ),
                 messages=cast(Any, messages),
                 tools=cast(Any, tool_schemas),
                 tool_choice="auto",

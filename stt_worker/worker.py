@@ -122,6 +122,7 @@ class STTWorker(BaseWorker):
             model=self.stt_settings.model,
             noise_reduction=self.stt_settings.noise_reduction,
             min_avg_logprob=self.stt_settings.min_avg_logprob,
+            min_avg_logprob_by_language=self.stt_settings.min_avg_logprob_by_language,
         )
         await self.model.load()
         await self.model.warm_up(pool_size=self.stt_settings.realtime_pool_size)

@@ -14,6 +14,7 @@ from openai import AsyncOpenAI
 
 from shared.config import TranslationSettings
 from shared.logger import get_logger
+from shared.openai_options import completion_options
 
 logger = get_logger(__name__)
 OUT_OF_MEETING_SCOPE = "[OUT_OF_MEETING_SCOPE]"
@@ -425,16 +426,11 @@ class OpenAITranslator:
     def _completion_options(self, token_limit: int) -> dict[str, Any]:
         """Return model-compatible generation controls.
 
-        GPT-5 models reject the legacy ``max_tokens`` parameter and only support
-        their default temperature. Keeping this in one helper prevents single and
-        batch translation paths from drifting apart.
+        The rule now lives in shared/openai_options.py so the assistant, chat-tool,
+        suggestion and security workers obey it too — they each used to build this
+        dict by hand and would fail outright against a gpt-5 model.
         """
-        if self.model.startswith("gpt-5"):
-            return {"max_completion_tokens": token_limit}
-        return {
-            "max_tokens": token_limit,
-            "temperature": self.temperature,
-        }
+        return completion_options(self.model, token_limit, self.temperature)
 
     async def translate(
         self,
