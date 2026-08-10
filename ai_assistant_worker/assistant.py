@@ -14,6 +14,7 @@ from openai import AsyncOpenAI
 from ai_assistant_worker.summary_templates import build_system_prompt, resolve_template
 from shared.config import AssistantSettings
 from shared.logger import get_logger
+from shared.openai_options import completion_options
 
 logger = get_logger(__name__)
 
@@ -95,8 +96,7 @@ When extracting action items:
                     "content": f"Please summarize this meeting transcript:\n\n{transcript}",
                 },
             ],
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
+            **completion_options(self.model, self.max_tokens, self.temperature),
         )
 
         return response.choices[0].message.content or ""
@@ -127,8 +127,9 @@ When extracting action items:
                     ),
                 },
             ],
-            max_tokens=self.max_tokens,
-            temperature=0.2,
+            # 0.2, not self.temperature: action-item extraction is deliberately tighter
+            # than summarization. Preserved as-is through the shared-options move.
+            **completion_options(self.model, self.max_tokens, 0.2),
         )
 
         return response.choices[0].message.content or ""
@@ -209,8 +210,7 @@ for decisions and actionItems."""
                         "content": f"Summarize this meeting transcript as JSON:\n\n{transcript}",
                     },
                 ],
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
+                **completion_options(self.model, self.max_tokens, self.temperature),
                 response_format={"type": "json_object"},
             )
             raw = response.choices[0].message.content or "{}"
