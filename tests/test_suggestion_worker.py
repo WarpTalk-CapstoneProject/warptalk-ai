@@ -117,7 +117,11 @@ def build_worker(
 def stt_message(
     text: str = "chúng ta cần chốt deadline cho phần tích hợp này",
     *,
-    confidence: float = 0.9,
+    # AVG LOGPROB (always <= 0), not a 0-1 score — this mirrors what stt_worker actually
+    # publishes. Production segments span -0.699 to 0.000, so -0.1 stands in for clean
+    # speech. Do not confuse this with SuggestionDecision.confidence below, which really
+    # is 0-1: the two live on different scales and are gated by different settings.
+    confidence: float = -0.1,
     is_final_chunk: bool = False,
     meeting_id: str = "room-1",
     speaker_id: str = "speaker-1",
@@ -195,7 +199,9 @@ class TestStageZeroGating:
     async def test_low_stt_confidence_is_dropped(self) -> None:
         worker, _, suggester = build_worker()
 
-        await worker.process(b"1-0", stt_message(confidence=0.3))
+        # -0.6: poor but still above stt_worker's own -0.7 discard floor, so this is a
+        # segment that really does reach this worker and really should be declined.
+        await worker.process(b"1-0", stt_message(confidence=-0.6))
 
         assert suggester.decide_calls == []
 

@@ -25,6 +25,7 @@ from openai import AsyncOpenAI
 from ai_assistant_worker.chat_tools import TOOLS, TOOLS_BY_NAME, ToolContext
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
+from shared.openai_options import completion_options
 from shared.schemas import ChatRequestMessage, ChatResultMessage
 
 SIBLING_SERVICE_TIMEOUT_SECONDS = 15.0
@@ -176,6 +177,15 @@ class ChatAssistantWorker(BaseWorker):
             or self._translation_room_client is None
             or self._openai is None
         ):
+            # Answer before raising. This check sits OUTSIDE the try/except below, so raising
+            # here published nothing at all — and a caller who mentions @WarpBot and receives
+            # complete silence cannot tell "the assistant is misconfigured" from "the mention
+            # was never seen". Every exit from process() must leave an answer behind.
+            await self._publish_result(
+                request,
+                type_="failed",
+                content="WarpBot is not available right now.",
+            )
             raise RuntimeError("ChatAssistantWorker is not initialized — call load_model() first")
 
         try:
@@ -243,8 +253,11 @@ class ChatAssistantWorker(BaseWorker):
             assert self._openai is not None, "OpenAI client must be initialized"
             stream = await self._openai.chat.completions.create(
                 model=self.chat_settings.model,
-                temperature=self.chat_settings.temperature,
-                max_tokens=self.chat_settings.max_tokens,
+                **completion_options(
+                    self.chat_settings.model,
+                    self.chat_settings.max_tokens,
+                    self.chat_settings.temperature,
+                ),
                 messages=cast(Any, messages),
                 tools=cast(Any, tool_schemas),
                 tool_choice="auto",

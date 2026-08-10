@@ -11,8 +11,10 @@ from typing import Any, cast
 
 from openai import AsyncOpenAI
 
+from ai_assistant_worker.summary_templates import build_system_prompt, resolve_template
 from shared.config import AssistantSettings
 from shared.logger import get_logger
+from shared.openai_options import completion_options
 
 logger = get_logger(__name__)
 
@@ -94,8 +96,7 @@ When extracting action items:
                     "content": f"Please summarize this meeting transcript:\n\n{transcript}",
                 },
             ],
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
+            **completion_options(self.model, self.max_tokens, self.temperature),
         )
 
         return response.choices[0].message.content or ""
@@ -126,8 +127,9 @@ When extracting action items:
                     ),
                 },
             ],
-            max_tokens=self.max_tokens,
-            temperature=0.2,
+            # 0.2, not self.temperature: action-item extraction is deliberately tighter
+            # than summarization. Preserved as-is through the shared-options move.
+            **completion_options(self.model, self.max_tokens, 0.2),
         )
 
         return response.choices[0].message.content or ""
@@ -151,6 +153,7 @@ for decisions and actionItems."""
         transcript: str,
         target_languages: list[str] | None = None,
         context_snapshot: str = "",
+        template_key: str | None = None,
     ) -> dict[str, Any]:
         """Generate a structured {summary, decisions[], actionItems[]} JSON object.
 
@@ -173,10 +176,16 @@ for decisions and actionItems."""
                 "summary": "No transcript content to summarize.",
                 "decisions": [],
                 "actionItems": [],
+                "citations": [],
+                "templateKey": resolve_template(template_key).key,
                 "insufficientData": True,
             }
 
-        system_content = self.STRUCTURED_SYSTEM_PROMPT
+        # The shape comes from the template, not from a constant. STRUCTURED_SYSTEM_PROMPT
+        # asked for a "concise overview paragraph" and got exactly that — three thin
+        # sentences for every meeting, whatever kind of meeting it was.
+        template = resolve_template(template_key)
+        system_content = build_system_prompt(template)
         if context_snapshot:
             system_content += f"\n\nMeeting Context (Reference Documents):\n{context_snapshot}"
 
@@ -201,15 +210,21 @@ for decisions and actionItems."""
                         "content": f"Summarize this meeting transcript as JSON:\n\n{transcript}",
                     },
                 ],
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
+                **completion_options(self.model, self.max_tokens, self.temperature),
                 response_format={"type": "json_object"},
             )
             raw = response.choices[0].message.content or "{}"
             parsed = cast(dict[str, Any], json.loads(raw))
             parsed.setdefault("summary", "")
+            # Every section the template declared, so a consumer never has to guess whether
+            # an absent key means "none of these" or "the model forgot".
+            for section in template.sections:
+                if section.kind != "paragraph":
+                    parsed.setdefault(section.key, [])
             parsed.setdefault("decisions", [])
             parsed.setdefault("actionItems", [])
+            parsed.setdefault("citations", [])
+            parsed["templateKey"] = template.key
             parsed["insufficientData"] = False
             return parsed
         except Exception:

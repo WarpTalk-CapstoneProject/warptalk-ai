@@ -129,6 +129,22 @@ class STTSettings(BaseSettings):
     # Production replay placed unrelated, unstable sentences at -0.767 to -0.8833.
     # Clear code-switched technical speech stayed above this boundary.
     min_avg_logprob: float = -0.7
+    # Per-language overrides for the discard floor above, keyed by bare ISO-639-1 code
+    # (e.g. STT_MIN_AVG_LOGPROB_BY_LANGUAGE='{"vi": -0.75}'). Empty by default: every
+    # language uses min_avg_logprob until someone measures a better value for it.
+    #
+    # Why the mechanism exists at all — a single global floor is not neutral. Published
+    # multilingual benchmarks put Vietnamese word error rate around 10% on FLEURS against
+    # roughly 6% for Japanese and Korean, so the same acoustic quality yields a lower
+    # average logprob in Vietnamese than in Japanese. One shared threshold therefore
+    # discards more real speech from the languages the model finds hardest, which is the
+    # opposite of what a multilingual product wants.
+    #
+    # HOW TO CALIBRATE (do not guess these): run a labelled set per language through
+    # tools/stt_filter_audit.py, sweep the floor, and take the value where content
+    # retention stops improving. ViMedCSS (Vietnamese-English code-switching, 34.6h),
+    # CanVEC and the relevant FLEURS split are suitable sources.
+    min_avg_logprob_by_language: dict[str, float] = {}
     # Warm WebSockets are claimed by the first active speakers so their first utterance
     # does not pay the ~1–2s Realtime connection handshake.
     realtime_pool_size: int = 4
@@ -180,6 +196,10 @@ class TTSSettings(BaseSettings):
     # target languages it actually needs, not just English.
     model: str = "sonic-3.5"
     sample_rate: int = 44100
+    # "slow" | "normal" | "fast" — the whole of Cartesia's range (cartesia.types.ModelSpeed).
+    # Defaults to fast: a dub has to land inside the gap the speaker left, and at normal it
+    # consistently finished after they had already moved on. Overridable as TTS_SPEED.
+    speed: str = "fast"
     voice_clone_min_seconds: float = 10.0  # Buffer threshold before calling /voices/clone
     min_clone_chars: int = 8
     cache_enabled: bool = True
@@ -279,7 +299,21 @@ class SuggestionSettings(BaseSettings):
 
     # Stage-0 heuristics — reject before spending a single token.
     min_words: int = 5
-    min_stt_confidence: float = 0.6
+    # AVG LOGPROB, not a 0-1 confidence. The `confidence` field on stt:results carries
+    # the model's average token logprob straight through, so it is always <= 0 — verified
+    # against production data, where 1,422 stored segments span -0.699 to 0.000 and never
+    # once reach a positive value.
+    #
+    # This was 0.6, a threshold on a 0-1 scale that does not exist here, so the stage-0
+    # gate rejected EVERY segment: the worker would have run, stayed healthy, consumed the
+    # stream and produced not one suggestion. That stayed invisible while
+    # SUGGESTION_ENABLED was false and would have surfaced as "the feature does nothing"
+    # the moment it was switched on.
+    #
+    # -0.35 matches the two sibling gates on the same field (stt_worker/worker.py:59 and
+    # translation_worker/worker.py:99) and keeps roughly the cleaner two thirds of real
+    # production speech, which suits a feature whose whole design is to stay quiet.
+    min_stt_confidence: float = -0.35
 
     # Rolling transcript window handed to the decide stage. Enough to tell a genuine
     # open question from a mid-sentence fragment without resending the whole meeting.

@@ -18,6 +18,7 @@ from typing import Any, cast
 import httpx
 
 from shared.logger import get_logger
+from shared.openai_options import completion_options
 from shared.redis_client import RedisStreamClient
 
 logger = get_logger(__name__)
@@ -245,7 +246,8 @@ async def _translate_text(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     try:
         response = await ctx.openai_client.chat.completions.create(
             model=ctx.model,
-            temperature=0.0,
+            # Uncapped by design — a translation must not be truncated mid-sentence.
+            **completion_options(ctx.model, temperature=0.0),
             messages=[
                 {
                     "role": "system",

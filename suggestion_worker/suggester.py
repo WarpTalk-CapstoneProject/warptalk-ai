@@ -21,6 +21,7 @@ from typing import Any, Protocol
 from openai import AsyncOpenAI
 
 from shared.logger import get_logger
+from shared.openai_options import completion_options
 
 logger = get_logger(__name__)
 
@@ -249,8 +250,11 @@ class OpenAISuggester:
                     {"role": "system", "content": _DECIDE_SYSTEM_PROMPT},
                     {"role": "user", "content": _render_transcript(window, segment)},
                 ],
-                max_tokens=self.decide_max_tokens,
-                temperature=self.temperature,
+                **completion_options(
+                    self.decide_model,
+                    self.decide_max_tokens,
+                    self.temperature,
+                ),
                 response_format={"type": "json_object"},
             )
             parsed = json.loads(completion.choices[0].message.content or "{}")
@@ -302,8 +306,11 @@ class OpenAISuggester:
                     {"role": "system", "content": system_content},
                     {"role": "user", "content": user_content},
                 ],
-                max_tokens=self.generate_max_tokens,
-                temperature=self.temperature,
+                **completion_options(
+                    self.generate_model,
+                    self.generate_max_tokens,
+                    self.temperature,
+                ),
                 response_format={"type": "json_object"},
             )
             parsed = json.loads(completion.choices[0].message.content or "{}")

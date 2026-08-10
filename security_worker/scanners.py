@@ -3,8 +3,14 @@ import json
 from openai import AsyncOpenAI
 
 from shared.config import SecuritySettings
+from shared.openai_options import completion_options
 
 # --- Constants ---
+# Fallbacks only. The live values come from SecuritySettings (SECURITY_MODEL,
+# SECURITY_MAX_TOKENS, SECURITY_TEMPERATURE, SECURITY_MAX_ANALYZE_LENGTH) — this
+# scanner used to read the module constants directly and ignore the settings object
+# entirely, which made SECURITY_MODEL a dead environment variable: production could
+# set it to anything and the scanner still called gpt-4o-mini.
 DEFAULT_MODEL = "gpt-4o-mini"
 MAX_ANALYZE_LENGTH = 20000
 MAX_TOKENS = 2000
@@ -33,9 +39,10 @@ class OpenAISecurityScanner:
         if not text:
             return False, False, False, text
 
+        max_analyze_length = self.settings.max_analyze_length or MAX_ANALYZE_LENGTH
         text_to_analyze = text
-        if len(text_to_analyze) > MAX_ANALYZE_LENGTH:
-            text_to_analyze = text_to_analyze[:MAX_ANALYZE_LENGTH] + "... [truncated]"
+        if len(text_to_analyze) > max_analyze_length:
+            text_to_analyze = text_to_analyze[:max_analyze_length] + "... [truncated]"
 
         keywords_json = json.dumps(keywords_blacklist)
 
@@ -75,15 +82,19 @@ class OpenAISecurityScanner:
             f"Text to analyze:\n{text_to_analyze}"
         )
 
+        model = self.settings.model or DEFAULT_MODEL
         completion = await self.client.chat.completions.create(
-            model=DEFAULT_MODEL,
+            model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
+            **completion_options(
+                model,
+                self.settings.max_tokens or MAX_TOKENS,
+                self.settings.temperature if self.settings.temperature is not None else TEMPERATURE,
+            ),
         )
 
         content_str = completion.choices[0].message.content

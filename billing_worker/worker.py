@@ -1,15 +1,21 @@
 """Billing settlement worker.
 
-Consumes the three AI pipeline result streams (stt:results, translate:results,
-tts:results) *after the fact* — via its own consumer groups, alongside whatever else
-already reads those streams (e.g. TranscriptService's Redis consumer persists segment/
-translation content; this worker only settles credits, it does not duplicate that job)
-— and turns each billable event into subscription.usage_records +
-subscription.credit_transactions rows.
+Consumes the BILLABLE AI pipeline result streams (translate:results, tts:results)
+*after the fact* — via its own consumer groups, alongside whatever else already reads
+those streams (e.g. TranscriptService's Redis consumer persists segment/translation
+content; this worker only settles credits, it does not duplicate that job) — and turns
+each billable event into subscription.usage_records + subscription.credit_transactions
+rows.
+
+WT-344: transcription (stt:results) and the inline assistant (ai_assistant:results)
+are FREE and are deliberately not consumed here at all. A meeting gets its transcript
+and its assistant without spending anything; it pays for translation and for dubbing.
+Those two streams still exist and are still read by the transcript pipeline — this
+worker simply has no business with them.
 
 Does not subclass shared.base_worker.BaseWorker: that class is built around one
 input_stream per instance plus a route-status pub/sub listener for the real-time
-pipeline. This worker needs three streams and has nothing to react to in real time —
+pipeline. This worker needs two streams and has nothing to react to in real time —
 it settles after the work is already done, so it gets its own small run loop instead.
 
 Scope note: this worker does NOT write transcript.audio_dubbings rows. Doing that
@@ -38,21 +44,13 @@ from shared.health_probe import heartbeat_key
 from shared.logger import get_logger
 from shared.redis_client import RedisStreamClient
 from shared.schemas import (
-    STTResultMessage,
-    SuggestionResultMessage,
     TranslationResultMessage,
     TTSResultMessage,
 )
 
 logger = get_logger("worker.billing")
 
-STT_CHARGE_TYPE = "STT"
 TRANSLATION_CHARGE_TYPE = "TRANSLATION"
-# Inline transcript suggestions settle against the existing AI_ASSISTANT charge type
-# rather than a new one — it is already declared in migration 017 and already has rate
-# card rows from migration 039, so suggestions draw down the same assistant budget a
-# workspace has always had instead of introducing a second one to reason about.
-SUGGESTION_CHARGE_TYPE = "AI_ASSISTANT"
 SettlementHandler = Callable[[Mapping[Any, Any]], Awaitable[None]]
 
 
@@ -113,18 +111,23 @@ class BillingSettlementWorker:
         await self._publish_heartbeat()
         self.logger.info("billing_worker_started")
         try:
+            # WT-344: only TRANSLATION and TTS are billable.
+            #
+            # STT and the inline assistant were dropped from the billable set on the owner's
+            # call, and the streams are no longer consumed AT ALL rather than consumed and
+            # skipped. A consumer group that reads a stream only to discard it still costs a
+            # Redis round trip per utterance, still holds a pending-entry list, and still
+            # shows up in lag dashboards as a worker falling behind — which is exactly the
+            # signal that hid a genuinely broken consumer once already.
+            #
+            # The product rule this encodes: transcription is what the meeting gets for
+            # free, and translation and dubbing are what it pays for.
             await asyncio.gather(
                 self._heartbeat_loop(),
-                self._consume_loop("stt:results", "billing-stt-workers", self._handle_stt),
                 self._consume_loop(
                     "translate:results", "billing-translation-workers", self._handle_translation
                 ),
                 self._consume_loop("tts:results", "billing-tts-workers", self._handle_tts),
-                self._consume_loop(
-                    "ai_assistant:results",
-                    "billing-suggestion-workers",
-                    self._handle_suggestion,
-                ),
             )
         except asyncio.CancelledError:
             pass
@@ -253,7 +256,6 @@ class BillingSettlementWorker:
                     "worker": "billing",
                     "consumer": self._consumer_name,
                     "streams": [
-                        "stt:results",
                         "translate:results",
                         "tts:results",
                     ],
@@ -325,45 +327,6 @@ class BillingSettlementWorker:
     # ------------------------------------------------------------------
     # Per-stream handlers
     # ------------------------------------------------------------------
-
-    async def _handle_stt(self, data: Mapping[Any, Any]) -> None:
-        msg = STTResultMessage.from_redis(data)
-        if not msg.text.strip():
-            return  # empty/flush messages carry no billable transcription
-
-        resolved = await self._resolve_subscription(msg.meeting_id)
-        if resolved is None:
-            self.logger.warning("no_subscription_for_room", translation_room_id=msg.meeting_id)
-            return
-        subscription_id, workspace_id = resolved
-
-        quantity_s = (
-            max((msg.end_ms - msg.start_ms) / 1000.0, 0.1) if msg.end_ms > msg.start_ms else 1.0
-        )
-        await self.db.record_usage_and_charge(
-            subscription_id=subscription_id,
-            user_id=msg.speaker_id,
-            workspace_id=workspace_id,
-            translation_room_id=msg.meeting_id,
-            usage_type=STT_CHARGE_TYPE,
-            charge_type=STT_CHARGE_TYPE,
-            reference_id=msg.segment_id,
-            reference_type="transcript_segment",
-            quantity=quantity_s,
-            unit="second",
-            source_language_code=msg.language,
-            # msg.segment_id IS the real TranscriptSegment.Id for STT events (unlike
-            # translation/TTS, which carry a composite "{guid}-c{idx}" string) — no
-            # extraction needed here.
-            transcript_segment_id=msg.segment_id,
-            # NOTE: msg.segment_id is randomly generated per STTResultMessage
-            # (Field(default_factory=uuid4) in shared/schemas.py) — it is NOT stable
-            # across a Redis Streams redelivery of the *upstream* audio chunk, since
-            # stt_worker.process() would mint a fresh one on retry. This idempotency
-            # key only protects against redelivery/retry at THIS worker's own consumer
-            # group, not against stt_worker re-processing the same audio chunk twice.
-            idempotency_key=f"{STT_CHARGE_TYPE}:{msg.segment_id}:NA",
-        )
 
     async def _handle_translation(self, data: Mapping[Any, Any]) -> None:
         msg = TranslationResultMessage.from_redis(data)
@@ -450,78 +413,6 @@ class BillingSettlementWorker:
             idempotency_key=f"{charge_type}:{msg.segment_id}:{msg.target_lang}",
             details={"clone_provider": msg.clone_provider, "voice_mode": msg.voice_mode},
         )
-
-    async def _handle_suggestion(self, data: Mapping[Any, Any]) -> None:
-        """Settle one inline transcript suggestion against the AI_ASSISTANT budget.
-
-        Shares the ai_assistant:results stream with meeting summaries and action items, so
-        anything that is not a suggestion is skipped here — the summary path predates this
-        worker and is not metered per message.
-
-        Unlike the three real-time handlers above, this one NEVER re-raises. A settlement
-        failure there is worth retrying because the user already received a caption they
-        must be charged for; here the alternative is a suggestion — an optional aside —
-        wedging this consumer group into an endless redelivery loop over one un-priced
-        message. The charge is dropped with a loud log instead.
-        """
-        if data.get(b"type", data.get("type")) not in (b"suggestion", "suggestion"):
-            return
-
-        msg = SuggestionResultMessage.from_redis(data)
-        if msg.token_count <= 0:
-            # Nothing was actually spent (or the producer did not report it) — recording a
-            # zero-quantity charge would only add noise to the usage ledger.
-            return
-
-        try:
-            resolved = await self._resolve_subscription(msg.meeting_id)
-        except Exception:
-            self.logger.exception("suggestion_subscription_lookup_failed", room=msg.meeting_id)
-            return
-
-        if resolved is None:
-            self.logger.warning("no_subscription_for_room", translation_room_id=msg.meeting_id)
-            return
-        subscription_id, workspace_id = resolved
-
-        # Unlike translation/TTS, this segment id is the STT segment's own GUID carried
-        # through untouched by suggestion_worker — no composite suffix to strip.
-        segment_id = _extract_underlying_segment_id(msg.segment_id)
-
-        try:
-            await self.db.record_usage_and_charge(
-                subscription_id=subscription_id,
-                # A suggestion is authored by the assistant, not by a participant — there is
-                # no user to attribute the spend to beyond the room and workspace.
-                user_id=None,
-                workspace_id=workspace_id,
-                translation_room_id=msg.meeting_id,
-                usage_type=SUGGESTION_CHARGE_TYPE,
-                charge_type=SUGGESTION_CHARGE_TYPE,
-                reference_id=segment_id,
-                reference_type="transcript_segment",
-                # Tokens across BOTH model calls (decide + generate) for this suggestion.
-                quantity=float(msg.token_count),
-                unit="token",
-                source_language_code=msg.language or None,
-                transcript_segment_id=segment_id,
-                # suggestion_worker takes a one-shot Redis slot per suggestion and never
-                # republishes one for the same segment, so the segment id alone is a stable
-                # key across a Redis Streams redelivery of this message.
-                idempotency_key=f"{SUGGESTION_CHARGE_TYPE}:{msg.segment_id}",
-                details={"category": msg.category, "confidence": msg.confidence},
-            )
-        except Exception:
-            self.logger.exception(
-                "suggestion_settlement_failed",
-                room=msg.meeting_id,
-                segment_id=msg.segment_id,
-                tokens=msg.token_count,
-            )
-
-    # ------------------------------------------------------------------
-    # Signal handling
-    # ------------------------------------------------------------------
 
     def _register_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()

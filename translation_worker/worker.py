@@ -434,7 +434,11 @@ class TranslationWorker(BaseWorker):
         # published on its own as soon as it's ready — TTS starts on it immediately,
         # same as before — while sentences 1..N-1 translate together in ONE batched call
         # that's already running in the background by the time we get to them.
-        passthrough = stt_result.language == target_lang
+        # is_same_language, not ==. A source of "vi" against a target of "vi-VN" is the
+        # same language spelled two ways, and comparing the tags said otherwise — so the
+        # worker translated Vietnamese into Vietnamese, paying for a model call to produce
+        # a sentence it already had.
+        passthrough = is_same_language(stt_result.language, target_lang)
         first_task: asyncio.Task[str] | None = None
         rest_task: asyncio.Task[list[str]] | None = None
         rest_results: list[str] | None = None
