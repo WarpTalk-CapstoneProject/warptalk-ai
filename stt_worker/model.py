@@ -21,6 +21,7 @@ import numpy as np
 from openai import AsyncOpenAI
 
 from shared.config import STTSettings
+from shared.lang import base_language
 from shared.logger import get_logger
 from shared.schemas import STT_UNKNOWN_CONFIDENCE
 from shared.text_utils import split_into_sentences
@@ -570,7 +571,9 @@ def _filter_segments(
         seen_texts.add(text_lower)
 
         seg_lang = lang_code or _guess_language_from_text(text, allowed)
-        corrected = _fix_vietnamese(text) if seg_lang == "vi" else text
+        # base_language: the repair is for the Vietnamese language, not for one spelling of
+        # its tag. STT returning "vi-VN" skipped it entirely.
+        corrected = _fix_vietnamese(text) if base_language(seg_lang) == "vi" else text
         if corrected != text:
             logger.info("spelling_corrected", original=text, corrected=corrected)
 
