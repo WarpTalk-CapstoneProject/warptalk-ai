@@ -11,6 +11,7 @@ from typing import Any, cast
 
 from cartesia import AsyncCartesia
 
+from shared.lang import base_language
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
@@ -152,7 +153,11 @@ class CartesiaSynthesizer:
             "en": "694f9389-aac1-45b6-b726-9d9369183238",  # Cartesia "Barbershop Man"
             "vi": "5619d38c-cf51-4d8e-9575-48f61a280413",  # Cartesia Vietnamese voice
         }
-        return defaults.get(language, defaults["en"])
+        # base_language first. This dict is keyed by primary subtag, and the lookup used the
+        # tag verbatim — so "vi-VN" missed "vi" and fell through to the English default. A
+        # Vietnamese-only meeting then spoke English, which is the report. The fallback is
+        # meant for a language nobody has a voice for, not for a spelling of one we do.
+        return defaults.get(base_language(language), defaults["en"])
 
     async def list_voices(
         self, language: str, limit: int = 12, max_scanned: int = 2000
@@ -181,7 +186,10 @@ class CartesiaSynthesizer:
             client = self._require_client()
             async for voice in client.voices.list(is_owner=False, limit=100):
                 scanned += 1
-                if voice.language == language:
+                # Same reason as _default_voice_id: Cartesia keys its library by primary
+                # subtag, so comparing a full tag matched nothing and starved the catalog —
+                # which then fell back to _default_voice_id and produced English anyway.
+                if base_language(voice.language or "") == base_language(language):
                     voices.append(
                         {
                             "id": voice.id,

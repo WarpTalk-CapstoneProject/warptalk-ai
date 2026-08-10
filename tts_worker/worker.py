@@ -360,7 +360,10 @@ class TTSWorker(BaseWorker):
         listeners_in_lang = {
             (uid.decode() if isinstance(uid, bytes) else uid)
             for uid, lang in (languages_raw or {}).items()
-            if (lang.decode() if isinstance(lang, bytes) else lang) == target_lang
+            # Listeners store whatever tag their picker gave them, so an exact match dropped
+            # anyone whose choice was spelled "vi-VN" against a target of "vi" — and a
+            # listener nobody counts is a listener nobody synthesises for.
+            if is_same_language(lang.decode() if isinstance(lang, bytes) else lang, target_lang)
         }
         if not listeners_in_lang:
             return set()
