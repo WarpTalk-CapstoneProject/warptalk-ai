@@ -196,3 +196,170 @@ class TestBillableSurface:
     def test_the_billable_handlers_are_still_wired(self) -> None:
         assert hasattr(BillingSettlementWorker, "_handle_translation")
         assert hasattr(BillingSettlementWorker, "_handle_tts")
+
+
+class _FakeConnection:
+    """Records what was executed and replays canned rows, so settlement can be tested
+    without a database. Only fetchrow is used by record_usage_and_charge."""
+
+    def __init__(self, rate_row, settle_row) -> None:
+        self._rate_row = rate_row
+        self._settle_row = settle_row
+        self.queries: list[str] = []
+        self.settle_args: tuple = ()
+
+    async def fetchrow(self, query, *args):
+        self.queries.append(query)
+        if "usage_rate_card" in query:
+            return self._rate_row
+        if "settle_usage_charge" in query:
+            self.settle_args = args
+            return self._settle_row
+        raise AssertionError(f"unexpected query: {query}")
+
+    async def execute(self, *args, **kwargs):  # pragma: no cover - must never be reached
+        raise AssertionError("settlement must not write its own statements")
+
+    async def fetchval(self, *args, **kwargs):  # pragma: no cover - must never be reached
+        raise AssertionError("settlement must not write its own statements")
+
+
+class _FakePool:
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    def acquire(self):
+        conn = self._conn
+
+        class _Ctx:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+def _repository(settle_row):
+    repo = billing_db.BillingRepository.__new__(billing_db.BillingRepository)
+    conn = _FakeConnection(
+        rate_row={"id": uuid.uuid4(), "unit_price": Decimal("0.25"), "currency": "CRD"},
+        settle_row=settle_row,
+    )
+    repo._pool = _FakePool(conn)
+    return repo, conn
+
+
+async def _settle(repo, **overrides):
+    kwargs = dict(
+        subscription_id=uuid.uuid4(),
+        user_id=str(uuid.uuid4()),
+        workspace_id=uuid.uuid4(),
+        translation_room_id=str(uuid.uuid4()),
+        usage_type="TRANSLATION",
+        charge_type="TRANSLATION",
+        reference_id=str(uuid.uuid4()),
+        reference_type="translation_content",
+        quantity=4.0,
+        unit="second",
+        idempotency_key="TRANSLATION:seg:vi",
+    )
+    kwargs.update(overrides)
+    return await repo.record_usage_and_charge(**kwargs)
+
+
+class TestSettlementGoesThroughTheDatabaseFunction:
+    """The worker must not reimplement settlement.
+
+    It used to write the usage record, the balance UPDATE and the credit transaction itself.
+    That version had no overage, never wrote service_state, and raised when a workspace ran
+    out of credits — turning an expected business state into a crash loop on redelivery.
+    """
+
+    async def test_it_calls_settle_usage_charge_and_writes_nothing_itself(self) -> None:
+        repo, conn = _repository(
+            {
+                "applied": True,
+                "transaction_id": uuid.uuid4(),
+                "usage_record_id": uuid.uuid4(),
+                "balance_after": 900,
+                "service_state": "healthy",
+                "suspended_reason": None,
+            }
+        )
+
+        outcome = await _settle(repo)
+
+        assert outcome.applied is True
+        assert outcome.service_state == "healthy"
+        assert outcome.balance_after == 900
+        # _FakeConnection.execute/fetchval raise, so reaching here proves no hand-written
+        # INSERT or UPDATE survived.
+        assert any("settle_usage_charge" in query for query in conn.queries)
+
+    async def test_running_out_of_credits_is_a_state_not_an_exception(self) -> None:
+        # The whole point of the consolidation. The old code raised
+        # "Insufficient credits for subscription ...", which crashed the handler and left the
+        # Redis message pending forever.
+        repo, _ = _repository(
+            {
+                "applied": True,
+                "transaction_id": uuid.uuid4(),
+                "usage_record_id": uuid.uuid4(),
+                "balance_after": -12,
+                "service_state": "in_overage",
+                "suspended_reason": None,
+            }
+        )
+
+        outcome = await _settle(repo)
+
+        assert outcome.applied is True
+        assert outcome.service_state == "in_overage"
+        assert outcome.balance_after == -12
+
+    async def test_a_suspended_subscription_is_refused_without_raising(self) -> None:
+        repo, _ = _repository(
+            {
+                "applied": False,
+                "transaction_id": None,
+                "usage_record_id": None,
+                "balance_after": 0,
+                "service_state": "suspended",
+                "suspended_reason": "overage_cap",
+            }
+        )
+
+        outcome = await _settle(repo)
+
+        assert outcome.applied is False
+        assert outcome.replayed is False
+        assert outcome.suspended_reason == "overage_cap"
+
+    async def test_a_replay_is_distinguishable_from_a_refusal(self) -> None:
+        # Both have applied=False. Only the replay carries the original transaction, and the
+        # two must not be logged or reacted to the same way.
+        repo, _ = _repository(
+            {
+                "applied": False,
+                "transaction_id": uuid.uuid4(),
+                "usage_record_id": uuid.uuid4(),
+                "balance_after": 900,
+                "service_state": "healthy",
+                "suspended_reason": None,
+            }
+        )
+
+        outcome = await _settle(repo)
+
+        assert outcome.applied is False
+        assert outcome.replayed is True
+
+    async def test_a_missing_rate_card_still_raises(self) -> None:
+        # A misconfiguration, not a business state — it must not be settled silently at zero.
+        repo, conn = _repository({"applied": True})
+        conn._rate_row = None
+
+        with pytest.raises(RuntimeError, match="No active usage rate card"):
+            await _settle(repo)
