@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from itertools import islice
 from typing import Any, TypeVar, cast
 
+from embedding_worker.facts import (
+    build_extraction_prompt,
+    fact_payload_fields,
+    parse_fact_response,
+)
 from embedding_worker.providers import (
     EmbeddingProvider,
     OpenAIEmbeddingProvider,
@@ -14,7 +20,7 @@ from embedding_worker.providers import (
 from embedding_worker.schemas import EmbeddingIndexRequest, EmbeddingIndexResult
 from embedding_worker.vector_store import VectorStore, create_vector_store
 from shared.base_worker import BaseWorker
-from shared.config import EmbeddingSettings, VectorDbSettings
+from shared.config import EmbeddingSettings, VectorDbSettings, resolve_openai_api_key
 
 T = TypeVar("T")
 
@@ -87,9 +93,16 @@ class EmbeddingWorker(BaseWorker):
                 vectors.extend(await self.provider.embed_texts([chunk.text for chunk in batch]))
 
             self._validate_dimensions(vectors)
+            facts = await self._extract_facts(chunks)
+
             payloads = [
                 {
                     **chunk.metadata,
+                    # The text itself. It was embedded and then thrown away, which left the
+                    # vector store holding 1536 floats and no way for a person — or a
+                    # review UI — to see what had been indexed about their own workspace.
+                    "text": chunk.text,
+                    **fact_payload_fields(facts[index]),
                     "workspace_id": request.workspace_id,
                     "source_type": request.source_type,
                     "source_id": request.source_id,
@@ -98,7 +111,7 @@ class EmbeddingWorker(BaseWorker):
                     "retention_state": request.retention_state,
                     "deletion_state": request.deletion_state,
                 }
-                for chunk in chunks
+                for index, chunk in enumerate(chunks)
             ]
             await self.vector_store.upsert(
                 collection=request.collection_id,
@@ -127,6 +140,47 @@ class EmbeddingWorker(BaseWorker):
         if not request.external_llm_allowed and isinstance(self.provider, OpenAIEmbeddingProvider):
             return "external_llm_disabled_without_local_embedding_provider"
         return ""
+
+    async def _extract_facts(self, chunks: list[Any]) -> list[dict[str, str] | None]:
+        """One readable fact per chunk, or None where the chunk carries none.
+
+        Failure here must never fail the index. Retrieval is the feature people depend on;
+        the fact is a convenience laid on top of it, and an OpenAI outage that stopped
+        documents being searchable in order to protect a table column would be the wrong
+        trade every time. Every path returns a list of the right length, so the payload
+        builder can index into it without checking.
+        """
+        if not self.embedding_settings.facts_enabled or not chunks:
+            return [None] * len(chunks)
+
+        try:
+            from openai import AsyncOpenAI
+
+            client = AsyncOpenAI(api_key=resolve_openai_api_key(self.embedding_settings.api_key))
+        except Exception:
+            self.logger.warning("fact_extraction_unavailable", chunks=len(chunks))
+            return [None] * len(chunks)
+
+        prompt = build_extraction_prompt()
+        limit = self.embedding_settings.facts_max_input_chars
+
+        async def extract_one(text: str) -> dict[str, str] | None:
+            try:
+                response = await client.chat.completions.create(
+                    model=self.embedding_settings.facts_model,
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": text[:limit]},
+                    ],
+                    temperature=0,
+                )
+                return parse_fact_response(response.choices[0].message.content)
+            except Exception:
+                # Per chunk, so one bad response does not cost the rest their facts.
+                self.logger.warning("fact_extraction_failed", exc_info=True)
+                return None
+
+        return await asyncio.gather(*(extract_one(chunk.text) for chunk in chunks))
 
     def _validate_dimensions(self, vectors: list[list[float]]) -> None:
         for index, vector in enumerate(vectors):

@@ -302,6 +302,13 @@ class EmbeddingSettings(BaseSettings):
     api_key: str = ""
     model: str = "text-embedding-3-small"
     dimensions: int = 1536
+    # Fact extraction. Off by default: it costs one chat call per chunk, and a workspace that
+    # only wants retrieval should not pay for a feature it never looks at. EMBEDDING_FACTS_ENABLED.
+    facts_enabled: bool = False
+    facts_model: str = "gpt-4o-mini"
+    # A chunk longer than this is truncated before extraction rather than skipped — the first
+    # part of a chunk is where its subject is stated.
+    facts_max_input_chars: int = 4000
     batch_size: int = 64
     timeout_ms: int = 30000
     # How many index-request messages (each = one document/transcript/glossary source, itself
