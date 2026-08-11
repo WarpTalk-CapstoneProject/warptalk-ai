@@ -26,6 +26,11 @@ logger = get_logger(__name__)
 SEMANTIC_SEARCH_TIMEOUT_SECONDS = 8.0
 TRANSCRIPT_SEGMENT_LIMIT = 200
 DOCUMENT_EXCERPT_CHAR_LIMIT = 4000
+# search_documents returns names and ids for the model to choose from, not content, so a
+# handful is enough to disambiguate "the onboarding spec" — and the cap keeps a workspace
+# with hundreds of documents from spending the turn's tokens on a directory listing.
+DOCUMENT_SEARCH_DEFAULT_LIMIT = 5
+DOCUMENT_SEARCH_MAX_LIMIT = 20
 # GlossaryTerm.Context and GlobalGlossaryTerm.Definition are unbounded TEXT columns in
 # Postgres (unlike Term/PreferredTranslation, which are VARCHAR(255) with a DB-level cap) —
 # without this, one admin- or workspace-authored term with a long free-text definition would
@@ -575,6 +580,60 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
         return json.dumps({"error": "Could not look up the transcript right now."})
 
 
+async def _search_documents(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Find workspace documents by name.
+
+    get_document needs an id, and the only ids the model could previously obtain came from an
+    @mention or from page context — so a user who simply named a document ("what does the
+    onboarding spec say?") could not be answered at all. This is the missing name→id step.
+
+    An empty query is deliberately allowed: "what documents do we have?" is a real question,
+    and the endpoint treats a missing search as "list the first page".
+    """
+    query = ((arguments or {}).get("query") or "").strip()
+    limit = (arguments or {}).get("limit")
+    try:
+        page_size = int(limit) if limit is not None else DOCUMENT_SEARCH_DEFAULT_LIMIT
+    except (TypeError, ValueError):
+        page_size = DOCUMENT_SEARCH_DEFAULT_LIMIT
+    page_size = max(1, min(page_size, DOCUMENT_SEARCH_MAX_LIMIT))
+
+    params: dict[str, Any] = {"page": 1, "pageSize": page_size}
+    if query:
+        params["search"] = query
+
+    try:
+        response = await ctx.workspace_client.get(
+            f"/api/v1/workspaces/{ctx.workspace_id}/documents",
+            params=params,
+            headers=_auth_headers(ctx),
+        )
+        if response.status_code != 200:
+            logger.warning("search_documents_failed", status=response.status_code)
+            return json.dumps({"error": "Could not look up workspace documents right now."})
+
+        items = response.json().get("items") or []
+        return json.dumps(
+            [
+                {
+                    "id": doc.get("id"),
+                    "name": doc.get("name"),
+                    "status": doc.get("status"),
+                    "ingestionStatus": doc.get("ingestionStatus"),
+                    # Whether the assistant is allowed to read this document's contents at
+                    # all. A false here means get_document will come back metadata-only, so
+                    # the model can say why rather than reporting an empty document.
+                    "isAiAllowed": doc.get("isAiAllowed"),
+                    "confidentialityLevel": doc.get("confidentialityLevel"),
+                }
+                for doc in items
+            ]
+        )
+    except Exception:
+        logger.exception("search_documents_error")
+        return json.dumps({"error": "Could not look up workspace documents right now."})
+
+
 async def _get_document(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     document_id = ((arguments or {}).get("document_id") or "").strip()
     if not document_id:
@@ -780,11 +839,39 @@ TOOLS: list[ChatTool] = [
         handler=_get_transcript,
     ),
     ChatTool(
+        name="search_documents",
+        description=(
+            "Find workspace documents by name, or list them when the user asks what "
+            "documents exist. Use this whenever the user refers to a document by name "
+            "rather than by id — it returns ids to pass to get_document. Matches on the "
+            "document's name, not on its contents; use semantic_search to find a passage."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Part of the document's name. Omit or leave empty to list the "
+                        "workspace's most recent documents."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "How many documents to return (default 5, max 20).",
+                },
+            },
+            "required": [],
+        },
+        handler=_search_documents,
+    ),
+    ChatTool(
         name="get_document",
         description=(
             "Get metadata and a text excerpt for a specific workspace document. Use this "
             "when the user asks about the content of a document, or references one by "
-            "name/id (e.g. from page context or an @mention)."
+            "name/id (e.g. from page context or an @mention). Call search_documents first "
+            "if you only know the document's name."
         ),
         parameters={
             "type": "object",
