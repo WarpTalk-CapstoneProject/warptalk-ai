@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+import unicodedata
 import uuid
+from difflib import SequenceMatcher
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -45,6 +47,49 @@ _LANG_NAMES: dict[str, str] = {
     "it": "Italian",
 }
 
+# The input is speech recognition output, and saying so is most of the work.
+#
+# Without this paragraph the translator treats what it receives as authoritative text and
+# faithfully translates a mishearing into a confident wrong sentence: "Codex" heard as
+# "cô đích" arrives as those two Vietnamese words and leaves as their literal English.
+#
+# The permission is deliberately narrow. A model told simply to "fix ASR errors" rewrites
+# sentences that were already correct, and a fluent invention is WORSE than a visible
+# mistranscription — a reader spots "cô đích" as nonsense instantly, but cannot tell a
+# confidently repaired sentence from a real one. So repair is allowed only where the
+# glossary or the meeting context supplies the evidence, and literal translation is the
+# stated default everywhere else.
+#
+# It is appended per call by _asr_repair_clause, NOT baked into the prompts below, because
+# it is inert on a call that carries no evidence — and that is most calls. Measured with
+# tools/probe_which_part_repairs.py, probe_context_only_repair.py, probe_gate_safety.py:
+#
+#   repaired a hard mishearing (n=6 each)     instruction   glossary block   both   neither
+#     term IS in glossary, gpt-4.1                  6/6            6/6        6/6      0/6
+#     term IS in glossary, gpt-realtime-2.1         4/6            6/6        6/6      5/6
+#     term NOT in glossary, context only            —               —          —        —
+#       gpt-4.1                                     6/6           n/a        n/a       6/6
+#       gpt-4.1-mini                                2/6           n/a        n/a       0/6
+#       gpt-realtime-2.1                            6/6           n/a        n/a       6/6
+#
+# So the glossary block carries the glossary case on its own, and the full models repair
+# from context without being told to. The instruction's only unique contribution is
+# gpt-4.1-mini repairing from context at all (0/6 -> 2/6) — weak, but it is what production
+# runs today, so the clause is kept and gated rather than deleted.
+#
+# Dropping it where there is no evidence was checked for invention, since its "invent
+# nothing" sentence is also the brake: on "Cái cô đích nó báo lỗi" with no glossary match
+# and no context, four models produced 0/24 inventions with it and 0/24 without. The base
+# prompt already declines to guess, so the gate costs no safety.
+_ASR_REPAIR_INSTRUCTION = (
+    " Your input is automatic speech recognition output, so it may contain words that were "
+    "misheard — most often a name or technical term rendered as similar-sounding syllables "
+    "in the speaker's own language. When the glossary or the meeting context makes it clear "
+    "what was really said, translate what the speaker MEANT. When you have no such evidence, "
+    "translate exactly what is written and invent nothing. Never add, drop, or 'complete' "
+    "content that is not there."
+)
+
 _SYSTEM_PROMPT = (
     "You are a professional real-time interpreter in a multilingual business meeting. "
     "Translate the user's message accurately and naturally. "
@@ -71,6 +116,25 @@ _CONTEXT_RELEVANCE_INSTRUCTION = (
 )
 
 
+def _asr_repair_clause(
+    glossary_terms: list[dict[str, str]] | None,
+    meeting_context: list[str] | None,
+) -> str:
+    """`_ASR_REPAIR_INSTRUCTION`, but only on calls that carry something to repair from.
+
+    The instruction grants repair "when the glossary or the meeting context makes it clear
+    what was really said". Both of those are per-call facts, so on a call with neither the
+    instruction can only ever reach its own fallback — translate literally, which is what
+    the base prompt already does. See the measured table above `_ASR_REPAIR_INSTRUCTION`;
+    the gated-off cell showed no increase in invention across four models.
+
+    Evidence means a *suspected* mishearing specifically. An exact glossary hit is a
+    terminology instruction, not a sign the recogniser slipped, so it does not open repair.
+    """
+    suspected = any((term.get("match") == "possible") for term in (glossary_terms or []))
+    return _ASR_REPAIR_INSTRUCTION if suspected or meeting_context else ""
+
+
 def _build_glossary_block(glossary_terms: list[dict[str, str]] | None) -> str:
     """Render this workspace's active glossary terms (see GlossaryStartedEventConsumer,
     published to `translationRoom:{meeting_id}:mt_glossary`) as a system-prompt addendum.
@@ -88,17 +152,27 @@ def _build_glossary_block(glossary_terms: list[dict[str, str]] | None) -> str:
 
     keep_lines: list[str] = []
     map_lines: list[str] = []
+    misheard_lines: list[str] = []
     for term in glossary_terms:
         source = (term.get("source") or "").strip()
         target = (term.get("target") or "").strip()
         if not source:
             continue
-        if not target or target.lower() == source.lower():
+        # A suspicion, not a fact — see _select_relevant_glossary_terms. It is listed
+        # separately so the model can weigh it rather than apply it blindly.
+        if term.get("match") == "possible":
+            rendered = (
+                f'"{source}"'
+                if not target or target.lower() == source.lower()
+                else (f'"{source}" (translate as "{target}")')
+            )
+            misheard_lines.append(f"- {rendered}")
+        elif not target or target.lower() == source.lower():
             keep_lines.append(f'- "{source}"')
         else:
             map_lines.append(f'- "{source}" → "{target}"')
 
-    if not keep_lines and not map_lines:
+    if not keep_lines and not map_lines and not misheard_lines:
         return ""
 
     sections = [
@@ -114,6 +188,15 @@ def _build_glossary_block(glossary_terms: list[dict[str, str]] | None) -> str:
         sections.append(
             "Use these exact translations instead of a generic one:\n" + "\n".join(map_lines)
         )
+    if misheard_lines:
+        sections.append(
+            "None of these next terms appear literally, but part of the utterance SOUNDS "
+            "like one of them, which usually means speech recognition mangled it. Read it "
+            "as the term ONLY if that makes the sentence coherent — a meeting about "
+            "deployment really can contain the word it sounds like. If reading it that way "
+            "would not make sense here, translate what was actually said and change "
+            "nothing:\n" + "\n".join(misheard_lines)
+        )
     return "\n\n".join(sections)
 
 
@@ -126,24 +209,98 @@ def _exception_clause(glossary_terms: list[dict[str, str]] | None) -> str:
     return f"{base}, or terms covered by the glossary below" if glossary_terms else base
 
 
+def _match_skeleton(value: str) -> str:
+    """Fold a string to what it roughly SOUNDS like, for comparing across a mishearing.
+
+    Diacritics and separators are dropped and everything is lowercased, so a Vietnamese
+    rendering of an English word lands near the word itself: "cô đích" and "Codex" become
+    "codich" and "codex". Vietnamese đ has no canonical decomposition, so it is mapped by
+    hand — without that, every đ survives and the two skeletons never converge.
+    """
+    decomposed = unicodedata.normalize("NFD", value.casefold())
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.sub(r"[\s_\-.]+", "", stripped.replace("đ", "d"))
+
+
+# Both numbers come from measuring real Vietnamese sentences, not from taste.
+#
+# Best-window similarity, glossary term against unrelated meeting speech:
+#
+#     term         len   mishearing   unrelated speech
+#     WarpTalk       8       1.000          0.353
+#     staging        7       0.923          0.533
+#     Kubernetes    10       0.667          0.333
+#     Codex          5       0.667          0.667   <-- indistinguishable
+#
+# 0.65 sits in the gap for every term of seven characters or more. Below that length the
+# gap closes completely: a five-character skeleton scores the same against a genuine
+# mishearing as against "Hôm nay trời đẹp quá", because any four Vietnamese letters share
+# enough with it by chance. No threshold can separate those, so short terms are excluded
+# rather than guessed at.
+#
+# That means this does NOT rescue "Codex" -> "cô đích", the case that prompted it. That
+# one has to be fixed upstream, by getting the term into the recogniser's keyword list, and
+# a matcher that fired at random on short terms would be worse than admitting the limit.
+_MISHEARD_SIMILARITY = 0.65
+_MIN_MISHEARD_SKELETON = 7
+
+
+def _sounds_like(source: str, text: str) -> bool:
+    """Whether `text` contains something close enough to `source` to be a mishearing."""
+    needle = _match_skeleton(source)
+    if len(needle) < _MIN_MISHEARD_SKELETON:
+        return False
+    haystack = _match_skeleton(text)
+    if not haystack:
+        return False
+    # Diacritic-insensitive containment first: exact once the accents are gone, which is
+    # both the cheapest case and the safest.
+    if needle in haystack:
+        return True
+
+    # Otherwise slide a window of roughly the term's length across the utterance. A
+    # mishearing changes length a little, so widths either side of the term are tried.
+    for width in range(max(_MIN_MISHEARD_SKELETON, len(needle) - 2), len(needle) + 3):
+        for start in range(0, len(haystack) - width + 1):
+            if SequenceMatcher(None, needle, haystack[start : start + width]).ratio() >= (
+                _MISHEARD_SIMILARITY
+            ):
+                return True
+    return False
+
+
 def _select_relevant_glossary_terms(
     text: str,
     glossary_terms: list[dict[str, str]] | None,
     *,
     limit: int = 12,
 ) -> list[dict[str, str]]:
-    """Keep only mappings whose source term is present in the current utterance.
+    """Glossary entries worth sending with this utterance, tagged by how they matched.
 
-    Sending the room's entire glossary on every realtime request adds tokens and can
-    steer short ambiguous speech toward unrelated terms. Word boundaries prevent a
-    short term such as ``UI`` from matching the middle of ``build``; spaces and
-    hyphens are treated equivalently for code-switched technical phrases.
+    Two kinds, and the distinction is the whole point:
+
+    ``match="exact"``
+        The term is literally in the text. Apply it.
+
+    ``match="possible"``
+        Nothing matched literally, but part of the utterance SOUNDS like the term. This
+        is the case the guardian behaviour exists for: STT hears "Codex" as "cô đích", and
+        the literal matcher below then finds nothing — so the one glossary entry that
+        could have repaired the sentence was dropped exactly when it was needed. A term is
+        offered as a suspicion, never as a fact; _build_glossary_block words it that way
+        and the system prompt tells the model to translate literally when unsure.
+
+    Sending the room's whole glossary on every realtime request would add tokens and steer
+    short ambiguous speech toward unrelated terms, so this stays capped at `limit`. Exact
+    matches are collected first and therefore never lose their slot to a suspicion.
     """
     if not glossary_terms or not text.strip():
         return []
 
     haystack = text.casefold()
-    selected: list[dict[str, str]] = []
+    exact: list[dict[str, str]] = []
+    possible: list[dict[str, str]] = []
+
     for term in glossary_terms:
         source = (term.get("source") or "").strip()
         if not source:
@@ -151,12 +308,15 @@ def _select_relevant_glossary_terms(
         pieces = [piece for piece in re.split(r"[\s_-]+", source.casefold()) if piece]
         if not pieces:
             continue
+        # Word boundaries keep a short term such as "UI" out of the middle of "build";
+        # spaces and hyphens are equivalent for code-switched technical phrases.
         pattern = r"(?<!\w)" + r"[\s_-]+".join(map(re.escape, pieces)) + r"(?!\w)"
         if re.search(pattern, haystack):
-            selected.append(term)
-            if len(selected) >= limit:
-                break
-    return selected
+            exact.append({**term, "match": "exact"})
+        elif _sounds_like(source, text):
+            possible.append({**term, "match": "possible"})
+
+    return (exact + possible)[:limit]
 
 
 _BATCH_LINE_RE = re.compile(r"^\s*\[(\d+)\]\s*(.*)$")
@@ -177,6 +337,7 @@ class OpenAITranslator:
         api_key: str,
         model: str = _DEFAULTS.model,
         realtime_model: str = _DEFAULTS.realtime_model,
+        realtime_reasoning_effort: str = _DEFAULTS.realtime_reasoning_effort,
         realtime_pool_size: int = _DEFAULTS.realtime_pool_size,
         realtime_timeout_seconds: float = _DEFAULTS.realtime_timeout_seconds,
         realtime_max_output_tokens: int = _DEFAULTS.realtime_max_output_tokens,
@@ -193,6 +354,7 @@ class OpenAITranslator:
         self.api_key = api_key
         self.model = model
         self.realtime_model = realtime_model
+        self.realtime_reasoning_effort = realtime_reasoning_effort
         self.realtime_pool_size = max(1, realtime_pool_size)
         self.realtime_timeout_seconds = realtime_timeout_seconds
         self.realtime_max_output_tokens = realtime_max_output_tokens
@@ -366,7 +528,7 @@ class OpenAITranslator:
                         "max_output_tokens": self.realtime_max_output_tokens,
                         "metadata": {"request_id": request_id},
                         "output_modalities": ["text"],
-                        "reasoning": {"effort": "minimal"},
+                        "reasoning": {"effort": self.realtime_reasoning_effort},
                     }
                 )
                 while True:
@@ -489,7 +651,7 @@ class OpenAITranslator:
         )
 
         result = ""
-        system_prompt = _SYSTEM_PROMPT
+        system_prompt = _SYSTEM_PROMPT + _asr_repair_clause(relevant_glossary, meeting_context)
         if meeting_context:
             system_prompt += _CONTEXT_RELEVANCE_INSTRUCTION
         if getattr(self, "realtime_model", ""):
@@ -577,7 +739,9 @@ class OpenAITranslator:
             f"{context_block}"
         )
 
-        system_prompt = _BATCH_SYSTEM_PROMPT
+        system_prompt = _BATCH_SYSTEM_PROMPT + _asr_repair_clause(
+            relevant_glossary, meeting_context
+        )
         if meeting_context:
             system_prompt += _CONTEXT_RELEVANCE_INSTRUCTION
         response = await self._create_with_retry(

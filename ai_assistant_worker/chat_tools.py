@@ -56,13 +56,17 @@ class ChatTool:
     handler: Callable[[ToolContext, dict[str, Any]], Awaitable[str]]
 
     def to_openai_schema(self) -> dict[str, Any]:
+        """Tool declaration in the shape /v1/responses expects.
+
+        FLAT, not the nested {"type": "function", "function": {...}} that chat
+        completions takes. Verified against the live API: the flat form is accepted by
+        both gpt-5.6-luna and gpt-4o-mini on this endpoint.
+        """
         return {
             "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            },
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
         }
 
 

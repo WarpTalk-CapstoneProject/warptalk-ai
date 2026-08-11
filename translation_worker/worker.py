@@ -133,6 +133,7 @@ class TranslationWorker(BaseWorker):
             api_key=resolve_openai_api_key(self.translation_settings.api_key),
             model=self.translation_settings.model,
             realtime_model=self.translation_settings.realtime_model,
+            realtime_reasoning_effort=self.translation_settings.realtime_reasoning_effort,
             realtime_pool_size=self.translation_settings.realtime_pool_size,
             realtime_timeout_seconds=self.translation_settings.realtime_timeout_seconds,
             realtime_max_output_tokens=self.translation_settings.realtime_max_output_tokens,
