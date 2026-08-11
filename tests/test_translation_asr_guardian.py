@@ -16,11 +16,13 @@ comment on _MISHEARD_SIMILARITY for the table they came from.
 
 from __future__ import annotations
 
+from shared.config import TranslationSettings
 from translation_worker.translator import (
     _ASR_REPAIR_INSTRUCTION,
     _BATCH_SYSTEM_PROMPT,
     _MIN_MISHEARD_SKELETON,
     _SYSTEM_PROMPT,
+    OpenAITranslator,
     _build_glossary_block,
     _match_skeleton,
     _select_relevant_glossary_terms,
@@ -130,3 +132,24 @@ class TestSystemPrompts:
         assert "glossary or the meeting context" in _ASR_REPAIR_INSTRUCTION
         assert "translate exactly what is written and invent nothing" in _ASR_REPAIR_INSTRUCTION
         assert "Never add, drop" in _ASR_REPAIR_INSTRUCTION
+
+
+class TestRealtimeReasoningEffort:
+    """The effort default is a measured dead end, not an untried knob.
+
+    tools/probe_realtime_effort.py swept minimal/low/medium against the real API. Raising
+    it never repaired the hard mishearing at any token ceiling, and at the production
+    ceiling of 128 it starved the response into `incomplete` — a RuntimeError that drops
+    the utterance onto the slower HTTP fallback. Repair capability turned out to belong to
+    the model, not to effort.
+    """
+
+    def test_effort_defaults_to_minimal(self) -> None:
+        assert TranslationSettings().realtime_reasoning_effort == "minimal"
+
+    def test_translator_honours_the_configured_effort(self) -> None:
+        """Threaded rather than hardcoded, so the sweep above stays reproducible."""
+        assert (
+            OpenAITranslator(api_key="x", realtime_reasoning_effort="low").realtime_reasoning_effort
+            == "low"
+        )

@@ -39,6 +39,7 @@ async def benchmark(args: argparse.Namespace) -> list[dict[str, object]]:
         api_key=resolve_openai_api_key(translation.api_key),
         model=translation.model,
         realtime_model=translation.realtime_model,
+        realtime_reasoning_effort=translation.realtime_reasoning_effort,
         realtime_pool_size=1,
         realtime_timeout_seconds=translation.realtime_timeout_seconds,
         realtime_max_output_tokens=translation.realtime_max_output_tokens,

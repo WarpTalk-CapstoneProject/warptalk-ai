@@ -165,6 +165,36 @@ class TranslationSettings(BaseSettings):
     # Mini was faster and more stable on the production Vietnamese/code-switching probe:
     # 660/919/655/737/715ms versus the full model's 667/1873/864/880/920ms.
     realtime_model: str = "gpt-realtime-2.1-mini"
+    # How hard the realtime model thinks before answering. Stays at minimal, and the
+    # sweep that says so is tools/probe_realtime_effort.py.
+    #
+    # The realtime path carries the FIRST sentence of every utterance, so it is the one
+    # call in the pipeline a listener waits on directly. Raising effort was tried as a
+    # way to make it repair ASR mishearings (see _ASR_REPAIR_INSTRUCTION); it does not
+    # work, and it is actively harmful at the current 128-token ceiling because hidden
+    # reasoning tokens are drawn from that same budget:
+    #
+    #     effort     max_tokens=128            max_tokens=512
+    #     minimal    859ms, no repair          800ms, no repair
+    #     low        incomplete -> fallback    1483ms, no repair
+    #     medium     incomplete -> fallback    1541ms (p-max 2045ms), no repair
+    #
+    # Every non-minimal cell either broke outright or cost latency for the same wrong
+    # answer, and medium at 512 crossed realtime_timeout_seconds. The mishearing is not
+    # a thinking-budget problem.
+    #
+    # What DOES fix it is the model, measured on the same probe and the same sentence
+    # ("cu bơ nét" -> Kubernetes, glossary supplied):
+    #
+    #     gpt-realtime-2.1-mini   effort=minimal   893ms   repaired 0/3
+    #     gpt-realtime-2.1        effort=minimal   985ms   repaired 3/3
+    #
+    # and the full model is not the latency risk the older comment above feared — on
+    # ordinary speech over 18 runs each it was p90 776ms vs mini's 840ms, nothing over
+    # 2s on either. Treat that as "not slower", not "faster": one machine, one session.
+    # Changing TRANSLATION_REALTIME_MODEL in production is a deploy decision, so the
+    # evidence is recorded here rather than acted on.
+    realtime_reasoning_effort: str = "minimal"
     realtime_pool_size: int = 4
     # Do not turn a rare ~1.2s provider response into a 5–19s latency cliff by
     # prematurely starting the slower HTTP fallback.

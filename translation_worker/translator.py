@@ -298,6 +298,7 @@ class OpenAITranslator:
         api_key: str,
         model: str = _DEFAULTS.model,
         realtime_model: str = _DEFAULTS.realtime_model,
+        realtime_reasoning_effort: str = _DEFAULTS.realtime_reasoning_effort,
         realtime_pool_size: int = _DEFAULTS.realtime_pool_size,
         realtime_timeout_seconds: float = _DEFAULTS.realtime_timeout_seconds,
         realtime_max_output_tokens: int = _DEFAULTS.realtime_max_output_tokens,
@@ -314,6 +315,7 @@ class OpenAITranslator:
         self.api_key = api_key
         self.model = model
         self.realtime_model = realtime_model
+        self.realtime_reasoning_effort = realtime_reasoning_effort
         self.realtime_pool_size = max(1, realtime_pool_size)
         self.realtime_timeout_seconds = realtime_timeout_seconds
         self.realtime_max_output_tokens = realtime_max_output_tokens
@@ -487,7 +489,7 @@ class OpenAITranslator:
                         "max_output_tokens": self.realtime_max_output_tokens,
                         "metadata": {"request_id": request_id},
                         "output_modalities": ["text"],
-                        "reasoning": {"effort": "minimal"},
+                        "reasoning": {"effort": self.realtime_reasoning_effort},
                     }
                 )
                 while True:
