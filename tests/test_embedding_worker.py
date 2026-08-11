@@ -122,6 +122,81 @@ class TestEmbeddingWorker:
         assert result["status"] == "indexed"
         assert result["chunks_indexed"] == "1"
 
+    async def test_stores_the_source_text_so_the_index_is_readable(self) -> None:
+        """A vector alone cannot be shown to anyone.
+
+        The workspace Knowledge page renders what was indexed; without `text` in the
+        payload every row reads "indexed before content was kept", which is
+        indistinguishable from a broken index.
+        """
+        worker = EmbeddingWorker.__new__(EmbeddingWorker)
+        worker.embedding_settings = EmbeddingSettings(
+            provider="openai", api_key="test-key", dimensions=2, batch_size=8
+        )
+        worker.provider = FakeEmbeddingProvider(vectors=[[0.1, 0.2]])
+        worker.vector_store = FakeVectorStore()
+        worker.publish = AsyncMock()
+
+        await worker.process(b"msg-1", _request().to_redis())
+
+        payload = worker.vector_store.upsert_mock.await_args.kwargs["payloads"][0]
+        assert payload["text"] == "hello world"
+
+    async def test_carries_an_agents_fact_through_without_interpreting_it(self) -> None:
+        """This worker never extracts facts — it only forwards what an agent put in metadata.
+
+        KnowledgeFactWorker is the only thing that reasons about content. If the spread of
+        `chunk.metadata` into the payload ever stops happening, the Knowledge page's Fact
+        column silently empties with nothing else failing.
+        """
+        worker = EmbeddingWorker.__new__(EmbeddingWorker)
+        worker.embedding_settings = EmbeddingSettings(
+            provider="openai", api_key="test-key", dimensions=2, batch_size=8
+        )
+        worker.provider = FakeEmbeddingProvider(vectors=[[0.1, 0.2]])
+        worker.vector_store = FakeVectorStore()
+        worker.publish = AsyncMock()
+
+        request = _request(
+            source_type="meeting_summary",
+            chunks=[
+                EmbeddingChunk(
+                    id="chunk-1",
+                    text="We ship on the 14th.",
+                    metadata={"fact": "Release is on the 14th.", "fact_category": "decision"},
+                )
+            ],
+        )
+        await worker.process(b"msg-1", request.to_redis())
+
+        payload = worker.vector_store.upsert_mock.await_args.kwargs["payloads"][0]
+        assert payload["fact"] == "Release is on the 14th."
+        assert payload["fact_category"] == "decision"
+        assert payload["source_type"] == "meeting_summary"
+
+    async def test_metadata_cannot_overwrite_the_text_that_was_embedded(self) -> None:
+        """`text` must be the string that produced the vector, not a metadata key of the
+        same name — otherwise the page could show text the search never matched on."""
+        worker = EmbeddingWorker.__new__(EmbeddingWorker)
+        worker.embedding_settings = EmbeddingSettings(
+            provider="openai", api_key="test-key", dimensions=2, batch_size=8
+        )
+        worker.provider = FakeEmbeddingProvider(vectors=[[0.1, 0.2]])
+        worker.vector_store = FakeVectorStore()
+        worker.publish = AsyncMock()
+
+        request = _request(
+            chunks=[
+                EmbeddingChunk(
+                    id="chunk-1", text="the embedded text", metadata={"text": "something else"}
+                )
+            ],
+        )
+        await worker.process(b"msg-1", request.to_redis())
+
+        payload = worker.vector_store.upsert_mock.await_args.kwargs["payloads"][0]
+        assert payload["text"] == "the embedded text"
+
     async def test_deletion_state_deletes_vector_instead_of_indexing(self) -> None:
         """A deletion_state="deleted" request (e.g. GlobalGlossaryService.ArchiveTermAsync/
         DeleteTermAsync) must actually remove the previously-indexed vector — not just get
