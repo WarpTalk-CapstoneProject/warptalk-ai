@@ -25,7 +25,7 @@ from openai import AsyncOpenAI
 from ai_assistant_worker.chat_tools import TOOLS, TOOLS_BY_NAME, ToolContext
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
-from shared.openai_options import completion_options
+from shared.openai_options import responses_options
 from shared.schemas import ChatRequestMessage, ChatResultMessage
 
 SIBLING_SERVICE_TIMEOUT_SECONDS = 15.0
@@ -229,16 +229,30 @@ class ChatAssistantWorker(BaseWorker):
         history: list[dict[str, str]],
         tool_context: ToolContext,
     ) -> tuple[str, list[dict[str, Any]]]:
-        messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # /v1/responses, not /v1/chat/completions. A reasoning model refuses function
+        # tools on chat completions — gpt-5.6-luna answers every such request with
+        #
+        #   400 Function tools with reasoning_effort are not supported ... use
+        #   /v1/responses or set reasoning_effort to 'none'
+        #
+        # and setting the effort to none would discard the reasoning that is the only
+        # reason to run a reasoning model here. This endpoint is the one that takes both.
+        # Every shape below was verified against the live API, not inferred from docs.
+
+        # Responses carries the system prompt as `instructions` rather than as a leading
+        # message, so the three system-role messages are joined into one.
+        instructions_parts = [SYSTEM_PROMPT]
         page_context_message = _format_page_context(request.page_context_json)
         if page_context_message:
-            messages.append({"role": "system", "content": page_context_message})
+            instructions_parts.append(page_context_message)
         mentions_message = _format_mentions(request.mentions_json)
         if mentions_message:
-            messages.append({"role": "system", "content": mentions_message})
-        messages.extend(
+            instructions_parts.append(mentions_message)
+        instructions = "\n\n".join(instructions_parts)
+
+        conversation: list[dict[str, Any]] = [
             {"role": turn.get("role"), "content": turn.get("content")} for turn in history
-        )
+        ]
 
         tool_schemas = [t.to_openai_schema() for t in TOOLS]
         tool_call_log: list[dict[str, Any]] = []
@@ -247,75 +261,58 @@ class ChatAssistantWorker(BaseWorker):
         for _ in range(self.chat_settings.max_tool_iterations):
             buffer = ""
             full_text = ""
-            tool_calls_acc: dict[int, dict[str, Any]] = {}
-            finish_reason: str | None = None
+            output_items: list[Any] = []
 
             assert self._openai is not None, "OpenAI client must be initialized"
-            stream = await self._openai.chat.completions.create(
+            stream = await self._openai.responses.create(
                 model=self.chat_settings.model,
-                **completion_options(
+                **responses_options(
                     self.chat_settings.model,
                     self.chat_settings.max_tokens,
                     self.chat_settings.temperature,
                 ),
-                messages=cast(Any, messages),
+                instructions=instructions,
+                input=cast(Any, conversation),
                 tools=cast(Any, tool_schemas),
-                tool_choice="auto",
                 stream=True,
             )
 
-            async for chunk in stream:
-                choice = chunk.choices[0]
-                delta = choice.delta
+            async for event in stream:
+                etype = getattr(event, "type", "")
 
-                if delta.content:
-                    buffer += delta.content
-                    full_text += delta.content
+                # Text arrives as response.output_text.delta. Streaming it out as it
+                # lands is what keeps the widget feeling live.
+                if etype == "response.output_text.delta":
+                    delta = getattr(event, "delta", "") or ""
+                    buffer += delta
+                    full_text += delta
                     if len(buffer) >= self.chat_settings.chunk_flush_chars:
                         await self._publish_result(request, type_="chunk", content=buffer)
                         buffer = ""
 
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        acc = tool_calls_acc.setdefault(
-                            tc.index, {"id": None, "name": None, "arguments": ""}
-                        )
-                        if tc.id:
-                            acc["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            acc["name"] = tc.function.name
-                        if tc.function and tc.function.arguments:
-                            acc["arguments"] += tc.function.arguments
-
-                if choice.finish_reason:
-                    finish_reason = choice.finish_reason
+                # Tool arguments also stream, but are NOT accumulated here on purpose:
+                # response.completed carries every output item whole, so reading them
+                # from there removes a class of partial-JSON bugs the chat-completions
+                # version had to guard against by hand.
+                elif etype == "response.completed":
+                    response = getattr(event, "response", None)
+                    output_items = list(getattr(response, "output", []) or [])
 
             if buffer:
                 await self._publish_result(request, type_="chunk", content=buffer)
 
-            if finish_reason != "tool_calls" or not tool_calls_acc:
+            function_calls = [
+                item for item in output_items if getattr(item, "type", "") == "function_call"
+            ]
+            if not function_calls:
+                # A turn that produced a message rather than a call is the final answer.
                 final_text = full_text
                 break
 
-            ordered_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": call["id"] or f"call_{uuid.uuid4().hex}",
-                            "type": "function",
-                            "function": {"name": call["name"], "arguments": call["arguments"]},
-                        }
-                        for call in ordered_calls
-                    ],
-                }
-            )
-
-            for call in ordered_calls:
-                call_id = call["id"] or f"call_{uuid.uuid4().hex}"
-                tool_name = call["name"] or ""
+            for call in function_calls:
+                call_id = getattr(call, "call_id", None) or f"call_{uuid.uuid4().hex}"
+                tool_name = getattr(call, "name", "") or ""
+                raw_arguments = getattr(call, "arguments", "") or ""
                 await self._publish_result(request, type_="tool_call_started", tool_name=tool_name)
 
                 tool = TOOLS_BY_NAME.get(tool_name)
@@ -324,7 +321,7 @@ class ChatAssistantWorker(BaseWorker):
                     status = "failed"
                 else:
                     try:
-                        arguments = json.loads(call["arguments"]) if call["arguments"] else {}
+                        arguments = json.loads(raw_arguments) if raw_arguments else {}
                     except json.JSONDecodeError:
                         arguments = {}
                     try:
@@ -338,17 +335,33 @@ class ChatAssistantWorker(BaseWorker):
                 await self._publish_result(
                     request, type_="tool_call_completed", tool_name=tool_name, tool_status=status
                 )
-                messages.append({"role": "tool", "tool_call_id": call_id, "content": result_json})
+                # The call and its result are fed back as a pair of typed input items —
+                # the Responses equivalent of the assistant/tool message pair.
+                conversation.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": tool_name,
+                        "arguments": raw_arguments,
+                    }
+                )
+                conversation.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": result_json,
+                    }
+                )
                 tool_call_log.append(
                     {
                         "tool": tool_name,
-                        "arguments": call["arguments"],
+                        "arguments": raw_arguments,
                         "result": result_json,
                         "status": status,
                     }
                 )
         else:
-            # Hit max_tool_iterations without a non-tool-call finish.
+            # Hit max_tool_iterations while the model still wanted another tool.
             final_text = (
                 final_text
                 or "I wasn't able to finish looking that up — please try rephrasing your question."

@@ -48,3 +48,28 @@ def completion_options(
     if temperature is not None:
         options["temperature"] = temperature
     return options
+
+
+def responses_options(
+    model: str,
+    token_limit: int | None = None,
+    temperature: float | None = None,
+) -> dict[str, Any]:
+    """The same question for /v1/responses, which names the cap differently.
+
+    Responses calls it `max_output_tokens`, and the temperature rule is unchanged:
+    verified against the live API, gpt-5.6-luna answers `temperature` with
+
+        400 Unsupported parameter: 'temperature' is not supported with this model
+
+    on this endpoint exactly as it does on chat completions, while gpt-4o-mini accepts
+    it. Keeping the two helpers side by side means a caller switching endpoints cannot
+    accidentally carry a parameter name the new one rejects — which is the mistake that
+    took the chat assistant down in v47.
+    """
+    options: dict[str, Any] = {}
+    if token_limit is not None:
+        options["max_output_tokens"] = token_limit
+    if temperature is not None and not model.startswith("gpt-5"):
+        options["temperature"] = temperature
+    return options
