@@ -808,11 +808,9 @@ class LiveKitIngressWorker(BaseWorker):
             await self._release_room_ownership(room_name)
             await self._disconnect_quietly(room_name, room)
 
-    def _is_translation_active(self, room_name: str) -> bool:
-        return self._route_states.get(room_name) in {
-            "IN_PROGRESS",
-            "AUDIO_ROUTING_ACTIVE",
-        }
+    # _is_translation_active moved to BaseWorker: this worker no longer asks the question at
+    # all, because transcription must not wait for translation to start. See
+    # shared/base_worker.py and the comments at both former call sites above.
 
     async def _hydrate_room_status(self, room_name: str) -> None:
         """Restore the last persisted room lifecycle after an ingress-worker restart."""
@@ -968,10 +966,13 @@ class LiveKitIngressWorker(BaseWorker):
             async for event in audio_stream:
                 if self._shutdown_event.is_set():
                     break
-                if not self._is_translation_active(room_name):
-                    # The meeting microphone is allowed to remain published before the host
-                    # starts translation and while translation is paused. Discard those frames
-                    # completely so pre-start speech cannot leak into the first active chunk.
+                if room_name in self._paused_rooms:
+                    # Paused only. This used to drop frames until translation had been
+                    # started, which meant a live meeting produced no transcript until
+                    # somebody pressed a button that has nothing to do with transcription.
+                    # A pause is different: the participants asked for the room to stop
+                    # listening, so discard the buffers completely rather than letting
+                    # speech from the pause leak into the first chunk after resume.
                     raw_buffer = bytearray()
                     speech_buffer = bytearray()
                     pre_speech_ring.clear()
@@ -1119,9 +1120,21 @@ class LiveKitIngressWorker(BaseWorker):
         sample_rate: int,
         near_field_gate: NearFieldGate | None = None,
     ) -> None:
-        if not self._is_translation_active(room_name):
-            self.logger.debug(
-                "speech_chunk_discarded_translation_inactive",
+        # Transcription is NOT translation, and this gate used to conflate them.
+        #
+        # It discarded every chunk until the room reported IN_PROGRESS/AUDIO_ROUTING_ACTIVE,
+        # a state only reached once someone started translation. So a live meeting where
+        # nobody had pressed Start produced no transcript at all — the microphone was read,
+        # VAD cut clean utterances, and each one was dropped here. It logged at debug, which
+        # production does not emit, so the whole pipeline failed in complete silence.
+        #
+        # The bot is only in this room because a participant published a microphone, so
+        # being here IS the signal that a meeting is live. Transcribe on that basis, and
+        # leave "has translation been started" to the translation worker, which is the
+        # stage that actually costs a translation.
+        if room_name in self._paused_rooms:
+            self.logger.info(
+                "speech_chunk_discarded_room_paused",
                 room=room_name,
                 speaker_id=speaker_id,
             )

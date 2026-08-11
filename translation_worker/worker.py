@@ -363,6 +363,21 @@ class TranslationWorker(BaseWorker):
         if stt_result.meeting_id in self._paused_rooms:
             return
 
+        # Translation is opt-in; transcription is not. This gate used to live in
+        # livekit_ingress_worker, where it stopped audio reaching STT at all — so a meeting
+        # nobody had started translation on produced no transcript either, and the two
+        # features could not be used apart.
+        #
+        # It belongs here instead. STT now runs for any live meeting, which is what fills
+        # the transcript panel, and this stage — the one that actually spends a translation
+        # and a dubbed voice — stays closed until the room reports translation active.
+        if not self._is_translation_active(stt_result.meeting_id):
+            self.logger.debug(
+                "translation_skipped_not_started",
+                meeting_id=stt_result.meeting_id,
+            )
+            return
+
         current_timestamp_ms = int(time.time() * 1000)
         e2e_latency_ms = current_timestamp_ms - stt_result.timestamp_ms
         await self.redis.publish_telemetry(stt_result.meeting_id, self.worker_name, e2e_latency_ms)

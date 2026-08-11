@@ -525,6 +525,7 @@ class TestConsumeLoopConcurrency:
     async def test_cleanup_room_purges_key_locks(self) -> None:
         worker = self._make_worker()
         worker._route_states = {}
+        worker._translation_active = {}
         worker._paused_rooms = set()
         worker._room_routes = {}
         worker._key_locks = {
