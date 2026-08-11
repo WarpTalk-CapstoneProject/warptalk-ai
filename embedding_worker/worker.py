@@ -87,6 +87,15 @@ class EmbeddingWorker(BaseWorker):
                 vectors.extend(await self.provider.embed_texts([chunk.text for chunk in batch]))
 
             self._validate_dimensions(vectors)
+            # `text` is stored, not just embedded. A vector alone is unreadable, so a
+            # workspace owner opening the Knowledge page could only ever be shown "something
+            # was indexed here" — which is indistinguishable from a broken index. Keeping the
+            # source text is what makes that screen honest.
+            #
+            # `fact`/`fact_category` are NOT produced here. This worker embeds and stores; it
+            # never reasons about content. Whichever agent extracted a fact puts it in the
+            # chunk's `metadata`, and the spread below carries it through untouched — so a
+            # chunk with no fact simply has none, rather than this worker inventing one.
             payloads = [
                 {
                     **chunk.metadata,
@@ -94,6 +103,7 @@ class EmbeddingWorker(BaseWorker):
                     "source_type": request.source_type,
                     "source_id": request.source_id,
                     "chunk_id": chunk.id,
+                    "text": chunk.text,
                     "ai_retrieval": request.ai_retrieval_allowed,
                     "retention_state": request.retention_state,
                     "deletion_state": request.deletion_state,

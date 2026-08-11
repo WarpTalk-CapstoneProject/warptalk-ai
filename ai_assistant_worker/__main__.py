@@ -1,10 +1,11 @@
 """AI Assistant Worker entry point.
 
-Runs three independent Redis-stream consumers concurrently in one process:
+Runs four independent Redis-stream consumers concurrently in one process:
     - AIAssistantWorker — per-meeting summarization (stt:results)
     - ChatAssistantWorker — global "Ask WarpTalk" tool-calling chat (assistant:chat_requests)
     - SummaryTemplateWorker — re-summarise a finished meeting (assistant:summary_requests)
-All three are lightweight consumers with their own consumer group; no need for separate
+    - KnowledgeFactWorker — durable facts out of workspace content (knowledge:fact_requests)
+All four are lightweight consumers with their own consumer group; no need for separate
 containers.
 
 ONE WORKER'S DEATH IS NOT THE OTHERS' DEATH
@@ -21,6 +22,7 @@ import asyncio
 import contextlib
 
 from ai_assistant_worker.chat_worker import ChatAssistantWorker
+from ai_assistant_worker.knowledge_fact_worker import KnowledgeFactWorker
 from ai_assistant_worker.summary_template_worker import SummaryTemplateWorker
 from ai_assistant_worker.worker import AIAssistantWorker
 from shared.config import AssistantSettings, ChatAssistantSettings, WorkerSettings
@@ -47,10 +49,20 @@ async def main() -> None:
         settings=worker_settings,
     )
 
+    # Fact extraction for the workspace Knowledge page. Separate from both summarisers
+    # because it reads content that is already written — a summary, a document — rather
+    # than producing it, and because a workspace can disable it (external_llm_allowed)
+    # without losing its summaries.
+    knowledge_fact_worker = KnowledgeFactWorker(
+        assistant_settings=AssistantSettings(),
+        settings=worker_settings,
+    )
+
     await asyncio.gather(
         _supervise("assistant", summarization_worker),
         _supervise("assistant-chat", chat_worker),
         _supervise("summary-template", summary_template_worker),
+        _supervise("knowledge-fact", knowledge_fact_worker),
     )
 
 

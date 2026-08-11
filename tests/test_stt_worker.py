@@ -1687,6 +1687,7 @@ class TestConsumeLoopConcurrency:
         worker._recent_transcripts = {"m1": deque(["meeting context"])}
         worker._room_languages = {"m1": ({"vi"}, 0.0)}
         worker._route_states = {}
+        worker._translation_active = {}
         worker._paused_rooms = set()
         worker._room_routes = {}
         worker._speaker_locks = {

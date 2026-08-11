@@ -570,6 +570,85 @@ class SuggestionResultMessage(BaseModel):
         )
 
 
+class KnowledgeFactRequestMessage(BaseModel):
+    """Backend → KnowledgeFactWorker: turn one piece of workspace content into facts.
+
+    WHY A SEPARATE AGENT RATHER THAN THE EMBEDDING WORKER
+        EmbeddingWorker embeds and stores; it never reads content. Extracting a fact is a
+        judgement call and costs an LLM round-trip, so it belongs to an agent that can be
+        scaled, retried, and disabled on its own. The agent publishes the finished chunks
+        onto `embedding:index_requests` like any other producer — the embedding worker
+        stays unaware that facts exist and simply carries `metadata` through to the payload.
+
+    WHY THE TEXT TRAVELS IN THE MESSAGE
+        Unlike SummaryRequestMessage, there is nothing to re-fetch: the caller already holds
+        the summary it just wrote or the document text it just extracted, and re-reading it
+        would need a bearer token this path does not have.
+
+    `external_llm_allowed` is the workspace's own privacy flag. False means no fact
+    extraction happens at all — the content is still indexed by whoever published it, just
+    without a fact. Silently sending it to OpenAI anyway would make the setting a lie.
+    """
+
+    __slots__ = ()
+
+    request_id: str
+    workspace_id: str
+    # "meeting_summary" | "document" | "glossary" | "workspace_context" — carried straight
+    # through to the Qdrant payload's source_type, which is what the Knowledge page filters on.
+    source_type: str
+    source_id: str
+    # Human-readable provenance: a meeting's name, a document's filename. Shown as the row's
+    # Source on the Knowledge page.
+    title: str = ""
+    text: str = ""
+    external_llm_allowed: bool = True
+    # Whether `text` itself still needs a vector, or only its facts do.
+    #
+    # A meeting summary arrives here having never been indexed, so it sets this True and the
+    # agent indexes the summary alongside its facts. A document's text was already chunked
+    # and indexed by RedisEmbeddingIndexPublisher before this request was made, so it sets
+    # False — indexing it again would duplicate every chunk under a second set of ids.
+    index_source_text: bool = False
+    retention_state: str = "active"
+    deletion_state: str = "active"
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_redis(self) -> dict[str, str]:
+        return {
+            "request_id": self.request_id,
+            "workspace_id": self.workspace_id,
+            "source_type": self.source_type,
+            "source_id": self.source_id,
+            "title": self.title,
+            "text": self.text,
+            "external_llm_allowed": _bool_to_redis(self.external_llm_allowed),
+            "index_source_text": _bool_to_redis(self.index_source_text),
+            "retention_state": self.retention_state,
+            "deletion_state": self.deletion_state,
+            "timestamp_ms": str(self.timestamp_ms),
+        }
+
+    @classmethod
+    def from_redis(cls, data: Mapping[Any, Any]) -> KnowledgeFactRequestMessage:
+        d = _decode_dict(data)
+        return cls(
+            request_id=d["request_id"],
+            workspace_id=d["workspace_id"],
+            source_type=d["source_type"],
+            source_id=d["source_id"],
+            title=d.get("title", ""),
+            text=d.get("text", ""),
+            external_llm_allowed=str(d.get("external_llm_allowed", "true")).strip().lower()
+            in {"true", "1", "yes"},
+            index_source_text=str(d.get("index_source_text", "false")).strip().lower()
+            in {"true", "1", "yes"},
+            retention_state=d.get("retention_state", "active"),
+            deletion_state=d.get("deletion_state", "active"),
+            timestamp_ms=int(d.get("timestamp_ms", 0) or 0),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

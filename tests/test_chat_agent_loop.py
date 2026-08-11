@@ -78,8 +78,15 @@ def _build_worker(
     return worker, published
 
 
-def _request() -> Any:
-    return SimpleNamespace(page_context_json="", mentions_json="")
+def _request(
+    *, origin: str = "assistant", page_context_json: str = "", mentions_json: str = ""
+) -> Any:
+    return SimpleNamespace(
+        request_id="req-1",
+        origin=origin,
+        page_context_json=page_context_json,
+        mentions_json=mentions_json,
+    )
 
 
 @pytest.fixture

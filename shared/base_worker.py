@@ -94,6 +94,10 @@ class BaseWorker(ABC):
         self._shutdown_event = asyncio.Event()
         self._consumer_name = f"{self.worker_name}-{socket.gethostname()}"
         self._route_states: dict[str, str] = {}
+        # Whether TRANSLATION is running, per room, as last reported by the backend. Separate
+        # from _route_states because the room's status cannot answer it — see
+        # _is_translation_active. Absent means "the backend has not said", not "no".
+        self._translation_active: dict[str, bool] = {}
         self._paused_rooms: set[str] = set()
         self._room_routes: dict[str, list[dict[str, Any]]] = {}
         self._pubsub: PubSub | None = None
@@ -255,6 +259,15 @@ class BaseWorker(ABC):
             if room_id and isinstance(inner.get("routes"), list):
                 self._room_routes[room_id] = inner["routes"]
 
+            # The backend's own answer to "is translation running", computed from the room's
+            # active TranslationRoomSession. Recorded separately from the room status below, and
+            # deliberately only when present: an older backend does not send it, and treating a
+            # missing field as False would silently stop translating for the whole fleet during a
+            # rolling deploy.
+            translation_active = inner.get("translation_active")
+            if room_id and isinstance(translation_active, bool):
+                self._translation_active[room_id] = translation_active
+
             if room_id and status:
                 self._route_states[room_id] = status
                 if status == "PAUSED":
@@ -269,6 +282,40 @@ class BaseWorker(ABC):
         except Exception as error:
             self.logger.warning("failed_to_parse_route_event", error=str(error))
 
+    def _is_translation_active(self, room_id: str) -> bool:
+        """Whether someone has actually started translation for this room.
+
+        Lives here, not in one worker, because the answer decides different things in
+        different stages and getting that split wrong took the transcript down: while this
+        was livekit_ingress_worker's private helper it gated AUDIO, so nothing was
+        transcribed until translation started and the two features could not be used
+        apart. Ingress now transcribes any live meeting and only translation_worker asks
+        this question, which is the stage that actually spends a translation.
+
+        The answer is `translation_active` from AUDIO_ROUTES_UPDATED, which the backend
+        computes from the room's active TranslationRoomSession — the row Start Translation
+        opens and Stop closes.
+
+        It used to be read off the room STATUS instead, and that was wrong in a way that
+        could not be worked around here: a room is IN_PROGRESS from the moment somebody
+        opens it, and since WT-339 opening a room deliberately does not start translation.
+        So "the meeting is live" and "translation is running" were the same value, and no
+        gate built on it could tell transcript-only from transcript-plus-translation.
+
+        The status fallback remains for a backend that predates the flag — during a rolling
+        deploy the old meaning is the safe one, since it errs towards translating rather
+        than towards a silent pipeline.
+        """
+        explicit: dict[str, bool] = getattr(self, "_translation_active", {})
+        if room_id in explicit:
+            return explicit[room_id]
+
+        states: dict[str, str] = getattr(self, "_route_states", {})
+        return states.get(room_id) in {
+            "IN_PROGRESS",
+            "AUDIO_ROUTING_ACTIVE",
+        }
+
     async def _on_route_status_changed(self, room_id: str, new_status: str) -> None:
         """Override in subclasses to react to route status changes."""
         pass
@@ -276,6 +323,7 @@ class BaseWorker(ABC):
     def _cleanup_room(self, room_id: str) -> None:
         """Override in subclasses to perform room-specific cleanup."""
         self._route_states.pop(room_id, None)
+        self._translation_active.pop(room_id, None)
         self._paused_rooms.discard(room_id)
         self._room_routes.pop(room_id, None)
 
