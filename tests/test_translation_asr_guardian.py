@@ -23,6 +23,7 @@ from translation_worker.translator import (
     _MIN_MISHEARD_SKELETON,
     _SYSTEM_PROMPT,
     OpenAITranslator,
+    _asr_repair_clause,
     _build_glossary_block,
     _match_skeleton,
     _select_relevant_glossary_terms,
@@ -122,16 +123,44 @@ class TestGlossaryBlock:
 
 
 class TestSystemPrompts:
-    def test_both_prompts_declare_the_input_is_asr(self) -> None:
-        """Without this the translator treats a mishearing as authoritative text."""
-        for prompt in (_SYSTEM_PROMPT, _BATCH_SYSTEM_PROMPT):
-            assert "automatic speech recognition" in prompt
-
     def test_repair_is_permitted_only_on_evidence(self) -> None:
         """A blanket 'fix ASR errors' rewrites sentences that were already right."""
         assert "glossary or the meeting context" in _ASR_REPAIR_INSTRUCTION
         assert "translate exactly what is written and invent nothing" in _ASR_REPAIR_INSTRUCTION
         assert "Never add, drop" in _ASR_REPAIR_INSTRUCTION
+
+    def test_neither_prompt_carries_it_unconditionally(self) -> None:
+        """It ships per call instead. Baked in, it charged every utterance in every
+        meeting for a permission that most utterances have no evidence to use."""
+        for prompt in (_SYSTEM_PROMPT, _BATCH_SYSTEM_PROMPT):
+            assert "automatic speech recognition" not in prompt
+
+
+class TestAsrRepairClause:
+    """The gate. Open only when the call carries something to repair *from*."""
+
+    def test_a_suspected_mishearing_opens_it(self) -> None:
+        terms = [{"source": "Kubernetes", "target": "Kubernetes", "match": "possible"}]
+        assert _asr_repair_clause(terms, None) == _ASR_REPAIR_INSTRUCTION
+
+    def test_meeting_context_opens_it(self) -> None:
+        """The Grafana case: the term is in nobody's glossary, and context is the only
+        evidence there is. Measured 0/6 -> 2/6 on gpt-4.1-mini, 6/6 on gpt-4.1."""
+        assert _asr_repair_clause(None, ["We moved the dashboards to Grafana."]) == (
+            _ASR_REPAIR_INSTRUCTION
+        )
+
+    def test_an_exact_glossary_hit_alone_does_not(self) -> None:
+        """A literal match is a terminology instruction, not a sign the recogniser
+        slipped, so it grants nothing the glossary block does not already say."""
+        terms = [{"source": "sprint", "target": "sprint", "match": "exact"}]
+        assert _asr_repair_clause(terms, None) == ""
+
+    def test_a_bare_call_gets_nothing(self) -> None:
+        """First utterance of a meeting, no glossary. The instruction could only reach
+        its own fallback here — translate literally — which the base prompt already does."""
+        assert _asr_repair_clause(None, None) == ""
+        assert _asr_repair_clause([], []) == ""
 
 
 class TestRealtimeReasoningEffort:

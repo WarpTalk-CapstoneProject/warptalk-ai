@@ -59,6 +59,28 @@ _LANG_NAMES: dict[str, str] = {
 # confidently repaired sentence from a real one. So repair is allowed only where the
 # glossary or the meeting context supplies the evidence, and literal translation is the
 # stated default everywhere else.
+#
+# It is appended per call by _asr_repair_clause, NOT baked into the prompts below, because
+# it is inert on a call that carries no evidence — and that is most calls. Measured with
+# tools/probe_which_part_repairs.py, probe_context_only_repair.py, probe_gate_safety.py:
+#
+#   repaired a hard mishearing (n=6 each)     instruction   glossary block   both   neither
+#     term IS in glossary, gpt-4.1                  6/6            6/6        6/6      0/6
+#     term IS in glossary, gpt-realtime-2.1         4/6            6/6        6/6      5/6
+#     term NOT in glossary, context only            —               —          —        —
+#       gpt-4.1                                     6/6           n/a        n/a       6/6
+#       gpt-4.1-mini                                2/6           n/a        n/a       0/6
+#       gpt-realtime-2.1                            6/6           n/a        n/a       6/6
+#
+# So the glossary block carries the glossary case on its own, and the full models repair
+# from context without being told to. The instruction's only unique contribution is
+# gpt-4.1-mini repairing from context at all (0/6 -> 2/6) — weak, but it is what production
+# runs today, so the clause is kept and gated rather than deleted.
+#
+# Dropping it where there is no evidence was checked for invention, since its "invent
+# nothing" sentence is also the brake: on "Cái cô đích nó báo lỗi" with no glossary match
+# and no context, four models produced 0/24 inventions with it and 0/24 without. The base
+# prompt already declines to guess, so the gate costs no safety.
 _ASR_REPAIR_INSTRUCTION = (
     " Your input is automatic speech recognition output, so it may contain words that were "
     "misheard — most often a name or technical term rendered as similar-sounding syllables "
@@ -73,7 +95,6 @@ _SYSTEM_PROMPT = (
     "Translate the user's message accurately and naturally. "
     "Preserve tone, technical terms, and speaker intent. "
     "Output ONLY the translation — no explanations, no notes, no alternatives."
-    + _ASR_REPAIR_INSTRUCTION
 )
 
 _BATCH_SYSTEM_PROMPT = (
@@ -83,7 +104,6 @@ _BATCH_SYSTEM_PROMPT = (
     "and speaker intent. Reply with exactly one line per input sentence, in the same "
     "order, each formatted as '[n] translation' using the same number n as the input. "
     "Output ONLY those numbered lines — no explanations, no notes, no alternatives."
-    + _ASR_REPAIR_INSTRUCTION
 )
 
 _CONTEXT_RELEVANCE_INSTRUCTION = (
@@ -94,6 +114,25 @@ _CONTEXT_RELEVANCE_INSTRUCTION = (
     "acknowledgement, question, correction, name, technical term, reasonable tangent, "
     "or is ambiguous, translate it normally. Suppress only when clearly unrelated."
 )
+
+
+def _asr_repair_clause(
+    glossary_terms: list[dict[str, str]] | None,
+    meeting_context: list[str] | None,
+) -> str:
+    """`_ASR_REPAIR_INSTRUCTION`, but only on calls that carry something to repair from.
+
+    The instruction grants repair "when the glossary or the meeting context makes it clear
+    what was really said". Both of those are per-call facts, so on a call with neither the
+    instruction can only ever reach its own fallback — translate literally, which is what
+    the base prompt already does. See the measured table above `_ASR_REPAIR_INSTRUCTION`;
+    the gated-off cell showed no increase in invention across four models.
+
+    Evidence means a *suspected* mishearing specifically. An exact glossary hit is a
+    terminology instruction, not a sign the recogniser slipped, so it does not open repair.
+    """
+    suspected = any((term.get("match") == "possible") for term in (glossary_terms or []))
+    return _ASR_REPAIR_INSTRUCTION if suspected or meeting_context else ""
 
 
 def _build_glossary_block(glossary_terms: list[dict[str, str]] | None) -> str:
@@ -612,7 +651,7 @@ class OpenAITranslator:
         )
 
         result = ""
-        system_prompt = _SYSTEM_PROMPT
+        system_prompt = _SYSTEM_PROMPT + _asr_repair_clause(relevant_glossary, meeting_context)
         if meeting_context:
             system_prompt += _CONTEXT_RELEVANCE_INSTRUCTION
         if getattr(self, "realtime_model", ""):
@@ -700,7 +739,9 @@ class OpenAITranslator:
             f"{context_block}"
         )
 
-        system_prompt = _BATCH_SYSTEM_PROMPT
+        system_prompt = _BATCH_SYSTEM_PROMPT + _asr_repair_clause(
+            relevant_glossary, meeting_context
+        )
         if meeting_context:
             system_prompt += _CONTEXT_RELEVANCE_INSTRUCTION
         response = await self._create_with_retry(
