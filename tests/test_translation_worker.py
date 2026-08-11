@@ -404,6 +404,11 @@ class TestTranslationWorker:
         worker.logger = MagicMock()
         worker.translation_settings = TranslationSettings()
         worker._paused_rooms = set()
+        # Translation is opt-in now: process() drops a segment unless the room has reported
+        # translation active. These tests are about what translation DOES once started, so
+        # they declare it started. The gate itself has its own tests.
+        worker._route_states = {}
+        worker._is_translation_active = lambda _room: True  # type: ignore[method-assign]
         worker._mt_glossaries = {}
         worker._recent_source_contexts = {}
         worker.worker_name = "translation"
@@ -850,6 +855,7 @@ class TestTranslationWorker:
     ) -> None:
         worker = self._make_worker(mock_redis_client, worker_settings)
         worker._route_states = {}
+        worker._translation_active = {}
         worker._room_routes = {}
         worker._mt_glossaries = {"m1": [{"source": "a", "target": "a"}]}
         worker._meeting_contexts = {"m1": ["Meeting topic: A."]}
