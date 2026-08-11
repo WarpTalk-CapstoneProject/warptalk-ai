@@ -22,6 +22,7 @@ from typing import Any, cast
 import httpx
 from openai import AsyncOpenAI
 
+from ai_assistant_worker.chat_templates import PERSONA, build_system_prompt, resolve_template
 from ai_assistant_worker.chat_tools import TOOLS, TOOLS_BY_NAME, ToolContext
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
@@ -30,19 +31,17 @@ from shared.schemas import ChatRequestMessage, ChatResultMessage
 
 SIBLING_SERVICE_TIMEOUT_SECONDS = 15.0
 
-SYSTEM_PROMPT = (
-    "You are WarpTalk AI, the assistant embedded in the WarpTalk real-time speech "
-    "translation platform. Answer clearly and concisely. Use the available tools to look "
-    "up real workspace data (members, terminology, recent meetings) whenever the user asks "
-    "about something tool-shaped rather than guessing. If a tool returns no results, say so "
-    "honestly instead of making something up."
-)
+# The prompt is generated per turn from chat_templates, which is where the routing rules
+# ("read the transcript when asked what was said") now live. This name survives as the
+# shared persona because it is still the opening of every prompt the worker sends.
+SYSTEM_PROMPT = PERSONA
 
 
-def _format_page_context(page_context_json: str) -> str | None:
-    """Render the frontend's ambient page_context_json (which page the user has the
-    assistant open on, e.g. a specific room) into a system message. Malformed or empty
-    payloads are silently ignored — this is a nice-to-have hint, never a hard requirement.
+def _parse_page_context(page_context_json: str) -> dict[str, Any] | None:
+    """The ambient page context as a dict, or None if there isn't a usable one.
+
+    Both the template routing and the rendered system message need this, and parsing it
+    twice is how the two would drift apart.
     """
     if not page_context_json:
         return None
@@ -51,6 +50,27 @@ def _format_page_context(page_context_json: str) -> str | None:
     except json.JSONDecodeError:
         return None
     if not isinstance(context, dict):
+        return None
+    return context
+
+
+def _page_type(page_context_json: str) -> str | None:
+    context = _parse_page_context(page_context_json)
+    if context is None:
+        return None
+    page_type = context.get("pageType")
+    return page_type if isinstance(page_type, str) and page_type else None
+
+
+def _format_page_context(page_context_json: str) -> str | None:
+    """Render the frontend's ambient page_context_json (which page the user has the
+    assistant open on, e.g. a specific room) into a system message. Malformed or empty
+    payloads are silently ignored — this is a nice-to-have hint, never a hard requirement.
+
+    This states the facts; the template says what the entity_id in them is good for.
+    """
+    context = _parse_page_context(page_context_json)
+    if context is None:
         return None
 
     page_type = context.get("pageType")
@@ -78,9 +98,39 @@ def _format_page_context(page_context_json: str) -> str | None:
 
 _MENTION_TOOL_HINTS = {
     "room": "get_room_detail or get_transcript",
+    "meeting": "get_transcript, then get_meeting_summary if it has ended",
     "document": "get_document",
     "member": "search_workspace_members",
 }
+
+# A mention of the assistant itself is how the user summoned it, not a thing to look up.
+# MeetingChatService forwards the whole mention list, so "@WarpBot" arrives here on every
+# in-meeting turn; rendering it as a reference produced the instruction "look up agent
+# WarpBot (id=bot-warpbot) with an appropriate tool", which no tool can satisfy.
+_NON_ENTITY_MENTION_TYPES = frozenset({"agent", "bot", "assistant"})
+
+
+def _normalize_mention(mention: dict[str, Any]) -> tuple[str, str, str] | None:
+    """One mention as (entity_type, entity_id, label), or None if it isn't a reference.
+
+    The two publishers disagree on shape. AssistantService sends
+    {entityType, entityId, label}; MeetingChatService forwards the frontend's ChatMentionDto
+    as {id, display, type}. Reading only the first shape silently dropped every in-meeting
+    mention, so both are accepted here — the fix belongs on the reading side, since the
+    meeting-chat shape is also what the browser stores and renders.
+    """
+    entity_type = mention.get("entityType") or mention.get("type")
+    entity_id = mention.get("entityId") or mention.get("id")
+    if not isinstance(entity_type, str) or not isinstance(entity_id, str):
+        return None
+    entity_type = entity_type.strip().lower()
+    entity_id = entity_id.strip()
+    if not entity_type or not entity_id:
+        return None
+    if entity_type in _NON_ENTITY_MENTION_TYPES:
+        return None
+    label = mention.get("label") or mention.get("display") or entity_id
+    return entity_type, entity_id, str(label)
 
 
 def _format_mentions(mentions_json: str) -> str | None:
@@ -102,11 +152,10 @@ def _format_mentions(mentions_json: str) -> str | None:
     for mention in mentions:
         if not isinstance(mention, dict):
             continue
-        entity_type = mention.get("entityType")
-        entity_id = mention.get("entityId")
-        if not entity_type or not entity_id:
+        normalized = _normalize_mention(mention)
+        if normalized is None:
             continue
-        label = mention.get("label") or entity_id
+        entity_type, entity_id, label = normalized
         tool_hint = _MENTION_TOOL_HINTS.get(entity_type, "an appropriate tool")
         lines.append(f'- {entity_type} "{label}" (id={entity_id}) — look it up with {tool_hint}.')
 
@@ -241,7 +290,17 @@ class ChatAssistantWorker(BaseWorker):
 
         # Responses carries the system prompt as `instructions` rather than as a leading
         # message, so the three system-role messages are joined into one.
-        instructions_parts = [SYSTEM_PROMPT]
+        template = resolve_template(
+            origin=request.origin,
+            page_type=_page_type(request.page_context_json),
+        )
+        self.logger.info(
+            "chat_template_resolved",
+            request_id=request.request_id,
+            template=template.key,
+            origin=request.origin,
+        )
+        instructions_parts = [build_system_prompt(template)]
         page_context_message = _format_page_context(request.page_context_json)
         if page_context_message:
             instructions_parts.append(page_context_message)
