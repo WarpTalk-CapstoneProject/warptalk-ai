@@ -175,35 +175,6 @@ _LANG_NAME_TO_CODE: dict[str, str] = {
 # en had every segment dropped.
 _DEFAULT_ALLOWED_LANGUAGES = {"vi", "en"}
 
-# Languages written in Latin script. The cross-script hallucination guard
-# (_FOREIGN_SCRIPT_RE) only makes sense for these: a speaker we know is speaking a
-# Latin-script language never legitimately produces Thai/Hangul/CJK/Kana. For a speaker
-# whose declared language IS one of those scripts, that same text is correct output and
-# must NOT be filtered — applying the guard unconditionally is what would silently drop
-# a legitimate Japanese/Korean/Chinese/Thai speaker.
-_LATIN_SCRIPT_LANGUAGES = {
-    "en",
-    "vi",
-    "fr",
-    "de",
-    "es",
-    "pt",
-    "it",
-    "id",
-    "ms",
-    "nl",
-    "pl",
-    "tr",
-    "sv",
-    "da",
-    "no",
-    "fi",
-    "cs",
-    "sk",
-    "hr",
-    "ro",
-    "hu",
-}
 
 # Vietnamese-UNIQUE characters only.
 #
@@ -239,6 +210,64 @@ _HANGUL_RE = re.compile(r"[가-힣ᄀ-ᇿ]")
 _KANA_RE = re.compile(r"[぀-ヿ]")
 _HAN_RE = re.compile(r"[一-鿿]")
 _THAI_RE = re.compile(r"[฀-๿]")
+_ARABIC_RE = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
+_CYRILLIC_RE = re.compile(r"[Ѐ-ӿԀ-ԯ]")
+_HEBREW_RE = re.compile(r"[֐-׿]")
+_DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
+_GREEK_RE = re.compile(r"[Ͱ-Ͽἀ-῿]")
+
+# Which writing systems each language is actually written in.
+#
+# A room that declared its languages has declared its writing systems too, and that is a
+# far stronger filter than a blocklist of the scripts somebody happened to think of. The
+# blocklist this replaced named Thai, Hangul, CJK and Kana — so Arabic, which is what
+# production actually produced in a Vietnamese/Japanese room, was never on it.
+#
+# Absent from this table means Latin, which covers every remaining language the product
+# offers.
+_LANGUAGE_SCRIPTS: dict[str, frozenset[str]] = {
+    "ja": frozenset({"kana", "han"}),
+    "zh": frozenset({"han"}),
+    "ko": frozenset({"hangul", "han"}),
+    "th": frozenset({"thai"}),
+    "ar": frozenset({"arabic"}),
+    "he": frozenset({"hebrew"}),
+    "ru": frozenset({"cyrillic"}),
+    "uk": frozenset({"cyrillic"}),
+    "bg": frozenset({"cyrillic"}),
+    "hi": frozenset({"devanagari"}),
+    "mr": frozenset({"devanagari"}),
+    "el": frozenset({"greek"}),
+}
+
+_SCRIPT_DETECTORS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("hangul", _HANGUL_RE),
+    ("kana", _KANA_RE),
+    ("han", _HAN_RE),
+    ("thai", _THAI_RE),
+    ("arabic", _ARABIC_RE),
+    ("cyrillic", _CYRILLIC_RE),
+    ("hebrew", _HEBREW_RE),
+    ("devanagari", _DEVANAGARI_RE),
+    ("greek", _GREEK_RE),
+)
+
+
+def _scripts_in(text: str) -> set[str]:
+    """Non-Latin writing systems present in `text`.
+
+    Latin is not reported and never filtered on. It is the script every code-switched
+    English product term arrives in — "deploy the backend API" inside a Vietnamese
+    sentence is the thing this product is for, not a defect to be filtered out.
+    """
+    return {name for name, pattern in _SCRIPT_DETECTORS if pattern.search(text)}
+
+
+def _allowed_scripts(languages: set[str]) -> set[str]:
+    scripts: set[str] = set()
+    for language in languages:
+        scripts |= _LANGUAGE_SCRIPTS.get(base_language(language), frozenset())
+    return scripts
 
 
 def _detect_script_language(text: str) -> str | None:
@@ -296,13 +325,6 @@ def _guess_language_from_text(text: str, allowed: set[str] | None = None) -> str
         return sorted(allowed)[0]
     return "en"
 
-
-_FOREIGN_SCRIPT_RE = re.compile(
-    r"[฀-๿"  # Thai
-    r"가-힣"  # Hangul syllables
-    r"一-鿿"  # CJK unified ideographs
-    r"぀-ヿ]"  # Hiragana/Katakana
-)
 
 # Even the fastest human speech in any language doesn't clear ~30 chars/sec, so this
 # pair (< 0.5s of real audio, yet > 20 chars of text) only fires on the classic
@@ -660,42 +682,58 @@ def _filter_segments(
     if lang_code:
         allowed.add(lang_code)
 
-    if language_known and lang_code not in allowed:
-        logger.debug(
-            "filtered_wrong_language",
-            detected=detected_language,
-            code=lang_code,
-            allowed=sorted(allowed),
-        )
-        return []
+    # There WAS a "reject the whole batch if its language is not allowed" check here. It
+    # could never fire: `lang_code` is the speaker's declared language and the two lines
+    # above had just added it to `allowed`, so the condition was always false. Worse, it
+    # read as the thing enforcing "only the room's languages" while enforcing nothing —
+    # which is why a room configured for vi + ja was showing Arabic. Enforcement is the
+    # script allow-list below, which tests the TEXT rather than a label that was assigned
+    # from the speaker's profile before anyone looked at what they said.
 
-    # The cross-script guard is only valid when the speaker's declared language is
-    # Latin-script; for a declared CJK/Thai/Hangul language that script is legitimate.
+    # WHAT THE ROOM MAY CONTAIN, AS AN ALLOW-LIST
     #
-    # When the per-utterance language is unknown (speaker joined with speak_language left
-    # on "auto" — see TranslationRoomHub.SetSpeakLanguage/JoinTranslationRoom — so there's
-    # no session-level hint at all), still apply the guard IF every language this meeting
-    # has actually declared (allowed, computed above) is Latin-script: nobody in the room
-    # is expected to produce Thai/Hangul/CJK/Kana regardless of which Latin-script language
-    # this particular speaker turns out to be using, so a hallucinated foreign-script
-    # segment is still safe to drop. If the room has a real CJK/Thai speaker declared,
-    # skip the guard here — there's no way to tell whose script is legitimate without a
-    # known per-segment language, and dropping could silently eat that speaker's real
-    # transcript.
+    # A room that declared vi + ja declared two writing systems: Latin and Japanese. Text
+    # in any other is not that room's speech, whoever the model thinks was talking. So the
+    # scripts of the DECLARED languages are what a segment is checked against.
     #
-    # `languages_declared` is what makes this fail OPEN. Before it, a room that had not
-    # yet published its language set fell back to the assumed vi/en allow-list, both
-    # Latin, and the guard therefore switched itself on — so every Japanese, Korean,
-    # Chinese or Thai utterance in that window was dropped in full, as "foreign script",
-    # in a room that had simply not finished announcing itself. Losing a speaker's entire
-    # transcript is a far worse outcome than letting a rare cross-script hallucination
-    # through, so an ASSUMED allow-list no longer arms the guard; only a declared one does.
-    apply_foreign_script_guard = (language_known and lang_code in _LATIN_SCRIPT_LANGUAGES) or (
-        not language_known
-        and languages_declared
-        and bool(allowed)
-        and all(lang in _LATIN_SCRIPT_LANGUAGES for lang in allowed)
-    )
+    # This replaces a blocklist — Thai, Hangul, CJK, Kana — which failed in both
+    # directions at once, and production hit both:
+    #
+    #   Arabic was never on the list, so it was never dropped. A Vietnamese/Japanese room
+    #   showed Arabic transcript lines.
+    #
+    #   The list armed only for a Latin-declared speaker, so a speaker registered as
+    #   Vietnamese who READ JAPANESE ALOUD had every kanji segment deleted as "foreign
+    #   script" — in a room that had declared Japanese. That is the report "đọc Kanji thì
+    #   không bắt transcript", and it was this guard doing it.
+    #
+    # Latin is never filtered on: it is the script code-switched English arrives in, and
+    # "deploy the backend API" inside a Vietnamese sentence is the product working.
+    #
+    # PRECEDENCE: the room, then the speaker, then nothing.
+    #
+    #   The room declared its languages   -> those scripts. This is what fixes the report:
+    #                                        a vi-registered speaker reading Japanese in a
+    #                                        room that declared ja is speaking one of the
+    #                                        room's languages, and the speaker's own
+    #                                        profile must not overrule the room's set.
+    #   Only the speaker's is known       -> that speaker's scripts. The room's set is
+    #                                        cached for 15s and can be briefly empty; in
+    #                                        that window the speaker's declaration is the
+    #                                        only evidence there is, and it is better than
+    #                                        none.
+    #   Neither                           -> filter nothing. An ASSUMED vi/en allow-list
+    #                                        once armed this guard and deleted a real
+    #                                        Japanese speaker's entire transcript in a room
+    #                                        that had simply not finished announcing
+    #                                        itself. Losing a speaker beats letting a rare
+    #                                        cross-script hallucination through.
+    if languages_declared:
+        permitted_scripts: set[str] | None = _allowed_scripts(allowed)
+    elif lang_code:
+        permitted_scripts = _allowed_scripts({lang_code})
+    else:
+        permitted_scripts = None
 
     results: list[TranscribedSegment] = []
     seen_texts: set[str] = set()
@@ -710,14 +748,18 @@ def _filter_segments(
         if not text:
             continue
 
-        # A speaker we already know is speaking a Latin-script language never
-        # legitimately produces Thai/Hangul/CJK/Kana characters, so this is a
-        # high-precision way to catch the residual cross-script hallucination — and to
-        # enforce "no language mixing": a segment whose script doesn't match the
-        # speaker's one declared language is dropped rather than emitted.
-        if apply_foreign_script_guard and _FOREIGN_SCRIPT_RE.search(text):
-            logger.debug("filtered_foreign_script", text=text)
-            continue
+        # The room said which languages it contains. A writing system belonging to none of
+        # them is not this room's speech.
+        if permitted_scripts is not None:
+            foreign_scripts = _scripts_in(text) - permitted_scripts
+            if foreign_scripts:
+                logger.debug(
+                    "filtered_foreign_script",
+                    text=text[:80],
+                    scripts=sorted(foreign_scripts),
+                    declared=sorted(allowed),
+                )
+                continue
 
         # Realtime completed events expose token logprobs when explicitly requested in
         # the session include list. transcribe() averages those into avg_logprob;
@@ -768,7 +810,23 @@ def _filter_segments(
         # per-language: models are measurably less confident in some languages than
         # others at identical audio quality, so one shared floor discards more real
         # speech from the languages it already handles worst.
-        seg_lang = lang_code or _guess_language_from_text(text, allowed)
+        # Writing system first, declared language second.
+        #
+        # `lang_code` is what the SPEAKER REGISTERED, not what the model heard — the
+        # Realtime completed event carries no language field, so every segment used to be
+        # labelled with the speaker's profile language no matter what they actually said.
+        # A Vietnamese-registered speaker reading Japanese produced segments labelled `vi`,
+        # which then went to the translator as vi→ja and came back as nonsense, and which
+        # no language filter could ever reject because the label was allowed by
+        # construction.
+        #
+        # Script evidence does not have that problem: kana is Japanese whatever the
+        # profile says. It is used when present and the declared language is kept
+        # otherwise, so Latin-script speech — where script proves nothing — behaves
+        # exactly as before.
+        seg_lang = (
+            _detect_script_language(text) or lang_code or _guess_language_from_text(text, allowed)
+        )
         language_floor = (min_avg_logprob_by_language or {}).get(
             base_language(seg_lang),
             min_avg_logprob,

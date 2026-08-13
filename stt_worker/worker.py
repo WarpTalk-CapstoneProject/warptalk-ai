@@ -753,28 +753,73 @@ class STTWorker(BaseWorker):
                 window.append(cleaned)
 
     async def _get_room_languages(self, meeting_id: str) -> set[str]:
-        """The set of languages this meeting is allowed to produce — the distinct
-        profile speak-languages of its currently-joined participants.
+        """Every language this meeting may contain.
 
-        Read from the Redis hash `translationRoom:{meeting_id}:speak_languages`
-        (userId -> normalized speak language), which TranslationRoomHub.JoinTranslationRoom
-        populates and OnDisconnected/Leave clears. This is the "languages present in the
-        meeting" set the room declares implicitly by who is in it — no separate config
-        needed. Empty set ⇒ nothing declared yet; _filter_segments falls back to its
-        default and always keeps the speaker's own hint language, so transcript is never
-        dropped just because this hash hasn't populated.
+        TWO SOURCES, AND THE SECOND ONE IS THE ANSWER TO A REAL BUG
+            `speak_languages` is what the people currently in the room are SPEAKING —
+            written by TranslationRoomHub.JoinTranslationRoom, cleared on leave.
+
+            `room_languages` is what the room was CONFIGURED for — its SourceLanguage plus
+            TargetLanguages, published on the audio_routes payload by
+            AudioRouteCacheService.
+
+            They are not the same set, and using only the first is what produced the
+            report. A room configured Vietnamese + Japanese, where both participants SPEAK
+            Vietnamese and one LISTENS in Japanese, has speak_languages = {vi}. Japanese —
+            which the host explicitly configured, and which the room exists to produce —
+            was not in the set, so STT treated Japanese characters as foreign to the room
+            and deleted every one of them. "Đọc Kanji thì không bắt transcript."
+
+            The union is the honest set: a language is possible here if somebody is
+            speaking it OR the room was set up for it.
+
+        Empty set ⇒ nothing declared yet, and _filter_segments then filters nothing rather
+        than filtering on an assumption.
         """
         now = time.monotonic()
         cached = self._room_languages.get(meeting_id)
         if cached is not None and now - cached[1] < _ROOM_LANGUAGES_TTL_S:
             return cached[0]
 
-        raw = await self.redis.hgetall(f"translationRoom:{meeting_id}:speak_languages")
         langs: set[str] = set()
+
+        raw = await self.redis.hgetall(f"translationRoom:{meeting_id}:speak_languages")
         for value in (raw or {}).values():
             code = value.decode() if isinstance(value, bytes) else value
             code = _normalize_language(code.strip()) if code else ""
             if code and code != "auto":
                 langs.add(code)
+
+        langs |= await self._get_configured_room_languages(meeting_id)
+
         self._room_languages[meeting_id] = (langs, now)
         return langs
+
+    async def _get_configured_room_languages(self, meeting_id: str) -> set[str]:
+        """The room's own language configuration, from the audio_routes payload.
+
+        Same key `_translation_state_allows_stt` already reads, so this adds no round trip
+        beyond the one this worker was making anyway. Best-effort: an unreadable or
+        older-format payload (one published before `room_languages` existed) yields an
+        empty set and the speak-languages half stands alone, which is exactly the previous
+        behaviour.
+        """
+        try:
+            raw = await self.redis.get(f"translationRoom:{meeting_id}:audio_routes")
+            if not raw:
+                return set()
+            payload = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            configured = payload.get("room_languages") or payload.get("roomLanguages") or []
+            langs = set()
+            for value in configured:
+                if not isinstance(value, str):
+                    continue
+                code = _normalize_language(value.strip())
+                if code and code != "auto":
+                    langs.add(code)
+            return langs
+        except Exception:
+            self.logger.warning(
+                "room_configured_languages_unreadable", meeting_id=meeting_id, exc_info=True
+            )
+            return set()

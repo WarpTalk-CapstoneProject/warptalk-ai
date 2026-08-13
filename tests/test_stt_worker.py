@@ -962,8 +962,12 @@ class TestFilterSegments:
         assert len(result) == 1
 
     def test_latin_speaker_foreign_script_filtered(self) -> None:
-        """A speaker declared in a Latin-script language emitting CJK/Kana text is the
-        model mixing languages mid-utterance — drop it to enforce "no mixing"."""
+        """With no room language set at all, the speaker's own declaration is the only
+        evidence there is, and CJK from a declared English speaker is the model mixing
+        languages mid-utterance. Dropped.
+
+        This is the WEAKEST of the three precedence cases — see the room-declared tests
+        below for the one that governs when a room has announced itself."""
         segs = [_segment("こんにちは")]
         result = _filter_segments(segs, "en", 0)
         assert result == []
@@ -1201,6 +1205,61 @@ class TestFilterSegments:
         segs = [_segment("This is a perfectly reasonable sentence for a few seconds of speech")]
         result = _filter_segments(segs, "en", 0, real_duration_s=3.0)
         assert len(result) == 1
+
+
+class TestRoomDeclaredLanguagesAreTheAllowList:
+    """A room that configured Vietnamese and Japanese must show Vietnamese and Japanese.
+
+    It was showing neither reliably: Arabic lines appeared in the transcript, and a
+    speaker registered as Vietnamese who read Japanese aloud had every kanji segment
+    deleted. Both came from the same place — a BLOCKLIST of four scripts that armed on the
+    speaker's profile language. Arabic was not on the list, so it was never dropped;
+    Japanese was, so it always was.
+    """
+
+    def test_a_script_no_declared_language_uses_is_dropped(self) -> None:
+        # The reported failure, verbatim in shape: a vi+ja room, Arabic on screen.
+        segs = [_segment("مرحبا كيف حالك اليوم")]
+        assert _filter_segments(segs, "vi", 0, allowed_languages={"vi", "ja"}) == []
+
+    def test_the_room_outranks_the_speakers_own_profile(self) -> None:
+        """The kanji case. The speaker is registered Vietnamese and is reading Japanese in
+        a room that DECLARED Japanese, so it is one of the room's languages and the
+        speaker's profile does not get to overrule that."""
+        segs = [_segment("今日の会議は九時からです")]
+        result = _filter_segments(segs, "vi", 0, allowed_languages={"vi", "ja"})
+
+        assert len(result) == 1
+        # …and it is labelled by what was WRITTEN, not by what the speaker registered.
+        # Labelled `vi` it would have gone to the translator as vi->ja and come back as
+        # nonsense, which is the garbage in the reported transcript.
+        assert result[0].language == "ja"
+
+    def test_code_switched_english_is_never_filtered(self) -> None:
+        # Latin is not filtered on at all: English product terms inside a Vietnamese
+        # sentence are the product working, not a language leak.
+        segs = [_segment("Mình sẽ deploy cái backend API này lên staging")]
+        result = _filter_segments(segs, "vi", 0, allowed_languages={"vi", "ja"})
+        assert len(result) == 1
+
+    def test_a_declared_language_is_kept_in_every_script_it_uses(self) -> None:
+        # Japanese is kana AND kanji. A rule that admitted one and not the other would
+        # chop real sentences in half.
+        for text in ("ひらがな", "カタカナ", "漢字", "今日はミーティングです"):
+            segs = [_segment(text)]
+            assert len(_filter_segments(segs, "ja", 0, allowed_languages={"vi", "ja"})) == 1, text
+
+    def test_cyrillic_and_hangul_are_dropped_from_a_vi_ja_room(self) -> None:
+        for text in ("Привет как дела сегодня", "안녕하세요 오늘 회의"):
+            segs = [_segment(text)]
+            assert _filter_segments(segs, "vi", 0, allowed_languages={"vi", "ja"}) == [], text
+
+    def test_an_undeclared_room_still_filters_nothing(self) -> None:
+        """The fail-open case, kept deliberately. A room whose language set has not been
+        published yet must not have a real speaker's transcript deleted on an assumption —
+        that regression cost a Japanese speaker every line they said."""
+        segs = [_segment("こんにちは")]
+        assert len(_filter_segments(segs, "unknown", 0)) == 1
 
 
 class TestNormalizeLanguage:
@@ -1602,6 +1661,72 @@ class TestSTTWorker:
 
         langs = await worker._get_room_languages("m1")
         assert langs == {"vi", "en", "ja"}
+
+    async def test_a_language_the_room_was_configured_for_counts_even_if_nobody_speaks_it(
+        self, mock_redis_client
+    ) -> None:
+        """The reported room, exactly: configured vi + ja, and BOTH people speak Vietnamese
+        because Japanese is what one of them LISTENS in.
+
+        On speak-languages alone the set is {vi}, so Japanese — the language the host
+        configured and the room exists to produce — counted as foreign to the room, and
+        every kanji segment was deleted as a cross-script hallucination.
+        """
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {}
+        mock_redis_client._redis.hgetall.return_value = {b"user-1": b"vi", b"user-2": b"vi"}
+        mock_redis_client._redis.get.return_value = json.dumps(
+            {"room_status": "IN_PROGRESS", "room_languages": ["vi", "ja"]}
+        ).encode()
+
+        assert await worker._get_room_languages("m1") == {"vi", "ja"}
+
+    async def test_a_speaker_who_joined_speaking_something_else_still_counts(
+        self, mock_redis_client
+    ) -> None:
+        # The union, not a replacement. Someone speaking Korean in a vi+ja room is really
+        # speaking Korean, and the configured set is not a reason to delete them.
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {}
+        mock_redis_client._redis.hgetall.return_value = {b"user-1": b"ko"}
+        mock_redis_client._redis.get.return_value = json.dumps(
+            {"room_languages": ["vi", "ja"]}
+        ).encode()
+
+        assert await worker._get_room_languages("m1") == {"vi", "ja", "ko"}
+
+    async def test_an_old_payload_without_room_languages_still_works(
+        self, mock_redis_client
+    ) -> None:
+        """A room whose audio_routes payload was published before this field existed. It
+        must degrade to the previous behaviour, not to an empty set — an empty set turns
+        filtering off, and a stale payload is not a reason to stop enforcing anything."""
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {}
+        mock_redis_client._redis.hgetall.return_value = {b"user-1": b"vi"}
+        mock_redis_client._redis.get.return_value = json.dumps(
+            {"room_status": "IN_PROGRESS"}
+        ).encode()
+
+        assert await worker._get_room_languages("m1") == {"vi"}
+
+    async def test_an_unreadable_payload_does_not_take_the_room_down(
+        self, mock_redis_client
+    ) -> None:
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {}
+        mock_redis_client._redis.hgetall.return_value = {b"user-1": b"vi"}
+        mock_redis_client._redis.get.return_value = b"{not json"
+
+        assert await worker._get_room_languages("m1") == {"vi"}
 
 
 def _pcm_tone(hz: float, seconds: float = 1.0, amplitude: float = 0.4) -> bytes:
