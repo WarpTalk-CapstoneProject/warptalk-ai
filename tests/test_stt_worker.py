@@ -11,7 +11,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from shared.config import STTSettings, WorkerSettings
-from shared.schemas import STT_UNKNOWN_CONFIDENCE, AudioChunkMessage
+from shared.prosody import SpeakerBaseline
+from shared.schemas import STT_UNKNOWN_CONFIDENCE, AudioChunkMessage, ProsodyEnvelope
 from stt_worker import worker as stt_worker_module
 from stt_worker.model import (
     OpenAISTT,
@@ -1601,6 +1602,193 @@ class TestSTTWorker:
 
         langs = await worker._get_room_languages("m1")
         assert langs == {"vi", "en", "ja"}
+
+
+def _pcm_tone(hz: float, seconds: float = 1.0, amplitude: float = 0.4) -> bytes:
+    """Raw 16-bit PCM at a known pitch and loudness — the format AudioChunkMessage.audio_data
+    actually carries (livekit_ingress publishes bytes(pcm), no WAV container)."""
+    import numpy as np
+
+    t = np.linspace(0, seconds, int(16000 * seconds), endpoint=False)
+    wave = np.sin(2 * np.pi * hz * t) + 0.3 * np.sin(2 * np.pi * 2 * hz * t)
+    wave = amplitude * wave / np.abs(wave).max()
+    return (wave * 32767).astype("<i2").tobytes()
+
+
+class TestProsodyMeasurement:
+    """The audio exists in exactly one message on this bus, so if delivery is not measured
+    here it cannot be recovered anywhere downstream — the text is all that survives.
+
+    These pin what reaches the next stage: a measurement when there is one, silence when
+    there is not, and a transcript either way.
+    """
+
+    def _make_worker(self, mock_redis_client, worker_settings, **settings_overrides) -> STTWorker:
+        worker = STTWorker.__new__(STTWorker)
+        worker.settings = worker_settings
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker.stt_settings = STTSettings(**settings_overrides)
+        worker._paused_rooms = set()
+        worker._stt_prompts = {}
+        worker._stt_keywords = {}
+        worker._room_languages = {}
+        worker._prosody_baselines = {}
+        worker.model = MagicMock()
+        worker.model.transcribe = AsyncMock(
+            return_value=[
+                TranscribedSegment(
+                    text="Hello", language="en", confidence=-0.25, start_ms=0, end_ms=1000
+                )
+            ]
+        )
+        return worker
+
+    def _published_stt_payloads(self, mock_redis_client) -> list[dict]:
+        return [
+            call.kwargs.get("fields", call.args[1] if len(call.args) > 1 else {})
+            for call in mock_redis_client._redis.xadd.call_args_list
+            if "stt:results" in str(call.args[0])
+        ]
+
+    async def _process_tone(self, worker, mock_redis_client, hz: float, amplitude: float) -> dict:
+        mock_redis_client._redis.xadd.reset_mock()
+        chunk = AudioChunkMessage(
+            meeting_id="meeting-1",
+            speaker_id="speaker-1",
+            chunk_index=0,
+            audio_data=_pcm_tone(hz, amplitude=amplitude),
+            language="en",
+        )
+        await worker.process(b"msg-1", chunk.to_redis())
+        payloads = self._published_stt_payloads(mock_redis_client)
+        assert payloads, "expected an stt:results publish"
+        return payloads[0]
+
+    async def test_an_unheard_speaker_gets_no_delivery_attached(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings)
+
+        payload = await self._process_tone(worker, mock_redis_client, 130.0, 0.4)
+
+        # Nothing is known about how this person normally sounds, so nothing can be said
+        # about how this utterance differs from it. The field is absent, and the dub is
+        # synthesized exactly as it was before this feature existed.
+        assert "prosody" not in payload
+        assert payload["text"] == "Hello"
+
+    async def test_a_louder_higher_utterance_is_reported_against_the_speakers_own_normal(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        # Three quiet, low utterances are what "normally" means for this speaker.
+        for _ in range(3):
+            await self._process_tone(worker, mock_redis_client, 120.0, 0.2)
+
+        payload = await self._process_tone(worker, mock_redis_client, 170.0, 0.6)
+
+        envelope = ProsodyEnvelope.from_wire(payload["prosody"])
+        assert envelope is not None
+        assert envelope.pitch_lift > 1.0
+        assert envelope.energy_ratio > 1.0
+        assert envelope.arousal == "high"
+        # Never guessed from sound. Nothing upstream has read the words.
+        assert envelope.valence == ""
+
+    async def test_an_utterance_is_compared_before_it_becomes_the_normal(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        """The fold-in order is the whole difference between detecting a raised voice and
+        half-cancelling it. Folded first, a shout would partly redefine the baseline it is
+        then measured against, and every strong utterance would report as weaker than it was.
+        """
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        worker._prosody_baselines[("meeting-1", "speaker-1")] = SpeakerBaseline(
+            pitch_median_hz=100.0, pitch_iqr_hz=8.0, rms=0.1, speech_rate=1.0, sample_count=5
+        )
+
+        payload = await self._process_tone(worker, mock_redis_client, 130.0, 0.4)
+
+        envelope = ProsodyEnvelope.from_wire(payload["prosody"])
+        assert envelope is not None
+        # 130 Hz against a 100 Hz normal is 1.3. Folding first would have moved the normal to
+        # 106 Hz and reported ~1.23 — a real utterance understated by its own measurement.
+        assert envelope.pitch_lift == pytest.approx(1.3, abs=0.03)
+        # …and the normal has moved now that the comparison is done.
+        assert worker._prosody_baselines[("meeting-1", "speaker-1")].pitch_median_hz > 100.0
+
+    async def test_the_normal_is_persisted_so_a_restart_does_not_start_over(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings)
+
+        await self._process_tone(worker, mock_redis_client, 130.0, 0.4)
+
+        setex_keys = [str(call.args[0]) for call in mock_redis_client._redis.setex.call_args_list]
+        assert "prosody:baseline:meeting-1:speaker-1" in setex_keys
+
+    async def test_a_stored_normal_is_read_back_for_a_speaker_this_worker_has_not_heard(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        # The case a second replica (or a restarted one) lands in mid-meeting: without this
+        # the speaker would silently start over and lose three utterances of delivery.
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.get.return_value = json.dumps(
+            {
+                "pitch_median_hz": 100.0,
+                "pitch_iqr_hz": 8.0,
+                "rms": 0.1,
+                "speech_rate": 1.0,
+                "sample_count": 5,
+            }
+        ).encode()
+
+        payload = await self._process_tone(worker, mock_redis_client, 130.0, 0.4)
+
+        assert ProsodyEnvelope.from_wire(payload["prosody"]) is not None
+
+    async def test_a_failed_measurement_costs_the_delivery_and_nothing_else(
+        self, mock_redis_client, worker_settings, monkeypatch
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        worker._prosody_baselines[("meeting-1", "speaker-1")] = SpeakerBaseline(
+            pitch_median_hz=100.0, pitch_iqr_hz=8.0, rms=0.1, speech_rate=1.0, sample_count=5
+        )
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("numpy went wrong")
+
+        monkeypatch.setattr(stt_worker_module, "measure", explode)
+
+        payload = await self._process_tone(worker, mock_redis_client, 130.0, 0.4)
+
+        # The transcript is the product. Tone is a decoration on it, and a decoration must
+        # never be able to take the thing it decorates down with it.
+        assert payload["text"] == "Hello"
+        assert "prosody" not in payload
+
+    async def test_the_feature_can_be_turned_off_without_touching_anything_else(
+        self, mock_redis_client, worker_settings, monkeypatch
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings, prosody_enabled=False)
+        worker._prosody_baselines[("meeting-1", "speaker-1")] = SpeakerBaseline(
+            pitch_median_hz=100.0, pitch_iqr_hz=8.0, rms=0.1, speech_rate=1.0, sample_count=5
+        )
+        called = False
+
+        def spy(*args, **kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("measure() must not run when the feature is off")
+
+        monkeypatch.setattr(stt_worker_module, "measure", spy)
+
+        payload = await self._process_tone(worker, mock_redis_client, 130.0, 0.4)
+
+        assert not called
+        assert "prosody" not in payload
+        assert payload["text"] == "Hello"
 
 
 class TestConsumeLoopConcurrency:

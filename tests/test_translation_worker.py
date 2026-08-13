@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from shared.config import TranslationSettings, WorkerSettings
-from shared.schemas import STT_UNKNOWN_CONFIDENCE, STTResultMessage
+from shared.schemas import STT_UNKNOWN_CONFIDENCE, ProsodyEnvelope, STTResultMessage
 from translation_worker.translator import (
     OpenAITranslator,
     _build_glossary_block,
@@ -427,6 +427,39 @@ class TestTranslationWorker:
             language=language,
             confidence=0.95,
         )
+
+    async def test_delivery_is_carried_to_every_translation_of_a_segment(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """This worker is the courier for prosody, not a source of it.
+
+        How something was said is settled at the audio, one stage upstream, and translating
+        the words cannot change it. If it is dropped here the measurement is dead — the TTS
+        worker reads this message and nothing else.
+        """
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
+        stt = self._make_stt_msg(language="en").model_copy(
+            update={
+                "prosody": ProsodyEnvelope(
+                    pitch_lift=1.3, pitch_variation=1.5, energy_ratio=1.4, arousal="high"
+                )
+            }
+        )
+
+        await worker.process(b"msg-1", stt.to_redis())
+
+        published = [
+            c.args[1]
+            for c in mock_redis_client._redis.xadd.call_args_list
+            if "translate:results" in str(c.args[0])
+        ]
+        assert published
+        for payload in published:
+            envelope = ProsodyEnvelope.from_wire(payload.get("prosody"))
+            assert envelope is not None
+            assert envelope.arousal == "high"
+            assert envelope.pitch_lift == pytest.approx(1.3)
 
     async def test_same_language_listener_gets_nothing_published(
         self, mock_redis_client, worker_settings: WorkerSettings

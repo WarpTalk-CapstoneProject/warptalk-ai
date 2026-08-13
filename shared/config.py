@@ -148,6 +148,19 @@ class STTSettings(BaseSettings):
     # Warm WebSockets are claimed by the first active speakers so their first utterance
     # does not pay the ~1–2s Realtime connection handshake.
     realtime_pool_size: int = 4
+    # Measure HOW an utterance was said and attach it to the transcript segment, so the dub can
+    # be delivered the way the speaker delivered it (shared/prosody.py).
+    #
+    # Off is a real position, not a placeholder: the measurement is ~3ms of CPU per second of
+    # audio (14ms for a full 6s chunk, benchmarked), and a deployment that finds that too
+    # expensive should be able to drop it without redeploying anything else. Turning it off
+    # removes the `prosody` field from stt:results; every consumer already treats that field as
+    # optional, so the pipeline reverts to exactly its pre-prosody behaviour.
+    prosody_enabled: bool = True
+    # A speaker's rolling normal lives for this long after their last utterance. Meeting-scoped
+    # on purpose — a different room means a different microphone, and a baseline built in one is
+    # not a description of how they sound in the other.
+    prosody_baseline_ttl_seconds: int = 21600  # 6h
 
 
 class TranslationSettings(BaseSettings):
@@ -244,6 +257,11 @@ class TTSSettings(BaseSettings):
     # Cartesia's public library doesn't churn often — cache the per-language catalog
     # in Redis this long before re-fetching, to avoid a /voices call on every miss.
     voice_catalog_cache_ttl_seconds: int = 21600  # 6h
+    # Deliver the dub the way the speaker delivered it, using the prosody measured upstream
+    # (STT_PROSODY_ENABLED) and carried on the translation message. Independent of the STT flag
+    # so the measurement and its use can be turned off separately — which is what makes an A/B
+    # possible without stopping the measurement.
+    prosody_enabled: bool = True
 
 
 class AssistantSettings(BaseSettings):

@@ -14,6 +14,28 @@ WHAT IS AND IS NOT POSSIBLE
     not help, because there is nowhere to put it. What this module does instead is measure the
     delivery, reduce it to those three controls, and pass them along.
 
+HOW MUCH OF IT SURVIVES ON THE MODEL THIS PRODUCT SHIPS
+    Measured 2026-08-13 against the live API, same sentence, median of three renders:
+
+        control          sonic-3 (en)              sonic-3.5 (en)      sonic-3.5 (vi)
+        speed 0.6        9567 ms  (1.70x longer)   6800 ms  (1.18x)    4960 ms  (1.19x)
+        speed 1.0        5619 ms                   5760 ms             4160 ms
+        speed 1.5        3436 ms  (1.64x shorter)  5600 ms  (1.03x)    3680 ms  (1.13x)
+        volume 0.6       rms 0.0564                rms 0.0884          rms 0.0887
+        volume 2.0       rms 0.2124  (3.8x)        rms 0.2626  (3.0x)  rms 0.3050  (3.4x)
+
+    So: volume is honoured almost literally everywhere. Speed is honoured almost literally on
+    sonic-3 and heavily damped on sonic-3.5 — a request to slow down 40% buys 18%, and a request
+    to speed up 50% buys almost nothing. TTS_MODEL is sonic-3.5 because it is the model with
+    Vietnamese, so the tempo half of this module currently lands as a nudge rather than a match.
+    That is a property of the model, not a defect here: the ratios sent are the true ones, and
+    they will land in full the day sonic-3 (or its successor) covers the target languages.
+
+    The older `speed` ENUM ("slow"/"normal"/"fast", TTSSettings.speed) does nothing at all on
+    sonic-3.5 — four renders each gave medians of 6120/6200/5960 ms with a per-case spread of
+    5680–6560, i.e. the setting is inside the noise. It is still sent, because it is not inert
+    on every model and removing it would be a silent behaviour change on models where it works.
+
 EVERYTHING IS RELATIVE TO THE SPEAKER
     Adult male F0 typically sits around 85–180 Hz and adult female around 165–255 Hz. An
     absolute rule like "above 200 Hz means excited" therefore classifies most women as
@@ -327,7 +349,7 @@ _EMOTION_TABLE: dict[tuple[Arousal, Valence], str] = {
 
 def to_generation_config(
     delivery: Delivery,
-    valence: Valence = "neutral",
+    valence: Valence | None = None,
     *,
     speed_center: float = 1.0,
 ) -> dict[str, float | str]:
@@ -338,6 +360,12 @@ def to_generation_config(
     rather than wrongly angry. The emotion label is the only categorical judgement here, and it
     is omitted entirely when the delivery is ordinary, because "neutral" is what the model
     already does and sending it adds a claim without adding information.
+
+    `valence=None` means NOT DETERMINED, which is the pipeline's actual state today: nothing
+    upstream reads the words for sentiment yet. It is not the same as "neutral", and it must not
+    collapse into it — ("high", "neutral") would label an emphatic speaker "surprised", which is
+    a guess about their feelings made from loudness alone. Unknown valence yields no emotion at
+    all, and the delivery still carries through speed and volume.
     """
     speed = _clamp(speed_center * delivery.rate_ratio, SPEED_MIN, SPEED_MAX)
     volume = _clamp(delivery.energy_ratio, VOLUME_MIN, VOLUME_MAX)
@@ -347,9 +375,10 @@ def to_generation_config(
         "volume": round(volume, 3),
     }
 
-    emotion = _EMOTION_TABLE.get((delivery.arousal, valence))
-    if emotion is not None:
-        config["emotion"] = emotion
+    if valence is not None:
+        emotion = _EMOTION_TABLE.get((delivery.arousal, valence))
+        if emotion is not None:
+            config["emotion"] = emotion
 
     return config
 

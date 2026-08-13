@@ -18,7 +18,14 @@ from typing import Any
 
 from shared.base_worker import BaseWorker
 from shared.config import STTSettings, resolve_openai_api_key
-from shared.schemas import AudioChunkMessage, STTResultMessage
+from shared.prosody import (
+    SpeakerBaseline,
+    measure,
+    pcm16_to_float,
+    to_delivery,
+    update_baseline,
+)
+from shared.schemas import AudioChunkMessage, ProsodyEnvelope, STTResultMessage
 from shared.text_utils import split_into_sentences
 from stt_worker.model import OpenAISTT, _normalize_language
 
@@ -114,6 +121,10 @@ class STTWorker(BaseWorker):
         # (meeting_id, speaker_id) -> lock serializing THAT speaker's own chunks — see
         # _consume_loop for why.
         self._speaker_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # (meeting_id, speaker_id) -> how that speaker normally sounds in THIS room. Held in
+        # memory and mirrored to Redis so a restart or a second replica does not start every
+        # speaker from scratch — see _speaker_baseline.
+        self._prosody_baselines: dict[tuple[str, str], SpeakerBaseline] = {}
         self._prewarm_listener_task: asyncio.Task[None] | None = None
 
     async def load_model(self) -> None:
@@ -282,6 +293,11 @@ class STTWorker(BaseWorker):
         stale_speakers = [key for key in self._speaker_locks if key[0] == room_id]
         for key in stale_speakers:
             self._speaker_locks.pop(key, None)
+        # Baselines are per (meeting, speaker) and describe a microphone in a room that no
+        # longer exists. The Redis copy expires on its own TTL; this is the in-process one.
+        baselines = self._baselines()
+        for key in [key for key in baselines if key[0] == room_id]:
+            baselines.pop(key, None)
 
     async def _cleanup(self) -> None:
         task = getattr(self, "_prewarm_listener_task", None)
@@ -326,6 +342,15 @@ class STTWorker(BaseWorker):
         language_hint = _language_hint_for_stt(chunk.language)
         allowed_languages = await self._get_room_languages(chunk.meeting_id)
         keywords = await self._get_stt_keywords(chunk.meeting_id)
+
+        # Measured CONCURRENTLY with recognition, not before it. Transcription is a
+        # network round trip of hundreds of milliseconds; the measurement is single-digit
+        # milliseconds of CPU in a thread. Started here and collected after, it costs the
+        # pipeline no wall-clock at all — which is the only way a delivery feature earns its
+        # place in front of a live meeting.
+        prosody_task: asyncio.Task[ProsodyEnvelope | None] | None = None
+        if self.stt_settings.prosody_enabled:
+            prosody_task = asyncio.create_task(self._measure_prosody(chunk))
 
         t0 = time.monotonic()
         try:
@@ -404,6 +429,11 @@ class STTWorker(BaseWorker):
             segments = []
         inference_ms = int((time.monotonic() - t0) * 1000)
 
+        # Awaited even when recognition failed, so the task is never left orphaned — and its
+        # baseline update is still worth keeping: the speaker did speak, whatever the model
+        # made of it.
+        prosody = await prosody_task if prosody_task is not None else None
+
         self.logger.info(
             "inference_complete",
             inference_ms=inference_ms,
@@ -433,6 +463,10 @@ class STTWorker(BaseWorker):
                 chunk_index=chunk.chunk_index,
                 is_final_chunk=chunk.is_final_chunk,
                 timestamp_ms=chunk.timestamp_ms,
+                # Every segment recognised in this chunk shares the chunk's delivery. The
+                # measurement's granularity is the audio, and splitting it per segment would
+                # be inventing precision that was never measured.
+                prosody=prosody,
             )
 
             await self.publish("stt:results", chunk.meeting_id, result.to_redis())
@@ -464,6 +498,128 @@ class STTWorker(BaseWorker):
                 timestamp_ms=chunk.timestamp_ms,
             )
             await self.publish("stt:results", chunk.meeting_id, result.to_redis())
+
+    async def _measure_prosody(self, chunk: AudioChunkMessage) -> ProsodyEnvelope | None:
+        """How this chunk was said, relative to how this speaker normally says things.
+
+        Returns None whenever there is nothing honest to report — unusable audio, or a speaker
+        the room has not heard enough of yet. None is not a failure and not "neutral": it means
+        the field is omitted, and the TTS worker then synthesizes exactly as it did before this
+        feature existed.
+
+        Never raises. A meeting must not lose its transcript because a measurement of tone went
+        wrong, so every failure here degrades to None and is logged.
+        """
+        try:
+            pcm = pcm16_to_float(chunk.audio_data)
+            # measure() is a per-frame Python loop over numpy — ~14ms for a full 6s chunk. Off
+            # the event loop so it cannot stall the other speakers being handled concurrently.
+            features = await asyncio.to_thread(measure, pcm, chunk.sample_rate)
+            if not features.is_usable:
+                return None
+
+            key = (chunk.meeting_id, chunk.speaker_id)
+            baseline = await self._speaker_baseline(key)
+
+            # Compare FIRST, then fold in. The other order would let a shout become part of the
+            # normal it is being measured against, and every strong utterance would partly
+            # cancel its own detection.
+            delivery = to_delivery(features, baseline)
+            await self._store_baseline(key, update_baseline(baseline, features))
+
+            if not delivery.is_measured:
+                return None
+
+            return ProsodyEnvelope(
+                pitch_lift=delivery.pitch_lift,
+                pitch_variation=delivery.pitch_variation,
+                energy_ratio=delivery.energy_ratio,
+                rate_ratio=delivery.rate_ratio,
+                arousal=delivery.arousal,
+                # Left empty on purpose: valence is a judgement about the words, and this worker
+                # has only heard the sound. See ProsodyEnvelope.valence.
+                valence="",
+            )
+        except Exception:
+            self.logger.warning(
+                "prosody_measurement_failed",
+                meeting_id=chunk.meeting_id,
+                speaker_id=chunk.speaker_id,
+                chunk_index=chunk.chunk_index,
+                exc_info=True,
+            )
+            return None
+
+    def _baselines(self) -> dict[tuple[str, str], SpeakerBaseline]:
+        """The in-process baseline table, created on demand — same defensive shape as
+        `_route_states` below, and for the same reason: workers built without __init__."""
+        baselines: dict[tuple[str, str], SpeakerBaseline] | None = getattr(
+            self, "_prosody_baselines", None
+        )
+        if baselines is None:
+            baselines = {}
+            self._prosody_baselines = baselines
+        return baselines
+
+    def _baseline_key(self, key: tuple[str, str]) -> str:
+        meeting_id, speaker_id = key
+        return f"prosody:baseline:{meeting_id}:{speaker_id}"
+
+    async def _speaker_baseline(self, key: tuple[str, str]) -> SpeakerBaseline:
+        """This speaker's rolling normal, from memory or (once) from Redis.
+
+        Redis is what makes the baseline survive a worker restart and lets a second replica
+        pick up a speaker mid-meeting without starting their normal over. Two replicas holding
+        the same speaker can lose an update to each other; that is accepted rather than locked
+        against, because the value is an exponential moving average whose whole purpose is to
+        be insensitive to any single sample.
+        """
+        baselines = self._baselines()
+        cached = baselines.get(key)
+        if cached is not None:
+            return cached
+
+        baseline = SpeakerBaseline()
+        try:
+            raw = await self.redis.get(self._baseline_key(key))
+            if raw:
+                d = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                baseline = SpeakerBaseline(
+                    pitch_median_hz=float(d["pitch_median_hz"]),
+                    pitch_iqr_hz=float(d["pitch_iqr_hz"]),
+                    rms=float(d["rms"]),
+                    speech_rate=float(d["speech_rate"]),
+                    sample_count=int(d["sample_count"]),
+                )
+        except Exception:
+            # A corrupt or unreachable baseline means this speaker starts over, which costs
+            # them MIN_BASELINE_SAMPLES utterances of plain delivery. Nothing else.
+            self.logger.warning("prosody_baseline_read_failed", exc_info=True)
+
+        baselines[key] = baseline
+        return baseline
+
+    async def _store_baseline(self, key: tuple[str, str], baseline: SpeakerBaseline) -> None:
+        self._baselines()[key] = baseline
+        try:
+            await self.redis.set_with_ttl(
+                self._baseline_key(key),
+                json.dumps(
+                    {
+                        "pitch_median_hz": round(baseline.pitch_median_hz, 3),
+                        "pitch_iqr_hz": round(baseline.pitch_iqr_hz, 3),
+                        "rms": round(baseline.rms, 6),
+                        "speech_rate": round(baseline.speech_rate, 4),
+                        "sample_count": baseline.sample_count,
+                    },
+                    separators=(",", ":"),
+                ),
+                self.stt_settings.prosody_baseline_ttl_seconds,
+            )
+        except Exception:
+            # In-memory copy is already updated, so this worker keeps working; only the
+            # hand-over to a restart or a sibling replica is lost.
+            self.logger.warning("prosody_baseline_write_failed", exc_info=True)
 
     async def _translation_state_allows_stt(self, meeting_id: str) -> bool:
         """Reject queued audio when the authoritative room state is known inactive.
