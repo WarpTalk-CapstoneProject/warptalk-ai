@@ -137,6 +137,21 @@ class SuggestionWorker(BaseWorker):
             )
             return
 
+        # Read before the claim, so a hint that cannot possibly be produced does not burn a
+        # cooldown slot and silence the room for the next 45 seconds.
+        context_snapshot = await self._context_snapshot(room_id)
+
+        # WT-371 Bug 6: "fact" means "a figure or reference the meeting's OWN DOCUMENTS cover".
+        # With no documents attached there is nothing to ground it in, and the only thing the
+        # model can do is recall a plausible number — which reaches the participants looking
+        # exactly like a sourced one. Declining is the correct answer, not a weaker prompt.
+        if decision.category == "fact" and not context_snapshot:
+            self.logger.debug(
+                "suggestion_fact_without_documents",
+                meeting_id=room_id,
+            )
+            return
+
         if not await self._claim_slot(room_id):
             return
 
@@ -144,7 +159,7 @@ class SuggestionWorker(BaseWorker):
             context,
             turn,
             decision,
-            context_snapshot=await self._context_snapshot(room_id),
+            context_snapshot=context_snapshot,
         )
         if suggestion is None or not suggestion.content.strip():
             return

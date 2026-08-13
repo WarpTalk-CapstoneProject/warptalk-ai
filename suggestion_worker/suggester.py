@@ -157,26 +157,82 @@ should_suggest is false. confidence is your certainty between 0 and 1. reason is
 most 12 words, for logging only."""
 
 
-def _generate_system_prompt(max_chars: int) -> str:
+# What a GOOD hint contains, per category.
+#
+# WT-371 Bug 6, half one: "thông tin gợi ý chưa chính xác". The generate stage was handed the
+# category as a bare label ("Hint type: clarification") and then asked, in the abstract, for "a
+# single short hint". Nothing told it what a clarification hint IS, so it wrote whatever seemed
+# related to the last thing said — which is how a category meaning "somebody asked a question
+# and nobody answered it" produced text that did not contain the question.
+#
+# Each line below is an output contract, not a description of the category. `decide` already
+# owns the question of WHETHER this category applies; this owns what must be in the answer.
+_CATEGORY_CONTRACTS = {
+    "clarification": (
+        "State the question that was asked and left unanswered, as close to the asker's own "
+        "words as the transcript allows. The hint is useless if the reader cannot tell which "
+        "question it means."
+    ),
+    "term": (
+        "Name the exact term or acronym as it was spoken, then define it in one clause. Define "
+        "it as it is used in THIS meeting when the transcript or the documents show that; a "
+        "generic dictionary gloss of a term the team uses differently is worse than nothing."
+    ),
+    "action": (
+        "State the commitment, then name precisely what is missing from it — an owner, a "
+        "deadline, or both. Do not invent either one."
+    ),
+    "correction": (
+        "State both sides: what was just said, and the earlier statement it contradicts. A "
+        "contradiction the reader has to go and find for themselves is not a hint."
+    ),
+    "fact": (
+        "Quote the figure or reference from the supplied documents, with enough of its source "
+        "to be checkable. Never produce this category from memory — if the documents do not "
+        "contain it, return an empty content string."
+    ),
+}
+
+
+def _generate_system_prompt(max_chars: int, category: str) -> str:
     """Built per call rather than str.format()-ed from a constant: the template embeds a
-    literal JSON schema, and format() would read those braces as placeholders."""
-    return f"""You write a single short hint that appears as a one-line strip above a \
-meeting transcript bubble.
+    literal JSON schema, and format() would read those braces as placeholders.
+
+    Takes the category so the contract for THIS hint is in the system prompt rather than
+    mentioned in passing in the user turn — see _CATEGORY_CONTRACTS.
+    """
+    contract = _CATEGORY_CONTRACTS.get(
+        category,
+        "State the hint directly and make it specific enough to act on.",
+    )
+    return f"""You write one hint about a live meeting. It is shown as a small labelled badge \
+beside a line in the transcript; a participant who taps the badge sees your `content` and, \
+under it, your `detail`. Nobody asked for this hint, so it earns its place by being correct \
+and specific or it should not exist.
+
+What this hint must contain:
+- {contract}
 
 Rules:
 - Write in the same language as the latest segment.
 - State the hint directly. No greeting, no "I noticed", no addressing anyone by name.
 - Add information; never restate what was just said.
-- If reference documents are supplied, prefer a concrete fact from them.
-- Be specific enough to act on. If you cannot be, return an empty content string.
+- Ground every claim in the transcript or in the supplied reference documents. If you cannot \
+point to where something came from, leave it out. An invented name, number, date or definition \
+is the worst outcome here — worse than silence, because the reader has no way to tell.
+- If you cannot meet the contract above from what you were given, return an empty content \
+string. That is a normal, correct answer.
 
 {_UNTRUSTED_INPUT_RULE}
 
 Respond ONLY with a JSON object of exactly this shape:
 {{"content": string, "detail": string}}
-content is the strip text and must be at most {max_chars} characters. detail is an \
-optional one or two sentence expansion shown when a participant expands the strip; \
-use "" when the hint needs no expansion."""
+content is the badge text and must be at most {max_chars} characters — the one sentence that \
+satisfies the contract above. detail is what the reader sees when they expand the badge: one \
+or two sentences carrying the evidence for `content` — the surrounding quote, the earlier \
+statement being contradicted, the document the figure came from. Write it whenever that \
+evidence exists, which is nearly always; use "" only when `content` is already complete on \
+its own and repeating it would add nothing."""
 
 
 def _render_transcript(window: Sequence[TranscriptTurn], segment: TranscriptTurn) -> str:
@@ -287,7 +343,7 @@ class OpenAISuggester:
         decision: SuggestionDecision,
         context_snapshot: str = "",
     ) -> GeneratedSuggestion | None:
-        system_content = _generate_system_prompt(self.max_suggestion_chars)
+        system_content = _generate_system_prompt(self.max_suggestion_chars, decision.category)
         user_content = (
             f"Hint type: {decision.category}\n"
             f"Why it was flagged: {decision.reason}\n"
@@ -325,6 +381,9 @@ class OpenAISuggester:
         if not content:
             return None
 
+        # Not truncated here. SuggestionWorker._publish already enforces max_suggestion_chars
+        # at the boundary where it matters, and a second cap would mean the rule lives in two
+        # places that can drift apart.
         return GeneratedSuggestion(
             content=content,
             detail=str(parsed.get("detail", "")).strip(),
