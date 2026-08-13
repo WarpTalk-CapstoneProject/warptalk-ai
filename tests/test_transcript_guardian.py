@@ -29,6 +29,19 @@ class TestFormattingIsAllowed:
         polished = "Anh xin lỗi, giờ để anh lướt."
         assert is_faithful(original, polished, "vi")
 
+    def test_a_filler_no_list_would_have_contained_may_be_dropped(self):
+        # The point of dropping the dictionary: "kiểu", "thì", "á" are ordinary Vietnamese
+        # hesitations and were on no list. Under the old similarity check this looked like a
+        # rewrite; under the subsequence rule it is plainly a deletion.
+        original = "thì cái này kiểu là mình deploy chiều nay á"
+        polished = "Cái này mình deploy chiều nay."
+        assert is_faithful(original, polished, "vi")
+
+    def test_english_false_starts_may_be_dropped(self):
+        original = "so i i i think we we should ship it"
+        polished = "So I think we should ship it."
+        assert is_faithful(original, polished, "en")
+
     def test_english_fillers_may_be_dropped(self):
         original = "um so i think uh we should ship it"
         polished = "So I think we should ship it."
@@ -73,6 +86,17 @@ class TestRewritingIsRefused:
         polished = "Anh Tú sẽ sửa bug billing."
         assert not is_faithful(original, polished, "vi")
 
+    def test_reordering_is_refused(self):
+        # Impossible to accept by construction: order is part of the subsequence rule.
+        original = "Nhi test rồi Tú deploy"
+        polished = "Tú deploy rồi Nhi test."
+        assert not is_faithful(original, polished, "vi")
+
+    def test_a_single_inserted_word_is_refused(self):
+        original = "mình deploy chiều nay"
+        polished = "Mình sẽ deploy chiều nay."
+        assert not is_faithful(original, polished, "vi")
+
 
 class TestDiacriticsAreWords:
     def test_stripping_vietnamese_tone_marks_is_a_rewrite(self):
@@ -100,8 +124,12 @@ class TestInstruction:
         assert "do NOT translate" in guardian_instruction("vi")
 
     def test_forbids_guessing_at_garbled_passages(self):
-        assert "Never guess" in guardian_instruction("vi")
+        assert "guess what a garbled passage" in guardian_instruction("vi")
 
-    def test_names_the_language_specific_fillers(self):
-        assert "ờ" in guardian_instruction("vi")
-        assert "uh" in guardian_instruction("en-US")
+    def test_states_the_boundary_rather_than_listing_fillers(self):
+        # No dictionary. A per-language filler list told a model that already knows them far
+        # more than it needed, and read as an exhaustive permission — real hesitations are not
+        # a closed set. The structural check in is_faithful is what makes the boundary true.
+        instruction = guardian_instruction("vi")
+        assert "filler sounds, stutters" in instruction
+        assert "ờ" not in instruction
