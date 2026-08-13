@@ -243,7 +243,15 @@ class TTSSettings(BaseSettings):
     # Defaults to fast: a dub has to land inside the gap the speaker left, and at normal it
     # consistently finished after they had already moved on. Overridable as TTS_SPEED.
     speed: str = "fast"
-    voice_clone_min_seconds: float = 10.0  # Buffer threshold before calling /voices/clone
+    # Raised from 10.0. Ten seconds is Cartesia's floor, not a good reference: it is whatever
+    # the speaker happened to say first, which is usually "alo alo, nghe rõ không". Twenty
+    # seconds of ACCEPTED speech (see tts_worker/clone_sample_quality.py) is enough for the
+    # clone to carry a person's timbre rather than their microphone check.
+    voice_clone_min_seconds: float = 20.0
+    # How much audio may be held while waiting for a clip that passes the quality gate. Rejected
+    # audio slides out of the front of the buffer; without a cap a speaker in a noisy room would
+    # accumulate the whole meeting in memory and never clone.
+    voice_clone_max_buffer_seconds: float = 90.0
     min_clone_chars: int = 8
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
