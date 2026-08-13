@@ -531,9 +531,7 @@ class TranslationWorker(BaseWorker):
                 except Exception:
                     polished = sentence
 
-                translated_text = choose_transcript(
-                    sentence, polished, stt_result.language
-                )
+                translated_text = choose_transcript(sentence, polished, stt_result.language)
             elif idx == 0:
                 assert first_task is not None
                 try:
