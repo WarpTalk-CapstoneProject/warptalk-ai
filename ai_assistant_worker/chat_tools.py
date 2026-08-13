@@ -17,6 +17,14 @@ from typing import Any, cast
 
 import httpx
 
+from ai_assistant_worker.meeting_draft import (
+    MEETING_TYPES,
+    RECURRENCE_TYPES,
+    build_payload,
+    draft_from_arguments,
+    missing_fields,
+    validate,
+)
 from shared.logger import get_logger
 from shared.openai_options import completion_options
 from shared.redis_client import RedisStreamClient
@@ -679,7 +687,261 @@ async def _get_document(ctx: ToolContext, arguments: dict[str, Any]) -> str:
         return json.dumps({"error": "Could not look up that document right now."})
 
 
+async def _ask_user(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Put a question card in front of the user and STOP.
+
+    This tool does not answer anything. It exists so the assistant can decline to guess.
+
+    The worker turns the arguments into a `question` event on the result stream, the web client
+    renders the choices as a card, and the user's pick comes back as an ordinary chat message on
+    the NEXT turn. Nothing here blocks: pausing a Redis request/response loop mid-flight to wait
+    for a human would hold a worker slot open for as long as somebody takes to read, and a
+    reconnect would strand the turn forever.
+
+    The string returned is for the MODEL, not the user — it is the instruction to stop talking
+    now rather than filling the silence with an assumption, which is what a model does when a
+    tool returns nothing useful.
+    """
+    questions = (arguments or {}).get("questions") or []
+    if not isinstance(questions, list) or not questions:
+        return json.dumps({"error": "ask_user needs at least one question."})
+
+    return json.dumps(
+        {
+            "status": "asked",
+            "question_count": len(questions),
+            "instruction": (
+                "The question card is now on the user's screen. End your turn WITHOUT calling "
+                "another tool and WITHOUT guessing an answer. Say one short sentence telling "
+                "them you need these details, then stop. Their reply arrives as a normal "
+                "message on your next turn."
+            ),
+        }
+    )
+
+
+async def _create_meeting(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Create a translation room. The assistant's first tool that writes anything.
+
+    Gated twice before the network is touched — once on what is missing, once on what would come
+    back as a 400 — because the failure modes here are not "a wrong answer on screen" but a real
+    room, real invitation emails, and for a recurring booking a whole series of them.
+    """
+    draft = draft_from_arguments(arguments)
+
+    absent = missing_fields(draft)
+    if absent:
+        # Handed back as a list the model can pass straight to ask_user, rather than as prose it
+        # has to parse out of an error string.
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": absent,
+                "instruction": (
+                    "Do NOT create the meeting. Call ask_user with one question per missing "
+                    "field, then stop."
+                ),
+            }
+        )
+
+    problems = validate(draft)
+    if problems:
+        return json.dumps({"status": "invalid", "problems": problems})
+
+    payload = build_payload(draft, ctx.workspace_id)
+
+    try:
+        response = await ctx.translation_room_client.post(
+            "/api/v1/translation-rooms",
+            json=payload,
+            headers=_auth_headers(ctx),
+        )
+    except Exception:
+        logger.exception("create_meeting_request_error")
+        return json.dumps({"error": "Could not reach the meeting service."})
+
+    if response.status_code not in (200, 201):
+        # The server's own words, not a generic failure: it is the only thing that knows why, and
+        # "you are not allowed to create meetings in this workspace" is something the user can act
+        # on where "the tool failed" is not.
+        detail = ""
+        try:
+            body = response.json()
+            detail = body.get("error") or body.get("message") or ""
+        except Exception:
+            detail = ""
+        logger.warning("create_meeting_failed", status=response.status_code)
+        return json.dumps(
+            {
+                "status": "failed",
+                "http_status": response.status_code,
+                "reason": detail or "The meeting service refused the request.",
+            }
+        )
+
+    try:
+        created = response.json()
+    except Exception:
+        created = {}
+
+    # A recurring booking answers with {series, firstOccurrence}; a single meeting answers with
+    # the room itself. Both are reported, so the model can say "every weekday from Monday" rather
+    # than "created" and leave the user to go and check.
+    room = created.get("firstOccurrence") or created
+    return json.dumps(
+        {
+            "status": "created",
+            "id": room.get("id"),
+            "title": room.get("title"),
+            "room_code": room.get("translationRoomCode"),
+            "scheduled_at": room.get("scheduledAt"),
+            "recurring": bool(created.get("series")),
+            "invited_count": len(draft.invited_emails),
+        }
+    )
+
+
 TOOLS: list[ChatTool] = [
+    ChatTool(
+        name="ask_user",
+        description=(
+            "Ask the user one or more multiple-choice questions and STOP. Use this the moment "
+            "you need a detail you do not have — never guess a meeting's title, languages, type "
+            "or time. The questions appear as a card the user picks from; their answer arrives "
+            "as a normal message on your next turn. Ask everything you need in ONE call: three "
+            "questions in one card is a form, three cards in a row is an interrogation."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "Between one and four questions, asked together.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "The full question, ending in a question mark.",
+                            },
+                            "header": {
+                                "type": "string",
+                                "description": "A 1-2 word chip label, e.g. 'Language' or 'Type'.",
+                            },
+                            "options": {
+                                "type": "array",
+                                "description": (
+                                    "Two to four concrete choices. The user can always type "
+                                    "something else, so do not add an 'Other' option."
+                                ),
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "description": {
+                                            "type": "string",
+                                            "description": "One line on what this choice means.",
+                                        },
+                                    },
+                                    "required": ["label"],
+                                },
+                            },
+                            "multi_select": {
+                                "type": "boolean",
+                                "description": (
+                                    "True when several answers may be picked at once, e.g. "
+                                    "target languages."
+                                ),
+                            },
+                        },
+                        "required": ["question", "header", "options"],
+                    },
+                }
+            },
+            "required": ["questions"],
+        },
+        handler=_ask_user,
+    ),
+    ChatTool(
+        name="create_meeting",
+        description=(
+            "Create a translation room in the current workspace. Call this ONLY once you know "
+            "the title, meeting type, source language and target languages — if any of those is "
+            "missing, call ask_user first. Supports a one-off time (scheduled_at) OR a repeating "
+            "rule (recurrence_*), never both. Invited people receive an email, so only pass "
+            "addresses the user actually gave you."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "What the meeting is called."},
+                "description": {
+                    "type": "string",
+                    "description": "Free-text purpose of the meeting.",
+                },
+                "agenda": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Agenda items in order. Appended to the description under an 'Agenda' "
+                        "heading — the API has no separate agenda field."
+                    ),
+                },
+                "translation_room_type": {
+                    "type": "string",
+                    "enum": list(MEETING_TYPES),
+                    "description": "CHANNEL_MEETING suits most internal team meetings.",
+                },
+                "source_language": {
+                    "type": "string",
+                    "description": "Language the speakers will use, e.g. 'vi'.",
+                },
+                "target_languages": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Languages to translate into, e.g. ['en'].",
+                },
+                "scheduled_at": {
+                    "type": "string",
+                    "description": (
+                        "ISO-8601 UTC start for a ONE-OFF meeting. Leave empty for a repeating one."
+                    ),
+                },
+                "invited_emails": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Email addresses to invite. Each one receives a real email.",
+                },
+                "recurrence_type": {
+                    "type": "string",
+                    "enum": list(RECURRENCE_TYPES),
+                    "description": "Present means this repeats. Omit for a single meeting.",
+                },
+                "recurrence_start_time_local": {
+                    "type": "string",
+                    "description": "24-hour HH:mm in the user's own zone, e.g. '09:00'.",
+                },
+                "recurrence_time_zone": {
+                    "type": "string",
+                    "description": "IANA zone, e.g. 'Asia/Ho_Chi_Minh'.",
+                },
+                "recurrence_start_date_local": {
+                    "type": "string",
+                    "description": "yyyy-MM-dd for the first occurrence.",
+                },
+                "recurrence_end_date_local": {
+                    "type": "string",
+                    "description": "yyyy-MM-dd, inclusive. Omit for the server's default span.",
+                },
+                "max_participants": {
+                    "type": "integer",
+                    "description": "Seat cap. Omit to let the meeting type decide.",
+                },
+            },
+            "required": ["title", "translation_room_type", "source_language", "target_languages"],
+        },
+        handler=_create_meeting,
+    ),
     ChatTool(
         name="search_workspace_members",
         description=(
