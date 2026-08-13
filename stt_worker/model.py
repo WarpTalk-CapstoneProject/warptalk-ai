@@ -90,6 +90,33 @@ def _supports_logprobs(model: str) -> bool:
     return _LOGPROBS_SUPPORT.get(model, True)
 
 
+def _demote_capability_from_error(model: str, error_text: str) -> str | None:
+    """
+    Record a capability the Realtime API rejected on the STREAM rather than on session.update.
+
+    Returns the name of what was demoted, or None if the error is about something else — an
+    audio problem, a disconnect, a timeout — none of which say anything about what this model
+    accepts, and demoting on those would strip the language hint off a model that handles it.
+
+    Matching is on the parameter name inside the API's own wording ("The 'languages' parameter
+    is not supported for this model."). Deliberately narrow: a broad `"languages" in error`
+    would match a transcript that happens to contain the word.
+    """
+    lowered = error_text.lower()
+    if "not supported" not in lowered and "invalid_parameter" not in lowered:
+        return None
+
+    if "'languages'" in lowered or '"languages"' in lowered or "'keywords'" in lowered:
+        _STRUCTURED_CONTEXT_SUPPORT[model] = False
+        return "structured_context"
+
+    if "logprob" in lowered:
+        _LOGPROBS_SUPPORT[model] = False
+        return "logprobs"
+
+    return None
+
+
 def reset_capability_memo() -> None:
     """Forget everything learned at runtime, back to the seeds. For tests."""
     _STRUCTURED_CONTEXT_SUPPORT.clear()
@@ -1241,7 +1268,24 @@ class OpenAISTT:
                 keywords,
                 exclude_emitted_from_final=exclude_emitted_from_final,
             )
-        except Exception:
+        except Exception as first_error:
+            # A capability the API rejected ASYNCHRONOUSLY has to be learned here, because the
+            # degradation ladder in _apply_session_config cannot see it. That ladder catches an
+            # exception from `session.update`; the Realtime API accepts the update, says nothing,
+            # and then rejects every transcription on the stream with an `error` event — which
+            # arrives as the RuntimeError being handled right now. The memo was therefore written
+            # as "supported", the retry below rebuilt an identical session, and it failed
+            # identically. Production ran 304 chunks through that loop in 45 minutes without one
+            # word of transcript: every audio chunk in every meeting, silently, for as long as the
+            # model was configured.
+            demoted = _demote_capability_from_error(self.model, str(first_error))
+            if demoted:
+                logger.warning(
+                    "stt_capability_demoted_from_stream_error",
+                    model=self.model,
+                    unsupported=demoted,
+                    meeting_id=meeting_id,
+                )
             logger.warning("realtime_session_retry", meeting_id=meeting_id, speaker_id=speaker_id)
             self._sessions.pop(key, None)
             try:
