@@ -389,6 +389,46 @@ class TestPublish:
         assert payload["token_count"] == "150", "decide + generate tokens are billed together"
 
     @pytest.mark.asyncio
+    async def test_fact_without_documents_is_declined_before_the_slot_is_claimed(self) -> None:
+        """WT-371 Bug 6.
+
+        "fact" is defined as a figure or reference THE MEETING'S OWN DOCUMENTS cover. With no
+        documents attached there is nothing to ground it in and the only thing the model can do
+        is recall a plausible number — which reaches the participants looking exactly like a
+        sourced one.
+
+        Asserted before the claim, not just before the publish: burning the 45s cooldown slot
+        would silence every other category in the room to produce nothing.
+        """
+        suggester = approving_suggester()
+        suggester.decision = SuggestionDecision(
+            should_suggest=True, category="fact", confidence=0.9, token_count=40
+        )
+        worker, redis, _ = build_worker(suggester=suggester)
+
+        await worker.process(b"1-0", stt_message())
+
+        assert suggester.generate_calls == 0
+        assert redis.published == []
+        assert redis.values == {}, "no cooldown slot may be claimed"
+
+    @pytest.mark.asyncio
+    async def test_fact_with_documents_is_allowed_through(self) -> None:
+        """The negative control: the rule above must gate on the DOCUMENTS, not on the
+        category. Declining every "fact" would look identical in the test above."""
+        suggester = approving_suggester()
+        suggester.decision = SuggestionDecision(
+            should_suggest=True, category="fact", confidence=0.9, token_count=40
+        )
+        worker, redis, _ = build_worker(suggester=suggester)
+        redis.values["meeting:room-1:context_snapshot"] = "Q3 revenue: 1.2M USD"
+
+        await worker.process(b"1-0", stt_message())
+
+        assert suggester.generate_calls == 1
+        assert len(redis.published) > 0
+
+    @pytest.mark.asyncio
     async def test_content_is_truncated_to_the_strip_width(self) -> None:
         suggester = approving_suggester()
         suggester.suggestion = GeneratedSuggestion(content="a" * 400, category="term")
