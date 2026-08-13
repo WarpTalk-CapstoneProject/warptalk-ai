@@ -21,6 +21,7 @@ from stt_worker.model import (
     _guess_language_from_text,
     _normalize_language,
     reset_capability_memo,
+    _demote_capability_from_error,
 )
 from stt_worker.worker import STTWorker, _language_hint_for_stt
 
@@ -278,6 +279,62 @@ class TestOpenAISTT:
         assert transcription["languages"] == ["vi", "en"]
         # Structured context and confidence are independent — this model should get both.
         assert "include" in payload
+
+    def test_a_stream_reported_rejection_demotes_the_capability(self) -> None:
+        """The production outage of 2026-08-13, in one assertion.
+
+        The Realtime API ACCEPTED `session.update` carrying `languages`, said nothing, and then
+        rejected every transcription on the stream with an error event. The degradation ladder
+        only watches for an exception from `session.update`, so it recorded the capability as
+        supported; the retry rebuilt an identical session and failed identically. 304 audio
+        chunks in 45 minutes produced not one word of transcript, in every meeting at once, with
+        the UI showing translation as running the whole time.
+        """
+        reset_capability_memo()
+        error = (
+            "realtime_transcription_error: RealtimeErrorEvent(error=RealtimeError("
+            "message=\"The \'languages\' parameter is not supported for this model.\", "
+            "type=\'invalid_request_error\', code=\'invalid_parameter\'))"
+        )
+
+        assert _demote_capability_from_error("gpt-4o-mini-transcribe", error) == "structured_context"
+
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.model = "gpt-4o-mini-transcribe"
+        stt.noise_reduction = "off"
+        payload = stt._session_payload(
+            language="vi",
+            prompt="WarpTalk meeting.",
+            allowed_languages={"vi", "en"},
+            keywords=["Codex"],
+        )
+        transcription = payload["audio"]["input"]["transcription"]
+        # The rebuilt session drops what was refused and keeps the documented singular hint,
+        # which is the whole point: degrade, do not go silent.
+        assert "languages" not in transcription
+        assert "keywords" not in transcription
+        assert transcription["language"] == "vi"
+        assert transcription["prompt"] == "WarpTalk meeting."
+
+    def test_an_unrelated_failure_does_not_strip_the_language_hint(self) -> None:
+        """A disconnect says nothing about what the model accepts.
+
+        Demoting on every error would quietly cost every model its language hint after one
+        network blip — the same silent degradation in the other direction.
+        """
+        reset_capability_memo()
+        for unrelated in (
+            "realtime_connection_closed_before_completed",
+            "asyncio.TimeoutError",
+            "RealtimeError(message='Audio buffer is empty', code='input_audio_buffer_commit_empty')",
+        ):
+            assert _demote_capability_from_error("gpt-4o-mini-transcribe", unrelated) is None
+
+    def test_the_word_languages_in_a_transcript_is_not_a_capability_signal(self) -> None:
+        """Someone saying "this model is not supported" out loud must not disable anything."""
+        reset_capability_memo()
+        spoken = "the languages we support are not supported by that vendor"
+        assert _demote_capability_from_error("gpt-4o-mini-transcribe", spoken) is None
 
     async def test_rejected_session_degrades_one_rung_and_is_remembered(self) -> None:
         """Degrading must keep the prompt and the language hint, and learn from it.
