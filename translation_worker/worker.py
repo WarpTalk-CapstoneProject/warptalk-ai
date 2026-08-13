@@ -22,6 +22,7 @@ from shared.config import TranslationSettings, resolve_openai_api_key
 from shared.lang import is_same_language
 from shared.schemas import STTResultMessage, TranslationResultMessage, optional_confidence
 from shared.text_utils import split_into_sentences
+from translation_worker.transcript_guardian import choose_transcript
 from translation_worker.translator import OUT_OF_MEETING_SCOPE, OpenAITranslator
 
 _CONTEXT_STOPWORDS = {
@@ -103,6 +104,10 @@ class TranslationWorker(BaseWorker):
     # deterministic LiveKit replay). Keep one bounded speculative slot alive long
     # enough to reuse that result instead of cancelling it and paying a second call.
     _SPECULATIVE_TIMEOUT_SECONDS = 1.5
+    # The same-language tidy-up's whole latency budget. Passthrough used to publish with no
+    # network call at all, so this is the amount of delay a nicer-looking transcript is worth;
+    # past it the raw recogniser text goes out unchanged.
+    _POLISH_TIMEOUT_SECONDS = 1.5
 
     def __init__(
         self,
@@ -508,7 +513,27 @@ class TranslationWorker(BaseWorker):
             chunk_segment_id = f"{stt_result.segment_id}-{target_lang}-c{idx}"
 
             if passthrough:
-                translated_text = sentence
+                # Same language as the speaker, so there is nothing to translate — but the text
+                # is raw recogniser output: no sentence casing, little punctuation, and every
+                # "ờ"/"à" that was actually said. A same-language pass makes it read like
+                # writing. See transcript_guardian for why the result is verified rather than
+                # trusted, and why a failed verification keeps the original instead of
+                # publishing a fluent guess.
+                # BOUNDED, because this path used to cost nothing at all.
+                #
+                # Passthrough previously forwarded the sentence with no network call, so adding
+                # one puts a model round-trip in front of a line that used to publish instantly.
+                # Tidier text is not worth a transcript that lags the speaker, so the tidy-up
+                # gets a small budget and the raw sentence goes out the moment it is exceeded.
+                try:
+                    async with asyncio.timeout(self._POLISH_TIMEOUT_SECONDS):
+                        polished = await translator.polish(sentence, stt_result.language)
+                except Exception:
+                    polished = sentence
+
+                translated_text = choose_transcript(
+                    sentence, polished, stt_result.language
+                )
             elif idx == 0:
                 assert first_task is not None
                 try:

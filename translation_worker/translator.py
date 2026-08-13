@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 from shared.config import TranslationSettings
 from shared.logger import get_logger
 from shared.openai_options import completion_options
+from translation_worker.transcript_guardian import guardian_instruction
 
 logger = get_logger(__name__)
 OUT_OF_MEETING_SCOPE = "[OUT_OF_MEETING_SCOPE]"
@@ -683,6 +684,44 @@ class OpenAITranslator:
             output_chars=len(result),
         )
         return result
+
+    async def polish(self, text: str, language: str) -> str:
+        """Tidy a same-language transcript line: casing, punctuation, spacing, fillers.
+
+        Returns the ORIGINAL text on any failure, and never raises. A passthrough line is
+        already correct and already publishable — the tidy-up is a bonus, and it must not be
+        able to delay or drop a transcript that would otherwise have gone out untouched.
+
+        The caller is still expected to run the result through
+        `transcript_guardian.choose_transcript`: this method promises only that it asked; that
+        function is what verifies the model did what it was told. See the module docstring
+        there for why an instruction alone is not enough.
+        """
+        if not text.strip():
+            return text
+
+        try:
+            response = await self._create_with_retry(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": guardian_instruction(language)},
+                    {"role": "user", "content": text},
+                ],
+                # Bounded by the input: a formatting pass cannot legitimately need much more
+                # room than it was given, and a cap is the cheapest guard against a model that
+                # starts writing an essay.
+                **self._completion_options(min(self.max_tokens, len(text) + 128)),
+            )
+            polished = (response.choices[0].message.content or "").strip()
+        except Exception as exc:
+            logger.warning(
+                "transcript_polish_failed",
+                language=language,
+                error=repr(exc),
+            )
+            return text
+
+        return polished or text
 
     async def translate_batch(
         self,
