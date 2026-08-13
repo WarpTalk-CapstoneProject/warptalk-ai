@@ -21,9 +21,12 @@ WHAT THE API ACTUALLY HAS
     rather than silently dropped — the user asked for one and must be able to see it on the
     meeting afterwards.
 
-    There is NO document attachment, on this endpoint or any other: no room↔document link exists
-    in the schema. `missing_fields` therefore never asks for documents, because collecting an
-    answer nothing can store would be a worse lie than saying it is not supported.
+    There is NO document attachment table either — no room↔document link exists in the schema.
+    Documents are therefore LINKED from the description rather than joined to the room: the
+    description is a TipTap field with the Markdown extension enabled (`Markdown.configure({
+    html: true })` on the room page), so a markdown list of links renders as links, and clicking
+    one opens the document. That is the whole feature without a migration, and it degrades
+    honestly — a reader with no access to a linked document sees a link, not a broken join.
 """
 
 from __future__ import annotations
@@ -76,6 +79,10 @@ class MeetingDraft:
     recurrence_start_date_local: str | None = None
     recurrence_end_date_local: str | None = None
     max_participants: int | None = None
+    #: (title, document_id) pairs. Linked from the description — see the module docstring.
+    documents: list[tuple[str, str]] = field(default_factory=list)
+    #: Needed to build a document URL. Absent means documents are listed by name only.
+    workspace_slug: str | None = None
 
 
 def missing_fields(draft: MeetingDraft) -> list[str]:
@@ -150,11 +157,15 @@ def validate(draft: MeetingDraft) -> list[str]:
 
 
 def compose_description(draft: MeetingDraft) -> str | None:
-    """Description and agenda in one field, because the API has only one.
+    """Description, agenda and document links in one markdown field.
 
-    The agenda is appended under a heading rather than merged into the prose: the user asked for
-    an agenda and has to be able to find it on the meeting afterwards, and a numbered list that
-    survives as a numbered list is the whole point of having asked.
+    MARKDOWN, not plain text and not HTML. The room page edits this with TipTap under
+    `Markdown.configure({ html: true })` and styles `[&_h2]`, so `## Agenda` renders as a heading
+    and `1.` renders as a list. Writing prose here would lose the structure the user asked for;
+    writing HTML would fight the editor that owns the field.
+
+    The agenda gets its own heading rather than being merged into the prose: an agenda that
+    survives as a numbered list is the whole point of having asked for one.
     """
     parts: list[str] = []
     description = (draft.description or "").strip()
@@ -163,9 +174,31 @@ def compose_description(draft: MeetingDraft) -> str | None:
 
     items = [line.strip() for line in draft.agenda if (line or "").strip()]
     if items:
-        parts.append("Agenda\n" + "\n".join(f"{i}. {line}" for i, line in enumerate(items, 1)))
+        parts.append("## Agenda\n" + "\n".join(f"{i}. {line}" for i, line in enumerate(items, 1)))
+
+    links = [
+        _document_link(title, document_id, draft.workspace_slug)
+        for title, document_id in draft.documents
+        if (title or "").strip() and (document_id or "").strip()
+    ]
+    if links:
+        # Linked, not attached. There is no room↔document table, and a link that opens the
+        # document is the thing a reader actually wanted from an attachment.
+        parts.append("## Documents\n" + "\n".join(f"- {link}" for link in links))
 
     return "\n\n".join(parts) if parts else None
+
+
+def _document_link(title: str, document_id: str, workspace_slug: str | None) -> str:
+    """A markdown link, or a bare name when there is no slug to build a URL from.
+
+    Degrading to the name is deliberate: a link to `/undefined/documents/...` is worse than no
+    link, because it looks clickable and goes nowhere.
+    """
+    clean_title = title.strip()
+    if not workspace_slug:
+        return clean_title
+    return f"[{clean_title}](/{workspace_slug}/documents/{document_id.strip()})"
 
 
 def build_payload(draft: MeetingDraft, workspace_id: str) -> dict[str, Any]:
@@ -235,7 +268,19 @@ def draft_from_arguments(arguments: dict[str, Any]) -> MeetingDraft:
     room_type = as_text(args.get("translation_room_type"))
     recurrence_type = as_text(args.get("recurrence_type"))
 
+    documents: list[tuple[str, str]] = []
+    raw_documents = args.get("documents")
+    if isinstance(raw_documents, list):
+        for entry in raw_documents:
+            if isinstance(entry, dict):
+                doc_title = str(entry.get("title") or "").strip()
+                doc_id = str(entry.get("id") or "").strip()
+                if doc_title and doc_id:
+                    documents.append((doc_title, doc_id))
+
     return MeetingDraft(
+        documents=documents,
+        workspace_slug=as_text(args.get("workspace_slug")),
         title=as_text(args.get("title")),
         description=as_text(args.get("description")),
         agenda=as_list(args.get("agenda")),

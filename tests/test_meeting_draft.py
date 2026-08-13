@@ -33,6 +33,7 @@ def _complete() -> MeetingDraft:
 
 # ── what still has to be asked ────────────────────────────────────────────────────────────────
 
+
 def test_a_bare_request_asks_for_the_four_the_server_cannot_default() -> None:
     assert missing_fields(MeetingDraft()) == [
         "title",
@@ -59,6 +60,7 @@ def test_a_half_specified_recurrence_is_asked_to_completion() -> None:
 
 
 # ── what would come back as a 400 ─────────────────────────────────────────────────────────────
+
 
 def test_scheduled_at_and_recurrence_together_are_refused_here_not_by_the_server() -> None:
     # "Daily at 9 starting Monday" reads as both a time and a rule. The server rejects the pair
@@ -102,6 +104,7 @@ def test_a_valid_draft_has_no_complaints() -> None:
 
 
 # ── the payload ───────────────────────────────────────────────────────────────────────────────
+
 
 def test_absent_fields_are_omitted_rather_than_sent_as_null() -> None:
     # The meeting type seeds whatever is left out, so an explicit null would overwrite a sensible
@@ -152,16 +155,73 @@ def test_an_agenda_with_no_description_still_renders() -> None:
 
 # ── the shapes models actually emit ───────────────────────────────────────────────────────────
 
+
 def test_a_comma_separated_string_is_accepted_where_a_list_is_expected() -> None:
     draft = draft_from_arguments({"target_languages": "en, ja , ko"})
     assert draft.target_languages == ["en", "ja", "ko"]
 
 
 def test_a_lowercase_meeting_type_is_accepted() -> None:
-    assert draft_from_arguments({"translation_room_type": "webinar"}).translation_room_type == "WEBINAR"
+    assert (
+        draft_from_arguments({"translation_room_type": "webinar"}).translation_room_type
+        == "WEBINAR"
+    )
 
 
 def test_empty_arguments_produce_an_empty_draft_rather_than_raising() -> None:
     draft = draft_from_arguments({})
     assert draft.title is None
     assert missing_fields(draft) == list(missing_fields(MeetingDraft()))
+
+
+# ── markdown, because the description field parses it ─────────────────────────────────────────
+#
+# The room page edits this with TipTap under Markdown.configure({ html: true }) and styles
+# [&_h2], so a heading is a heading and a numbered list is a list. Plain prose would lose the
+# structure the user asked for; HTML would fight the editor that owns the field.
+
+
+def test_the_agenda_heading_is_markdown_not_a_bare_word() -> None:
+    draft = _complete()
+    draft.agenda = ["Demo", "Blockers"]
+    assert "## Agenda" in (compose_description(draft) or "")
+
+
+def test_documents_are_linked_from_the_description() -> None:
+    # There is no room↔document table. A markdown link is the whole feature without a migration,
+    # and clicking it opens the document — which is what an attachment was wanted for.
+    draft = _complete()
+    draft.workspace_slug = "warptalk-demo"
+    draft.documents = [("Onboarding spec", "doc-123")]
+
+    description = compose_description(draft) or ""
+    assert "## Documents" in description
+    assert "[Onboarding spec](/warptalk-demo/documents/doc-123)" in description
+
+
+def test_a_document_without_a_workspace_slug_degrades_to_its_name() -> None:
+    # A link to /undefined/documents/... is worse than no link: it looks clickable and goes
+    # nowhere.
+    draft = _complete()
+    draft.documents = [("Onboarding spec", "doc-123")]
+
+    description = compose_description(draft) or ""
+    assert "Onboarding spec" in description
+    assert "](/" not in description
+
+
+def test_a_document_missing_an_id_is_skipped_rather_than_linked_to_nothing() -> None:
+    draft = _complete()
+    draft.workspace_slug = "warptalk-demo"
+    draft.documents = [("Real doc", "doc-1"), ("Half a doc", "")]
+
+    description = compose_description(draft) or ""
+    assert "Real doc" in description
+    assert "Half a doc" not in description
+
+
+def test_documents_arrive_from_tool_arguments_as_title_id_pairs() -> None:
+    draft = draft_from_arguments(
+        {"documents": [{"title": "Spec", "id": "doc-9"}, {"title": "", "id": "doc-8"}]}
+    )
+    assert draft.documents == [("Spec", "doc-9")]

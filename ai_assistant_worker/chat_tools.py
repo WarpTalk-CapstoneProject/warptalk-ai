@@ -59,6 +59,9 @@ class ToolContext:
     openai_client: Any
     model: str
     redis: RedisStreamClient
+    #: Used to build document links in a created meeting's description. Last and defaulted so
+    #: every existing construction site keeps working unchanged.
+    workspace_slug: str | None = None
 
 
 @dataclass
@@ -728,6 +731,9 @@ async def _create_meeting(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     room, real invitation emails, and for a recurring booking a whole series of them.
     """
     draft = draft_from_arguments(arguments)
+    # The slug is the worker's to supply, not the model's: it comes from the request context, and
+    # a model-invented slug would produce links that look clickable and go nowhere.
+    draft.workspace_slug = getattr(ctx, "workspace_slug", None) or None
 
     absent = missing_fields(draft)
     if absent:
@@ -936,6 +942,23 @@ TOOLS: list[ChatTool] = [
                 "max_participants": {
                     "type": "integer",
                     "description": "Seat cap. Omit to let the meeting type decide.",
+                },
+                "documents": {
+                    "type": "array",
+                    "description": (
+                        "Workspace documents to put in front of attendees. Find them with "
+                        "search_documents first and pass back its exact title and id — they are "
+                        "rendered as markdown links in the meeting description, since a meeting "
+                        "has no attachment field. Never invent an id."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "id": {"type": "string"},
+                        },
+                        "required": ["title", "id"],
+                    },
                 },
             },
             "required": ["title", "translation_room_type", "source_language", "target_languages"],
