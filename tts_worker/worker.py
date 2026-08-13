@@ -26,6 +26,7 @@ from shared.config import TTSSettings
 from shared.lang import is_same_language
 from shared.prosody import Arousal, Delivery, Valence, to_generation_config
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
+from tts_worker.clone_sample_quality import assess_clone_sample
 from tts_worker.livekit_publisher import LiveKitTTSPublisher
 from tts_worker.synthesizer import CartesiaSynthesizer
 
@@ -614,14 +615,51 @@ class TTSWorker(BaseWorker):
                         buffer_lang[key] = chunk.language
 
                         if buffer_seconds[key] >= self.tts_settings.voice_clone_min_seconds:
-                            audio_snapshot = bytes(buffers.pop(key))
-                            del buffer_seconds[key]
-                            clone_lang = _clone_language(buffer_lang.pop(key, "en"))
-                            asyncio.create_task(
-                                self._clone_and_cache(
-                                    chunk.meeting_id, chunk.speaker_id, audio_snapshot, clone_lang
+                            # The clip is only a reference if it is worth referring to.
+                            #
+                            # This used to clone the first N seconds unconditionally, and
+                            # _get_voice_id short-circuits, so a microphone check became the
+                            # speaker's voice for the entire meeting. Now a clip that fails the
+                            # same bar the upload page enforces is not cloned — the oldest audio
+                            # slides out and the speaker gets another go, which costs nothing
+                            # because they are still talking.
+                            assessment = assess_clone_sample(bytes(buffers[key]), chunk.sample_rate)
+                            if assessment.accepted:
+                                audio_snapshot = bytes(buffers.pop(key))
+                                del buffer_seconds[key]
+                                clone_lang = _clone_language(buffer_lang.pop(key, "en"))
+                                self.logger.info(
+                                    "voice_clone_sample_accepted",
+                                    speaker_id=chunk.speaker_id,
+                                    seconds=round(
+                                        buffer_seconds.get(key, 0.0)
+                                        or self.tts_settings.voice_clone_min_seconds,
+                                        1,
+                                    ),
+                                    active_speech_ratio=round(assessment.active_speech_ratio, 3),
                                 )
-                            )
+                                asyncio.create_task(
+                                    self._clone_and_cache(
+                                        chunk.meeting_id,
+                                        chunk.speaker_id,
+                                        audio_snapshot,
+                                        clone_lang,
+                                    )
+                                )
+                            else:
+                                # Logged at info, not warning: a rejected clip is the gate doing
+                                # its job, and a speaker who has not said anything usable yet is
+                                # an ordinary state, not a fault.
+                                self.logger.info(
+                                    "voice_clone_sample_rejected",
+                                    speaker_id=chunk.speaker_id,
+                                    reason=assessment.reason,
+                                    rms=round(assessment.rms, 4),
+                                    active_speech_ratio=round(assessment.active_speech_ratio, 3),
+                                )
+                                self._trim_clone_buffer(
+                                    key, buffers, buffer_seconds, chunk.sample_rate
+                                )
                     except Exception:
                         self.logger.exception("audio_chunk_processing_error")
             except asyncio.CancelledError:
@@ -629,6 +667,32 @@ class TTSWorker(BaseWorker):
             except Exception:
                 self.logger.exception("audio_consumer_error")
                 await asyncio.sleep(2)
+
+    def _trim_clone_buffer(
+        self,
+        key: tuple[str, str],
+        buffers: dict[tuple[str, str], bytearray],
+        buffer_seconds: dict[tuple[str, str], float],
+        sample_rate: int,
+    ) -> None:
+        """Drop the oldest audio so a rejected clip does not block the next attempt forever.
+
+        A sliding window, not a reset. Resetting would throw away the speech that arrived while
+        the clip was being judged, and in a room where every window is marginal it would mean
+        never assembling a usable one. Keeping everything is the other failure: a speaker in a
+        noisy office would hold the whole meeting in memory and still never clone.
+        """
+        buffer = buffers.get(key)
+        if buffer is None or sample_rate <= 0:
+            return
+
+        max_bytes = int(self.tts_settings.voice_clone_max_buffer_seconds * sample_rate * 2)
+        if max_bytes <= 0 or len(buffer) <= max_bytes:
+            return
+
+        overflow = len(buffer) - max_bytes
+        del buffer[:overflow]
+        buffer_seconds[key] = len(buffer) / 2 / sample_rate
 
     async def _clone_and_cache(
         self, meeting_id: str, speaker_id: str, audio_bytes: bytes, language: str = "en"
