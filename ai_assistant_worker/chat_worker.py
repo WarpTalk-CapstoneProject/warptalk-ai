@@ -394,6 +394,23 @@ class ChatAssistantWorker(BaseWorker):
                 await self._publish_result(
                     request, type_="tool_call_completed", tool_name=tool_name, tool_status=status
                 )
+
+                # ask_user is the one tool whose OUTPUT is a UI, not text for the model. The
+                # questions go out on their own event so the client can render a card rather
+                # than trying to find them inside an assistant message.
+                #
+                # Deliberately NOT blocking: pausing this loop until a human answers would hold a
+                # worker slot open for as long as somebody takes to read, and a reconnect would
+                # strand the turn with no way back. The card is fire-and-forget; the answer
+                # arrives as an ordinary message on the next turn, which is also why the user can
+                # ignore it and type something else entirely.
+                if tool_name == "ask_user" and status == "completed":
+                    await self._publish_result(
+                        request,
+                        type_="question",
+                        tool_name=tool_name,
+                        tool_calls_json=raw_arguments,
+                    )
                 # The call and its result are fed back as a pair of typed input items —
                 # the Responses equivalent of the assistant/tool message pair.
                 conversation.append(
