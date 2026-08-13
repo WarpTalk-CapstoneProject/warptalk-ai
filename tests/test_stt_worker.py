@@ -293,11 +293,13 @@ class TestOpenAISTT:
         reset_capability_memo()
         error = (
             "realtime_transcription_error: RealtimeErrorEvent(error=RealtimeError("
-            "message=\"The \'languages\' parameter is not supported for this model.\", "
-            "type=\'invalid_request_error\', code=\'invalid_parameter\'))"
+            "message=\"The 'languages' parameter is not supported for this model.\", "
+            "type='invalid_request_error', code='invalid_parameter'))"
         )
 
-        assert _demote_capability_from_error("gpt-4o-mini-transcribe", error) == "structured_context"
+        assert (
+            _demote_capability_from_error("gpt-4o-mini-transcribe", error) == "structured_context"
+        )
 
         stt = OpenAISTT.__new__(OpenAISTT)
         stt.model = "gpt-4o-mini-transcribe"
