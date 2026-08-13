@@ -167,6 +167,28 @@ class TestGenerationConfig:
         whisper = Delivery(0.9, 0.8, 0.35, 0.9, "low")
         assert float(to_generation_config(whisper)["volume"]) < 1.0
 
+    def test_undetermined_valence_is_not_neutral_valence(self) -> None:
+        """The pipeline's real state today: nothing has read the words for sentiment.
+
+        Collapsing that into "neutral" would reach ("high", "neutral") in the table and label
+        an emphatic speaker "surprised" — a claim about their feelings inferred from loudness
+        alone. Unknown must produce no label at all.
+        """
+        emphatic = Delivery(1.3, 1.5, 1.4, 1.2, "high")
+
+        assert "emotion" not in to_generation_config(emphatic)
+        assert "emotion" not in to_generation_config(emphatic, None)
+        assert to_generation_config(emphatic, "neutral")["emotion"] == "surprised"
+
+    def test_delivery_still_carries_without_any_valence(self) -> None:
+        # The half that needs no reading of the words must not be held hostage to the half
+        # that does — an unlabelled utterance is still dubbed faster and louder if that is how
+        # it was said.
+        config = to_generation_config(Delivery(1.3, 1.5, 1.4, 1.25, "high"))
+
+        assert config["speed"] == pytest.approx(1.25)
+        assert config["volume"] == pytest.approx(1.4)
+
 
 class TestPcmConversion:
     def test_round_trips_amplitude(self) -> None:

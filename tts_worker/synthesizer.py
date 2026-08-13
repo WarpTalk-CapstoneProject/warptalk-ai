@@ -88,6 +88,7 @@ class CartesiaSynthesizer:
         text: str,
         language: str,
         voice_id: str | None = None,
+        generation_config: dict[str, float | str] | None = None,
     ) -> tuple[bytes, int, str]:
         """Synthesize text to speech.
 
@@ -95,6 +96,10 @@ class CartesiaSynthesizer:
             text: Text to synthesize
             language: ISO 639-1 language code (e.g. "en", "vi")
             voice_id: Cartesia voice_id from clone_voice(); None uses Cartesia default
+            generation_config: Cartesia's delivery controls — {"speed": float in [0.6, 1.5],
+                "volume": float, "emotion": str}. Built from the speaker's measured prosody
+                (shared/prosody.py) and omitted entirely when nothing was measured, so an
+                unmeasured utterance is synthesized exactly as it was before this existed.
 
         Returns:
             Tuple of (wav_bytes, duration_ms, resolved_voice_id). resolved_voice_id is
@@ -119,6 +124,15 @@ class CartesiaSynthesizer:
         # object with __aiter__ method, got coroutine". Cartesia was unreachable/misconfigured
         # before now, so neither mistake had ever been exercised end-to-end.
         client = self._require_client()
+        # `speed` (the ModelSpeed enum below) and `generation_config["speed"]` are two separate
+        # inputs and both are sent. The enum measurably does nothing on sonic-3.5 — four renders
+        # each of slow/normal/fast gave 6120/6200/5960ms medians against a 5680–6560ms spread —
+        # but it is not inert on every Cartesia model, so dropping it would be a silent
+        # behaviour change for anyone running one where it works.
+        extra: dict[str, Any] = {}
+        if generation_config:
+            extra["generation_config"] = cast(Any, generation_config)
+
         stream = await client.tts.bytes(
             model_id=self.model,
             transcript=text,
@@ -133,6 +147,7 @@ class CartesiaSynthesizer:
             ),
             language=language,
             speed=cast(Any, self.speed),
+            **extra,
         )
         chunks: list[bytes] = [chunk async for chunk in stream]
         audio_bytes: bytes = b"".join(chunks)

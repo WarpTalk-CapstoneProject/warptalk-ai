@@ -7,6 +7,7 @@ serialization. Field names align with backend TranscriptSegmentDto.
 from __future__ import annotations
 
 import base64
+import json
 import math
 import time
 import uuid
@@ -88,6 +89,74 @@ class AudioChunkMessage(BaseModel):
         )
 
 
+class ProsodyEnvelope(BaseModel):
+    """How something was said, in the only terms that survive translation.
+
+    The pipeline destroys delivery at the STT boundary: audio goes in, text comes out, and the
+    dub is read in the target language's default manner however the speaker actually sounded.
+    Audio exists in exactly one message on this bus (AudioChunkMessage), so the measurement has
+    to be taken in the STT worker and CARRIED — this is the envelope it travels in, from
+    STTResultMessage through TranslationResultMessage to the TTS worker, which turns it into
+    Cartesia's generation_config.
+
+    Every number is a RATIO against that speaker's own rolling normal, never an absolute. See
+    shared/prosody.py for why absolutes would classify most women as permanently excited.
+
+    Absent rather than neutral. A message with no `prosody` field means nothing was measured —
+    the speaker has no baseline yet, or the chunk was mostly silence. That is deliberately
+    different from a measured-and-ordinary delivery, because the TTS worker must send no
+    controls at all in the first case and the speaker's real (near-1.0) ratios in the second.
+    """
+
+    __slots__ = ()
+
+    pitch_lift: float = 1.0
+    pitch_variation: float = 1.0
+    energy_ratio: float = 1.0
+    rate_ratio: float = 1.0
+    arousal: str = "neutral"  # 'low' | 'neutral' | 'high' — from the sound
+    # 'negative' | 'neutral' | 'positive', or "" for NOT DETERMINED. Valence cannot be heard
+    # (anger and delight look alike on pitch and energy), so it can only come from something
+    # that read the words. Nothing populates it yet; "" travels as "no opinion" and the TTS
+    # worker then sends no emotion label rather than guessing one from arousal alone.
+    valence: str = ""
+
+    def to_wire(self) -> str:
+        """One compact JSON string, because Redis stream fields are flat strings and six more
+        columns on two messages is six more places for a consumer to half-implement this."""
+        return json.dumps(
+            {
+                "pl": round(self.pitch_lift, 4),
+                "pv": round(self.pitch_variation, 4),
+                "er": round(self.energy_ratio, 4),
+                "rr": round(self.rate_ratio, 4),
+                "a": self.arousal,
+                "v": self.valence,
+            },
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_wire(cls, raw: str | None) -> ProsodyEnvelope | None:
+        """Never raises. A malformed envelope costs the dub its delivery, and that is the whole
+        of the damage — it must not cost the meeting its audio, so this returns None and the
+        pipeline carries on exactly as it did before prosody existed."""
+        if not raw:
+            return None
+        try:
+            d = json.loads(raw)
+            return cls(
+                pitch_lift=float(d["pl"]),
+                pitch_variation=float(d["pv"]),
+                energy_ratio=float(d["er"]),
+                rate_ratio=float(d["rr"]),
+                arousal=str(d.get("a", "neutral")),
+                valence=str(d.get("v", "")),
+            )
+        except (ValueError, TypeError, KeyError):
+            return None
+
+
 class STTResultMessage(BaseModel):
     """STT Worker → Translation Worker + AI Assistant.
 
@@ -107,9 +176,13 @@ class STTResultMessage(BaseModel):
     chunk_index: int = 0
     is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    # How the speaker sounded saying this, measured from the audio chunk this segment came out
+    # of — the only point in the pipeline where the audio still exists. None when nothing could
+    # be measured; see ProsodyEnvelope.
+    prosody: ProsodyEnvelope | None = None
 
     def to_redis(self) -> dict[str, str]:
-        return {
+        payload = {
             "segment_id": self.segment_id,
             "meeting_id": self.meeting_id,
             "speaker_id": self.speaker_id,
@@ -122,6 +195,11 @@ class STTResultMessage(BaseModel):
             "is_final_chunk": "1" if self.is_final_chunk else "0",
             "timestamp_ms": str(self.timestamp_ms),
         }
+        # Omitted rather than sent as a neutral placeholder — "not measured" and "measured as
+        # ordinary" are different instructions to the synthesizer.
+        if self.prosody is not None:
+            payload["prosody"] = self.prosody.to_wire()
+        return payload
 
     @classmethod
     def from_redis(cls, data: Mapping[Any, Any]) -> STTResultMessage:
@@ -138,6 +216,7 @@ class STTResultMessage(BaseModel):
             chunk_index=int(d.get("chunk_index", "0")),
             is_final_chunk=d.get("is_final_chunk") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
+            prosody=ProsodyEnvelope.from_wire(d.get("prosody")),
         )
 
 
@@ -185,6 +264,11 @@ class TranslationResultMessage(BaseModel):
     # the first (and usually only) sentence. A consumer uses this to APPEND rather than
     # overwrite when one STT segment yields more than one translated chunk.
     chunk_index: int = 0
+    # Carried unchanged from the STT segment this was translated from. The translation worker
+    # measures nothing — it is the courier. Every sentence split out of one STT segment inherits
+    # the same envelope, because the measurement's granularity is the audio chunk, not the
+    # sentence, and pretending otherwise would invent per-sentence delivery that was never heard.
+    prosody: ProsodyEnvelope | None = None
 
     def to_redis(self) -> dict[str, str]:
         payload = {
@@ -208,6 +292,8 @@ class TranslationResultMessage(BaseModel):
         # placeholder number here is exactly the failure this ticket removed.
         if self.source_stt_confidence is not None:
             payload["source_stt_confidence"] = str(self.source_stt_confidence)
+        if self.prosody is not None:
+            payload["prosody"] = self.prosody.to_wire()
         return payload
 
     @classmethod
@@ -232,6 +318,7 @@ class TranslationResultMessage(BaseModel):
             translator_model=d.get("translator_model", ""),
             source_segment_id=d.get("source_segment_id", ""),
             chunk_index=int(d.get("chunk_index", "0")),
+            prosody=ProsodyEnvelope.from_wire(d.get("prosody")),
         )
 
 

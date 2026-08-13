@@ -413,6 +413,7 @@ class TranslationWorker(BaseWorker):
                         translator_model=self._require_translator().model,
                         source_segment_id=stt_result.segment_id,
                         chunk_index=stt_result.chunk_index,
+                        prosody=stt_result.prosody,
                     )
                     await self.publish(
                         "translate:results", stt_result.meeting_id, result.to_redis()
@@ -560,6 +561,9 @@ class TranslationWorker(BaseWorker):
                 translator_model=translator.model,
                 source_segment_id=stt_result.segment_id,
                 chunk_index=stt_result.chunk_index,
+                # Carried, not derived. What the speaker's delivery was is settled upstream at
+                # the audio; translating the words does not change how they were said.
+                prosody=stt_result.prosody,
             )
 
             # Publish IMMEDIATELY so TTS can synthesize while next chunk is translated

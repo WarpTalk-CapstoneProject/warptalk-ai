@@ -24,6 +24,7 @@ from typing import Any, cast
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
 from shared.lang import is_same_language
+from shared.prosody import Arousal, Delivery, Valence, to_generation_config
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
 from tts_worker.livekit_publisher import LiveKitTTSPublisher
 from tts_worker.synthesizer import CartesiaSynthesizer
@@ -387,6 +388,8 @@ class TTSWorker(BaseWorker):
         voice_type: str,
         voice_key: str,
     ) -> None:
+        generation_config = self._generation_config(translation)
+
         cache_key = self._cache_key(
             speaker_id=translation.speaker_id,
             target_lang=translation.target_lang,
@@ -395,6 +398,11 @@ class TTSWorker(BaseWorker):
             # voice_id, not just the type, is part of what was actually rendered.
             text=text,
             voice_mode=f"{voice_type}:{voice_id}",
+            # Same words, same voice, said differently is DIFFERENT AUDIO. Without this the
+            # first rendering of a phrase would be replayed for every later one, and a speaker
+            # who said "okay" calmly and then shouted it would be dubbed identically both
+            # times — the cache would quietly undo the whole feature.
+            generation_config=generation_config,
         )
 
         if self.tts_settings.cache_enabled:
@@ -434,6 +442,7 @@ class TTSWorker(BaseWorker):
                 text=text,
                 language=translation.target_lang,
                 voice_id=voice_id,
+                generation_config=generation_config,
             )
         except Exception as e:
             self.logger.error("cartesia_synthesis_failed", error=str(e), voice_type=voice_type)
@@ -476,6 +485,10 @@ class TTSWorker(BaseWorker):
             synthesis_latency_ms=synthesis_latency_ms,
             text=text[:60],
             is_final=translation.is_final_chunk,
+            # Empty when the speaker's delivery was not measured — which is what makes
+            # "is prosody actually reaching Cartesia in production?" answerable from the logs
+            # instead of by inspection.
+            generation_config=generation_config or None,
         )
 
     async def _publish_result(
@@ -651,13 +664,64 @@ class TTSWorker(BaseWorker):
                 error=str(e),
             )
 
+    def _generation_config(
+        self, translation: TranslationResultMessage
+    ) -> dict[str, float | str] | None:
+        """Cartesia's delivery controls for this line, or None to say nothing about delivery.
+
+        None is the important case and it is the common one: the STT worker omits prosody
+        whenever it could not honestly measure it (a speaker it has not heard enough of, a
+        chunk that was mostly silence), and this returns None again whenever the feature is
+        off. In every one of those cases the call is byte-for-byte the call this worker made
+        before prosody existed.
+        """
+        if not self.tts_settings.prosody_enabled:
+            return None
+
+        envelope = translation.prosody
+        if envelope is None:
+            return None
+
+        # Rebuilt rather than passed around as a Delivery: the wire format is deliberately
+        # plain numbers (schemas.py knows nothing about numpy or about prosody's vocabulary),
+        # and this is the one place that translates it back.
+        arousal: Arousal = (
+            envelope.arousal if envelope.arousal in ("low", "neutral", "high") else "neutral"  # type: ignore[assignment]
+        )
+        valence: Valence | None = (
+            envelope.valence  # type: ignore[assignment]
+            if envelope.valence in ("negative", "neutral", "positive")
+            else None
+        )
+
+        return to_generation_config(
+            Delivery(
+                pitch_lift=envelope.pitch_lift,
+                pitch_variation=envelope.pitch_variation,
+                energy_ratio=envelope.energy_ratio,
+                rate_ratio=envelope.rate_ratio,
+                arousal=arousal,
+            ),
+            valence,
+        )
+
     @staticmethod
-    def _cache_key(speaker_id: str, target_lang: str, text: str, voice_mode: str) -> str:
+    def _cache_key(
+        speaker_id: str,
+        target_lang: str,
+        text: str,
+        voice_mode: str,
+        generation_config: dict[str, float | str] | None = None,
+    ) -> str:
         normalized = " ".join(text.casefold().split())
-        digest = hashlib.sha256(
-            f"{speaker_id}|{target_lang}|{normalized}|{voice_mode}".encode()
-        ).hexdigest()
-        return f"tts:cache:{digest}"
+        material = f"{speaker_id}|{target_lang}|{normalized}|{voice_mode}"
+        if generation_config:
+            # Appended only when there ARE delivery controls, so a line with none hashes to
+            # exactly the key it hashed to before prosody existed and the warm cache survives
+            # the deploy. Sorted so two configs with the same content but a different insertion
+            # order share one entry instead of rendering twice.
+            material += "|" + json.dumps(generation_config, sort_keys=True, separators=(",", ":"))
+        return f"tts:cache:{hashlib.sha256(material.encode()).hexdigest()}"
 
     def _require_cartesia(self) -> CartesiaSynthesizer:
         if self.cartesia is None:
