@@ -320,6 +320,42 @@ def _detect_script_language(text: str) -> str | None:
     return None
 
 
+def _detect_unambiguous_language(text: str) -> str | None:
+    """The language the TEXT proves, or None when the text proves nothing.
+
+    Two signals, both of which this module already documents as unambiguous:
+    a non-Latin writing system, and the Vietnamese-unique character class.
+
+    WHY BOTH, IN ONE PLACE
+      `_detect_script_language` returns None for Latin script — it says so in its own
+      docstring — so it can never separate Vietnamese from English. The evidence that CAN
+      separate them lived only inside `_guess_language_from_text`, which by design runs
+      only when the speaker declared no language at all.
+
+      So for a speaker who declared one, the declaration was the last word even against
+      proof to the contrary. A participant whose profile said `en` and who spoke Vietnamese
+      for a whole meeting had every segment labelled `en`; the translator then ran en→vi
+      over text that was already Vietnamese, and the "translation" was nonsense.
+
+      A declaration is a statement of intent, and people get it wrong — this exact meeting
+      is the evidence. Absence of evidence is a reason to trust the declaration.
+      CONTRADICTION is not.
+
+    Returns None for ordinary Latin text, where a declaration remains the best information
+    available and must keep winning.
+    """
+    script_language = _detect_script_language(text)
+    if script_language:
+        return script_language
+
+    # The character class no other Latin-script language uses — see _VI_UNIQUE_CHAR_RE for
+    # why it is this narrow, and for the Spanish/French false positives that made it so.
+    if _VI_UNIQUE_CHAR_RE.search(text):
+        return "vi"
+
+    return None
+
+
 def _guess_language_from_text(text: str, allowed: set[str] | None = None) -> str:
     """gpt-realtime-whisper's completed event carries no language field (unlike
     the old REST Whisper response this replaced), so there is no real per-chunk
@@ -356,6 +392,12 @@ def _guess_language_from_text(text: str, allowed: set[str] | None = None) -> str
 # Even the fastest human speech in any language doesn't clear ~30 chars/sec, so this
 # pair (< 0.5s of real audio, yet > 20 chars of text) only fires on the classic
 # Whisper-family hallucination pattern: a full phrase invented over near-silence/noise.
+# How many CONSECUTIVE segments must contradict a speaker's declared language before the
+# session is re-pinned to what they are actually speaking. Two, not one: the evidence itself is
+# unambiguous, so this guards only against a stray mis-transcription, and every extra segment of
+# patience is another chunk decoded with the wrong language.
+_LANGUAGE_OVERRIDE_SEGMENTS = 2
+
 _MIN_SPEECH_SECONDS_FOR_LONG_TEXT = 0.5
 _MAX_CHARS_FOR_SHORT_AUDIO = 20
 
@@ -851,9 +893,27 @@ def _filter_segments(
         # profile says. It is used when present and the declared language is kept
         # otherwise, so Latin-script speech — where script proves nothing — behaves
         # exactly as before.
+        # Evidence, then the declaration, then a guess.
+        #
+        # This used to read `_detect_script_language(text) or lang_code or ...`, which looks
+        # like the same order but is not: _detect_script_language is blind to Latin script, so
+        # for a vi/en room the first term was ALWAYS None and the declaration always won.
+        # _detect_unambiguous_language adds the Vietnamese-unique evidence that was previously
+        # locked inside the no-declaration fallback path.
         seg_lang = (
-            _detect_script_language(text) or lang_code or _guess_language_from_text(text, allowed)
+            _detect_unambiguous_language(text)
+            or lang_code
+            or _guess_language_from_text(text, allowed)
         )
+        if lang_code and seg_lang != lang_code:
+            # Worth a line in the log: the speaker's profile and their actual speech disagree,
+            # which is a setup mistake they cannot see and which degrades their transcription
+            # badly — STT is pinned to the declared language on the session.
+            logger.info(
+                "stt_declared_language_contradicted",
+                speaker_declared=lang_code,
+                text_evidence=seg_lang,
+            )
         language_floor = (min_avg_logprob_by_language or {}).get(
             base_language(seg_lang),
             min_avg_logprob,
@@ -1024,6 +1084,20 @@ class OpenAISTT:
         self._client: AsyncOpenAI | None = None
         # (meeting_id, speaker_id) -> {"manager": ..., "conn": ..., "last_used": float}
         self._sessions: dict[tuple[str, str], dict[str, Any]] = {}
+        # WHAT THIS SPEAKER IS ACTUALLY SPEAKING, when it contradicts what they declared.
+        #
+        # STT is pinned to the declared language on the session, so a participant who picks
+        # the wrong one in their profile gets a whole meeting of mistranscription and no sign
+        # of why: the audio is Vietnamese, the decoder is told to expect English, and the words
+        # come back fluent-looking and wrong. It is a setup mistake, invisible to the person
+        # making it, and it cannot be fixed by anything downstream — once the decoder has
+        # mis-heard a word, the word is gone.
+        #
+        # So the evidence is allowed to correct the declaration, after it has been consistent.
+        # `_language_evidence` counts consecutive contradicting segments; `_language_override`
+        # is what actually replaces the pinned language once the count is met.
+        self._language_evidence: dict[tuple[str, str], tuple[str, int]] = {}
+        self._language_override: dict[tuple[str, str], str] = {}
         self._warm_sessions: deque[dict[str, Any]] = deque()
         # How many warm sockets to keep ready. Set by warm_up() and used by
         # _schedule_warm_refill to replace every socket a speaker claims.
@@ -1194,6 +1268,25 @@ class OpenAISTT:
             return []
 
         lang_arg = language if language and language != "auto" else None
+
+        # An override earned from this speaker's own speech outranks their profile. It is only
+        # ever set after several consecutive segments carried unambiguous evidence of another
+        # language (see _learn_language_evidence), and it re-pins the realtime session through
+        # the ordinary language-change path in _get_or_create_session.
+        # getattr, not attribute access: instances built without __init__ are a supported
+        # shape here — see the same guard on _warm_sessions — and this must not be the thing
+        # that decides whether transcription runs at all.
+        learned = getattr(self, "_language_override", {}).get((meeting_id, speaker_id))
+        if learned and learned != lang_arg:
+            logger.info(
+                "stt_language_override_applied",
+                meeting_id=meeting_id,
+                speaker_id=speaker_id,
+                declared=lang_arg,
+                speaking=learned,
+            )
+            lang_arg = learned
+
         detected_language = lang_arg or "unknown"
 
         async def _emit_early(sentence_text: str) -> None:
@@ -1322,7 +1415,7 @@ class OpenAISTT:
         # audio actually backing this specific text, making the check in _filter_segments
         # more lenient than perfectly accurate. That's the safe direction: it only ever
         # risks missing a hallucination, never dropping real trailing speech.
-        return _filter_segments(
+        segments = _filter_segments(
             segments_dicts,
             detected_language,
             chunk_offset_ms,
@@ -1332,6 +1425,65 @@ class OpenAISTT:
             keywords=keywords,
             min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
         )
+        # Learned from the COMPLETED path only. Early and speculative segments are provisional
+        # by construction, and re-pinning a session on a guess that a later completed event
+        # withdraws would be worse than the mislabelling this exists to fix.
+        self._learn_language_evidence((meeting_id, speaker_id), lang_arg, segments)
+        return segments
+
+    def _learn_language_evidence(
+        self,
+        key: tuple[str, str],
+        declared: str | None,
+        segments: list[TranscribedSegment],
+    ) -> None:
+        """Let a speaker's actual speech correct the language they declared.
+
+        Only unambiguous evidence counts — a non-Latin writing system, or the Vietnamese-unique
+        character class — so ordinary Latin text never moves this. `_filter_segments` has
+        already resolved each segment's language through `_detect_unambiguous_language`, so a
+        label that differs from `declared` IS that evidence.
+
+        CONSECUTIVE, not cumulative. One contradicting segment in an otherwise consistent
+        meeting is far more likely to be a stray mis-transcription than a person switching
+        language mid-sentence, and re-pinning the session on it would trade a rare wrong label
+        for a whole chunk of wrong audio. Any segment that agrees with the declaration resets
+        the count to zero.
+        """
+        if not declared or not segments:
+            return
+
+        # Lazily created for the same reason transcribe() reads them with getattr: an instance
+        # may exist without __init__ having run.
+        if getattr(self, "_language_evidence", None) is None:
+            self._language_evidence = {}
+        if getattr(self, "_language_override", None) is None:
+            self._language_override = {}
+
+        if key in self._language_override:
+            return
+
+        for segment in segments:
+            if segment.language == declared:
+                self._language_evidence.pop(key, None)
+                continue
+
+            previous_language, count = self._language_evidence.get(key, (segment.language, 0))
+            count = count + 1 if previous_language == segment.language else 1
+            self._language_evidence[key] = (segment.language, count)
+
+            if count >= _LANGUAGE_OVERRIDE_SEGMENTS:
+                self._language_override[key] = segment.language
+                self._language_evidence.pop(key, None)
+                logger.warning(
+                    "stt_language_override_learned",
+                    meeting_id=key[0],
+                    speaker_id=key[1],
+                    declared=declared,
+                    speaking=segment.language,
+                    after_segments=count,
+                )
+                return
 
     async def _transcribe_via_session(
         self,
