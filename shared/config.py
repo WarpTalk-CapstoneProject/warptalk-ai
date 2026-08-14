@@ -313,6 +313,20 @@ class TTSSettings(BaseSettings):
     # in production, but it has still never been listened to, and turning it off must not
     # require a rebuild.
     prosody_continuity: bool = True
+    # WT-397. Push each Cartesia chunk onto the LiveKit track as it arrives instead of holding
+    # the whole sentence — the wait this removes is most of the `tts_synthesis` stage measured
+    # at p50 1.00s on 43 production segments.
+    #
+    # ON from the start, unlike prosody_continuity, because the two are not comparable risks.
+    # That one was an unexercised WebSocket protocol; this one is buffering arithmetic behind a
+    # Protocol seam, and every branch of it — clean stream, context lost mid-sentence, context
+    # lost before the first chunk — is covered by tests that run in CI.
+    #
+    # What CI still cannot answer is whether a real AudioSource stays fed when audio is handed
+    # over in small pieces rather than one buffer. Cartesia generates well ahead of real time,
+    # so it should; TTS_STREAM_TO_LIVEKIT=false is here so that being wrong costs an env var
+    # and a restart rather than a release.
+    stream_to_livekit: bool = True
     voice_clone_max_upgrades: int = 1
     # How much better a later clip must score before it is worth replacing a working clone. Small
     # gains are noise in the estimator, and re-cloning for them would change the voice people are

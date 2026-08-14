@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from shared.logger import get_logger
@@ -112,12 +113,19 @@ class ProsodyContext:
         self,
         text: str,
         generation_config: dict[str, float | str] | None = None,
+        on_pcm: Callable[[bytes], Awaitable[None]] | None = None,
     ) -> tuple[bytes, int]:
         """Add one sentence to this turn and return its audio as (wav_bytes, duration_ms).
 
         `continue_=True` on every push: this sentence is never the last word of the turn as far
         as the model is concerned, which is what stops it from applying a final-sentence cadence
         to a clause that has more coming. The turn is ended by `aclose`, not by a push.
+
+        `on_pcm` (WT-397) receives each raw chunk as it lands, so the listener can start hearing
+        the sentence before it has finished generating. THE RETURN VALUE IS UNCHANGED — the
+        chunks are still accumulated and still returned whole, because the TTS cache, billing
+        (tts:results) and the transcript row all read that buffer and none of them can work from
+        a stream. `on_pcm` is a tee, not a handover.
         """
         if self._closed:
             raise RuntimeError("ProsodyContext is closed")
@@ -136,7 +144,7 @@ class ProsodyContext:
 
         try:
             async with asyncio.timeout(SENTENCE_TIMEOUT_SECONDS):
-                return await self._collect(expected_flush)
+                return await self._collect(expected_flush, on_pcm)
         except TimeoutError:
             # Deliberately raised, not returned as empty audio: the caller's fallback is what
             # turns this into a spoken sentence, and it only runs on an exception. The context
@@ -147,7 +155,11 @@ class ProsodyContext:
                 f"Cartesia context produced no flush_done within {SENTENCE_TIMEOUT_SECONDS}s"
             ) from None
 
-    async def _collect(self, expected_flush: int) -> tuple[bytes, int]:
+    async def _collect(
+        self,
+        expected_flush: int,
+        on_pcm: Callable[[bytes], Awaitable[None]] | None = None,
+    ) -> tuple[bytes, int]:
         pcm = bytearray()
         async for event in self._transport.receive():
             kind = getattr(event, "type", None)
@@ -164,6 +176,13 @@ class ProsodyContext:
                 audio = getattr(event, "audio", None)
                 if audio:
                     pcm.extend(audio)
+                    if on_pcm is not None:
+                        # Deliberately not guarded: the sink is TrackStream.feed, which only
+                        # enqueues and is documented never to raise. Swallowing an exception
+                        # here would let a broken sink return a complete buffer that the
+                        # caller then believes was already spoken — silence the caller cannot
+                        # detect. Failing loudly drops to the one-shot fallback instead.
+                        await on_pcm(bytes(audio))
                 continue
 
             if kind == "flush_done" and getattr(event, "flush_id", None) == expected_flush:
