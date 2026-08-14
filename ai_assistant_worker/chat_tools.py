@@ -236,7 +236,16 @@ async def _list_recent_meetings(ctx: ToolContext, arguments: dict[str, Any]) -> 
         )
         if response.status_code != 200:
             logger.warning("list_recent_meetings_failed", status=response.status_code)
-            return json.dumps({"error": "Could not look up recent meetings right now."})
+            # The status travels with the message. It used to be logged and dropped, so the
+            # answer a user could screenshot said only "could not look up recent meetings" —
+            # which is why WT-373's report could not say whether this was auth, routing or an
+            # outage, and the logs that knew had already been rotated away by a deploy.
+            return json.dumps(
+                {
+                    "error": "Could not look up recent meetings right now.",
+                    "status": response.status_code,
+                }
+            )
 
         rooms = response.json().get("rooms", [])
         return json.dumps(
@@ -252,9 +261,14 @@ async def _list_recent_meetings(ctx: ToolContext, arguments: dict[str, Any]) -> 
                 for r in rooms
             ]
         )
-    except Exception:
+    except Exception as error:
         logger.exception("list_recent_meetings_error")
-        return json.dumps({"error": "Could not look up recent meetings right now."})
+        return json.dumps(
+            {
+                "error": "Could not look up recent meetings right now.",
+                "reason": type(error).__name__,
+            }
+        )
 
 
 async def _translate_text(ctx: ToolContext, arguments: dict[str, Any]) -> str:
@@ -334,6 +348,91 @@ async def _run_embedding_search(
     except Exception:
         logger.exception("semantic_search_collection_error", extra={"collection_id": collection_id})
         return []
+
+
+# The closed set the extractor writes — knowledge_facts.py FACT_CATEGORIES, mirrored by the web
+# client's FACT_CATEGORIES. Closed on purpose: an open set produces a different label per chunk.
+FACT_CATEGORIES = ("decision", "requirement", "definition", "commitment", "risk", "reference")
+
+
+async def _search_facts(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """The workspace's extracted knowledge facts, filtered and listed rather than embedded.
+
+    `semantic_search` reaches the same facts through the vector index, and is the right tool for
+    "what do we know about X". This one answers the question that index is bad at: "what was
+    DECIDED", where the category is the query and completeness matters more than similarity. A
+    vector search for "decision" returns whatever is nearest in embedding space; this returns the
+    rows actually tagged as decisions, which is what the Knowledge page shows a human.
+    """
+    arguments = arguments or {}
+    category = (arguments.get("fact_category") or "").strip().lower()
+    query = (arguments.get("query") or "").strip().lower()
+
+    if category and category not in FACT_CATEGORIES:
+        return json.dumps(
+            {"error": f"Unknown fact_category '{category}'.", "allowed": list(FACT_CATEGORIES)}
+        )
+
+    params: dict[str, Any] = {"pageSize": 100}
+    if category:
+        params["factCategory"] = category
+
+    try:
+        response = await ctx.workspace_client.get(
+            f"/api/v1/workspaces/{ctx.workspace_id}/knowledge",
+            params=params,
+            headers=_auth_headers(ctx),
+        )
+        if response.status_code != 200:
+            logger.warning("search_facts_failed", status=response.status_code)
+            return json.dumps(
+                {
+                    "error": "Could not read the knowledge base right now.",
+                    "status": response.status_code,
+                }
+            )
+
+        items = response.json().get("items", []) or []
+    except Exception as error:
+        logger.exception("search_facts_error")
+        return json.dumps(
+            {
+                "error": "Could not read the knowledge base right now.",
+                "reason": type(error).__name__,
+            }
+        )
+
+    matches = []
+    for item in items:
+        fact = item.get("fact")
+        # A row with no extracted fact is an indexed chunk, not knowledge. Listing those would
+        # bury six real decisions under a hundred transcript fragments.
+        if not fact:
+            continue
+        if query and query not in f"{fact} {item.get('sourceTitle') or ''}".lower():
+            continue
+        matches.append(
+            {
+                "fact": fact,
+                "category": item.get("factCategory"),
+                "source": item.get("sourceTitle") or item.get("documentName"),
+                "source_type": item.get("sourceType"),
+            }
+        )
+        if len(matches) >= 25:
+            break
+
+    if not matches:
+        return json.dumps(
+            {
+                "facts": [],
+                "note": (
+                    "No facts recorded for that filter. Facts are extracted after a meeting ends "
+                    "or a document finishes indexing, so a very recent meeting may have none yet."
+                ),
+            }
+        )
+    return json.dumps({"facts": matches})
 
 
 async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
@@ -1043,12 +1142,43 @@ TOOLS: list[ChatTool] = [
         handler=_translate_text,
     ),
     ChatTool(
+        name="search_facts",
+        description=(
+            "List the knowledge facts recorded for this workspace — decisions, requirements, "
+            "definitions, commitments, risks and references extracted from meetings and "
+            "documents. Prefer this over semantic_search when the question names a category "
+            '("what was decided", "what did we commit to", "what risks were raised"), '
+            "because it returns everything tagged that way rather than whatever is nearest in "
+            "embedding space."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "fact_category": {
+                    "type": "string",
+                    "enum": list(FACT_CATEGORIES),
+                    "description": "Restrict to one category. Omit for all of them.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Optional keyword to narrow by, matched against the fact "
+                        "and its source title."
+                    ),
+                },
+            },
+            "required": [],
+        },
+        handler=_search_facts,
+    ),
+    ChatTool(
         name="semantic_search",
         description=(
-            "Semantically search the workspace's indexed knowledge base (documents, "
-            "transcripts, glossaries) for content related to a query. Use this for "
-            "conceptual questions that a simple keyword search wouldn't answer well. "
-            "May return no matches if nothing relevant has been indexed yet."
+            "Semantically search everything indexed for this workspace: documents, meeting "
+            "transcripts, glossaries, AND the knowledge facts extracted from meetings — "
+            "decisions, requirements, definitions, commitments, risks and references. Use this "
+            "for conceptual questions, and whenever asked what was decided, agreed, required or "
+            "flagged. May return no matches if nothing relevant has been indexed yet."
         ),
         parameters={
             "type": "object",
