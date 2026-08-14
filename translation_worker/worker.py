@@ -20,10 +20,38 @@ from typing import Any, cast
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
 from shared.lang import is_same_language
-from shared.schemas import STTResultMessage, TranslationResultMessage, optional_confidence
+from shared.schemas import (
+    ProsodyEnvelope,
+    STTResultMessage,
+    TranslationResultMessage,
+    optional_confidence,
+)
 from shared.text_utils import split_into_sentences
 from translation_worker.transcript_guardian import choose_transcript
 from translation_worker.translator import OUT_OF_MEETING_SCOPE, OpenAITranslator
+from translation_worker.valence import Valence
+
+# What a translation task yields: the text, and the sentiment of what was said — or None when
+# the model said nothing trustworthy about it. Carried together so a speculative hit keeps its
+# valence instead of silently losing it, which is how a wired feature becomes an unwired one.
+_Translated = tuple[str, "Valence | None"]
+
+
+def _with_valence(
+    envelope: ProsodyEnvelope | None, valence: Valence | None
+) -> ProsodyEnvelope | None:
+    """The measured delivery, plus the sentiment of what was said.
+
+    Returns the envelope UNCHANGED when there is no valence — including when there is no
+    envelope at all. An absent envelope means the STT worker could not honestly measure this
+    speaker yet, and inventing one here just to carry a sentiment would tell the TTS worker that
+    a delivery was measured when none was: every ratio would be a default 1.0 presented as a
+    reading. Valence rides along with a measurement; it does not manufacture one.
+    """
+    if envelope is None or valence is None:
+        return envelope
+    return envelope.model_copy(update={"valence": valence})
+
 
 _CONTEXT_STOPWORDS = {
     "and",
@@ -127,7 +155,7 @@ class TranslationWorker(BaseWorker):
         self._recent_source_contexts: dict[str, deque[str]] = {}
         self._speculative_translations: dict[
             tuple[str, str, str, str],
-            tuple[asyncio.Task[str], float],
+            tuple[asyncio.Task[_Translated], float],
         ] = {}
         self._speculative_semaphore = asyncio.Semaphore(1)
         self._speculative_listener_task: asyncio.Task[None] | None = None
@@ -214,7 +242,7 @@ class TranslationWorker(BaseWorker):
             cache = {}
             self._speculative_translations = cache
 
-        tasks: list[asyncio.Task[str]] = []
+        tasks: list[asyncio.Task[_Translated]] = []
         now = time.monotonic()
         semaphore = getattr(self, "_speculative_semaphore", None)
         if semaphore is None:
@@ -243,11 +271,11 @@ class TranslationWorker(BaseWorker):
                 async def run_speculative(
                     sentence_text: str = sentence,
                     language_target: str = target_lang,
-                ) -> str:
+                ) -> _Translated:
                     async with semaphore:
                         try:
                             async with asyncio.timeout(self._SPECULATIVE_TIMEOUT_SECONDS):
-                                return await translator.translate(
+                                return await translator.translate_with_valence(
                                     sentence_text,
                                     source_lang=source_lang,
                                     target_lang=language_target,
@@ -262,7 +290,9 @@ class TranslationWorker(BaseWorker):
                                 "speculative_translation_abandoned",
                                 meeting_id=meeting_id,
                             )
-                            return ""
+                            # Empty text is the caller's signal to translate for real; the
+                            # valence beside it is None because nothing was read.
+                            return "", None
 
                 task = asyncio.create_task(run_speculative())
                 cache[key] = (task, now)
@@ -284,11 +314,11 @@ class TranslationWorker(BaseWorker):
         speaker_id: str,
         target_lang: str,
         text: str,
-    ) -> asyncio.Task[str] | None:
+    ) -> asyncio.Task[_Translated] | None:
         cache = cast(
             dict[
                 tuple[str, str, str, str],
-                tuple[asyncio.Task[str], float],
+                tuple[asyncio.Task[_Translated], float],
             ],
             getattr(self, "_speculative_translations", {}),
         )
@@ -461,7 +491,7 @@ class TranslationWorker(BaseWorker):
         # worker translated Vietnamese into Vietnamese, paying for a model call to produce
         # a sentence it already had.
         passthrough = is_same_language(stt_result.language, target_lang)
-        first_task: asyncio.Task[str] | None = None
+        first_task: asyncio.Task[_Translated] | None = None
         rest_task: asyncio.Task[list[str]] | None = None
         rest_results: list[str] | None = None
         speculative_hit = False
@@ -478,7 +508,7 @@ class TranslationWorker(BaseWorker):
             speculative_hit = first_task is not None
             if first_task is None:
                 first_task = asyncio.create_task(
-                    translator.translate(
+                    translator.translate_with_valence(
                         sentences[0],
                         source_lang=stt_result.language,
                         target_lang=target_lang,
@@ -532,14 +562,15 @@ class TranslationWorker(BaseWorker):
                     polished = sentence
 
                 translated_text = choose_transcript(sentence, polished, stt_result.language)
+                valence = None
             elif idx == 0:
                 assert first_task is not None
                 try:
-                    translated_text = await first_task
+                    translated_text, valence = await first_task
                 except Exception:
-                    translated_text = ""
+                    translated_text, valence = "", None
                 if not translated_text:
-                    translated_text = await translator.translate(
+                    translated_text, valence = await translator.translate_with_valence(
                         sentence,
                         source_lang=stt_result.language,
                         target_lang=target_lang,
@@ -551,6 +582,11 @@ class TranslationWorker(BaseWorker):
                     assert rest_task is not None
                     rest_results = await rest_task
                 translated_text = rest_results[idx - 1]
+                # translate_batch does not ask for a marker: its reply is a numbered list, and a
+                # per-line marker would be one more thing for the line parser to get wrong. The
+                # sentences after the first therefore carry no valence, which the pipeline reads
+                # as NOT DETERMINED — the same as before this existed.
+                valence = None
 
             if translated_text.strip().upper() == OUT_OF_MEETING_SCOPE:
                 self.logger.info(
@@ -584,9 +620,12 @@ class TranslationWorker(BaseWorker):
                 translator_model=translator.model,
                 source_segment_id=stt_result.segment_id,
                 chunk_index=stt_result.chunk_index,
-                # Carried, not derived. What the speaker's delivery was is settled upstream at
-                # the audio; translating the words does not change how they were said.
-                prosody=stt_result.prosody,
+                # Delivery is carried, not derived: how the speaker sounded is settled upstream
+                # at the audio, and translating the words does not change it. VALENCE is the one
+                # part that cannot come from the audio — anger and delight look alike on pitch
+                # and energy — so it is folded in here, from the model that actually read the
+                # sentence. See translation_worker/valence.py.
+                prosody=_with_valence(stt_result.prosody, valence),
             )
 
             # Publish IMMEDIATELY so TTS can synthesize while next chunk is translated
