@@ -7,8 +7,11 @@ that matters most in a live meeting — that every failure still produces audio.
 
 from __future__ import annotations
 
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -24,12 +27,25 @@ class _FakeTurn:
         self.closed = False
         self.abandoned = False
         self.fail = False
+        self.fail_after_streaming = False
 
-    async def speak(self, text: str, generation_config: Any = None) -> tuple[bytes, int]:
+    async def speak(
+        self,
+        text: str,
+        generation_config: Any = None,
+        on_pcm: Any = None,
+    ) -> tuple[bytes, int]:
         if self.fail:
             raise RuntimeError("socket died")
         self.spoken.append((text, generation_config))
-        return b"\x00" * 44 + b"\x01\x02" * 100, 12
+        pcm = b"\x01\x02" * 100
+        if on_pcm is not None:
+            await on_pcm(pcm)
+        if self.fail_after_streaming:
+            # The socket dies with part of the sentence already on the track — the one case
+            # the fallback cannot simply be played into.
+            raise RuntimeError("socket died mid-sentence")
+        return b"\x00" * 44 + pcm, 12
 
     async def aclose(self) -> None:
         self.closed = True
@@ -71,13 +87,60 @@ class _FakeSynthesizer:
         return turn, connection
 
 
-def _worker(*, continuity: bool) -> tuple[TTSWorker, _FakeSynthesizer]:
+class _FakeTrack:
+    """Stands in for TrackStream — records what was streamed, and how much was heard."""
+
+    def __init__(self, deaf: bool = False) -> None:
+        self.fed: list[bytes] = []
+        self.closed = False
+        self.first_audio_at: float | None = None
+        self._deaf = deaf
+
+    async def feed(self, pcm: bytes) -> None:
+        self.fed.append(pcm)
+        if not self._deaf and self.first_audio_at is None:
+            self.first_audio_at = time.monotonic()
+
+    @property
+    def spoken_bytes(self) -> int:
+        if not self.closed:
+            # The real pump is still draining when speak() returns, so a count taken before
+            # close() undercounts — modelled here so a caller that asks too early fails.
+            return 0
+        return 0 if self._deaf else sum(len(c) for c in self.fed)
+
+
+class _FakePublisher:
+    """Only the streaming seam — the rest of LiveKitTTSPublisher is covered elsewhere."""
+
+    def __init__(self, deaf: bool = False) -> None:
+        self.tracks: list[_FakeTrack] = []
+        self.published: list[bytes] = []
+        self._deaf = deaf
+
+    @asynccontextmanager
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[_FakeTrack]:
+        track = _FakeTrack(deaf=self._deaf)
+        self.tracks.append(track)
+        try:
+            yield track
+        finally:
+            track.closed = True
+
+    async def publish_pcm(self, *args: Any, **kwargs: Any) -> None:
+        self.published.append(args[3])
+
+
+def _worker(
+    *, continuity: bool, publisher: _FakePublisher | None = None
+) -> tuple[TTSWorker, _FakeSynthesizer]:
     worker = TTSWorker.__new__(TTSWorker)
     worker.settings = WorkerSettings()
     worker.tts_settings = TTSSettings(prosody_continuity=continuity)
     worker.logger = MagicMock()
     worker._turns = {}
     worker._turn_connections = {}
+    worker.livekit_publisher = publisher  # type: ignore[assignment]
     synthesizer = _FakeSynthesizer()
     worker.cartesia = synthesizer  # type: ignore[assignment]
     return worker, synthesizer
@@ -173,11 +236,14 @@ async def test_a_broken_context_still_produces_audio() -> None:
     await _say(worker, _msg("Câu một.", chunk=0))
     synth.turns[0].fail = True
 
-    audio, _duration, _voice = await _say(worker, _msg("Câu hai.", chunk=1))
+    sentence = await _say(worker, _msg("Câu hai.", chunk=1))
 
     assert synth.one_shot_calls == ["Câu hai."]
-    assert len(audio) > 44
+    assert len(sentence.audio) > 44
     assert worker._turns == {}, "the failed turn was kept and would fail again"
+    assert sentence.already_spoken is False, (
+        "nothing was streamed, so the fallback must still be played"
+    )
 
 
 @pytest.mark.asyncio
@@ -207,6 +273,148 @@ async def test_ending_a_room_abandons_its_turns_without_waiting() -> None:
     worker._cleanup_room("m1")
 
     assert worker._turns == {}
+
+
+# ── WT-397: who has already heard what ──────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_sentence_is_reported_as_already_spoken() -> None:
+    """The caller publishes what synthesis returns. Once the sentence has gone out chunk by
+    chunk, publishing it again would speak the whole line a second time."""
+    publisher = _FakePublisher()
+    worker, synth = _worker(continuity=True, publisher=publisher)
+
+    sentence = await _say(worker, _msg("Câu một."))
+
+    assert publisher.tracks[0].fed == [b"\x01\x02" * 100], "nothing reached the track"
+    assert publisher.tracks[0].closed is True, "the track was left open past the sentence"
+    assert sentence.already_spoken is True
+    assert synth.one_shot_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_context_that_dies_mid_sentence_does_not_speak_the_opening_twice() -> None:
+    """The trap this feature turns on.
+
+    The fallback re-synthesizes the WHOLE sentence. If part of it is already on the track,
+    playing the fallback repeats the opening words — a dub that stutters reads as the system
+    being broken, which is worse than the truncation it would be repairing. The bytes are still
+    returned in full, because billing and the transcript read them and neither is audible.
+    """
+    publisher = _FakePublisher()
+    worker, synth = _worker(continuity=True, publisher=publisher)
+    await _say(worker, _msg("Câu một.", chunk=0))
+    synth.turns[0].fail_after_streaming = True
+
+    sentence = await _say(worker, _msg("Câu hai.", chunk=1))
+
+    assert sentence.already_spoken is True, (
+        "the fallback would be played on top of a half-spoken line"
+    )
+    assert synth.one_shot_calls == ["Câu hai."], "the sentence was not re-synthesized at all"
+    assert len(sentence.audio) > 44, "the transcript and billing were handed an empty sentence"
+
+
+@pytest.mark.asyncio
+async def test_a_context_that_dies_before_the_first_chunk_still_gets_its_fallback() -> None:
+    # Nothing was heard, so there is nothing to collide with — the proven one-shot path must
+    # still reach the room, or a dead socket becomes silence.
+    publisher = _FakePublisher()
+    worker, synth = _worker(continuity=True, publisher=publisher)
+    await _say(worker, _msg("Câu một.", chunk=0))
+    synth.turns[0].fail = True
+
+    sentence = await _say(worker, _msg("Câu hai.", chunk=1))
+
+    assert sentence.already_spoken is False
+    assert synth.one_shot_calls == ["Câu hai."]
+
+
+@pytest.mark.asyncio
+async def test_a_track_that_swallowed_everything_is_not_counted_as_spoken() -> None:
+    """`spoken_bytes`, not "we called feed".
+
+    A track that never connected accepts every chunk and plays none of them. Treating the
+    attempt as success would suppress the fallback and leave the room silent.
+    """
+    publisher = _FakePublisher(deaf=True)
+    worker, synth = _worker(continuity=True, publisher=publisher)
+    synth_turn_msg = _msg("Câu một.", chunk=0)
+    await _say(worker, synth_turn_msg)
+    synth.turns[0].fail_after_streaming = True
+
+    sentence = await _say(worker, _msg("Câu hai.", chunk=1))
+
+    assert sentence.already_spoken is False, "a silent track was reported as having spoken"
+
+
+@pytest.mark.asyncio
+async def test_the_kill_switch_stops_streaming_without_stopping_the_dub() -> None:
+    # TTS_STREAM_TO_LIVEKIT=false must leave the pre-WT-397 behaviour exactly in place: the
+    # sentence is still synthesized through the shared context, and the caller still publishes.
+    assert TTSSettings().stream_to_livekit is True, "streaming ships on"
+
+    publisher = _FakePublisher()
+    worker, synth = _worker(continuity=True, publisher=publisher)
+    worker.tts_settings = TTSSettings(prosody_continuity=True, stream_to_livekit=False)
+
+    sentence = await _say(worker, _msg("Câu một."))
+
+    assert publisher.tracks == [], "the track was opened with streaming switched off"
+    assert sentence.already_spoken is False
+    assert synth.one_shot_calls == [], "the kill switch also disabled prosody continuity"
+
+
+@pytest.mark.asyncio
+async def test_billing_and_the_transcript_still_see_a_streamed_sentence() -> None:
+    """tts:results drives billing_worker and TranscriptRedisConsumerService. Suppressing the
+    LiveKit push must not suppress that message, or a streamed sentence would be free and
+    would never appear in the transcript."""
+    publisher = _FakePublisher()
+    worker, _synth = _worker(continuity=True, publisher=publisher)
+    worker.redis = AsyncMock()
+    worker.redis.get = AsyncMock(return_value=None)
+    worker.publish = AsyncMock()
+    worker._publish_livekit_only = AsyncMock()
+    worker._dub_fits = {}
+    worker._turn_dub_ms = {}
+
+    await worker._synthesize_and_publish(
+        _msg("Câu một.", final=True), "Câu một.", "v1", "default", ""
+    )
+
+    assert worker.publish.await_count == 1
+    assert worker.publish.await_args.args[0] == "tts:results"
+    worker._publish_livekit_only.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_number_this_feature_moves_is_actually_recorded() -> None:
+    """Without `tts_first_audio` there is no evidence WT-397 did anything.
+
+    `tts_synthesis` covers the whole call and now includes handing the audio to the track,
+    which back-pressures to real time — so it RISES with streaming on. Shipping only that
+    would make the dashboard read as a regression while listeners waited less. This is the
+    number that answers the complaint, and metrics_exporter picks up any stage key by glob, so
+    recording it here is all the wiring there is.
+    """
+    publisher = _FakePublisher()
+    worker, _synth = _worker(continuity=True, publisher=publisher)
+    worker.redis = AsyncMock()
+    worker.redis.get = AsyncMock(return_value=None)
+    worker.publish = AsyncMock()
+    worker._publish_livekit_only = AsyncMock()
+    worker._dub_fits = {}
+    worker._turn_dub_ms = {}
+
+    await worker._synthesize_and_publish(
+        _msg("Câu một.", final=True), "Câu một.", "v1", "default", ""
+    )
+
+    stages = [call.args[0] for call in worker.redis.record_latency.await_args_list]
+    assert "tts_first_audio" in stages, "the only measure of this feature was never recorded"
+    assert "tts_synthesis" in stages, "the existing stage measurement was dropped"
 
 
 # ── Isochrony wiring ────────────────────────────────────────────────────────────────────────

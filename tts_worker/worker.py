@@ -19,6 +19,7 @@ import hashlib
 import json
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, cast
 
 from shared import isochrony
@@ -28,7 +29,7 @@ from shared.lang import is_same_language
 from shared.prosody import Arousal, Delivery, Valence, to_generation_config
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
 from tts_worker.clone_sample_quality import assess_clone_sample
-from tts_worker.livekit_publisher import LiveKitTTSPublisher
+from tts_worker.livekit_publisher import LiveKitTTSPublisher, TrackStream
 from tts_worker.prosody_context import ProsodyContext
 from tts_worker.synthesizer import CartesiaSynthesizer
 
@@ -97,6 +98,32 @@ def _decode_field(data: Mapping[Any, Any], key: str) -> str:
     if raw is None:
         return ""
     return raw.decode() if isinstance(raw, bytes) else raw
+
+
+@dataclass(slots=True)
+class SynthesizedSentence:
+    """What one sentence of synthesis produced, and what has already been done with it.
+
+    This was a bare `(bytes, duration_ms, voice_id)` tuple until WT-397 made synthesis able to
+    publish. Two of the fields below only mean anything because of that:
+
+    `already_spoken` — the listener has ALREADY heard this audio; it went onto the LiveKit
+        track chunk by chunk as Cartesia produced it. The caller must not publish it again. The
+        bytes are still complete, because the cache, billing (tts:results) and the transcript
+        all read them and none of them is audible.
+
+    `first_audio_at` — `time.monotonic()` at the moment the first frame reached the track.
+        THE NUMBER THIS FEATURE MOVES. `tts_synthesis` covers the whole call and now includes
+        handing the audio over, which takes about as long as the sentence lasts — so it RISES
+        with streaming on while the listener waits far less. Anyone reading the dashboard needs
+        `tts_first_audio` next to it or v91 looks like a regression.
+    """
+
+    audio: bytes
+    duration_ms: int
+    voice_id: str
+    already_spoken: bool = False
+    first_audio_at: float | None = None
 
 
 def _extract_tts_key(
@@ -236,7 +263,7 @@ class TTSWorker(BaseWorker):
         voice_id: str | None,
         voice_key: str,
         generation_config: dict[str, float | str] | None,
-    ) -> tuple[bytes, int, str]:
+    ) -> SynthesizedSentence:
         """One sentence of a turn, spoken in prosodic continuity with the ones before it.
 
         WT-371 follow-up / Level 4. A spoken turn is routinely split into several sentences
@@ -248,6 +275,8 @@ class TTSWorker(BaseWorker):
         Falls back to the proven one-shot path on ANY failure, and when the feature is off. That
         is not defensive padding: this WebSocket path has never run against the real API from
         this codebase, and a dub that fails is silence in a live meeting.
+
+        See SynthesizedSentence for what comes back and why it is no longer just the audio.
         """
         synthesizer = self._require_cartesia()
         resolved_voice_id = voice_id or CartesiaSynthesizer._default_voice_id(
@@ -255,12 +284,13 @@ class TTSWorker(BaseWorker):
         )
 
         if not self.tts_settings.prosody_continuity:
-            return await synthesizer.synthesize(
+            audio_bytes, duration_ms, one_shot_voice_id = await synthesizer.synthesize(
                 text=text,
                 language=translation.target_lang,
                 voice_id=voice_id,
                 generation_config=generation_config,
             )
+            return SynthesizedSentence(audio_bytes, duration_ms, one_shot_voice_id)
 
         # Keyed by voice as well as by speaker and language: a clone upgrade replaces the voice
         # mid-meeting (voice_clone_max_upgrades), and continuing a turn into a different voice
@@ -273,6 +303,7 @@ class TTSWorker(BaseWorker):
             resolved_voice_id,
         )
 
+        track: TrackStream | None = None
         try:
             turn = self._turns.get(key)
             if turn is None:
@@ -284,20 +315,77 @@ class TTSWorker(BaseWorker):
                 self._turns[key] = turn
                 self._turn_connections[key] = connection
 
-            audio_bytes, duration_ms = await turn.speak(text, generation_config)
-            return audio_bytes, duration_ms, resolved_voice_id
+            # getattr, because some tests build workers with __new__ and never run __init__ —
+            # the same guard the rest of this codebase uses for that pattern.
+            publisher = getattr(self, "livekit_publisher", None)
+            if publisher is None or not self.tts_settings.stream_to_livekit:
+                audio_bytes, duration_ms = await turn.speak(text, generation_config)
+                return SynthesizedSentence(audio_bytes, duration_ms, resolved_voice_id)
+
+            async with publisher.stream(
+                translation.meeting_id,
+                translation.speaker_id,
+                translation.target_lang,
+                self.tts_settings.sample_rate,
+                voice_key=voice_key,
+            ) as track:
+                audio_bytes, duration_ms = await turn.speak(
+                    text, generation_config, on_pcm=track.feed
+                )
+            # Read AFTER the stream closed: the pump is still draining while speak() returns,
+            # so asking inside the block would undercount what the listener actually heard.
+            return SynthesizedSentence(
+                audio_bytes,
+                duration_ms,
+                resolved_voice_id,
+                already_spoken=track.spoken_bytes > 0,
+                first_audio_at=track.first_audio_at,
+            )
         except Exception:
+            already_spoken = track is not None and track.spoken_bytes > 0
             self.logger.warning(
                 "prosody_context_failed_falling_back",
                 meeting_id=translation.meeting_id,
+                already_spoken=already_spoken,
                 exc_info=True,
             )
             await self._end_turn(key)
-            return await synthesizer.synthesize(
+            audio_bytes, duration_ms, one_shot_voice_id = await synthesizer.synthesize(
                 text=text,
                 language=translation.target_lang,
                 voice_id=voice_id,
                 generation_config=generation_config,
+            )
+            if already_spoken:
+                # THE ONE DECISION THIS FEATURE TURNS ON, recorded here rather than in a ticket.
+                #
+                # The context died after part of the sentence was already on the track. The
+                # fallback re-synthesizes the WHOLE sentence, so playing it would speak the
+                # opening words a second time. Three options were weighed:
+                #
+                #   1. don't play the fallback — the listener hears a truncated sentence
+                #   2. play only the missing tail — needs a byte offset across two independent
+                #      generations, which will not match at the seam
+                #   3. only stream once a flush has already succeeded in this turn — narrows
+                #      the window, never closes it
+                #
+                # (1), because the two failures are not equally bad. A cut-off sentence reads
+                # as a dropout: the listener asks the speaker to repeat and the transcript
+                # (built from the bytes returned below, which ARE complete) still has the whole
+                # line. A sentence that stutters its own opening reads as the system being
+                # broken, and there is nothing to fix it with.
+                self.logger.warning(
+                    "tts_fallback_suppressed_after_partial_stream",
+                    meeting_id=translation.meeting_id,
+                    speaker_id=translation.speaker_id,
+                    spoken_bytes=track.spoken_bytes if track else 0,
+                )
+            return SynthesizedSentence(
+                audio_bytes,
+                duration_ms,
+                one_shot_voice_id,
+                already_spoken=already_spoken,
+                first_audio_at=track.first_audio_at if track else None,
             )
         finally:
             # The turn ends where the SPEAKER stopped, not where a chunk boundary fell —
@@ -548,7 +636,7 @@ class TTSWorker(BaseWorker):
 
         t0 = time.monotonic()
         try:
-            audio_bytes, duration_ms, resolved_voice_id = await self._synthesize_sentence(
+            sentence = await self._synthesize_sentence(
                 translation=translation,
                 text=text,
                 voice_id=voice_id,
@@ -564,17 +652,35 @@ class TTSWorker(BaseWorker):
             )
             return
 
+        audio_bytes = sentence.audio
+        duration_ms = sentence.duration_ms
+        resolved_voice_id = sentence.voice_id
+        already_spoken = sentence.already_spoken
+
         synthesis_latency_ms = int((time.monotonic() - t0) * 1000)
         # Already measured, and until now only ever attached to a published message. This is the
         # stage B2 clocked at p95 8.54s while STT and translation both stayed under 1.5s — kept
         # apart from the cumulative pipeline number so a slow Cartesia call and a queue building
         # behind the per-key lock are two readings rather than one.
+        #
+        # WT-397 CHANGED WHAT THIS COVERS. With streaming on, _synthesize_sentence does not
+        # return until the audio has been handed to the track, which back-pressures to real
+        # time — so this number now includes roughly the duration of the dub and is EXPECTED to
+        # rise. It is still the right measure of "how long the worker was busy with this
+        # sentence"; it is no longer a measure of how long anyone waited to hear it.
         await self.redis.record_latency("tts_synthesis", synthesis_latency_ms)
+        if sentence.first_audio_at is not None:
+            # What the listener actually experiences, and the only number that answers the
+            # complaint this work came from. Same t0 as above, so the two are comparable.
+            await self.redis.record_latency(
+                "tts_first_audio", int((sentence.first_audio_at - t0) * 1000)
+            )
         self._observe_dub_fit(translation, duration_ms)
 
         if audio_bytes:
             if voice_key:
-                await self._publish_livekit_only(translation, audio_bytes, voice_key)
+                if not already_spoken:
+                    await self._publish_livekit_only(translation, audio_bytes, voice_key)
             else:
                 await self._publish_result(
                     translation=translation,
@@ -586,6 +692,10 @@ class TTSWorker(BaseWorker):
                     cache_key=cache_key,
                     cache_hit=False,
                     synthesis_latency_ms=synthesis_latency_ms,
+                    # WT-397: streamed audio has already reached the track. tts:results still
+                    # goes out below — billing and the transcript are driven by that message,
+                    # not by the LiveKit push, and both must see every synthesized sentence.
+                    publish_to_livekit=not already_spoken,
                 )
             if self.tts_settings.cache_enabled:
                 await self.redis.set_with_ttl(
@@ -619,6 +729,7 @@ class TTSWorker(BaseWorker):
         cache_key: str,
         cache_hit: bool,
         synthesis_latency_ms: int,
+        publish_to_livekit: bool = True,
     ) -> None:
         """Full publish: tts:results (billing_worker/TranscriptRedisConsumerService
         depend on this) + LiveKit track.
@@ -653,7 +764,8 @@ class TTSWorker(BaseWorker):
             timestamp_ms=translation.timestamp_ms,
         )
         await self.publish("tts:results", translation.meeting_id, result.to_redis())
-        await self._publish_livekit_only(translation, audio_bytes, voice_key)
+        if publish_to_livekit:
+            await self._publish_livekit_only(translation, audio_bytes, voice_key)
 
     async def _publish_livekit_only(
         self, translation: TranslationResultMessage, audio_bytes: bytes, voice_key: str
