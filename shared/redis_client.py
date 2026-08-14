@@ -25,6 +25,18 @@ from shared.config import RedisSettings
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Where the stage-latency histograms live, and how they are bucketed.
+#
+# Chosen against what this pipeline actually does rather than a default ladder: a live dub is
+# already uncomfortable at 2s and unusable past 8s, so the interesting resolution is between
+# them. The wide tail exists because production p95 was measured at 11.4s — a ladder that
+# topped out at 5s would have reported "everything is over 5s" and said nothing more.
+LATENCY_BUCKETS_MS = (250, 500, 1000, 2000, 3000, 5000, 8000, 12000, 20000)
+LATENCY_KEY_PREFIX = "warptalk:latency:"
+# Refreshed on every observation. Long enough to survive a quiet weekend, bounded so this can
+# never become the next thing that fills Redis.
+LATENCY_KEY_TTL_SECONDS = 7 * 24 * 60 * 60
 P = ParamSpec("P")
 R = TypeVar("R")
 
@@ -301,7 +313,14 @@ class RedisStreamClient:
         return int(milliseconds), int(sequence)
 
     async def publish_telemetry(self, room_id: str, worker_type: str, latency_ms: int) -> None:
-        """Publish raw telemetry data to the translationRoom:telemetry Pub/Sub channel."""
+        """Publish raw telemetry data to the translationRoom:telemetry Pub/Sub channel.
+
+        The pub/sub half is live-only and has no subscriber that records anything, so until
+        `record_latency` was added below, every one of these numbers was computed and thrown
+        away. When a tester reported the dub arriving 5-10s late there was no metric anywhere in
+        Prometheus to say which stage it was — the answer had to be reconstructed by hand from
+        Redis stream entry ids.
+        """
         import time
 
         payload = {
@@ -312,6 +331,40 @@ class RedisStreamClient:
             "timestamp": int(time.time() * 1000),
         }
         await self._retry(self.redis.publish, "translationRoom:telemetry", json.dumps(payload))
+        await self.record_latency(worker_type, latency_ms)
+
+    async def record_latency(self, stage: str, latency_ms: int) -> None:
+        """Add one observation to a durable histogram the metrics exporter can scrape.
+
+        WHY A REDIS HASH AND NOT A PROMETHEUS CLIENT IN THE WORKER
+            The workers are consumers with no HTTP server, so there is nothing for Prometheus to
+            scrape them on. The exporter is already the one process that answers /metrics and it
+            is deliberately stateless — it derives everything from Redis on each scrape. Keeping
+            that shape means this needs no new port, no new scrape target, and no new deployment.
+
+        Buckets are stored raw (not cumulative); the exporter accumulates them, because that is
+        the only place that has to care what Prometheus's text format wants.
+
+        The key carries a TTL, refreshed on write. A counter that resets is something
+        `rate()` handles; an unbounded Redis key is what filled production to 93% this morning.
+        Best effort throughout — a metric must never be able to fail the pipeline it measures.
+        """
+        if latency_ms < 0:
+            return
+        bucket = next(
+            (str(edge) for edge in LATENCY_BUCKETS_MS if latency_ms <= edge),
+            "+Inf",
+        )
+        key = f"{LATENCY_KEY_PREFIX}{stage}"
+        try:
+            pipeline = self.redis.pipeline(transaction=False)
+            pipeline.hincrby(key, f"le:{bucket}", 1)
+            pipeline.hincrby(key, "sum", latency_ms)
+            pipeline.hincrby(key, "count", 1)
+            pipeline.expire(key, LATENCY_KEY_TTL_SECONDS)
+            await pipeline.execute()
+        except Exception:
+            logger.debug("latency_record_failed", stage=stage, exc_info=True)
 
     async def publish_system_event(
         self, room_id: str, event_type: str, payload: dict[str, Any]
