@@ -11,6 +11,9 @@ from __future__ import annotations
 import pytest
 
 from ai_assistant_worker.meeting_draft import (
+    NO_RECURRENCE,
+    RECURRENCE_CHOICES,
+    RECURRENCE_TYPES,
     MeetingDraft,
     build_payload,
     compose_description,
@@ -225,3 +228,140 @@ def test_documents_arrive_from_tool_arguments_as_title_id_pairs() -> None:
         {"documents": [{"title": "Spec", "id": "doc-9"}, {"title": "", "id": "doc-8"}]}
     )
     assert draft.documents == [("Spec", "doc-9")]
+
+
+# ── WT-399: the filler values a model sends for properties it does not mean ──────────────────
+#
+# Captured verbatim from `assistant:chat_results` on production, 2026-08-14 15:55 UTC. The user
+# asked for one meeting, now, and said explicitly they did not want it scheduled. `create_meeting`
+# was called TWELVE times across three turns, never once reached the meeting service, and the
+# conversation ended with an English error in a Vietnamese chat.
+#
+# Every property is filled — "" for strings, [] for arrays, 0 for the number. That is what a model
+# does with an optional property. `recurrence_type` was the one that had no filler to reach for,
+# because its enum listed three ways to repeat and no way not to.
+
+PROD_ARGUMENTS = {
+    "title": "Thảo luận tin tức AI",
+    "description": "Cuộc họp thảo luận các tin tức AI gần đây.",
+    "agenda": ["Tóm tắt các tin tức AI gần đây"],
+    "translation_room_type": "CHANNEL_MEETING",
+    "source_language": "vi",
+    "target_languages": ["en"],
+    "scheduled_at": "2026-08-14T16:10:00Z",
+    "invited_emails": [],
+    "recurrence_type": "DAILY",
+    "recurrence_start_time_local": "",
+    "recurrence_time_zone": "",
+    "recurrence_start_date_local": "",
+    "recurrence_end_date_local": "",
+    "max_participants": 0,
+    "documents": [],
+}
+
+
+def test_the_exact_production_arguments_now_reach_the_meeting_service() -> None:
+    draft = draft_from_arguments(PROD_ARGUMENTS)
+
+    assert missing_fields(draft) == [], "still asking for something the user already answered"
+    assert validate(draft) == [], "still refusing a request the user made correctly"
+
+    payload = build_payload(draft, WORKSPACE)
+    assert "recurrence" not in payload, "a one-off meeting was booked as a repeating series"
+    assert payload["scheduledAt"] == "2026-08-14T16:10:00Z"
+    assert "maxParticipants" not in payload, "0 was sent as a real seat cap"
+
+
+def test_none_is_a_thing_the_model_can_actually_say() -> None:
+    # The root cause: the enum had no member meaning "this does not repeat", so a model that
+    # fills every property had to pick a repeating rule for a one-off meeting.
+    assert NO_RECURRENCE in RECURRENCE_CHOICES
+    assert NO_RECURRENCE not in RECURRENCE_TYPES, "NONE must never be sent to the server"
+
+    draft = draft_from_arguments({**PROD_ARGUMENTS, "recurrence_type": NO_RECURRENCE})
+
+    assert draft.recurrence_type is None
+    assert "recurrence" not in build_payload(draft, WORKSPACE)
+
+
+@pytest.mark.parametrize("alias", ["NEVER", "ONCE", "one_off", "single", "no"])
+def test_other_ways_of_saying_not_repeating_land_too(alias: str) -> None:
+    draft = draft_from_arguments({**PROD_ARGUMENTS, "recurrence_type": alias})
+    assert draft.recurrence_type is None
+
+
+def test_a_real_recurrence_is_never_quietly_turned_into_one_meeting() -> None:
+    """The failure the fix must not introduce.
+
+    Reading every recurrence_type as filler would give a user who asked for a weekly series a
+    single meeting and no error — worse than the loop being fixed here, because nothing tells
+    them. A rule carrying ANY detail of its own is taken at face value.
+    """
+    draft = draft_from_arguments(
+        {
+            **PROD_ARGUMENTS,
+            "scheduled_at": "",
+            "recurrence_type": "WEEKLY",
+            "recurrence_start_time_local": "09:00",
+            "recurrence_time_zone": "Asia/Ho_Chi_Minh",
+        }
+    )
+
+    assert draft.recurrence_type == "WEEKLY"
+    payload = build_payload(draft, WORKSPACE)
+    assert payload["recurrence"]["type"] == "WEEKLY"
+    assert payload["recurrence"]["startTimeLocal"] == "09:00"
+    assert "scheduledAt" not in payload
+
+
+def test_a_recurrence_with_only_a_first_date_is_still_a_recurrence() -> None:
+    # startDateLocal alone is enough detail to mean it: the model chose a date, it did not have
+    # one handed to it by the schema.
+    draft = draft_from_arguments(
+        {
+            **PROD_ARGUMENTS,
+            "recurrence_type": "MONTHLY",
+            "recurrence_start_date_local": "2026-09-01",
+        }
+    )
+
+    assert draft.recurrence_type == "MONTHLY"
+    assert validate(draft), "a complete recurrence beside a scheduled_at is still a contradiction"
+
+
+def test_a_genuine_contradiction_is_still_refused() -> None:
+    # The "never both" rule is not weakened — a rule with real detail AND a one-off start is two
+    # different meetings described at once, and guessing which one was meant is not this code's
+    # decision to make.
+    draft = draft_from_arguments(
+        {
+            **PROD_ARGUMENTS,
+            "recurrence_type": "WEEKLY",
+            "recurrence_start_time_local": "09:00",
+        }
+    )
+
+    assert any("never both" in p for p in validate(draft))
+
+
+@pytest.mark.parametrize("filler", [0, "0", -1, "", "  ", "none"])
+def test_no_spelling_of_an_empty_seat_cap_becomes_a_real_one(filler: object) -> None:
+    """Both shapes, deliberately.
+
+    The integer 0 used to be dropped only because `0 or ""` is falsy — an accident, not a rule.
+    The STRING "0" went straight through it and failed validation as a seat cap of zero. Which
+    of the two a model sends is not something worth leaving to chance.
+    """
+    draft = draft_from_arguments({**PROD_ARGUMENTS, "max_participants": filler})
+
+    assert draft.max_participants is None
+    assert validate(draft) == []
+    assert "maxParticipants" not in build_payload(draft, WORKSPACE)
+
+
+def test_a_seat_cap_somebody_actually_typed_is_still_checked() -> None:
+    # 1 is a number a person chose, and a meeting for one person is still an error worth showing
+    # them — the filler handling above must not swallow it.
+    assert validate(draft_from_arguments({**PROD_ARGUMENTS, "max_participants": 1}))
+    assert draft_from_arguments({**PROD_ARGUMENTS, "max_participants": 8}).max_participants == 8
+    assert draft_from_arguments({**PROD_ARGUMENTS, "max_participants": "8"}).max_participants == 8

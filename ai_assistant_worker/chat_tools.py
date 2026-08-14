@@ -19,7 +19,7 @@ import httpx
 
 from ai_assistant_worker.meeting_draft import (
     MEETING_TYPES,
-    RECURRENCE_TYPES,
+    RECURRENCE_CHOICES,
     build_payload,
     draft_from_arguments,
     missing_fields,
@@ -1019,8 +1019,11 @@ TOOLS: list[ChatTool] = [
                 },
                 "recurrence_type": {
                     "type": "string",
-                    "enum": list(RECURRENCE_TYPES),
-                    "description": "Present means this repeats. Omit for a single meeting.",
+                    "enum": list(RECURRENCE_CHOICES),
+                    "description": (
+                        "NONE for a meeting that happens once — which is most of them. Only "
+                        "DAILY/WEEKLY/MONTHLY when the user asked for something repeating."
+                    ),
                 },
                 "recurrence_start_time_local": {
                     "type": "string",
