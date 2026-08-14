@@ -735,13 +735,43 @@ class LiveKitIngressWorker(BaseWorker):
         occupied = 0
         humans = 0
 
+        lost: list[str] = []
+
         for room_name, room in list(self.rooms.items()):
             try:
-                # A handle we hold on a room LiveKit already dropped bills nothing, but it
-                # is not occupied either — let the same grace window retire it.
-                count = self._human_participant_count(room) if room.isconnected() else 0
+                connected = room.isconnected()
+                count = self._human_participant_count(room) if connected else 0
             except Exception:
                 self.logger.warning("idle_sweep_room_probe_failed", room=room_name, exc_info=True)
+                continue
+
+            # WT-395 — a connection we lost is NOT an empty room, and must not be retired by
+            # the path that retires empty ones.
+            #
+            # This branch used to fall through to `count = 0`, on the reasoning that a handle
+            # LiveKit already dropped bills nothing. True for the cost question WT-314 was
+            # about, and wrong for this one: retiring is only safe if something re-joins, and
+            # nothing does. `_release_idle_room` discards the room from `_deferred_rooms` too,
+            # and the only other way back is a `meeting.track_published` event — which, as the
+            # comment on `_deferred_rooms` says, in a room where everyone has already
+            # published is never.
+            #
+            # So one dropped connection ended audio ingestion for the rest of the meeting.
+            # Production 2026-08-14, room 01a00058: both speakers' transcripts stopped within
+            # four seconds of each other at 13:01 and never resumed, while the room and the
+            # translation session stayed alive until 13:11. Nothing failed loudly; the meeting
+            # simply stopped being heard.
+            #
+            # Requeued instead. `_claim_deferred_rooms` runs immediately after this sweep in
+            # the same tick and re-dials, so the cost is one sweep interval of lost audio
+            # rather than the remainder of the meeting. Ownership is dropped first because the
+            # claim is what that path gates on.
+            if not connected:
+                self.rooms.pop(room_name, None)
+                self._room_last_occupied.pop(room_name, None)
+                self._cancel_room_audio_tasks(room_name)
+                self._deferred_rooms.add(room_name)
+                lost.append(room_name)
                 continue
 
             if count > 0:
@@ -756,15 +786,22 @@ class LiveKitIngressWorker(BaseWorker):
 
         # The reason WT-314 ran undetected is that a leaked bot is completely silent. This
         # is the gauge that makes a recurrence visible in logs instead of on the invoice.
-        if self.rooms or idle_rooms:
+        if self.rooms or idle_rooms or lost:
             self.logger.info(
                 "livekit_ingress_room_census",
                 connected_rooms=len(self.rooms),
                 occupied_rooms=occupied,
                 human_participants=humans,
                 releasing_idle_rooms=len(idle_rooms),
+                requeued_lost_rooms=len(lost),
                 idle_releases_total=self._idle_releases_total,
             )
+
+        for room_name in lost:
+            # Warning, not info: losing the connection to a live meeting is the failure this
+            # branch exists to catch, and it left no trace at all before today.
+            self.logger.warning("livekit_room_connection_lost_requeued", room=room_name)
+            await self._release_room_ownership(room_name)
 
         for room_name in idle_rooms:
             # Strong reference held for the task's whole life. asyncio keeps only a weak
