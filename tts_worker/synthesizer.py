@@ -13,7 +13,7 @@ from cartesia import AsyncCartesia
 
 from shared.lang import base_language
 from shared.logger import get_logger
-from tts_worker.prosody_context import ProsodyContext
+from tts_worker.prosody_context import SENTENCE_TIMEOUT_SECONDS, ProsodyContext
 
 logger = get_logger(__name__)
 
@@ -76,6 +76,10 @@ class CartesiaSynthesizer:
         connection = await client.tts.websocket_connect().enter()
         context = connection.context(
             context_id=context_id,
+            # Belt and braces with ProsodyContext's own asyncio.timeout: this one is the SDK's
+            # and may abort a wedged read closer to the socket, the other one is ours and is
+            # what actually guarantees the caller gets an exception it can fall back from.
+            timeout=SENTENCE_TIMEOUT_SECONDS,
             model_id=self.model,
             voice=cast(Any, {"id": voice_id or self._default_voice_id(language)}),
             language=cast(Any, language),

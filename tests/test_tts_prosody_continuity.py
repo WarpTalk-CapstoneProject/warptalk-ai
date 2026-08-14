@@ -108,10 +108,14 @@ async def _say(worker: TTSWorker, message: TranslationResultMessage, voice: str 
 
 
 @pytest.mark.asyncio
-async def test_off_by_default_uses_the_proven_one_shot_path() -> None:
-    # The setting ships OFF: the WebSocket path has never run against the real API from this
-    # codebase, and a dub that fails is silence in a live meeting.
-    assert TTSSettings().prosody_continuity is False
+async def test_turning_it_off_falls_back_to_the_proven_one_shot_path() -> None:
+    """The escape hatch has to keep working now that the default is ON.
+
+    It shipped dark in v79 and was turned on for v81 once the wedged-socket hang was closed —
+    but the path still has not been LISTENED to, so `TTS_PROSODY_CONTINUITY=false` must remain
+    a real off switch that needs no rebuild.
+    """
+    assert TTSSettings().prosody_continuity is True, "the default was flipped on for v81"
 
     worker, synth = _worker(continuity=False)
     await _say(worker, _msg("Một."))

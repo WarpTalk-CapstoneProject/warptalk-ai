@@ -264,12 +264,20 @@ class TTSSettings(BaseSettings):
     # across them instead of every sentence being an independent generation — see
     # tts_worker/prosody_context.py.
     #
-    # OFF by default on purpose. The WebSocket path has never been exercised in this codebase
-    # and cannot be exercised without a live Cartesia connection; synthesize()'s own comments
-    # record two protocol mistakes in the HTTP path that survived review for exactly that
-    # reason. Every failure falls back to the proven one-shot path, and turning this on is a
-    # deliberate decision to be taken after a real room has been listened to.
-    prosody_continuity: bool = False
+    # ON as of 2026-08-14, at the owner's instruction, having shipped dark in v79 first.
+    #
+    # What made it safe to flip was not time passing — it was closing the one failure the
+    # fallback could not catch. Every ERROR degrades to the one-shot path, but a socket that
+    # stays up and simply never sends flush_done raises nothing: the worker holds a
+    # per-(speaker, language) lock while a sentence synthesises, so a wedged read would have
+    # stopped that speaker's dub for the rest of the meeting, silently. ProsodyContext now
+    # bounds every sentence (SENTENCE_TIMEOUT_SECONDS) so a hang becomes an exception, which
+    # the fallback does catch.
+    #
+    # Still overridable per deployment as TTS_PROSODY_CONTINUITY=false — the path has now run
+    # in production, but it has still never been listened to, and turning it off must not
+    # require a rebuild.
+    prosody_continuity: bool = True
     voice_clone_max_upgrades: int = 1
     # How much better a later clip must score before it is worth replacing a working clone. Small
     # gains are noise in the estimator, and re-cloning for them would change the voice people are
