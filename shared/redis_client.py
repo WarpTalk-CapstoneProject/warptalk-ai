@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, ParamSpec, TypeVar, cast
 from urllib.parse import urlsplit
@@ -167,9 +168,42 @@ class RedisStreamClient:
             key: value if isinstance(value, (bytes, str, int, float)) else json.dumps(value)
             for key, value in data.items()
         }
-        message_id = await self._retry(self.redis.xadd, stream, cast(Any, redis_data))
+        message_id = await self._append_and_refresh_ttl(stream, redis_data)
         await self._trim_stream_without_losing_unconsumed_entries(stream)
         return message_id
+
+    async def _append_and_refresh_ttl(
+        self,
+        stream: str,
+        redis_data: dict[str, bytes | str | int | float],
+    ) -> bytes | str:
+        """XADD, and push the stream's expiry back out to now + stream_ttl_seconds.
+
+        Nothing else in this system ever deletes a stream. Rooms end, their four streams stay,
+        and production reached 70 abandoned room streams holding 284 MB — the oldest untouched
+        for ten days — inside a 768 MB Redis. Since the policy there is `allkeys-lru`, filling it
+        does not fail a write: Redis silently deletes whichever keys look least recently used,
+        which during a meeting includes that meeting's own streams and consumer groups. The
+        transcript simply stops, with nothing in any log.
+
+        The EXPIRE rides in the same pipeline as the XADD deliberately. This is the hot path —
+        one publish per speech chunk — and a second round trip here would add latency to the very
+        pipeline the leak was already slowing down.
+        """
+        ttl = self._settings.stream_ttl_seconds
+        if ttl <= 0:
+            return cast(
+                "bytes | str", await self._retry(self.redis.xadd, stream, cast(Any, redis_data))
+            )
+
+        async def _append() -> bytes | str:
+            pipeline = self.redis.pipeline(transaction=False)
+            pipeline.xadd(stream, cast(Any, redis_data))
+            pipeline.expire(stream, ttl)
+            results = await pipeline.execute()
+            return cast("bytes | str", results[0])
+
+        return await self._retry(_append)
 
     async def _trim_stream_without_losing_unconsumed_entries(self, stream: str) -> None:
         """Bound a stream only when trimming cannot remove pending/unread messages.
@@ -202,6 +236,24 @@ class RedisStreamClient:
             if self._stream_id_tuple(last_delivered) == (0, 0):
                 return
 
+            # A group that has stopped advancing is not a slow consumer, and treating it as one
+            # is what turned this safety check into the leak it was meant to prevent: on
+            # 2026-08-14 `billing-stt-workers` still held the floor of `stt:results` at its
+            # 2026-08-10 position, so four days of entries could not be trimmed by anyone.
+            if self._group_is_stale(last_delivered):
+                logger.warning(
+                    "stream_group_stale_ignored_for_trim",
+                    stream=stream,
+                    group=group_name.decode() if isinstance(group_name, bytes) else group_name,
+                    last_delivered_id=(
+                        last_delivered.decode()
+                        if isinstance(last_delivered, bytes)
+                        else last_delivered
+                    ),
+                    stale_after_seconds=self._settings.stream_group_stale_after_seconds,
+                )
+                continue
+
             pending = cast(
                 dict[Any, Any],
                 await self._retry(self.redis.xpending, stream, group_name),
@@ -216,6 +268,12 @@ class RedisStreamClient:
                 )
             required_ids.append(required)
 
+        # Every group on this stream is stale. Bounded growth is no longer the safer option —
+        # nobody is reading — so fall back to the plain count bound rather than growing forever.
+        if not required_ids:
+            await self._retry(self.redis.xtrim, stream, maxlen=maxlen, approximate=True)
+            return
+
         earliest_required = min(required_ids, key=self._stream_id_tuple)
         await self._retry(
             self.redis.xtrim,
@@ -223,6 +281,18 @@ class RedisStreamClient:
             minid=earliest_required,
             approximate=False,
         )
+
+    def _group_is_stale(self, last_delivered: bytes | str) -> bool:
+        """Whether a group has gone quiet long enough to stop holding the trim floor.
+
+        Read off the stream ID itself, whose millisecond component is the wall-clock time Redis
+        stamped on the entry. That needs no extra call and no bookkeeping of our own.
+        """
+        stale_after = self._settings.stream_group_stale_after_seconds
+        if stale_after <= 0:
+            return False
+        delivered_ms, _ = self._stream_id_tuple(last_delivered)
+        return (time.time() * 1000) - delivered_ms > stale_after * 1000
 
     @staticmethod
     def _stream_id_tuple(message_id: bytes | str) -> tuple[int, int]:
