@@ -260,6 +260,16 @@ class TTSSettings(BaseSettings):
     # One upgrade, not unlimited: each re-clone is a paid Cartesia call, and the synthesised voice
     # audibly changes when it lands. One is enough to escape a bad opening clip; more would be a
     # voice that keeps shifting under the listener.
+    # Speak the sentences of one turn through a single Cartesia context, so prosody carries
+    # across them instead of every sentence being an independent generation — see
+    # tts_worker/prosody_context.py.
+    #
+    # OFF by default on purpose. The WebSocket path has never been exercised in this codebase
+    # and cannot be exercised without a live Cartesia connection; synthesize()'s own comments
+    # record two protocol mistakes in the HTTP path that survived review for exactly that
+    # reason. Every failure falls back to the proven one-shot path, and turning this on is a
+    # deliberate decision to be taken after a real room has been listened to.
+    prosody_continuity: bool = False
     voice_clone_max_upgrades: int = 1
     # How much better a later clip must score before it is worth replacing a working clone. Small
     # gains are noise in the estimator, and re-cloning for them would change the voice people are

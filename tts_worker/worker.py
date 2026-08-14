@@ -21,6 +21,7 @@ import time
 from collections.abc import Mapping
 from typing import Any, cast
 
+from shared import isochrony
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
 from shared.lang import is_same_language
@@ -28,6 +29,7 @@ from shared.prosody import Arousal, Delivery, Valence, to_generation_config
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
 from tts_worker.clone_sample_quality import assess_clone_sample
 from tts_worker.livekit_publisher import LiveKitTTSPublisher
+from tts_worker.prosody_context import ProsodyContext
 from tts_worker.synthesizer import CartesiaSynthesizer
 
 # Standard WAV header size for the pcm_s16le format CartesiaSynthesizer requests —
@@ -131,6 +133,15 @@ class TTSWorker(BaseWorker):
         # (meeting_id, speaker_id, target_lang) -> lock serializing that key's own
         # messages — see _consume_loop for why.
         self._key_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        # One in-flight spoken turn per (meeting, speaker, language, voice). The per-key lock
+        # above is what makes a plain dict safe here: a key's sentences are processed one at a
+        # time, so a turn can never be pushed into concurrently.
+        self._turns: dict[tuple[str, ...], ProsodyContext] = {}
+        self._turn_connections: dict[tuple[str, ...], Any] = {}
+        # Isochrony state, per (meeting, speaker, target language): how this speaker's dubs have
+        # been running against the clock, and the turn currently being accumulated.
+        self._dub_fits: dict[tuple[str, str, str], isochrony.DubFit] = {}
+        self._turn_dub_ms: dict[tuple[str, str, str], int] = {}
 
     async def load_model(self) -> None:
         self.cartesia = CartesiaSynthesizer(
@@ -206,6 +217,104 @@ class TTSWorker(BaseWorker):
         stale_keys = [key for key in self._key_locks if key[0] == room_id]
         for key in stale_keys:
             self._key_locks.pop(key, None)
+        # getattr, because the tests build workers with __new__ and never run __init__ — the
+        # same guard the rest of this codebase uses for that pattern. A worker with no turns
+        # dict has no turns to abandon.
+        turns: dict[tuple[str, ...], ProsodyContext] = getattr(self, "_turns", {})
+        for turn_key in [k for k in turns if k[0] == room_id]:
+            turn = turns.pop(turn_key, None)
+            if turn is not None:
+                # Fire-and-forget: _cleanup_room is sync (it is called from the route-state
+                # broadcast handler), and a room that has ended is not waiting on a socket.
+                asyncio.create_task(turn.abandon())
+
+    async def _synthesize_sentence(
+        self,
+        *,
+        translation: TranslationResultMessage,
+        text: str,
+        voice_id: str | None,
+        voice_key: str,
+        generation_config: dict[str, float | str] | None,
+    ) -> tuple[bytes, int, str]:
+        """One sentence of a turn, spoken in prosodic continuity with the ones before it.
+
+        WT-371 follow-up / Level 4. A spoken turn is routinely split into several sentences
+        (chunk_index > 0), and each used to be an independent one-shot generation with no memory
+        of the one before it — so the model opened every sentence at its own default baseline and
+        the dub came back as a list of separately-read sentences. Cartesia's contexts exist for
+        exactly this; see tts_worker/prosody_context.py.
+
+        Falls back to the proven one-shot path on ANY failure, and when the feature is off. That
+        is not defensive padding: this WebSocket path has never run against the real API from
+        this codebase, and a dub that fails is silence in a live meeting.
+        """
+        synthesizer = self._require_cartesia()
+        resolved_voice_id = voice_id or CartesiaSynthesizer._default_voice_id(
+            translation.target_lang
+        )
+
+        if not self.tts_settings.prosody_continuity:
+            return await synthesizer.synthesize(
+                text=text,
+                language=translation.target_lang,
+                voice_id=voice_id,
+                generation_config=generation_config,
+            )
+
+        # Keyed by voice as well as by speaker and language: a clone upgrade replaces the voice
+        # mid-meeting (voice_clone_max_upgrades), and continuing a turn into a different voice
+        # would be worse than the seam this removes.
+        key = (
+            translation.meeting_id,
+            translation.speaker_id,
+            translation.target_lang,
+            voice_key,
+            resolved_voice_id,
+        )
+
+        try:
+            turn = self._turns.get(key)
+            if turn is None:
+                turn, connection = await synthesizer.open_prosody_context(
+                    context_id=f"{translation.speaker_id}:{translation.target_lang}:{voice_key}",
+                    language=translation.target_lang,
+                    voice_id=voice_id,
+                )
+                self._turns[key] = turn
+                self._turn_connections[key] = connection
+
+            audio_bytes, duration_ms = await turn.speak(text, generation_config)
+            return audio_bytes, duration_ms, resolved_voice_id
+        except Exception:
+            self.logger.warning(
+                "prosody_context_failed_falling_back",
+                meeting_id=translation.meeting_id,
+                exc_info=True,
+            )
+            await self._end_turn(key)
+            return await synthesizer.synthesize(
+                text=text,
+                language=translation.target_lang,
+                voice_id=voice_id,
+                generation_config=generation_config,
+            )
+        finally:
+            # The turn ends where the SPEAKER stopped, not where a chunk boundary fell —
+            # is_final_chunk is the only signal that carries that.
+            if translation.is_final_chunk:
+                await self._end_turn(key)
+
+    async def _end_turn(self, key: tuple[str, ...]) -> None:
+        turn = self._turns.pop(key, None)
+        connection = self._turn_connections.pop(key, None)
+        if turn is not None:
+            await turn.aclose()
+        if connection is not None:
+            try:
+                await connection.close()
+            except Exception:
+                self.logger.debug("prosody_connection_close_failed", exc_info=True)
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Synthesize one translated text segment — into every DISTINCT voice this
@@ -439,10 +548,11 @@ class TTSWorker(BaseWorker):
 
         t0 = time.monotonic()
         try:
-            audio_bytes, duration_ms, resolved_voice_id = await self._require_cartesia().synthesize(
+            audio_bytes, duration_ms, resolved_voice_id = await self._synthesize_sentence(
+                translation=translation,
                 text=text,
-                language=translation.target_lang,
                 voice_id=voice_id,
+                voice_key=voice_key,
                 generation_config=generation_config,
             )
         except Exception as e:
@@ -455,6 +565,7 @@ class TTSWorker(BaseWorker):
             return
 
         synthesis_latency_ms = int((time.monotonic() - t0) * 1000)
+        self._observe_dub_fit(translation, duration_ms)
 
         if audio_bytes:
             if voice_key:
@@ -818,7 +929,51 @@ class TTSWorker(BaseWorker):
                 arousal=arousal,
             ),
             valence,
+            # Isochrony. The centre this speaker's tempo is applied AROUND, learned from how
+            # their previous dubs actually ran against the clock — see shared/isochrony.py.
+            # Exactly 1.0 until a fit is established, which is byte-for-byte the previous
+            # behaviour. Their own rate_ratio still multiplies through it, so somebody who
+            # genuinely slowed down still sounds like they slowed down, inside a slot that fits.
+            speed_center=isochrony.speed_center(self._dub_fit(translation)),
         )
+
+    def _fit_key(self, translation: TranslationResultMessage) -> tuple[str, str, str]:
+        """Fit is per (meeting, speaker, target language). Not global: how much longer a dub
+        runs is a property of the language pair and of how this person talks, and pooling a
+        terse speaker with a discursive one would centre both on neither."""
+        return (translation.meeting_id, translation.speaker_id, translation.target_lang)
+
+    def _dub_fit(self, translation: TranslationResultMessage) -> isochrony.DubFit:
+        fits: dict[tuple[str, str, str], isochrony.DubFit] = getattr(self, "_dub_fits", {})
+        return fits.get(self._fit_key(translation), isochrony.NO_FIT)
+
+    def _observe_dub_fit(self, translation: TranslationResultMessage, dub_ms: int) -> None:
+        """Accumulate this sentence's dub, and compare the WHOLE turn once the turn is over.
+
+        The comparison is turn against turn. `start_ms`/`end_ms` describe the whole spoken turn,
+        so weighing one sentence's dub against them would report a fit of about 1/N for an
+        N-sentence turn and drive the controller to speak everybody faster and faster. The
+        sentences are summed and the total is what gets folded in on `is_final_chunk`.
+        """
+        if not self.tts_settings.prosody_enabled:
+            return
+
+        key = self._fit_key(translation)
+        pending: dict[tuple[str, str, str], int] = getattr(self, "_turn_dub_ms", None) or {}
+        self._turn_dub_ms = pending
+        pending[key] = pending.get(key, 0) + max(0, dub_ms)
+
+        if not translation.is_final_chunk:
+            return
+
+        turn_dub_ms = pending.pop(key, 0)
+        source_ms = translation.end_ms - translation.start_ms
+        if source_ms <= 0:
+            return
+
+        fits: dict[tuple[str, str, str], isochrony.DubFit] = getattr(self, "_dub_fits", None) or {}
+        self._dub_fits = fits
+        fits[key] = isochrony.observe(fits.get(key, isochrony.NO_FIT), source_ms, turn_dub_ms)
 
     @staticmethod
     def _cache_key(
