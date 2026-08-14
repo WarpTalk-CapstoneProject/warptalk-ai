@@ -734,6 +734,7 @@ class LiveKitIngressWorker(BaseWorker):
         idle_rooms: list[str] = []
         occupied = 0
         humans = 0
+        reattached_readers = 0
 
         lost: list[str] = []
 
@@ -778,6 +779,32 @@ class LiveKitIngressWorker(BaseWorker):
                 self._room_last_occupied[room_name] = now
                 occupied += 1
                 humans += count
+
+                # WT-404 — a connected room with people in it is not the same as a room being
+                # HEARD, and until now nothing checked the difference.
+                #
+                # `process_audio_track` ends silently when its AudioStream ends without raising:
+                # the task completes, `_forget_audio_task` drops it, and the only trace is one
+                # INFO line. `_start_audio_task` is called from exactly two places — the
+                # `track_subscribed` event and joining a room — so if LiveKit does not fire a
+                # fresh subscribe for that track, that speaker is never read again.
+                #
+                # Production 2026-08-14, room 01a0015d: audio reached `audio:chunks` for 76
+                # seconds of an eight-minute meeting and then stopped, while this very sweep went
+                # on reporting the room connected and occupied. One transcript segment was saved.
+                # The listener still heard dubbed audio, so nothing looked broken from outside.
+                #
+                # Idempotent by construction: `_start_audio_task` returns False for a live reader
+                # on the same track, so this only ever fills a genuine gap.
+                reattached = self._start_pending_audio_tasks(room_name, room)
+                if reattached:
+                    reattached_readers += reattached
+                    self.logger.warning(
+                        "audio_reader_reattached",
+                        room=room_name,
+                        readers=reattached,
+                        detail="a speaker in a live room had no audio reader",
+                    )
                 continue
 
             last_occupied = self._room_last_occupied.setdefault(room_name, now)
@@ -794,6 +821,9 @@ class LiveKitIngressWorker(BaseWorker):
                 human_participants=humans,
                 releasing_idle_rooms=len(idle_rooms),
                 requeued_lost_rooms=len(lost),
+                # WT-404. The census reported a healthy room throughout a meeting nobody was
+                # being heard in. This is the number that would have shown it.
+                reattached_readers=reattached_readers,
                 idle_releases_total=self._idle_releases_total,
             )
 
@@ -970,6 +1000,9 @@ class LiveKitIngressWorker(BaseWorker):
         """Stream audio from LiveKit, gate with VAD, publish only speech chunks."""
         audio_stream = rtc.AudioStream(track)
         sample_rate = self.SAMPLE_RATE
+        # Distinguishes a reader somebody stopped from one that stopped itself — see the finally
+        # block. Without it both ended on the same INFO line and WT-404 was invisible.
+        cancelled = False
 
         # VAD configuration from settings
         vad_threshold = self.settings.vad_threshold
@@ -1189,6 +1222,12 @@ class LiveKitIngressWorker(BaseWorker):
                             # Store in pre-speech ring for next onset
                             pre_speech_ring.append(window_data)
 
+        except asyncio.CancelledError:
+            # Somebody decided this reader should stop — the speaker left, the room was
+            # released, or a republished track replaced it. Expected, and told apart from the
+            # case below on purpose (WT-404).
+            cancelled = True
+            raise
         except Exception:
             self.logger.exception("process_audio_track_error", track_sid=track.sid)
         finally:
@@ -1204,7 +1243,26 @@ class LiveKitIngressWorker(BaseWorker):
                     sample_rate,
                     near_field_gate=near_field_gate,
                 )
-            self.logger.info("stopped_audio_stream_processing", track_sid=track.sid)
+            if cancelled:
+                self.logger.info("stopped_audio_stream_processing", track_sid=track.sid)
+            else:
+                # THE LINE THAT WAS MISSING. An AudioStream that ends on its own is how a
+                # speaker stops being heard while the room stays connected and the census keeps
+                # reporting it healthy — the whole of WT-404. It was logged at INFO, in the same
+                # words as an ordinary cancellation, so it could happen mid-meeting and read as
+                # routine teardown.
+                #
+                # Not an error: a track really does end when somebody leaves, and the sweep will
+                # simply find nothing to re-attach. It is a warning because in a room that is
+                # still live it means somebody has gone silent.
+                self.logger.warning(
+                    "audio_stream_ended_on_its_own",
+                    room=room_name,
+                    speaker_id=speaker_id,
+                    track_sid=track.sid,
+                    detail="the reader stopped without being cancelled; "
+                    "the idle sweep re-attaches if the track is still published",
+                )
 
     def _require_vad_model(self) -> Any:
         if self._vad_model is None:
