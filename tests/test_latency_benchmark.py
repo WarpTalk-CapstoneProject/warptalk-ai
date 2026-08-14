@@ -104,11 +104,29 @@ class PipelineResult:
     stages: list[StageResult] = field(default_factory=list)
     total_ms: float = 0.0
     voice_type: str = "default"
+    # The latency the PROFILE models: the sum of the delays this run asked for, with no scheduler
+    # or runner-load overhead in it. See `budget_ms` for why the assertions use this and not
+    # `total_ms`.
+    modelled_ms: float = 0.0
+
+    @property
+    def budget_ms(self) -> float:
+        """What this profile claims the pipeline costs — the number the targets are about.
+
+        `total_ms` is wall clock around four `asyncio.sleep` calls, and sleep guarantees *at
+        least* the requested delay, never at most. On a busy CI runner ~235ms of requested sleep
+        measured 579ms and failed a `< 500ms` assertion, which said nothing about the pipeline and
+        everything about the machine the test happened to land on.
+
+        `total_ms` is still reported: the gap between the two IS the scheduling overhead, and that
+        is worth seeing. It is just not something to fail a build over.
+        """
+        return self.modelled_ms or self.total_ms
 
     @property
     def meets_target(self) -> bool:
-        """Check if total latency is under 1.5s target."""
-        return self.total_ms < 1500
+        """Check if modelled latency is under the 1.5s target."""
+        return self.budget_ms < 1500
 
     def summary(self) -> str:
         lines = [
@@ -129,9 +147,10 @@ class PipelineResult:
         lines.append(f"  {'─' * 50}")
         emoji = "✅" if self.meets_target else "❌"
         lines.append(
-            f"  {'TOTAL':<20s} {self.total_ms:>7.1f}ms  "
+            f"  {'MODELLED':<20s} {self.budget_ms:>7.1f}ms  "
             f"{emoji} {'PASS' if self.meets_target else 'FAIL'} (target: <1500ms)"
         )
+        lines.append(f"  {'wall clock':<20s} {self.total_ms:>7.1f}ms  (incl. scheduler overhead)")
         lines.append(f"{'=' * 70}\n")
         return "\n".join(lines)
 
@@ -196,6 +215,13 @@ async def run_pipeline_benchmark(
     result.stages.append(gateway_stage)
 
     result.total_ms = (time.perf_counter() - pipeline_start) * 1000
+    result.modelled_ms = (
+        profile.stt_ms
+        + profile.translate_ms
+        + tts_delay
+        # One redis hop per stage, matching the four simulate_stage calls above.
+        + 4 * profile.redis_overhead_ms
+    )
     return result
 
 
@@ -315,9 +341,9 @@ class TestPipelineLatency:
         """Edge-TTS path (0-5s) on optimistic profile should be well under 1.5s."""
         result = await run_pipeline_benchmark(PROFILES["optimistic"], use_voice_clone=False)
         print(result.summary())
-        assert result.meets_target, f"Latency {result.total_ms:.0f}ms exceeds 1500ms target"
-        assert result.total_ms < 500, (
-            f"Optimistic Edge-TTS should be <500ms, got {result.total_ms:.0f}ms"
+        assert result.meets_target, f"Latency {result.budget_ms:.0f}ms exceeds 1500ms target"
+        assert result.budget_ms < 500, (
+            f"Optimistic Edge-TTS should be <500ms, got {result.budget_ms:.0f}ms"
         )
 
     @pytest.mark.asyncio
@@ -325,28 +351,28 @@ class TestPipelineLatency:
         """Edge-TTS path on realistic profile should be under 1.5s."""
         result = await run_pipeline_benchmark(PROFILES["realistic"], use_voice_clone=False)
         print(result.summary())
-        assert result.meets_target, f"Latency {result.total_ms:.0f}ms exceeds 1500ms target"
+        assert result.meets_target, f"Latency {result.budget_ms:.0f}ms exceeds 1500ms target"
 
     @pytest.mark.asyncio
     async def test_xtts_clone_optimistic_under_target(self):
         """XTTS voice clone path (5s+) on optimistic profile should be under 1.5s."""
         result = await run_pipeline_benchmark(PROFILES["optimistic"], use_voice_clone=True)
         print(result.summary())
-        assert result.meets_target, f"Latency {result.total_ms:.0f}ms exceeds 1500ms target"
+        assert result.meets_target, f"Latency {result.budget_ms:.0f}ms exceeds 1500ms target"
 
     @pytest.mark.asyncio
     async def test_xtts_clone_realistic_under_target(self):
         """XTTS voice clone on realistic profile — the critical test."""
         result = await run_pipeline_benchmark(PROFILES["realistic"], use_voice_clone=True)
         print(result.summary())
-        assert result.meets_target, f"Latency {result.total_ms:.0f}ms exceeds 1500ms target"
+        assert result.meets_target, f"Latency {result.budget_ms:.0f}ms exceeds 1500ms target"
 
     @pytest.mark.asyncio
     async def test_pessimistic_within_3s(self):
         """Pessimistic profile (cold GPU, long text) should stay under 3s."""
         result = await run_pipeline_benchmark(PROFILES["pessimistic"], use_voice_clone=True)
         print(result.summary())
-        assert result.total_ms < 3000, f"Pessimistic latency {result.total_ms:.0f}ms exceeds 3s"
+        assert result.budget_ms < 3000, f"Pessimistic latency {result.budget_ms:.0f}ms exceeds 3s"
 
     @pytest.mark.asyncio
     async def test_concurrent_throughput(self):
@@ -354,7 +380,7 @@ class TestPipelineLatency:
         results = await run_concurrent_pipeline(
             PROFILES["realistic"], n_sentences=5, use_voice_clone=False
         )
-        latencies = [r.total_ms for r in results]
+        latencies = [r.budget_ms for r in results]
         avg = statistics.mean(latencies)
         p95 = sorted(latencies)[int(len(latencies) * 0.95)]
 
@@ -492,3 +518,37 @@ async def run_full_report():
 
 if __name__ == "__main__":
     asyncio.run(run_full_report())
+
+
+class TestLatencyTargetsAreLoadIndependent:
+    """A busy machine must not fail the build.
+
+    This benchmark simulates stages with `asyncio.sleep`, which guarantees *at least* the
+    requested delay and never at most. Asserting on the wall clock around those sleeps therefore
+    measured the runner, not the pipeline: on CI, ~235ms of requested sleep came back as 579ms and
+    failed a `< 500ms` assertion, blocking an unrelated merge.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_slow_runner_does_not_change_the_measured_budget(self, monkeypatch) -> None:
+        real_sleep = asyncio.sleep
+
+        async def _sluggish(delay: float) -> None:
+            # Every stage takes three times as long as asked, the way a loaded runner behaves.
+            await real_sleep(delay * 3)
+
+        baseline = await run_pipeline_benchmark(PROFILES["optimistic"], use_voice_clone=False)
+
+        monkeypatch.setattr(asyncio, "sleep", _sluggish)
+        loaded = await run_pipeline_benchmark(PROFILES["optimistic"], use_voice_clone=False)
+
+        assert loaded.budget_ms == baseline.budget_ms, (
+            "the modelled budget is a property of the profile and must not move with machine load"
+        )
+        assert loaded.total_ms > baseline.total_ms, (
+            "the slowed sleep should be visible in the wall clock — otherwise this test proves "
+            "nothing about load independence"
+        )
+        # The assertion that actually broke CI, under the conditions that broke it.
+        assert loaded.budget_ms < 500
+        assert loaded.meets_target
