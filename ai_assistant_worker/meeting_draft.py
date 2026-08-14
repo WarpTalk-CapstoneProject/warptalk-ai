@@ -47,6 +47,24 @@ MEETING_TYPES: tuple[str, ...] = (
 
 RECURRENCE_TYPES: tuple[str, ...] = ("DAILY", "WEEKLY", "MONTHLY")
 
+# What the TOOL offers the model, which is not what the server accepts.
+#
+# WT-399. A model does not omit optional properties — it fills every one of them, with "" for a
+# string, [] for an array, 0 for a number. `recurrence_type` was the one property with no filler
+# available: an enum of three repeating rules and no member meaning "this does not repeat". So a
+# one-off meeting arrived tagged DAILY, `missing_fields` then demanded the start time a DAILY
+# rule needs, the model asked the user for a time they had explicitly said they did not want,
+# and there was no argument it could send that escaped — every route led back to the same two
+# errors until the turn ran out of tool iterations.
+#
+# NONE is that missing member. It is stripped in draft_from_arguments and never reaches the
+# server, which knows only the three above.
+NO_RECURRENCE = "NONE"
+RECURRENCE_CHOICES: tuple[str, ...] = (NO_RECURRENCE, *RECURRENCE_TYPES)
+
+# Other spellings of "not repeating" a model reaches for when it has not read the enum.
+_NO_RECURRENCE_ALIASES = frozenset({NO_RECURRENCE, "NEVER", "ONCE", "NO", "ONE_OFF", "SINGLE"})
+
 # The four the server cannot default. Everything else has a sensible fallback, and asking about
 # it would turn a one-sentence request into an interrogation.
 REQUIRED_FIELDS: tuple[str, ...] = (
@@ -266,7 +284,47 @@ def draft_from_arguments(arguments: dict[str, Any]) -> MeetingDraft:
         return text or None
 
     room_type = as_text(args.get("translation_room_type"))
+
+    scheduled_at = as_text(args.get("scheduled_at"))
     recurrence_type = as_text(args.get("recurrence_type"))
+    recurrence_type = recurrence_type.upper() if recurrence_type else None
+    recurrence_start_time_local = as_text(args.get("recurrence_start_time_local"))
+    recurrence_start_date_local = as_text(args.get("recurrence_start_date_local"))
+
+    if recurrence_type in _NO_RECURRENCE_ALIASES:
+        recurrence_type = None
+    elif (
+        recurrence_type
+        and scheduled_at
+        and not recurrence_start_time_local
+        and not recurrence_start_date_local
+    ):
+        # WT-399. A rule with a concrete one-off start AND nothing that makes it a rule — no
+        # time of day, no first date — is the enum's filler value showing through, not a request
+        # to repeat anything. Read it as the one-off the scheduled_at already describes.
+        #
+        # Narrow on purpose. A recurrence carrying ANY detail of its own is taken at face value
+        # and, if it also carries a scheduled_at, still fails `validate` as a contradiction — a
+        # user who asked for a weekly series must never be given one meeting instead, which is a
+        # far worse failure than the error this replaces.
+        recurrence_type = None
+
+    # 0 is the number-shaped filler, the same way "" is the string one — see RECURRENCE_CHOICES.
+    # Left as a real value it trips the "at least 2" rule in validate() and becomes the next dead
+    # end in the same loop. A genuine 1 is still an error: somebody meant it.
+    #
+    # Written out rather than left to `str(args.get(...) or "").strip().isdigit()`, which dropped
+    # the integer 0 only because 0 is falsy — while letting the STRING "0" through to fail
+    # validation. Which of those a model sends is not something to leave to chance.
+    max_participants_raw = args.get("max_participants")
+    max_participants: int | None = None
+    if max_participants_raw is not None:
+        try:
+            parsed = int(str(max_participants_raw).strip())
+        except (TypeError, ValueError):
+            parsed = 0
+        if parsed > 0:
+            max_participants = parsed
 
     documents: list[tuple[str, str]] = []
     raw_documents = args.get("documents")
@@ -288,16 +346,12 @@ def draft_from_arguments(arguments: dict[str, Any]) -> MeetingDraft:
         translation_room_type=room_type.upper() if room_type else None,
         source_language=as_text(args.get("source_language")),
         target_languages=as_list(args.get("target_languages")),
-        scheduled_at=as_text(args.get("scheduled_at")),
+        scheduled_at=scheduled_at,
         invited_emails=as_list(args.get("invited_emails")),
-        recurrence_type=recurrence_type.upper() if recurrence_type else None,
-        recurrence_start_time_local=as_text(args.get("recurrence_start_time_local")),
+        recurrence_type=recurrence_type,
+        recurrence_start_time_local=recurrence_start_time_local,
         recurrence_time_zone=as_text(args.get("recurrence_time_zone")),
-        recurrence_start_date_local=as_text(args.get("recurrence_start_date_local")),
+        recurrence_start_date_local=recurrence_start_date_local,
         recurrence_end_date_local=as_text(args.get("recurrence_end_date_local")),
-        max_participants=(
-            int(args["max_participants"])
-            if str(args.get("max_participants") or "").strip().isdigit()
-            else None
-        ),
+        max_participants=max_participants,
     )
