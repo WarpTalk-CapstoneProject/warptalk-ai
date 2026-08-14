@@ -329,6 +329,13 @@ class ChatAssistantSettings(BaseSettings):
     max_tokens: int = 1024
     temperature: float = 0.4
     max_tool_iterations: int = 5
+    # OpenAI's HOSTED web_search tool, added to the /v1/responses tool list.
+    #
+    # No new vendor and no new key: it runs on the same credentials this worker already uses,
+    # and OpenAI executes it server-side, so nothing here dispatches it. It costs per call,
+    # which is the only reason it is a switch at all — `ASSISTANT_CHAT_WEB_SEARCH_ENABLED=false`
+    # turns it off with no rebuild.
+    web_search_enabled: bool = True
     # Flush a streamed chunk to Redis every N characters rather than per-token — keeps
     # Redis Stream / SignalR traffic bounded, matching the rest of the pipeline's coarse
     # buffered-unit convention (STT/TTS/AI-assistant results are never per-token either).

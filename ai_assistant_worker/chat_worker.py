@@ -313,7 +313,18 @@ class ChatAssistantWorker(BaseWorker):
             {"role": turn.get("role"), "content": turn.get("content")} for turn in history
         ]
 
-        tool_schemas = [t.to_openai_schema() for t in TOOLS]
+        tool_schemas: list[dict[str, Any]] = [t.to_openai_schema() for t in TOOLS]
+
+        # OpenAI's HOSTED web search, not a ChatTool: the model calls it and OpenAI runs it
+        # server-side, so it has no handler here and never reaches the dispatch below — that loop
+        # filters on `type == "function_call"`, and a hosted call comes back as its own item type.
+        # The answer text it produces streams in on the same response, which is why adding it
+        # needs nothing else.
+        #
+        # It bills per call, which is the only reason it is a switch: ASSISTANT_CHAT_WEB_SEARCH_
+        # ENABLED=false turns it off without a rebuild.
+        if self.chat_settings.web_search_enabled:
+            tool_schemas.append({"type": "web_search"})
         tool_call_log: list[dict[str, Any]] = []
         final_text = ""
 
