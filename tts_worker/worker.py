@@ -713,7 +713,16 @@ class TTSWorker(BaseWorker):
                         # Consent gate: never buffer/clone a speaker's voice (biometric
                         # data) unless they have at least one current outgoing route with
                         # VoiceCloneEnabled = true. See base_worker.is_voice_clone_consented.
-                        if not self.is_voice_clone_consented(chunk.meeting_id, chunk.speaker_id):
+                        #
+                        # Asked in the form that can recover the routes from Redis and that
+                        # reports WHICH no it is: production ran with zero cloned voices and
+                        # every dub on the default catalog voice, and this branch — the one that
+                        # swallows the whole meeting — said nothing at all on the way past.
+                        consented, consent_reason = await self.voice_clone_consent_state(
+                            chunk.meeting_id, chunk.speaker_id
+                        )
+                        if not consented:
+                            self._note_clone_state(key, consent_reason)
                             buffers.pop(key, None)
                             buffer_seconds.pop(key, None)
                             buffer_lang.pop(key, None)
@@ -733,6 +742,7 @@ class TTSWorker(BaseWorker):
                                 upgrades_used.get(key, 0)
                                 >= self.tts_settings.voice_clone_max_upgrades
                             ):
+                                self._note_clone_state(key, "cloned_upgrades_exhausted")
                                 buffers.pop(key, None)
                                 buffer_seconds.pop(key, None)
                                 buffer_lang.pop(key, None)
@@ -741,6 +751,7 @@ class TTSWorker(BaseWorker):
                             # no local score. Treat it as good enough to keep rather than racing to
                             # replace something we cannot compare against.
                             if key not in cloned_score:
+                                self._note_clone_state(key, "cloned_elsewhere_kept")
                                 continue
 
                         buffers.setdefault(key, bytearray()).extend(chunk.audio_data)
@@ -793,6 +804,7 @@ class TTSWorker(BaseWorker):
                                     score=round(assessment.score, 3),
                                     upgrade=is_upgrade,
                                 )
+                                self._note_clone_state(key, "cloning")
                                 asyncio.create_task(
                                     self._clone_and_cache(
                                         chunk.meeting_id,
@@ -829,6 +841,30 @@ class TTSWorker(BaseWorker):
             except Exception:
                 self.logger.exception("audio_consumer_error")
                 await asyncio.sleep(2)
+
+    def _note_clone_state(self, key: tuple[str, str], reason: str) -> None:
+        """Say why this speaker is not on a cloned voice — once per change, not once per chunk.
+
+        Audio chunks arrive continuously for the whole meeting, so logging at each of these
+        branches directly would bury the pipeline in one line per chunk per speaker and get the
+        level turned back down within a day. Only a CHANGE is news.
+
+        This exists because production ran with `voice:*` empty and 97 of 97 dubbed segments on
+        `voice_type=default`, and not one line in any log said why. Every exit before the clone
+        call returned in silence, so the difference between "nobody opted in" and "this worker
+        never learned the room's routes" was invisible from outside.
+        """
+        if getattr(self, "_clone_state", None) is None:
+            self._clone_state: dict[tuple[str, str], str] = {}
+        if self._clone_state.get(key) == reason:
+            return
+        self._clone_state[key] = reason
+        self.logger.info(
+            "voice_clone_state",
+            meeting_id=key[0],
+            speaker_id=key[1],
+            reason=reason,
+        )
 
     def _trim_clone_buffer(
         self,
