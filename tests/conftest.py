@@ -5,7 +5,7 @@ Uses mocked Redis for unit tests and pytest-asyncio for async tests.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -100,6 +100,32 @@ def mock_redis_client(redis_settings: RedisSettings) -> RedisStreamClient:
     client._redis.hget.return_value = None
     client._redis.hgetall.return_value = {}
     client._redis.get.return_value = None
+
+    # `Redis.pipeline()` is SYNCHRONOUS in redis-py — it returns a Pipeline, it does not await to
+    # one. AsyncMock makes every attribute a coroutine function, so without this the publish path
+    # got a coroutine where it expected the pipeline and failed with
+    # "'coroutine' object has no attribute 'xadd'".
+    #
+    # publish() batches its XADD and the stream's EXPIRE into one pipeline so the TTL refresh
+    # costs no extra round trip on the hot path (see shared/redis_client.py). The first result is
+    # the message id.
+    pipeline = MagicMock()
+
+    def _record_xadd(*args: object, **kwargs: object) -> None:
+        # Forwarded onto the same `xadd` mock the direct path used, so that every existing
+        # assertion of the form "what did this worker publish?" — five test modules read
+        # `_redis.xadd.call_args_list` — keeps describing the same thing it always did. Rewriting
+        # them all to reach into the pipeline instead would be a large diff over tests that are
+        # not what changed, and each rewrite is a chance to weaken an assertion by accident.
+        #
+        # AsyncMock records the call and hands back a coroutine nobody awaits; closing it keeps
+        # pytest from reporting a "coroutine was never awaited" warning for every publish.
+        client._redis.xadd(*args, **kwargs).close()
+
+    pipeline.xadd = MagicMock(side_effect=_record_xadd)
+    pipeline.expire = MagicMock()
+    pipeline.execute = AsyncMock(return_value=[b"1234567890-0", True])
+    client._redis.pipeline = MagicMock(return_value=pipeline)
 
     return client
 

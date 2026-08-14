@@ -39,9 +39,44 @@ class RedisSettings(BaseSettings):
     # normal long-poll does not become a retry storm under load.
     socket_timeout: float = 15.0
     socket_connect_timeout: float = 5.0
-    stream_maxlen: int = 1000  # MAXLEN ~ for XADD trimming
+    # A COUNT, and the entries it counts are audio. One tts:results entry carries ~113 KB of
+    # WAV, so 1000 of them is a 113 MB ceiling for ONE stream — and there is a set of these per
+    # room. On 2026-08-14 that filled a 768 MB production Redis to 93%, and `allkeys-lru` then
+    # began deleting live meetings' streams to make room. See stream_ttl_seconds below.
+    stream_maxlen: int = 200
     retry_max_attempts: int = 5
     retry_base_delay: float = 0.5
+
+    # How long a stream may sit unwritten before Redis drops it. Refreshed on every publish, so
+    # it only elapses after a stream has genuinely gone quiet.
+    #
+    # WHY THIS EXISTS
+    #   Nothing deleted a room's streams. `_cleanup_room` releases the LiveKit lease and the
+    #   in-process state and never touches Redis, and no other path does either — so every
+    #   meeting ever held left `audio:chunks:{room}`, `stt:results:{room}`, `translate:results:
+    #   {room}` and `tts:results:{room}` behind forever. Production held 70 such keys, 284 MB,
+    #   the oldest untouched for 10 days.
+    #
+    #   A TTL rather than a delete-on-terminal-event because the event is not reliable: the
+    #   ingress worker's terminal-status hook only fires when the backend publishes
+    #   AUDIO_ROUTES_UPDATED with a terminal status, which it suppresses for a room that never
+    #   had audio routes. Anything that depends on a message arriving leaks whenever it does
+    #   not. A refreshed TTL needs no message at all.
+    #
+    #   One hour: far longer than any late consumer, reclaim or dead-letter pass (the longest is
+    #   the 60s reclaim idle window), and short enough that a day's meetings cannot accumulate.
+    stream_ttl_seconds: int = 3600
+
+    # A consumer group that has stopped advancing must not pin the trim floor forever.
+    #
+    # `_trim_stream_without_losing_unconsumed_entries` trims to `min(last-delivered)` across all
+    # groups, which is right for a group that is merely slow and catastrophic for one that is
+    # gone. In production `billing-stt-workers` last read `stt:results` on 2026-08-10 and had
+    # held the floor of that stream for four days by 2026-08-14 — the safety check had become
+    # the leak. Past this age a group is treated as dead for trimming purposes and said so out
+    # loud, because losing unread entries for a consumer that is not consuming is the lesser
+    # harm and the silence is what let it run for four days.
+    stream_group_stale_after_seconds: int = 3600
 
 
 class LiveKitSettings(BaseSettings):

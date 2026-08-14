@@ -19,6 +19,10 @@ def client() -> RedisStreamClient:
     c._settings.stream_maxlen = 1000
     c._settings.retry_max_attempts = 1
     c._settings.retry_base_delay = 0.01
+    # Publishing now rides an EXPIRE alongside the XADD (see test_redis_stream_lifecycle.py).
+    # These are real numbers rather than MagicMock attributes because the client compares them.
+    c._settings.stream_ttl_seconds = 3600
+    c._settings.stream_group_stale_after_seconds = 0
     c._pool = None
 
     # Mock Redis instance
@@ -37,7 +41,15 @@ def client() -> RedisStreamClient:
     mock_redis.hset = AsyncMock()
     mock_redis.hget = AsyncMock(return_value=None)
     mock_redis.close = AsyncMock()
+
+    mock_pipeline = MagicMock()
+    mock_pipeline.xadd = MagicMock()
+    mock_pipeline.expire = MagicMock()
+    mock_pipeline.execute = AsyncMock(return_value=[b"1234567890-0", True])
+    mock_redis.pipeline = MagicMock(return_value=mock_pipeline)
+
     c._redis = mock_redis
+    c._test_pipeline = mock_pipeline
 
     return c
 
@@ -84,10 +96,14 @@ class TestPublish:
     """RedisStreamClient.publish tests."""
 
     async def test_publish_does_not_trim_inside_xadd(self, client: RedisStreamClient) -> None:
-        """XADD MAXLEN can delete pending entries, so publishing must add first."""
+        """XADD MAXLEN can delete pending entries, so publishing must add first.
+
+        The XADD goes through a pipeline now so its EXPIRE costs no extra round trip, but what
+        has to stay true is unchanged: no MAXLEN argument on the append itself.
+        """
         await client.publish("test:stream", {"key": "value"})
 
-        client._redis.xadd.assert_called_once_with(
+        client._test_pipeline.xadd.assert_called_once_with(
             "test:stream",
             {"key": "value"},
         )
@@ -147,7 +163,7 @@ class TestPublish:
 
     async def test_publish_returns_message_id(self, client: RedisStreamClient) -> None:
         """publish() should return the Redis message ID."""
-        client._redis.xadd = AsyncMock(return_value=b"9999-0")
+        client._test_pipeline.execute = AsyncMock(return_value=[b"9999-0", True])
         result = await client.publish("s", {"k": "v"})
         assert result == b"9999-0"
 
