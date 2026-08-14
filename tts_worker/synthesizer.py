@@ -13,6 +13,7 @@ from cartesia import AsyncCartesia
 
 from shared.lang import base_language
 from shared.logger import get_logger
+from tts_worker.prosody_context import ProsodyContext
 
 logger = get_logger(__name__)
 
@@ -53,6 +54,41 @@ class CartesiaSynthesizer:
     async def load(self) -> None:
         self._client = AsyncCartesia(api_key=self.api_key)
         logger.info("cartesia_ready", model=self.model, sample_rate=self.sample_rate)
+
+    async def open_prosody_context(
+        self,
+        *,
+        context_id: str,
+        language: str,
+        voice_id: str | None = None,
+    ) -> tuple[ProsodyContext, Any]:
+        """A single prosodic thread for one spoken turn — see tts_worker/prosody_context.py.
+
+        Returns the context AND the connection that owns it, because the caller has to keep the
+        connection alive for the whole turn and close it afterwards; a context outliving its
+        socket is just a closed socket with extra steps.
+
+        Raw PCM rather than a WAV container: this is a stream, so there is no total length to
+        put in a header up front. ProsodyContext re-wraps each sentence in the 44-byte header
+        the publish path expects, so nothing downstream can tell the difference.
+        """
+        client = self._require_client()
+        connection = await client.tts.websocket_connect().enter()
+        context = connection.context(
+            context_id=context_id,
+            model_id=self.model,
+            voice=cast(Any, {"id": voice_id or self._default_voice_id(language)}),
+            language=cast(Any, language),
+            output_format=cast(
+                Any,
+                {
+                    "container": "raw",
+                    "sample_rate": self.sample_rate,
+                    "encoding": "pcm_s16le",
+                },
+            ),
+        )
+        return ProsodyContext(context, self.sample_rate), connection
 
     async def clone_voice(
         self, audio_bytes: bytes, speaker_label: str, language: str = "en"
