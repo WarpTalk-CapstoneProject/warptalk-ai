@@ -14,6 +14,7 @@ import asyncio
 import json
 import socket
 import time
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, ParamSpec, TypeVar, cast
 from urllib.parse import urlsplit
@@ -37,6 +38,38 @@ LATENCY_KEY_PREFIX = "warptalk:latency:"
 # Refreshed on every observation. Long enough to survive a quiet weekend, bounded so this can
 # never become the next thing that fills Redis.
 LATENCY_KEY_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+def _is_per_room_stream(stream: str) -> bool:
+    """Whether this stream belongs to ONE room and may therefore be expired.
+
+    WT-402. Stream expiry was added to stop abandoned per-room streams filling Redis, and it was
+    applied to every stream — including `audio:chunks`, `stt:results`, `translate:results`,
+    `tts:results` and `ai_assistant:results`, which are permanent and shared. An hour with no
+    meeting expired them, Redis deleted the keys, and every consumer group on them went too.
+
+    The Python workers survive that: `ensure_consumer_group` runs ahead of each read and rebuilds
+    what it needs. The GATEWAY does not — it is a .NET service that creates its groups once at
+    startup — so `gateway-consumers` simply ceased to exist and every XREADGROUP after it threw
+    NOGROUP. No translation, no dub and no assistant reply reached a browser again, and the
+    gateway's health check reported healthy throughout.
+
+    THE DEFAULT IS "NEVER EXPIRE", AND THAT DIRECTION IS THE POINT. Deciding by name means a
+    stream nobody thought about is treated as permanent: the cost of being wrong that way is disk,
+    which monitoring already watches, while the cost of being wrong the other way is a silently
+    dead pipeline. A per-room stream is `{base}:{roomId}`, so the question is whether the last
+    segment is a room id — nothing else in this system suffixes a stream with a UUID.
+    """
+    _, _, last = stream.rpartition(":")
+    if not last:
+        return False
+    try:
+        uuid.UUID(last)
+    except ValueError:
+        return False
+    return True
+
+
 P = ParamSpec("P")
 R = TypeVar("R")
 
@@ -201,8 +234,15 @@ class RedisStreamClient:
         The EXPIRE rides in the same pipeline as the XADD deliberately. This is the hot path —
         one publish per speech chunk — and a second round trip here would add latency to the very
         pipeline the leak was already slowing down.
+
+        ONLY PER-ROOM STREAMS. See _is_per_room_stream: this shipped expiring EVERY stream, and
+        the global ones are permanent infrastructure whose consumer groups belong to services
+        that never rebuild them. An hour without a meeting was enough to delete `translate:results`
+        and take `gateway-consumers` with it, after which the gateway threw NOGROUP on every read
+        and no translation, dub or assistant reply reached a browser again — while its health
+        check stayed green. Found in production the same day it shipped (WT-402).
         """
-        ttl = self._settings.stream_ttl_seconds
+        ttl = self._settings.stream_ttl_seconds if _is_per_room_stream(stream) else 0
         if ttl <= 0:
             return cast(
                 "bytes | str", await self._retry(self.redis.xadd, stream, cast(Any, redis_data))

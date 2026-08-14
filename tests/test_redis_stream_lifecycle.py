@@ -31,7 +31,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from shared.config import RedisSettings
-from shared.redis_client import RedisStreamClient
+from shared.redis_client import RedisStreamClient, _is_per_room_stream
+
+# A real room id, because the rule that decides expiry parses one. "room1" is not a shape this
+# system ever produces, and a test using it cannot tell a correct rule from a broken one.
+ROOM_STREAM = "audio:chunks:019fff06-2b98-7e1d-a923-1f53d10b455a"
 
 # Applied per-test rather than module-wide: one check below is synchronous.
 async_test = pytest.mark.asyncio
@@ -70,9 +74,9 @@ def _stream_id(seconds_ago: float) -> bytes:
 async def test_publishing_refreshes_the_streams_expiry() -> None:
     client = _client(stream_ttl_seconds=3600)
 
-    await client.publish("audio:chunks:room1", {"k": "v"})
+    await client.publish(ROOM_STREAM, {"k": "v"})
 
-    client._pipeline.expire.assert_called_once_with("audio:chunks:room1", 3600)
+    client._pipeline.expire.assert_called_once_with(ROOM_STREAM, 3600)
 
 
 @async_test
@@ -81,7 +85,7 @@ async def test_the_expiry_rides_with_the_xadd_rather_than_costing_a_round_trip()
     # latency to the pipeline whose latency was already the other half of the report.
     client = _client(stream_ttl_seconds=3600)
 
-    await client.publish("audio:chunks:room1", {"k": "v"})
+    await client.publish(ROOM_STREAM, {"k": "v"})
 
     client._redis.pipeline.assert_called_once_with(transaction=False)
     client._pipeline.execute.assert_awaited_once()
@@ -95,14 +99,14 @@ async def test_publish_still_returns_the_message_id_through_the_pipeline() -> No
     # would break every caller that tracks its own message.
     client = _client(stream_ttl_seconds=3600)
 
-    assert await client.publish("audio:chunks:room1", {"k": "v"}) == b"1-0"
+    assert await client.publish(ROOM_STREAM, {"k": "v"}) == b"1-0"
 
 
 @async_test
 async def test_a_ttl_of_zero_leaves_streams_permanent_and_skips_the_pipeline() -> None:
     client = _client(stream_ttl_seconds=0)
 
-    await client.publish("audio:chunks:room1", {"k": "v"})
+    await client.publish(ROOM_STREAM, {"k": "v"})
 
     client._redis.xadd.assert_awaited_once()
     client._redis.pipeline.assert_not_called()
@@ -208,3 +212,89 @@ async def test_a_group_that_has_never_read_anything_still_blocks_trimming_entire
     await client.publish("stt:results", {"k": "v"})
 
     client._redis.xtrim.assert_not_awaited()
+
+
+# ── WT-402: which streams may be expired at all ──────────────────────────────────────────────
+#
+# Stream expiry shipped applying to EVERY stream. Within hours of reaching production an idle
+# hour expired `translate:results`, Redis deleted the key, and every consumer group on it went
+# with it. The Python workers rebuild theirs before each read; the gateway is a .NET service that
+# creates its groups once at startup, so `gateway-consumers` ceased to exist and it threw NOGROUP
+# on every subsequent read — no translation, no dub and no assistant reply reaching any browser,
+# with its health check green the whole time.
+
+
+GLOBAL_STREAMS = [
+    "audio:chunks",
+    "stt:results",
+    "translate:results",
+    "translate:requests",
+    "tts:results",
+    "ai_assistant:results",
+    "assistant:chat_requests",
+    "assistant:chat_results",
+    "assistant:summary_results",
+    "knowledge:fact_requests",
+    "embedding:search_requests",
+    "translationRoom:system_events",
+]
+
+ROOM_STREAMS = [
+    "audio:chunks:019fff06-2b98-7e1d-a923-1f53d10b455a",
+    "stt:results:01a000f8-69c3-7888-bd1f-b4f33634cc1e",
+    "translate:results:019fe9ee-b2a0-77a1-b7ab-9fb5b54f5baf",
+    "tts:results:019ffff5-6396-781e-bfc5-9e1ba073de82",
+    "ai_assistant:results:019fbb91-a381-74d7-abe9-330fea589d81",
+    "assistant:chat_results:ca0e7abf-f20b-4b46-80fb-69f2aaa065d0",
+]
+
+
+@pytest.mark.parametrize("stream", GLOBAL_STREAMS)
+def test_a_shared_stream_is_never_expired(stream: str) -> None:
+    """The failure this exists to stop.
+
+    Every name here is a real key observed on production. Expiring any of them deletes the
+    consumer groups of services that do not rebuild them.
+    """
+    assert not _is_per_room_stream(stream), (
+        f"{stream} would be given a TTL — its consumer groups would be deleted with the key"
+    )
+
+
+@pytest.mark.parametrize("stream", ROOM_STREAMS)
+def test_a_room_stream_is_still_expired(stream: str) -> None:
+    # The leak the TTL was added for is real: 70 abandoned room streams, 284 MB, the oldest
+    # untouched for ten days, inside a 768 MB Redis running allkeys-lru. Narrowing the rule must
+    # not quietly turn the whole thing off.
+    assert _is_per_room_stream(stream)
+
+
+def test_something_that_merely_looks_suffixed_is_left_alone() -> None:
+    # The default is "permanent", so anything that is not provably a room stream keeps its data.
+    # Being wrong this way costs disk, which is monitored; being wrong the other way kills a
+    # pipeline in silence.
+    for stream in ("stt:results:latest", "audio:chunks:v2", "warptalk:latency:tts", "plain"):
+        assert not _is_per_room_stream(stream), stream
+
+
+@async_test
+async def test_publishing_to_a_shared_stream_sets_no_expiry() -> None:
+    """The wiring, not the predicate.
+
+    A correct rule that publish() never consults is the same outage with better documentation.
+    """
+    client = _client(stream_ttl_seconds=3600)
+
+    await client.publish("translate:results", {"k": "v"})
+
+    client._pipeline.expire.assert_not_called()
+    client._redis.expire.assert_not_awaited()
+
+
+@async_test
+async def test_publishing_to_a_room_stream_still_sets_one() -> None:
+    client = _client(stream_ttl_seconds=3600)
+
+    await client.publish(ROOM_STREAM, {"k": "v"})
+
+    client._pipeline.expire.assert_called_once_with(ROOM_STREAM, 3600)

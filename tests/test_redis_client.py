@@ -10,6 +10,10 @@ from redis.asyncio import ReadOnlyError, ResponseError
 from shared.config import RedisSettings
 from shared.redis_client import RedisStreamClient, _redact_redis_url
 
+# A real room id: since WT-402 only per-room streams take the EXPIRE pipeline path, and the rule
+# that decides parses the suffix as a UUID.
+ROOM_STREAM = "audio:chunks:019fff06-2b98-7e1d-a923-1f53d10b455a"
+
 
 @pytest.fixture
 def client() -> RedisStreamClient:
@@ -98,15 +102,26 @@ class TestPublish:
     async def test_publish_does_not_trim_inside_xadd(self, client: RedisStreamClient) -> None:
         """XADD MAXLEN can delete pending entries, so publishing must add first.
 
-        The XADD goes through a pipeline now so its EXPIRE costs no extra round trip, but what
-        has to stay true is unchanged: no MAXLEN argument on the append itself.
+        A ROOM stream, because only those take the pipeline path: since WT-402 a shared stream
+        gets no EXPIRE and so needs no pipeline. What has to stay true is the same on both
+        paths — no MAXLEN argument on the append itself.
         """
-        await client.publish("test:stream", {"key": "value"})
+        await client.publish(ROOM_STREAM, {"key": "value"})
 
         client._test_pipeline.xadd.assert_called_once_with(
-            "test:stream",
+            ROOM_STREAM,
             {"key": "value"},
         )
+        client._redis.xtrim.assert_not_awaited()
+
+    async def test_publish_to_a_shared_stream_does_not_trim_inside_xadd_either(
+        self, client: RedisStreamClient
+    ) -> None:
+        # The other path, which WT-402 introduced. A shared stream skips the pipeline entirely,
+        # and the rule it exists to protect must survive that.
+        await client.publish("test:stream", {"key": "value"})
+
+        client._redis.xadd.assert_awaited_once_with("test:stream", {"key": "value"})
         client._redis.xtrim.assert_not_awaited()
 
     async def test_publish_trims_only_before_earliest_pending_entry(
@@ -162,10 +177,12 @@ class TestPublish:
         )
 
     async def test_publish_returns_message_id(self, client: RedisStreamClient) -> None:
-        """publish() should return the Redis message ID."""
+        """publish() should return the Redis message ID — from either path."""
         client._test_pipeline.execute = AsyncMock(return_value=[b"9999-0", True])
-        result = await client.publish("s", {"k": "v"})
-        assert result == b"9999-0"
+        assert await client.publish(ROOM_STREAM, {"k": "v"}) == b"9999-0"
+
+        client._redis.xadd = AsyncMock(return_value=b"8888-0")
+        assert await client.publish("shared:stream", {"k": "v"}) == b"8888-0"
 
 
 async def test_retry_recovers_after_sentinel_read_only_failover(
