@@ -428,6 +428,45 @@ class BaseWorker(ABC):
             for route in routes
         )
 
+    async def voice_clone_consent_state(
+        self, room_id: str, speaker_user_id: str
+    ) -> tuple[bool, str]:
+        """`is_voice_clone_consented`, allowed to go and find out — and to say which answer it gave.
+
+        THE ASYMMETRY THIS CLOSES
+            The sync version fails closed on an unknown room, which is right: never clone a voice
+            without a confirmed opt-in. But it cannot tell "this speaker did not opt in" apart from
+            "this worker has never been told anything about this room", and those are different
+            facts with different fixes.
+
+            `_room_routes` is populated only by the AUDIO_ROUTES_UPDATED pub/sub broadcast, and
+            pub/sub has no replay. Every deploy restarts every worker, so a worker that comes up
+            mid-meeting never learns that room's routes and answers "no consent" for the rest of
+            the meeting — silently, for every speaker in it. That is exactly the failure
+            `_translation_active_for` was added to close for the translation gate; the consent gate
+            reads the same cache and never got the same treatment.
+
+            The snapshot needs nothing new: the backend already writes the identical payload to
+            `translationRoom:{id}:audio_routes` as a durable key.
+
+        Returns (consented, reason) where reason is one of:
+            "consented"      — a current outgoing route for this speaker has VoiceCloneEnabled.
+            "not_opted_in"   — routes are known and none of this speaker's has it enabled.
+            "routes_unknown" — no routes for this room, and no snapshot to recover them from.
+                               Still fails closed, but now says so instead of looking identical
+                               to a deliberate opt-out.
+        """
+        if self.is_voice_clone_consented(room_id, speaker_user_id):
+            return True, "consented"
+
+        if room_id not in self._room_routes and await self._load_route_snapshot(room_id):
+            if self.is_voice_clone_consented(room_id, speaker_user_id):
+                return True, "consented"
+
+        if self._room_routes.get(room_id):
+            return False, "not_opted_in"
+        return False, "routes_unknown"
+
     # ------------------------------------------------------------------
     # Abstract interface
     # ------------------------------------------------------------------
