@@ -498,8 +498,21 @@ class TTSWorker(BaseWorker):
         deduping identical listen-languages). Skipped entirely if it happens to equal
         the default voice already being rendered.
         """
-        cloned_voice_id = await self._get_voice_id(meeting_id, speaker_id)
-        if cloned_voice_id:
+        # WT-396. The speaker's OWN choice wins over everything, including a voice cloned live in
+        # this meeting: they went and picked one, and a live clone quietly overriding it is the
+        # same class of bug as the pick never being read at all.
+        #
+        # Until now nothing read it. A person uploaded a recording of themselves, the UI listed
+        # the profile as active, and the dub came back in a stock catalogue voice — because the
+        # only voice this function ever looked for was one cloned from the meeting's microphone.
+        chosen_voice_id = self.chosen_dub_voice(meeting_id, speaker_id)
+        cloned_voice_id = (
+            None if chosen_voice_id else await self._get_voice_id(meeting_id, speaker_id)
+        )
+
+        if chosen_voice_id:
+            default_voice_id, default_voice_type = chosen_voice_id, "profile"
+        elif cloned_voice_id:
             default_voice_id, default_voice_type = cloned_voice_id, "cloned"
         else:
             default_voice_id = await self._hashed_default_voice_id(target_lang, speaker_id)
@@ -758,7 +771,13 @@ class TTSWorker(BaseWorker):
             cache_key=cache_key,
             cache_hit=cache_hit,
             synthesis_latency_ms=synthesis_latency_ms,
-            fallback_reason="" if voice_type == "cloned" else "voice_profile_not_ready",
+            # WT-396: "profile" is a voice the speaker CHOSE, so nothing fell back. Leaving the
+            # old else-branch in place would stamp every deliberately picked voice
+            # "voice_profile_not_ready" — the transcript would then report the exact opposite of
+            # what happened, which is worse than reporting nothing.
+            fallback_reason=(
+                "" if voice_type in ("cloned", "profile") else "voice_profile_not_ready"
+            ),
             target_lang=translation.target_lang,
             is_final_chunk=translation.is_final_chunk,
             timestamp_ms=translation.timestamp_ms,

@@ -428,6 +428,27 @@ class BaseWorker(ABC):
             for route in routes
         )
 
+    def chosen_dub_voice(self, room_id: str, speaker_user_id: str) -> str | None:
+        """The voice this speaker asked to be dubbed in, or None to clone them live (WT-396).
+
+        Read from the same route snapshot as the consent gate above, and matched the same way —
+        on SourceUserId, because routes are keyed by participant id in Postgres while the AI
+        pipeline knows people by auth user id.
+
+        None on an unknown room, exactly like is_voice_clone_consented, but for the opposite
+        reason: there the unknown answer must fail closed because it guards biometric processing,
+        here it simply means nobody has told us a preference yet and the pipeline should do what
+        it always did. Missing the field entirely is also None — an older backend does not send
+        it, and during a rolling deploy half the fleet is talking to one that does not.
+        """
+        for route in self._room_routes.get(room_id, []):
+            if str(route.get("SourceUserId") or "").lower() != speaker_user_id.lower():
+                continue
+            voice_id = route.get("SourceDubVoiceId")
+            if voice_id:
+                return str(voice_id)
+        return None
+
     async def voice_clone_consent_state(
         self, room_id: str, speaker_user_id: str
     ) -> tuple[bool, str]:
