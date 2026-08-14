@@ -386,12 +386,14 @@ class TestTranslateBatch:
         # Model only returned 1 line for 2 inputs — malformed batch response.
         mock_response.choices[0].message.content = "[1] Xin chào"
         translator._client.chat.completions.create = AsyncMock(return_value=mock_response)
-        translator.translate = AsyncMock(side_effect=["Xin chào", "Thế giới"])
+        translator.translate_with_valence = AsyncMock(
+            side_effect=[("Xin chào", None), ("Thế giới", None)]
+        )
 
         result = await translator.translate_batch(["Hello", "World"], "en", "vi")
 
         assert result == ["Xin chào", "Thế giới"]
-        assert translator.translate.await_count == 2
+        assert translator.translate_with_valence.await_count == 2
 
 
 class TestTranslationWorker:
@@ -414,7 +416,7 @@ class TestTranslationWorker:
         worker.worker_name = "translation"
         mock_translator = MagicMock()
         mock_translator.model = "gpt-4.1-mini"
-        mock_translator.translate = AsyncMock(return_value="Xin chào")
+        mock_translator.translate_with_valence = AsyncMock(return_value=("Xin chào", None))
         mock_translator.translate_batch = AsyncMock(return_value=[])
         worker.translator = mock_translator
         return worker
@@ -498,7 +500,8 @@ class TestTranslationWorker:
         await worker.process(b"msg-1", self._make_stt_msg(language="en").to_redis())
 
         published = [
-            c.kwargs.get("target_lang") for c in worker.translator.translate.call_args_list
+            c.kwargs.get("target_lang")
+            for c in worker.translator.translate_with_valence.call_args_list
         ]
         assert published == ["vi"]
 
@@ -540,7 +543,7 @@ class TestTranslationWorker:
 
         await worker.process(b"msg-1", self._make_stt_msg(language="en").to_redis())
 
-        worker.translator.translate.assert_called()
+        worker.translator.translate_with_valence.assert_called()
 
     async def test_default_fallback_language_is_en(
         self, mock_redis_client, worker_settings: WorkerSettings
@@ -554,7 +557,7 @@ class TestTranslationWorker:
         await worker.process(b"msg-1", self._make_stt_msg(language="vi").to_redis())
 
         # Translator called with target_lang="en"
-        call_kwargs = worker.translator.translate.call_args
+        call_kwargs = worker.translator.translate_with_valence.call_args
         target = call_kwargs.kwargs.get("target_lang") or call_kwargs[1].get("target_lang")
         assert target == "en"
 
@@ -584,7 +587,9 @@ class TestTranslationWorker:
             return None
 
         mock_redis_client._redis.get.side_effect = get_value
-        worker.translator.translate = AsyncMock(return_value="[OUT_OF_MEETING_SCOPE]")
+        worker.translator.translate_with_valence = AsyncMock(
+            return_value=("[OUT_OF_MEETING_SCOPE]", None)
+        )
 
         message = self._make_stt_msg(
             language="vi",
@@ -607,8 +612,8 @@ class TestTranslationWorker:
         worker._speculative_translations = {}
         mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"en"}
         mock_redis_client._redis.get.return_value = None
-        worker.translator.translate = AsyncMock(
-            return_value="Today we deploy Docker on Kubernetes."
+        worker.translator.translate_with_valence = AsyncMock(
+            return_value=("Today we deploy Docker on Kubernetes.", None)
         )
 
         await worker._prefetch_from_event(
@@ -619,8 +624,8 @@ class TestTranslationWorker:
                 "language": "vi",
             }
         )
-        worker.translator.translate.assert_awaited_once()
-        worker.translator.translate.reset_mock()
+        worker.translator.translate_with_valence.assert_awaited_once()
+        worker.translator.translate_with_valence.reset_mock()
 
         message = self._make_stt_msg(
             language="vi",
@@ -628,7 +633,7 @@ class TestTranslationWorker:
         )
         await worker.process(b"msg-final", message.to_redis())
 
-        worker.translator.translate.assert_not_awaited()
+        worker.translator.translate_with_valence.assert_not_awaited()
         published = [
             call.args[1]
             for call in mock_redis_client._redis.xadd.call_args_list
@@ -655,13 +660,13 @@ class TestTranslationWorker:
         """
         worker = self._make_worker(mock_redis_client, worker_settings)
         mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
-        worker.translator.translate = AsyncMock(return_value="Xin chào")
+        worker.translator.translate_with_valence = AsyncMock(return_value=("Xin chào", None))
         worker.translator.translate_batch = AsyncMock(return_value=["Bạn khỏe không"])
 
         msg = self._make_stt_msg(language="en", text="Hello there. How are you?")
         await worker.process(b"msg-1", msg.to_redis())
 
-        worker.translator.translate.assert_awaited_once_with(
+        worker.translator.translate_with_valence.assert_awaited_once_with(
             "Hello there.",
             source_lang="en",
             target_lang="vi",
@@ -796,7 +801,7 @@ class TestTranslationWorker:
         msg = self._make_stt_msg(language="en", text="Hello there.")
         await worker.process(b"msg-1", msg.to_redis())
 
-        worker.translator.translate.assert_awaited_once_with(
+        worker.translator.translate_with_valence.assert_awaited_once_with(
             "Hello there.",
             source_lang="en",
             target_lang="vi",
@@ -878,7 +883,7 @@ class TestTranslationWorker:
         message.meeting_id = "m1"
         await worker.process(b"msg-1", message.to_redis())
 
-        assert worker.translator.translate.await_args.kwargs["meeting_context"] == [
+        assert worker.translator.translate_with_valence.await_args.kwargs["meeting_context"] == [
             "Review the validator.",
             "Meeting topic: WarpTalk code review.",
         ]
@@ -914,7 +919,7 @@ class TestTranslationWorker:
         second.meeting_id = "meeting-b"
         await worker.process(b"msg-b", second.to_redis())
 
-        calls = worker.translator.translate.await_args_list
+        calls = worker.translator.translate_with_valence.await_args_list
         assert calls[0].kwargs["meeting_context"] == []
         assert calls[1].kwargs["meeting_context"] == []
 
@@ -922,7 +927,9 @@ class TestTranslationWorker:
         follow_up.meeting_id = "meeting-a"
         await worker.process(b"msg-c", follow_up.to_redis())
 
-        context = worker.translator.translate.await_args_list[-1].kwargs["meeting_context"]
+        context = worker.translator.translate_with_valence.await_args_list[-1].kwargs[
+            "meeting_context"
+        ]
         assert context == ["Review the validator."]
         assert "Approve the pull request." not in context
 
