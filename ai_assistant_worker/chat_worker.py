@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 import httpx
@@ -169,6 +170,37 @@ def _format_mentions(mentions_json: str) -> str | None:
     )
 
 
+#: Meetings are scheduled by people in Vietnam, and "9 giờ sáng mai" means 9am there. UTC+7 has
+#: no DST, so a fixed offset is exact rather than an approximation.
+WORKSPACE_TIMEZONE = timezone(timedelta(hours=7), "ICT")
+
+
+def _now_message(now: datetime | None = None) -> str:
+    """Tell the model what "today" is.
+
+    NOTHING did. Not the persona, not the templates, not the tool schemas — the worker never put
+    a date in front of the model at all. So `create_meeting`, whose whole job is scheduling, could
+    not turn "hôm nay", "ngày mai" or "thứ Sáu tuần sau" into the YYYY-MM-DD it requires, and the
+    conversation deadlocked: it asked for a date, the user answered "Hôm nay", and it asked again.
+    Its own prompt suggested "ngày mai lúc 09:30" as an example of what to say — an example it
+    could not then act on.
+
+    A model cannot know this and must not guess it: guessing produces a meeting scheduled in the
+    wrong year, which is worse than the loop because it looks like it worked.
+    """
+    now = now or datetime.now(WORKSPACE_TIMEZONE)
+    return (
+        "CURRENT TIME\n"
+        f"Right now it is {now:%A, %d %B %Y, %H:%M} in Vietnam (UTC+7), "
+        f"which is {now:%Y-%m-%d} in ISO form.\n"
+        "Resolve every relative date the user gives you — today, tomorrow, tonight, next Friday, "
+        "cuối tuần này — against this, yourself. Never ask the user to convert a date to "
+        "YYYY-MM-DD; that is arithmetic you can do and they cannot be expected to. Only ask when "
+        "the date is genuinely ambiguous, and then offer the candidates you resolved.\n"
+        "Times the user gives with no timezone are Vietnam time."
+    )
+
+
 class ChatAssistantWorker(BaseWorker):
     """Global assistant worker — free-form Q&A with tool-calling, independent of any meeting."""
 
@@ -300,7 +332,7 @@ class ChatAssistantWorker(BaseWorker):
             template=template.key,
             origin=request.origin,
         )
-        instructions_parts = [build_system_prompt(template)]
+        instructions_parts = [build_system_prompt(template), _now_message()]
         page_context_message = _format_page_context(request.page_context_json)
         if page_context_message:
             instructions_parts.append(page_context_message)
