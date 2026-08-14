@@ -252,6 +252,19 @@ class TTSSettings(BaseSettings):
     # audio slides out of the front of the buffer; without a cap a speaker in a noisy room would
     # accumulate the whole meeting in memory and never clone.
     voice_clone_max_buffer_seconds: float = 90.0
+    # WT-371 #9: how many times a speaker's clone may be REPLACED by a better sample within one
+    # meeting. Cloning used to happen exactly once, from the first clip that passed the gate, and
+    # the worker then stopped listening — so the voice was locked to whatever register the speaker
+    # happened to open in. Raise or crack your voice and the clone stopped being you.
+    #
+    # One upgrade, not unlimited: each re-clone is a paid Cartesia call, and the synthesised voice
+    # audibly changes when it lands. One is enough to escape a bad opening clip; more would be a
+    # voice that keeps shifting under the listener.
+    voice_clone_max_upgrades: int = 1
+    # How much better a later clip must score before it is worth replacing a working clone. Small
+    # gains are noise in the estimator, and re-cloning for them would change the voice people are
+    # listening to in exchange for nothing.
+    voice_clone_upgrade_margin: float = 0.15
     min_clone_chars: int = 8
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
