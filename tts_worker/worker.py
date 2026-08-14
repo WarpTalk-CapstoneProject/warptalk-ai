@@ -581,6 +581,10 @@ class TTSWorker(BaseWorker):
         buffers: dict[tuple[str, str], bytearray] = {}
         buffer_seconds: dict[tuple[str, str], float] = {}
         buffer_lang: dict[tuple[str, str], str] = {}
+        # WT-371 #9: what the clone currently in use was built from, so a later clip can be
+        # recognised as better. Absent until this speaker has been cloned in this process.
+        cloned_score: dict[tuple[str, str], float] = {}
+        upgrades_used: dict[tuple[str, str], int] = {}
 
         while self._running:
             try:
@@ -602,11 +606,31 @@ class TTSWorker(BaseWorker):
                             buffers.pop(key, None)
                             buffer_seconds.pop(key, None)
                             buffer_lang.pop(key, None)
+                            cloned_score.pop(key, None)
+                            upgrades_used.pop(key, None)
                             continue
 
-                        # Skip if voice already cloned for this speaker
+                        # WT-371 #9: this used to be `if already cloned: continue` — the worker
+                        # stopped listening the moment it had any clone at all, so the voice was
+                        # locked to whatever register the speaker opened the meeting in. Change
+                        # your tone, or crack your voice, and the clone stopped being you.
+                        #
+                        # It keeps listening now, but only while an upgrade is still allowed, so a
+                        # speaker whose clone is already good costs nothing beyond the buffer.
                         if await self._get_voice_id(chunk.meeting_id, chunk.speaker_id):
-                            continue
+                            if (
+                                upgrades_used.get(key, 0)
+                                >= self.tts_settings.voice_clone_max_upgrades
+                            ):
+                                buffers.pop(key, None)
+                                buffer_seconds.pop(key, None)
+                                buffer_lang.pop(key, None)
+                                continue
+                            # A clone made by ANOTHER replica, or before this process started, has
+                            # no local score. Treat it as good enough to keep rather than racing to
+                            # replace something we cannot compare against.
+                            if key not in cloned_score:
+                                continue
 
                         buffers.setdefault(key, bytearray()).extend(chunk.audio_data)
                         # PCM 16-bit mono: 2 bytes per sample
@@ -624,10 +648,27 @@ class TTSWorker(BaseWorker):
                             # slides out and the speaker gets another go, which costs nothing
                             # because they are still talking.
                             assessment = assess_clone_sample(bytes(buffers[key]), chunk.sample_rate)
-                            if assessment.accepted:
+                            previous_score = cloned_score.get(key)
+                            is_upgrade = previous_score is not None
+                            # An upgrade has to EARN the disruption: re-cloning changes the voice
+                            # people are currently listening to, and small score differences are
+                            # noise in the pitch estimator rather than a better reference.
+                            if not assessment.accepted:
+                                worth_cloning = False
+                            elif previous_score is None:
+                                worth_cloning = True
+                            else:
+                                worth_cloning = (
+                                    assessment.score
+                                    >= previous_score + self.tts_settings.voice_clone_upgrade_margin
+                                )
+                            if worth_cloning:
                                 audio_snapshot = bytes(buffers.pop(key))
                                 del buffer_seconds[key]
                                 clone_lang = _clone_language(buffer_lang.pop(key, "en"))
+                                cloned_score[key] = assessment.score
+                                if is_upgrade:
+                                    upgrades_used[key] = upgrades_used.get(key, 0) + 1
                                 self.logger.info(
                                     "voice_clone_sample_accepted",
                                     speaker_id=chunk.speaker_id,
@@ -637,6 +678,9 @@ class TTSWorker(BaseWorker):
                                         1,
                                     ),
                                     active_speech_ratio=round(assessment.active_speech_ratio, 3),
+                                    pitch_semitones=round(assessment.pitch_semitone_range, 2),
+                                    score=round(assessment.score, 3),
+                                    upgrade=is_upgrade,
                                 )
                                 asyncio.create_task(
                                     self._clone_and_cache(
@@ -645,6 +689,13 @@ class TTSWorker(BaseWorker):
                                         audio_snapshot,
                                         clone_lang,
                                     )
+                                )
+                            elif assessment.accepted:
+                                # Usable, but no better than the clone already in use. Slide the
+                                # window on and keep listening — the speaker may yet say something
+                                # that covers more of their range.
+                                self._trim_clone_buffer(
+                                    key, buffers, buffer_seconds, chunk.sample_rate
                                 )
                             else:
                                 # Logged at info, not warning: a rejected clip is the gate doing
