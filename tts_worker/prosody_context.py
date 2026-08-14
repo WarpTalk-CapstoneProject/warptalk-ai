@@ -27,10 +27,17 @@ WHY THIS IS OFF BY DEFAULT
 
 HOW A SENTENCE IS SEPARATED FROM THE NEXT
     The context streams audio continuously; `flush` puts a numbered boundary in that stream.
-    Cartesia numbers flushes from 1 per context, and stamps every chunk with the `flush_id` it
-    belongs to, so pushing each sentence with `flush=True` and reading until the matching
+    Cartesia numbers flushes from ZERO per context, and stamps every chunk with the `flush_id`
+    it belongs to, so pushing each sentence with `flush=True` and reading until the matching
     `flush_done` yields exactly that sentence's audio — while the context, and therefore the
     prosody, carries on into the next one.
+
+    This file said "from 1" until 2026-08-14, and said it as a fact rather than as a guess.
+    Nothing checked it, because the only thing that could was the live API, so every sentence
+    waited for an id one higher than any the server sends: no chunk matched, no flush_done
+    matched, and the turn timed out into the one-shot fallback. Prosody continuity was switched
+    on in v81 and had not run once. The timeout is now the only bound on a wrong id AND it
+    reports which ids it actually saw — a mismatch should cost one glance, not an afternoon.
 """
 
 from __future__ import annotations
@@ -104,6 +111,8 @@ class ProsodyContext:
         self._sample_rate = sample_rate
         self._flushes = 0
         self._closed = False
+        #: Every flush_id seen on this context, so a timeout can say what the server WAS sending.
+        self._seen_flush_ids: set[int] = set()
 
     @property
     def sentences_spoken(self) -> int:
@@ -130,8 +139,16 @@ class ProsodyContext:
         if self._closed:
             raise RuntimeError("ProsodyContext is closed")
 
-        self._flushes += 1
+        # Post-increment, because Cartesia numbers the first flush of a context ZERO.
+        #
+        # This was `+= 1` first, so every sentence waited for a flush_id one higher than the one
+        # the server would ever send. No chunk matched, no flush_done matched, and every single
+        # sentence sat until SENTENCE_TIMEOUT_SECONDS and fell back to the one-shot path — which
+        # is why prosody continuity has never actually run in production despite being switched
+        # on in v81, and why the dub cost six dead seconds per sentence before Cartesia was even
+        # asked. Verified against the live API: pushes return flush_id 0, then 1, then 2.
         expected_flush = self._flushes
+        self._flushes += 1
 
         push_kwargs: dict[str, Any] = {"flush": True}
         if generation_config:
@@ -151,8 +168,12 @@ class ProsodyContext:
             # is marked closed because a socket that missed one flush cannot be trusted to
             # deliver the next.
             self._closed = True
+            # The ids that DID arrive, not just the one that did not. An off-by-one in the flush
+            # numbering is indistinguishable from a wedged socket without them, and that
+            # ambiguity is what let a dead feature look like a flaky vendor for two releases.
             raise RuntimeError(
-                f"Cartesia context produced no flush_done within {SENTENCE_TIMEOUT_SECONDS}s"
+                f"Cartesia context produced no flush_done for flush_id={expected_flush} "
+                f"within {SENTENCE_TIMEOUT_SECONDS}s; saw flush_ids={sorted(self._seen_flush_ids)}"
             ) from None
 
     async def _collect(
@@ -163,6 +184,10 @@ class ProsodyContext:
         pcm = bytearray()
         async for event in self._transport.receive():
             kind = getattr(event, "type", None)
+
+            flush_id = getattr(event, "flush_id", None)
+            if isinstance(flush_id, int):
+                self._seen_flush_ids.add(flush_id)
 
             if kind == "error":
                 raise RuntimeError(f"Cartesia context error: {getattr(event, 'error', event)}")
