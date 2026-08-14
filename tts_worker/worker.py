@@ -565,6 +565,11 @@ class TTSWorker(BaseWorker):
             return
 
         synthesis_latency_ms = int((time.monotonic() - t0) * 1000)
+        # Already measured, and until now only ever attached to a published message. This is the
+        # stage B2 clocked at p95 8.54s while STT and translation both stayed under 1.5s — kept
+        # apart from the cumulative pipeline number so a slow Cartesia call and a queue building
+        # behind the per-key lock are two readings rather than one.
+        await self.redis.record_latency("tts_synthesis", synthesis_latency_ms)
         self._observe_dub_fit(translation, duration_ms)
 
         if audio_bytes:

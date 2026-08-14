@@ -55,7 +55,13 @@ async def test_collect_metrics_reports_lag_pending_heartbeats_and_dead_letters()
     assert 'redis_keys_count{key="warptalk:worker:heartbeat:stt:*"} 2' in output
     assert 'redis_stream_length{stream="stt:dead-letter"} 2' in output
     assert 'redis_stream_length{stream="tts:dead-letter"} 0' in output
-    assert redis.scan_patterns == ["warptalk:worker:heartbeat:*", "*:dead-letter"]
+    assert redis.scan_patterns == [
+        "warptalk:worker:heartbeat:*",
+        "*:dead-letter",
+        # Stage-latency histograms. Pinned like the other two: an exporter that
+        # silently stops scanning a pattern reports a healthy, idle pipeline.
+        "warptalk:latency:*",
+    ]
 
 
 async def test_collect_metrics_escapes_prometheus_label_values() -> None:
