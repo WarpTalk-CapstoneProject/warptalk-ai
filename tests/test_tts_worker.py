@@ -20,7 +20,18 @@ def _make_worker(mock_redis_client, worker_settings, tts_settings=None, consente
     worker.settings = worker_settings
     worker.redis = mock_redis_client
     worker.logger = MagicMock()
-    worker.tts_settings = tts_settings or TTSSettings()
+    # Pinned to the one-shot HTTP path, deliberately.
+    #
+    # Nothing in this file is ABOUT transport — these tests cover voice resolution, publishing,
+    # metadata, LiveKit fan-out and prosody reaching generation_config, all of which are the
+    # same either way. Pinning keeps them asserting on `cartesia.synthesize` instead of
+    # re-plumbing every assertion through a WebSocket context for no gain in what they check.
+    #
+    # The default is now True, so the OTHER path is covered elsewhere and deliberately:
+    # tests/test_tts_prosody_continuity.py drives it in both states, and
+    # tests/test_prosody_context.py asserts generation_config reaches the push. Neither path is
+    # untested; they are tested where each belongs.
+    worker.tts_settings = tts_settings or TTSSettings(prosody_continuity=False)
     worker._route_states = {}
     # Voice-clone consent gate reads _room_routes (populated in real usage by
     # AudioRouteCacheService's AUDIO_ROUTES_UPDATED broadcast — see
@@ -802,7 +813,12 @@ class TestProsodyReachesTheSynthesizer:
         # Separate from STT_PROSODY_ENABLED on purpose: measuring and using are different
         # decisions, and keeping them apart is what makes an A/B possible.
         worker = _make_worker(
-            mock_redis_client, worker_settings, tts_settings=TTSSettings(prosody_enabled=False)
+            mock_redis_client,
+            worker_settings,
+            # prosody_continuity pinned for the same reason as the factory default above: this
+            # test is about prosody_enabled, and passing tts_settings explicitly would
+            # otherwise opt back into the WebSocket path and change what synthesize sees.
+            tts_settings=TTSSettings(prosody_enabled=False, prosody_continuity=False),
         )
         mock_redis_client._redis.hget.return_value = None
         mock_redis_client._redis.get.return_value = None

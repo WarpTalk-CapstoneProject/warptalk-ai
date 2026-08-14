@@ -9,12 +9,17 @@ that is tested.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
 
-from tts_worker.prosody_context import ProsodyContext, wav_header
+from tts_worker.prosody_context import (
+    SENTENCE_TIMEOUT_SECONDS,
+    ProsodyContext,
+    wav_header,
+)
 
 SAMPLE_RATE = 16000
 HEADER = 44
@@ -214,3 +219,53 @@ def test_the_wav_header_matches_what_the_publish_path_strips() -> None:
     assert len(header) == HEADER
     assert header[:4] == b"RIFF"
     assert header[8:12] == b"WAVE"
+
+
+class _WedgedContext(_ScriptedContext):
+    """Accepts the push, then never yields the flush_done — a socket that is up but stuck.
+
+    This is the failure the timeout exists for, and the reason it matters more than an error:
+    the worker holds a per-(speaker, language) lock while a sentence is synthesised, so a
+    receive() that never returns stops that speaker's dub for the rest of the meeting, with
+    nothing raised for the fallback to catch.
+    """
+
+    def receive(self) -> Any:
+        async def _hang() -> Any:
+            await asyncio.sleep(3600)
+            yield  # pragma: no cover — unreachable, keeps this an async generator
+
+        return _hang()
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_socket_raises_instead_of_hanging_forever(monkeypatch) -> None:
+    monkeypatch.setattr("tts_worker.prosody_context.SENTENCE_TIMEOUT_SECONDS", 0.05)
+    ctx = ProsodyContext(_WedgedContext([]), SAMPLE_RATE)
+
+    with pytest.raises(RuntimeError, match="no flush_done"):
+        await asyncio.wait_for(ctx.speak("Một."), timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_context_is_not_reused_for_the_next_sentence(monkeypatch) -> None:
+    # A socket that missed one flush cannot be trusted to deliver the next; continuing to push
+    # into it would stall every remaining sentence of the turn in the same way.
+    monkeypatch.setattr("tts_worker.prosody_context.SENTENCE_TIMEOUT_SECONDS", 0.05)
+    ctx = ProsodyContext(_WedgedContext([]), SAMPLE_RATE)
+
+    # wait_for on BOTH calls, not just the assertion: a test that hangs is worse than a test
+    # that fails — it takes the whole suite with it and reports nothing. Proven the hard way,
+    # by deleting the timeout under test and watching pytest never return.
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(ctx.speak("Một."), timeout=2.0)
+
+    with pytest.raises(RuntimeError, match="closed"):
+        await asyncio.wait_for(ctx.speak("Hai."), timeout=2.0)
+
+
+def test_the_timeout_is_generous_next_to_cartesias_own_latency() -> None:
+    # ~90ms time-to-first-audio, sub-second for a long sentence. A bound this far above that
+    # can only fire on a real failure, never on a slow success — which is what keeps the
+    # fallback from stealing sentences that would have arrived.
+    assert SENTENCE_TIMEOUT_SECONDS >= 3.0

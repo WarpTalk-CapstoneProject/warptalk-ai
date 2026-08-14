@@ -35,12 +35,26 @@ HOW A SENTENCE IS SEPARATED FROM THE NEXT
 
 from __future__ import annotations
 
+import asyncio
 import struct
 from typing import Any, Protocol
 
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
+
+# How long one sentence may take to come back before the turn is abandoned.
+#
+# A HANG IS WORSE THAN AN ERROR, AND THIS IS THE ONLY THING THAT TURNS ONE INTO THE OTHER.
+# The worker holds a per-(speaker, language) lock while a sentence is synthesised, so a
+# `receive()` that never yields its flush_done does not merely lose this sentence: it stops that
+# speaker's dub entirely, for the rest of the meeting, without raising anything for the fallback
+# to catch. Silence, indefinitely, with no error anywhere.
+#
+# 6 seconds because Cartesia's time-to-first-audio is ~90ms and a long sentence streams in well
+# under a second; anything near this bound is already a failure, not a slow success. Generous
+# enough never to fire on a healthy call, short enough that a wedged socket costs one sentence.
+SENTENCE_TIMEOUT_SECONDS = 6.0
 
 
 class ContextTransport(Protocol):
@@ -120,6 +134,20 @@ class ProsodyContext:
 
         await self._transport.push(text, continue_=True, **push_kwargs)
 
+        try:
+            async with asyncio.timeout(SENTENCE_TIMEOUT_SECONDS):
+                return await self._collect(expected_flush)
+        except TimeoutError:
+            # Deliberately raised, not returned as empty audio: the caller's fallback is what
+            # turns this into a spoken sentence, and it only runs on an exception. The context
+            # is marked closed because a socket that missed one flush cannot be trusted to
+            # deliver the next.
+            self._closed = True
+            raise RuntimeError(
+                f"Cartesia context produced no flush_done within {SENTENCE_TIMEOUT_SECONDS}s"
+            ) from None
+
+    async def _collect(self, expected_flush: int) -> tuple[bytes, int]:
         pcm = bytearray()
         async for event in self._transport.receive():
             kind = getattr(event, "type", None)
