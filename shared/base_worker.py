@@ -282,6 +282,89 @@ class BaseWorker(ABC):
         except Exception as error:
             self.logger.warning("failed_to_parse_route_event", error=str(error))
 
+    async def _load_route_snapshot(self, room_id: str) -> bool:
+        """Re-read a room's route state from Redis, into the in-memory caches.
+
+        WHY THIS EXISTS
+            `_translation_active`, `_route_states` and `_room_routes` were populated ONLY by the
+            AUDIO_ROUTES_UPDATED pub/sub event. Pub/sub has no replay: a worker that was not
+            subscribed at the instant the backend published — because it was restarting, which is
+            what every deploy does to every worker — never learns the state and has no way to ask.
+
+            For `_is_translation_active` that is not a degraded answer, it is a WRONG one. An
+            unknown room falls through to a status lookup that is also empty, and the gate in
+            translation_worker then reads False and drops every STT result for a live meeting,
+            permanently, behind a `logger.debug` that INFO-level production never prints. The dub
+            simply stops and nothing anywhere says so.
+
+            The comment on `_handle_route_update_message` claims a missing field must not be read
+            as False because it "would silently stop translating for the whole fleet during a
+            rolling deploy". That reasoning is right and the protection was incomplete: it guards
+            the field being absent from a message, not the message being missed entirely.
+
+            Nothing new has to be published for this. The backend already writes the identical
+            payload to `translationRoom:{id}:audio_routes` as a durable key — same `routes`, same
+            `room_status`, same `translation_active` — and `_get_target_languages` has always read
+            its own state from Redis rather than waiting to be told. This closes the asymmetry.
+
+        Returns True when a snapshot was found and applied.
+        """
+        try:
+            raw = await self.redis.get(f"translationRoom:{room_id}:audio_routes")
+        except Exception as error:
+            self.logger.warning("route_snapshot_read_failed", room_id=room_id, error=str(error))
+            return False
+
+        if not raw:
+            return False
+
+        try:
+            snapshot = json.loads(raw)
+        except (ValueError, TypeError) as error:
+            self.logger.warning("route_snapshot_parse_failed", room_id=room_id, error=str(error))
+            return False
+
+        if not isinstance(snapshot, dict):
+            return False
+
+        if isinstance(snapshot.get("routes"), list):
+            self._room_routes[room_id] = snapshot["routes"]
+
+        status = snapshot.get("room_status")
+        if isinstance(status, str) and status:
+            self._route_states[room_id] = status
+            if status == "PAUSED":
+                self._paused_rooms.add(room_id)
+
+        translation_active = snapshot.get("translation_active")
+        if isinstance(translation_active, bool):
+            self._translation_active[room_id] = translation_active
+
+        self.logger.info(
+            "route_snapshot_recovered",
+            room_id=room_id,
+            room_status=status,
+            translation_active=translation_active,
+        )
+        return True
+
+    async def _translation_active_for(self, room_id: str) -> bool:
+        """`_is_translation_active`, but allowed to go and find out.
+
+        The sync version can only answer from what a broadcast happened to deliver. This one
+        recovers the snapshot from Redis on a miss, so a worker that restarted mid-meeting picks
+        the meeting back up instead of staying deaf to it until the room ends.
+        """
+        if room_id in getattr(self, "_translation_active", {}):
+            return self._translation_active[room_id]
+
+        if await self._load_route_snapshot(room_id):
+            return self._is_translation_active(room_id)
+
+        # No snapshot at all. Fall back to the sync answer, which errs towards translating when a
+        # status is known — the pre-existing rolling-deploy behaviour, deliberately unchanged.
+        return self._is_translation_active(room_id)
+
     def _is_translation_active(self, room_id: str) -> bool:
         """Whether someone has actually started translation for this room.
 

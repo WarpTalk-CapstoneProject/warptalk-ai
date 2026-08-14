@@ -406,8 +406,16 @@ class TranslationWorker(BaseWorker):
         # It belongs here instead. STT now runs for any live meeting, which is what fills
         # the transcript panel, and this stage — the one that actually spends a translation
         # and a dubbed voice — stays closed until the room reports translation active.
-        if not self._is_translation_active(stt_result.meeting_id):
-            self.logger.debug(
+        # `_translation_active_for`, not `_is_translation_active`: the async one recovers the
+        # room's route snapshot from Redis when no broadcast has been seen for it. A worker that
+        # restarted mid-meeting — which is what a deploy does — otherwise reads False here for a
+        # room that is actively translating and drops every result until the room ends.
+        if not await self._translation_active_for(stt_result.meeting_id):
+            # INFO, not debug. This is the one branch that discards a paid-for STT result, and at
+            # production's INFO level the debug line was invisible: the pipeline went silent with
+            # no record of the decision anywhere. WT-373 was diagnosed from Redis stream offsets
+            # because these logs did not exist.
+            self.logger.info(
                 "translation_skipped_not_started",
                 meeting_id=stt_result.meeting_id,
             )
