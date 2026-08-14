@@ -24,8 +24,30 @@ from shared.base_worker import BaseWorker
 from shared.schemas import AudioChunkMessage
 
 SILERO_VAD_REPOSITORY = "snakers4/silero-vad:v6.2.1"
-MIN_VAD_SPEECH_FRAMES = 3
-VAD_WINDOW_SAMPLES = 512 * MIN_VAD_SPEECH_FRAMES
+
+# How long one VAD decision covers. Three exact Silero frames (3 x 32ms = 96ms) is the
+# smallest window that can carry any majority at all.
+VAD_WINDOW_FRAMES = 3
+
+# How many of those frames must clear the threshold for the window to count as speech.
+#
+# WT-371 #7. This used to BE the window length — `VAD_WINDOW_SAMPLES = 512 * MIN_VAD_SPEECH_FRAMES`
+# with the check `speech_frames >= MIN_VAD_SPEECH_FRAMES`. One constant set both, so the rule was
+# never "some evidence"; it was UNANIMITY. Every frame in the window had to clear the threshold,
+# and the knob could not express anything else: raising it grew the window by exactly as much as
+# it raised the bar.
+#
+# Unanimity is the wrong rule for the start of an utterance, which is exactly where speech is
+# least confident — a breath before the first vowel, an unvoiced consonant, a word begun partway
+# through a window. One such frame rejected the whole 96ms, so onsets were routinely classified as
+# silence and detection waited for the next window. Which is the reported symptom: speech register-
+# ing late, and registering better when there is background noise keeping every frame's
+# probability up.
+#
+# A majority still rejects the isolated spike the original docstring was written to reject.
+MIN_VAD_SPEECH_FRAMES = 2
+
+VAD_WINDOW_SAMPLES = 512 * VAD_WINDOW_FRAMES
 VAD_WINDOW_MS = VAD_WINDOW_SAMPLES * 1000 // 16000
 
 # Bot participant identities used elsewhere in this pipeline — this worker's own
@@ -886,10 +908,13 @@ class LiveKitIngressWorker(BaseWorker):
     ) -> float:
         """Run Silero VAD and reject isolated probability spikes.
 
-        Silero requires 512-sample (32ms) frames. We process all frames
-        in the window, but require roughly 96ms of speech evidence before returning
-        the strongest probability. A single noisy frame must not classify the window
-        as speech.
+        Silero requires 512-sample (32ms) frames. Every frame in the window is scored, and the
+        window counts as speech once MIN_VAD_SPEECH_FRAMES of them clear the threshold — a
+        majority, so one noisy frame cannot classify the window as speech and one weak frame
+        cannot disqualify it.
+
+        The evidence bar and the window length are separate constants on purpose; see
+        MIN_VAD_SPEECH_FRAMES for what happened when they were the same one.
         """
         model = vad_model or self._require_vad_model()
         max_prob = 0.0
@@ -946,6 +971,10 @@ class LiveKitIngressWorker(BaseWorker):
             maxlen=max(1, pre_speech_samples * 2 // (vad_window_samples * 2))
         )  # Rolling pre-speech windows (in bytes, 2 bytes/sample)
         is_speaking = False
+        # Samples in speech_buffer that VAD actually called speech — excludes the pre-speech
+        # padding and the hangover tail. This, not the buffer length, is what the minimum-speech
+        # gate weighs; see where it is compared for what the buffer length let through.
+        speech_samples = 0
         silence_counter = 0
         chunk_index = 0
         resampler = None
@@ -977,6 +1006,7 @@ class LiveKitIngressWorker(BaseWorker):
                     speech_buffer = bytearray()
                     pre_speech_ring.clear()
                     is_speaking = False
+                    speech_samples = 0
                     silence_counter = 0
                     track_vad_model.reset_states()
                     continue
@@ -1016,7 +1046,7 @@ class LiveKitIngressWorker(BaseWorker):
                     window_data = bytes(raw_buffer[:window_bytes])
                     raw_buffer = raw_buffer[window_bytes:]
 
-                    # Run VAD on this 500ms window
+                    # Run VAD on this ~96ms window (VAD_WINDOW_FRAMES exact Silero frames).
                     window_pcm = np.frombuffer(window_data, dtype=np.int16)
                     window_f32 = window_pcm.astype(np.float32) / 32768.0
                     vad_prob = self._run_vad_on_window(
@@ -1031,6 +1061,7 @@ class LiveKitIngressWorker(BaseWorker):
                             # Speech onset — prepend pre-speech ring buffer
                             is_speaking = True
                             speech_buffer = bytearray()
+                            speech_samples = 0
                             for pre_window in pre_speech_ring:
                                 speech_buffer.extend(pre_window)
                             self.logger.info(
@@ -1041,11 +1072,13 @@ class LiveKitIngressWorker(BaseWorker):
                             )
 
                         speech_buffer.extend(window_data)
+                        speech_samples += len(window_data) // 2
                         silence_counter = 0
 
-                        # Check max chunk length — publish if exceeded
-                        speech_samples = len(speech_buffer) // 2
-                        if speech_samples >= max_chunk_samples:
+                        # Max chunk length is about the SIZE of what gets sent, so it weighs the
+                        # whole buffer — padding included. Only the minimum-speech gate below asks
+                        # the different question of whether anyone actually spoke.
+                        if len(speech_buffer) // 2 >= max_chunk_samples:
                             await self._publish_speech_chunk(
                                 room_name,
                                 speaker_id,
@@ -1056,6 +1089,10 @@ class LiveKitIngressWorker(BaseWorker):
                             )
                             chunk_index += 1
                             speech_buffer = bytearray()
+                            # Still mid-utterance — the speaker has simply run past the maximum
+                            # chunk length. The accumulated speech went out with the chunk, so the
+                            # remainder starts its own count.
+                            speech_samples = 0
 
                     else:
                         # No speech in this window
@@ -1064,8 +1101,17 @@ class LiveKitIngressWorker(BaseWorker):
                             speech_buffer.extend(window_data)  # Keep recording during pauses
 
                             if silence_counter >= silence_hangover_windows:
-                                # End of speech — publish if long enough
-                                speech_samples = len(speech_buffer) // 2
+                                # End of speech — publish if there was enough SPEECH in it.
+                                #
+                                # WT-371 #7: this measured the whole buffer, which by this point
+                                # also holds the pre-speech padding and the entire 576ms hangover.
+                                # A 100ms cough therefore arrived at the gate as ~870ms and sailed
+                                # past a 288ms minimum. What reached Whisper was a fragment of
+                                # non-speech with no confidence signal of its own — the exact input
+                                # it invents fluent sentences from (see test_vad_threshold_default).
+                                #
+                                # The padding still ships; it is just no longer counted as evidence
+                                # that somebody spoke.
                                 if speech_samples >= min_speech_samples:
                                     await self._publish_speech_chunk(
                                         room_name,
@@ -1085,8 +1131,23 @@ class LiveKitIngressWorker(BaseWorker):
 
                                 is_speaking = False
                                 speech_buffer = bytearray()
+                                speech_samples = 0
                                 silence_counter = 0
-                                track_vad_model.reset_states()
+                                # WT-371 #7: the VAD state is NOT reset here any more.
+                                #
+                                # Silero is recurrent. Resetting it discards everything it has
+                                # learned about this microphone and this room, and its first frames
+                                # after a reset are its least reliable — which is precisely the
+                                # moment the next utterance begins. Doing it after EVERY utterance
+                                # meant every sentence in a conversation was judged by a cold model,
+                                # so the first word registered late or not at all, and registered
+                                # better when background noise kept the probabilities up. That is
+                                # the reported symptom, and it is self-inflicted.
+                                #
+                                # A reset is right where the audio genuinely discontinues: a new
+                                # track (above) and a pause/resume (which discards the buffers for
+                                # the same reason). A pause between two sentences is not a
+                                # discontinuity — it is the signal Silero is built to model.
                         else:
                             # Store in pre-speech ring for next onset
                             pre_speech_ring.append(window_data)
@@ -1094,8 +1155,10 @@ class LiveKitIngressWorker(BaseWorker):
         except Exception:
             self.logger.exception("process_audio_track_error", track_sid=track.sid)
         finally:
-            # Publish any remaining speech buffer
-            if speech_buffer and len(speech_buffer) // 2 >= min_speech_samples:
+            # Publish any remaining speech buffer. Gated on the speech in it, for the same reason
+            # the end-of-utterance path is: the track can end on a hangover tail, and buffer
+            # length would count that padding as somebody having spoken.
+            if speech_buffer and speech_samples >= min_speech_samples:
                 await self._publish_speech_chunk(
                     room_name,
                     speaker_id,
