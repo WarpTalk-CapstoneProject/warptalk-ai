@@ -21,6 +21,7 @@ import time
 from collections.abc import Mapping
 from typing import Any, cast
 
+from shared import isochrony
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
 from shared.lang import is_same_language
@@ -137,6 +138,10 @@ class TTSWorker(BaseWorker):
         # time, so a turn can never be pushed into concurrently.
         self._turns: dict[tuple[str, ...], ProsodyContext] = {}
         self._turn_connections: dict[tuple[str, ...], Any] = {}
+        # Isochrony state, per (meeting, speaker, target language): how this speaker's dubs have
+        # been running against the clock, and the turn currently being accumulated.
+        self._dub_fits: dict[tuple[str, str, str], isochrony.DubFit] = {}
+        self._turn_dub_ms: dict[tuple[str, str, str], int] = {}
 
     async def load_model(self) -> None:
         self.cartesia = CartesiaSynthesizer(
@@ -560,6 +565,7 @@ class TTSWorker(BaseWorker):
             return
 
         synthesis_latency_ms = int((time.monotonic() - t0) * 1000)
+        self._observe_dub_fit(translation, duration_ms)
 
         if audio_bytes:
             if voice_key:
@@ -923,7 +929,51 @@ class TTSWorker(BaseWorker):
                 arousal=arousal,
             ),
             valence,
+            # Isochrony. The centre this speaker's tempo is applied AROUND, learned from how
+            # their previous dubs actually ran against the clock — see shared/isochrony.py.
+            # Exactly 1.0 until a fit is established, which is byte-for-byte the previous
+            # behaviour. Their own rate_ratio still multiplies through it, so somebody who
+            # genuinely slowed down still sounds like they slowed down, inside a slot that fits.
+            speed_center=isochrony.speed_center(self._dub_fit(translation)),
         )
+
+    def _fit_key(self, translation: TranslationResultMessage) -> tuple[str, str, str]:
+        """Fit is per (meeting, speaker, target language). Not global: how much longer a dub
+        runs is a property of the language pair and of how this person talks, and pooling a
+        terse speaker with a discursive one would centre both on neither."""
+        return (translation.meeting_id, translation.speaker_id, translation.target_lang)
+
+    def _dub_fit(self, translation: TranslationResultMessage) -> isochrony.DubFit:
+        fits: dict[tuple[str, str, str], isochrony.DubFit] = getattr(self, "_dub_fits", {})
+        return fits.get(self._fit_key(translation), isochrony.NO_FIT)
+
+    def _observe_dub_fit(self, translation: TranslationResultMessage, dub_ms: int) -> None:
+        """Accumulate this sentence's dub, and compare the WHOLE turn once the turn is over.
+
+        The comparison is turn against turn. `start_ms`/`end_ms` describe the whole spoken turn,
+        so weighing one sentence's dub against them would report a fit of about 1/N for an
+        N-sentence turn and drive the controller to speak everybody faster and faster. The
+        sentences are summed and the total is what gets folded in on `is_final_chunk`.
+        """
+        if not self.tts_settings.prosody_enabled:
+            return
+
+        key = self._fit_key(translation)
+        pending: dict[tuple[str, str, str], int] = getattr(self, "_turn_dub_ms", None) or {}
+        self._turn_dub_ms = pending
+        pending[key] = pending.get(key, 0) + max(0, dub_ms)
+
+        if not translation.is_final_chunk:
+            return
+
+        turn_dub_ms = pending.pop(key, 0)
+        source_ms = translation.end_ms - translation.start_ms
+        if source_ms <= 0:
+            return
+
+        fits: dict[tuple[str, str, str], isochrony.DubFit] = getattr(self, "_dub_fits", None) or {}
+        self._dub_fits = fits
+        fits[key] = isochrony.observe(fits.get(key, isochrony.NO_FIT), source_ms, turn_dub_ms)
 
     @staticmethod
     def _cache_key(

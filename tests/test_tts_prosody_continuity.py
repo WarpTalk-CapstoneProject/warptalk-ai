@@ -12,8 +12,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from shared import isochrony
 from shared.config import TTSSettings, WorkerSettings
-from shared.schemas import TranslationResultMessage
+from shared.schemas import ProsodyEnvelope, TranslationResultMessage
 from tts_worker.worker import TTSWorker
 
 
@@ -202,3 +203,108 @@ async def test_ending_a_room_abandons_its_turns_without_waiting() -> None:
     worker._cleanup_room("m1")
 
     assert worker._turns == {}
+
+
+# ── Isochrony wiring ────────────────────────────────────────────────────────────────────────
+
+
+def _iso_worker() -> TTSWorker:
+    worker = TTSWorker.__new__(TTSWorker)
+    worker.settings = WorkerSettings()
+    worker.tts_settings = TTSSettings(prosody_enabled=True)
+    worker.logger = MagicMock()
+    worker._dub_fits = {}
+    worker._turn_dub_ms = {}
+    return worker
+
+
+def _turn(worker: TTSWorker, *, source_ms: int, sentence_ms: list[int]) -> None:
+    """One spoken turn, delivered as len(sentence_ms) sentences."""
+    for index, dub_ms in enumerate(sentence_ms):
+        message = _msg(
+            f"câu {index}",
+            chunk=index,
+            final=index == len(sentence_ms) - 1,
+        )
+        message = message.model_copy(update={"start_ms": 1000, "end_ms": 1000 + source_ms})
+        worker._observe_dub_fit(message, dub_ms)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_is_measured_whole_not_sentence_by_sentence() -> None:
+    """`start_ms`/`end_ms` describe the WHOLE turn.
+
+    Weighing one sentence's dub against them reports a fit of roughly 1/N for an N-sentence
+    turn, and the controller then drives everybody faster and faster. The sentences are summed
+    and the total is what gets folded in.
+    """
+    worker = _iso_worker()
+
+    # Four sentences totalling 4000ms against a 4000ms source: a perfect fit.
+    for _ in range(6):
+        _turn(worker, source_ms=4000, sentence_ms=[1000, 1000, 1000, 1000])
+
+    fit = worker._dub_fits[("m1", "s1", "vi")]
+    assert fit.ratio == pytest.approx(1.0, abs=0.05), (
+        f"a turn that fits exactly measured as {fit.ratio:.2f} — the sentences were not summed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_overrunning_turn_speeds_the_next_one_up() -> None:
+    worker = _iso_worker()
+
+    for _ in range(6):
+        _turn(worker, source_ms=4000, sentence_ms=[2600, 2600])
+
+    message = _msg("tiếp")
+    message = message.model_copy(update={"start_ms": 0, "end_ms": 4000})
+    assert isochrony.speed_center(worker._dub_fit(message)) > 1.0
+
+
+@pytest.mark.asyncio
+async def test_an_unfinished_turn_does_not_leak_into_the_next() -> None:
+    # A turn whose final chunk never arrives must not have its partial total added to whatever
+    # the speaker says next.
+    worker = _iso_worker()
+    _turn(worker, source_ms=4000, sentence_ms=[1500, 1500])
+    assert worker._turn_dub_ms == {}
+
+
+@pytest.mark.asyncio
+async def test_prosody_off_records_nothing() -> None:
+    worker = _iso_worker()
+    worker.tts_settings = TTSSettings(prosody_enabled=False)
+
+    _turn(worker, source_ms=4000, sentence_ms=[6000])
+
+    assert worker._dub_fits == {}
+
+
+@pytest.mark.asyncio
+async def test_the_learned_fit_actually_reaches_cartesias_controls() -> None:
+    """The wiring, not the arithmetic.
+
+    Measuring the fit and never sending it would leave the whole controller inert while every
+    unit test above still passed — this asserts on what `_generation_config` really produces.
+    """
+    worker = _iso_worker()
+    envelope = ProsodyEnvelope(rate_ratio=1.0, arousal="neutral")
+
+    def _measured(final: bool = True) -> TranslationResultMessage:
+        message = _msg("câu", final=final)
+        return message.model_copy(update={"start_ms": 0, "end_ms": 4000, "prosody": envelope})
+
+    before = worker._generation_config(_measured())
+    assert before is not None
+    baseline_speed = float(before["speed"])
+
+    # Six turns that each overran by 30%.
+    for _ in range(6):
+        _turn(worker, source_ms=4000, sentence_ms=[5200])
+
+    after = worker._generation_config(_measured())
+    assert after is not None
+    assert float(after["speed"]) > baseline_speed, (
+        "the fit was learned but never reached generation_config — the controller is inert"
+    )
