@@ -65,7 +65,11 @@ def _worker(clones: list[bytes], **overrides: Any) -> tuple[TTSWorker, list[byte
     voice_id: list[str] = []
 
     async def _clone_and_cache(
-        _meeting: str, _speaker: str, audio: bytes, _language: str = "en"
+        _meeting: str,
+        _speaker: str,
+        audio: bytes,
+        _language: str = "en",
+        _sample_rate: int = 16000,
     ) -> None:
         cloned_from.append(audio)
         voice_id.append("voice-1")

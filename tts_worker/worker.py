@@ -25,12 +25,12 @@ from typing import Any, cast
 from shared import isochrony
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
-from shared.lang import is_same_language
+from shared.lang import base_language, is_same_language
 from shared.prosody import Arousal, Delivery, Valence, to_generation_config
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
-from tts_worker.clone_sample_quality import assess_clone_sample
+from tts_worker.clone_sample_quality import MAX_SAMPLE_SCORE, assess_clone_sample
 from tts_worker.livekit_publisher import LiveKitTTSPublisher, TrackStream
-from tts_worker.prosody_context import ProsodyContext
+from tts_worker.prosody_context import ProsodyContext, wav_header
 from tts_worker.synthesizer import CartesiaSynthesizer
 
 # Standard WAV header size for the pcm_s16le format CartesiaSynthesizer requests —
@@ -105,7 +105,22 @@ _CARTESIA_SUPPORTED_LANGUAGES = {
 
 
 def _clone_language(hint: str) -> str:
-    return hint if hint in _CARTESIA_SUPPORTED_LANGUAGES else "en"
+    """The language to clone a voice IN, normalized to what Cartesia is keyed by.
+
+    `base_language` first, for the third time in this codebase and for the same reason each
+    time: `_CARTESIA_SUPPORTED_LANGUAGES` holds primary subtags, and a locale tag compared
+    against it verbatim matches nothing. "vi-VN" therefore fell through to "en" and a Vietnamese
+    speaker's clip was cloned as an English voice — the same class of bug that made
+    `_default_voice_id` speak English in a Vietnamese-only meeting and that starved
+    `list_voices` of every non-English language.
+
+    "auto" still lands on "en", and that is the honest answer rather than a fix: it means the
+    speak language never resolved (see participant-language-preference.ts, UNRESOLVED_LANGUAGE),
+    so there is nothing better to say. It is worth knowing that the fallback is now only ever
+    reached by a language we genuinely have no support for, not by a spelling of one we do.
+    """
+    normalized = base_language(hint)
+    return normalized if normalized in _CARTESIA_SUPPORTED_LANGUAGES else "en"
 
 
 def _decode_field(data: Mapping[Any, Any], key: str) -> str:
@@ -1012,6 +1027,37 @@ class TTSWorker(BaseWorker):
                                 await self._note_clone_state(key, "cloned_elsewhere_kept")
                                 continue
 
+                        # Stop measuring once no upgrade can possibly be earned.
+                        #
+                        # `worth_cloning` below is `score >= previous + upgrade_margin`, and
+                        # `score` is capped at MAX_SAMPLE_SCORE by construction. A speaker whose
+                        # clip scored 1.0 therefore needs 1.15 to improve on it, which no clip can
+                        # ever reach — the comparison is unsatisfiable, not merely unlikely.
+                        #
+                        # Both production speakers in meeting 01a00547 scored exactly 1.0, so this
+                        # is the ordinary case rather than an edge one. What happened next: the
+                        # buffer kept growing (20.4 → 70.8 seconds before the 90s cap would have
+                        # slid it) and `assess_clone_sample` re-ran over the WHOLE buffer on every
+                        # single chunk — an FFT per 40ms frame, so ~3,500 of them per chunk per
+                        # speaker at 70 seconds — to re-derive a verdict that was already decided.
+                        #
+                        # Dropping the buffer here is not a lost opportunity: there is nothing left
+                        # to find. It is reported rather than done silently, for the same reason
+                        # every other exit on this path is.
+                        best_so_far = cloned_score.get(key)
+                        if (
+                            best_so_far is not None
+                            and best_so_far + self.tts_settings.voice_clone_upgrade_margin
+                            > MAX_SAMPLE_SCORE
+                        ):
+                            await self._note_clone_state(
+                                key, "cloned_best_possible", score=best_so_far
+                            )
+                            buffers.pop(key, None)
+                            buffer_seconds.pop(key, None)
+                            buffer_lang.pop(key, None)
+                            continue
+
                         buffers.setdefault(key, bytearray()).extend(chunk.audio_data)
                         # PCM 16-bit mono: 2 bytes per sample
                         duration_s = len(chunk.audio_data) / 2 / max(chunk.sample_rate, 1)
@@ -1105,6 +1151,11 @@ class TTSWorker(BaseWorker):
                                         chunk.speaker_id,
                                         audio_snapshot,
                                         clone_lang,
+                                        # The rate the buffer was actually captured at. The WAV
+                                        # header _clone_and_cache writes is only correct if it
+                                        # matches, and a header that lies about the rate is how a
+                                        # clone comes back chipmunked rather than refused.
+                                        chunk.sample_rate,
                                     )
                                 )
                             elif assessment.accepted:
@@ -1234,13 +1285,35 @@ class TTSWorker(BaseWorker):
         buffer_seconds[key] = len(buffer) / 2 / sample_rate
 
     async def _clone_and_cache(
-        self, meeting_id: str, speaker_id: str, audio_bytes: bytes, language: str = "en"
+        self,
+        meeting_id: str,
+        speaker_id: str,
+        audio_bytes: bytes,
+        language: str = "en",
+        sample_rate: int = 16000,
     ) -> None:
-        """Clone voice via Cartesia and cache voice_id in Redis."""
+        """Clone voice via Cartesia and cache voice_id in Redis.
+
+        `audio_bytes` is the RAW PCM the clone buffer accumulated — headerless 16-bit mono
+        samples, exactly what `assess_clone_sample` reads with `np.frombuffer(..., int16)`.
+        Cartesia's /voices/clone takes an audio FILE, so it is wrapped in a RIFF header here.
+
+        THIS IS WHY VOICE CLONING HAD NEVER RUN IN PRODUCTION. `voices.clone()` was being handed
+        a naked PCM stream and could not decode it, so every in-meeting clone request failed at
+        the vendor — 2153 dubs on record, every one of them `voice_type=default`, not a single
+        `cloned` row ever written. And it failed INVISIBLY: this method only logged, so from the
+        outside it was indistinguishable from cloning being switched off. The quality gate, the
+        consent gate and the upgrade logic were all working perfectly the whole time; the clip
+        that reached Cartesia simply was not a file.
+
+        The upload path (`_handle_upload_clone_request`) never hit this because the bytes it
+        sends come straight from a user-uploaded recording, which already has a container.
+        """
         label = f"speaker-{speaker_id[:8]}-{meeting_id[:8]}"
+        key = (meeting_id, speaker_id)
         try:
             voice_id = await self._require_cartesia().clone_voice(
-                audio_bytes,
+                wav_header(len(audio_bytes), sample_rate) + audio_bytes,
                 label,
                 language,
             )
@@ -1254,6 +1327,7 @@ class TTSWorker(BaseWorker):
                 speaker_id=speaker_id,
                 voice_id=voice_id,
             )
+            await self._note_clone_state(key, "cloned")
             await self.redis.publish_system_event(
                 room_id=meeting_id,
                 event_type="voice_clone_ready",
@@ -1266,6 +1340,16 @@ class TTSWorker(BaseWorker):
                 speaker_id=speaker_id,
                 error=str(e),
             )
+            # The last silent exit on this path, and the one that hid the bug above for the whole
+            # life of the feature. Every OTHER branch in _consume_audio_for_cloning publishes its
+            # reason (WT-420), so the clone-state stream showed `capturing` → `cloning` → nothing,
+            # forever: from the outside, identical to a clone still in flight. A vendor refusal is
+            # exactly the state the person at the microphone needs to see, and the only place that
+            # knows it is here.
+            #
+            # Truncated because it goes on the wire to a UI, and a Cartesia stack trace is not a
+            # message for a person in a meeting.
+            await self._note_clone_state(key, f"clone_failed:{str(e)[:120]}")
 
     def _generation_config(
         self, translation: TranslationResultMessage
