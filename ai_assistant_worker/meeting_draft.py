@@ -65,6 +65,30 @@ RECURRENCE_CHOICES: tuple[str, ...] = (NO_RECURRENCE, *RECURRENCE_TYPES)
 # Other spellings of "not repeating" a model reaches for when it has not read the enum.
 _NO_RECURRENCE_ALIASES = frozenset({NO_RECURRENCE, "NEVER", "ONCE", "NO", "ONE_OFF", "SINGLE"})
 
+# "This meeting does not need translating" — the answer that had no way to be given.
+#
+# Exactly the WT-399 trap above, one field over, and it survived because the fix was applied to
+# recurrence_type alone. `target_languages` is required, and a model fills every property it is
+# offered, so a monolingual meeting had no argument it could send: an empty list reads as "not
+# answered yet" and re-asks, and any real language code claims a translation the user refused.
+#
+# Production, 15 Aug. The user opened with "tạo meeting ngay bây giờ để nói về starlink, mời ngô
+# xuân hạnh nhi vào, ngôn ngữ tiếng việt" — the language was in the FIRST sentence — and was then
+# asked for it eight times, each answer rejected and re-asked in different words. It ended by
+# accepting "Tiếng Việt, có dịch sang tiếng Việt": a vi→vi meeting, which generates no audio route
+# at all. Eight turns to arrive at a configuration that translates nothing, having started from a
+# request that wanted exactly that.
+#
+# Resolved to [source_language] in draft_from_arguments — the server has no "monolingual" flag,
+# and a room whose source and targets match is precisely how it represents one.
+NO_TRANSLATION = "NONE"
+
+# What a model reaches for when it means "no translation" and has not read the enum. Includes the
+# words a Vietnamese-speaking user's answer gets paraphrased into.
+_NO_TRANSLATION_ALIASES = frozenset(
+    {NO_TRANSLATION, "NO", "NONE", "SAME", "SAME_AS_SOURCE", "NO_TRANSLATION", "MONOLINGUAL"}
+)
+
 # The four the server cannot default. Everything else has a sensible fallback, and asking about
 # it would turn a one-sentence request into an interrogation.
 REQUIRED_FIELDS: tuple[str, ...] = (
@@ -84,6 +108,10 @@ class MeetingDraft:
     """Everything gathered so far. Every field optional — a draft is allowed to be incomplete."""
 
     title: str | None = None
+    # True when the user has said this meeting needs no translation. Distinct from an empty
+    # target_languages, which means "not asked yet" — the two were the same value, and that is
+    # why the question could not be answered. Never sent to the server; see build_payload.
+    no_translation: bool = False
     description: str | None = None
     agenda: list[str] = field(default_factory=list)
     translation_room_type: str | None = None
@@ -117,7 +145,11 @@ def missing_fields(draft: MeetingDraft) -> list[str]:
         absent.append("translation_room_type")
     if not (draft.source_language or "").strip():
         absent.append("source_language")
-    if not [t for t in draft.target_languages if (t or "").strip()]:
+    # A declared "no translation" counts as ANSWERED. Treating it as absent is what made the
+    # question unanswerable: the user says they want one language, the draft records nothing, and
+    # the model asks again — forever. See NO_TRANSLATION.
+    targets = [t for t in draft.target_languages if (t or "").strip()]
+    if not targets and not draft.no_translation:
         absent.append("target_languages")
 
     # Recurrence is not required — but a HALF-specified one is worse than none, because the
@@ -283,6 +315,30 @@ def draft_from_arguments(arguments: dict[str, Any]) -> MeetingDraft:
         text = str(value).strip()
         return text or None
 
+    source_language = as_text(args.get("source_language"))
+
+    # "NONE" and its cousins are the answer "this meeting needs no translation". Resolved here so
+    # the sentinel never reaches the draft, the payload or the server — the same treatment
+    # recurrence_type's NONE gets a few lines below.
+    raw_targets = as_list(args.get("target_languages"))
+    declared_no_translation = any(t.strip().upper() in _NO_TRANSLATION_ALIASES for t in raw_targets)
+    target_languages = [t for t in raw_targets if t.strip().upper() not in _NO_TRANSLATION_ALIASES]
+
+    # A monolingual meeting IS a room whose targets match its source — that is how the server
+    # represents one, and it is what produces no audio route between same-language participants.
+    # Saying it explicitly beats leaving the list empty, which reads downstream as "unanswered".
+    if declared_no_translation and not target_languages and source_language:
+        target_languages = [source_language]
+
+    # The user naming one language for the whole meeting is the same statement. It arrived as
+    # source=vi, targets=[vi] and was re-asked as though nothing had been said.
+    if (
+        source_language
+        and target_languages
+        and all(t.strip().lower() == source_language.strip().lower() for t in target_languages)
+    ):
+        declared_no_translation = True
+
     room_type = as_text(args.get("translation_room_type"))
 
     scheduled_at = as_text(args.get("scheduled_at"))
@@ -344,8 +400,9 @@ def draft_from_arguments(arguments: dict[str, Any]) -> MeetingDraft:
         agenda=as_list(args.get("agenda")),
         # Upper-cased so "webinar" from a model that did not read the enum still lands.
         translation_room_type=room_type.upper() if room_type else None,
-        source_language=as_text(args.get("source_language")),
-        target_languages=as_list(args.get("target_languages")),
+        source_language=source_language,
+        target_languages=target_languages,
+        no_translation=declared_no_translation,
         scheduled_at=scheduled_at,
         invited_emails=as_list(args.get("invited_emails")),
         recurrence_type=recurrence_type,
