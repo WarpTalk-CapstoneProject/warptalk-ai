@@ -980,7 +980,7 @@ class TTSWorker(BaseWorker):
                             chunk.meeting_id, chunk.speaker_id
                         )
                         if not consented:
-                            self._note_clone_state(key, consent_reason)
+                            await self._note_clone_state(key, consent_reason)
                             buffers.pop(key, None)
                             buffer_seconds.pop(key, None)
                             buffer_lang.pop(key, None)
@@ -1000,7 +1000,7 @@ class TTSWorker(BaseWorker):
                                 upgrades_used.get(key, 0)
                                 >= self.tts_settings.voice_clone_max_upgrades
                             ):
-                                self._note_clone_state(key, "cloned_upgrades_exhausted")
+                                await self._note_clone_state(key, "cloned_upgrades_exhausted")
                                 buffers.pop(key, None)
                                 buffer_seconds.pop(key, None)
                                 buffer_lang.pop(key, None)
@@ -1009,7 +1009,7 @@ class TTSWorker(BaseWorker):
                             # no local score. Treat it as good enough to keep rather than racing to
                             # replace something we cannot compare against.
                             if key not in cloned_score:
-                                self._note_clone_state(key, "cloned_elsewhere_kept")
+                                await self._note_clone_state(key, "cloned_elsewhere_kept")
                                 continue
 
                         buffers.setdefault(key, bytearray()).extend(chunk.audio_data)
@@ -1017,6 +1017,16 @@ class TTSWorker(BaseWorker):
                         duration_s = len(chunk.audio_data) / 2 / max(chunk.sample_rate, 1)
                         buffer_seconds[key] = buffer_seconds.get(key, 0.0) + duration_s
                         buffer_lang[key] = chunk.language
+
+                        # WT-420: the bar needs something to fill with. Nothing before this
+                        # reported that capture was even happening — "ủa nó ko tự thu hở" was the
+                        # reasonable conclusion, and it was wrong the whole time.
+                        await self._note_clone_state(
+                            key,
+                            "capturing",
+                            seconds=buffer_seconds[key],
+                            required_seconds=float(self.tts_settings.voice_clone_min_seconds),
+                        )
 
                         if buffer_seconds[key] >= self.tts_settings.voice_clone_min_seconds:
                             # The clip is only a reference if it is worth referring to.
@@ -1051,7 +1061,11 @@ class TTSWorker(BaseWorker):
                                 # conversations with the user, and none of them can start from
                                 # silence. Prefixed so a threshold that turns out to be wrong is
                                 # tuned against measurements rather than guessed at.
-                                self._note_clone_state(key, f"clip_rejected:{assessment.reason}")
+                                await self._note_clone_state(
+                                    key,
+                                    f"clip_rejected:{assessment.reason}",
+                                    active_speech_ratio=assessment.active_speech_ratio,
+                                )
                             elif previous_score is None:
                                 worth_cloning = True
                             else:
@@ -1079,7 +1093,12 @@ class TTSWorker(BaseWorker):
                                     score=round(assessment.score, 3),
                                     upgrade=is_upgrade,
                                 )
-                                self._note_clone_state(key, "cloning")
+                                await self._note_clone_state(
+                                    key,
+                                    "cloning",
+                                    score=assessment.score,
+                                    active_speech_ratio=assessment.active_speech_ratio,
+                                )
                                 asyncio.create_task(
                                     self._clone_and_cache(
                                         chunk.meeting_id,
@@ -1117,7 +1136,16 @@ class TTSWorker(BaseWorker):
                 self.logger.exception("audio_consumer_error")
                 await asyncio.sleep(2)
 
-    def _note_clone_state(self, key: tuple[str, str], reason: str) -> None:
+    async def _note_clone_state(
+        self,
+        key: tuple[str, str],
+        reason: str,
+        *,
+        seconds: float | None = None,
+        required_seconds: float | None = None,
+        score: float | None = None,
+        active_speech_ratio: float | None = None,
+    ) -> None:
         """Say why this speaker is not on a cloned voice — once per change, not once per chunk.
 
         Audio chunks arrive continuously for the whole meeting, so logging at each of these
@@ -1128,18 +1156,56 @@ class TTSWorker(BaseWorker):
         `voice_type=default`, and not one line in any log said why. Every exit before the clone
         call returned in silence, so the difference between "nobody opted in" and "this worker
         never learned the room's routes" was invisible from outside.
+
+        WT-420: it now also PUBLISHES, because a log solved the wrong half of the problem. On
+        15 Aug the whole team tried to hear a cloned voice, could not, and reported cloning as
+        broken — while this method was writing `score: 1.0` into a log nobody in a meeting can
+        read. Every one of these reasons is something the person at the microphone needs, and
+        the worker is the only place that knows it.
+
+        The stream carries the same facts as the log line, so the two cannot drift into
+        disagreeing about the same speaker.
         """
         if getattr(self, "_clone_state", None) is None:
             self._clone_state: dict[tuple[str, str], str] = {}
-        if self._clone_state.get(key) == reason:
+
+        # Progress is bucketed into the dedupe key rather than excluded from it: `capturing`
+        # changes on every chunk, so deduping on the reason alone would emit it once and freeze
+        # the bar at its first value, while deduping on nothing would publish per chunk per
+        # speaker — the exact volume this method exists to avoid.
+        fingerprint = reason if seconds is None else f"{reason}:{int(seconds)}"
+        if self._clone_state.get(key) == fingerprint:
             return
-        self._clone_state[key] = reason
+        self._clone_state[key] = fingerprint
+
         self.logger.info(
             "voice_clone_state",
             meeting_id=key[0],
             speaker_id=key[1],
             reason=reason,
         )
+
+        payload: dict[str, Any] = {
+            "meeting_id": key[0],
+            "speaker_id": key[1],
+            "reason": reason,
+        }
+        if seconds is not None:
+            payload["seconds"] = round(seconds, 1)
+        if required_seconds is not None:
+            payload["required_seconds"] = round(required_seconds, 1)
+        if score is not None:
+            payload["score"] = round(score, 3)
+        if active_speech_ratio is not None:
+            payload["active_speech_ratio"] = round(active_speech_ratio, 3)
+
+        try:
+            await self.publish("voice:clone:state", key[0], payload)
+        except Exception:
+            # Never let telemetry take the clone path down with it. A speaker whose progress bar
+            # stalls is a worse UI; a speaker whose voice stops being cloned because a Redis
+            # write failed is a worse product.
+            self.logger.warning("voice_clone_state_publish_failed", meeting_id=key[0])
 
     def _trim_clone_buffer(
         self,

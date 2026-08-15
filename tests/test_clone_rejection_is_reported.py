@@ -70,7 +70,13 @@ def _worker(**overrides: Any) -> tuple[TTSWorker, list[tuple[tuple[str, str], st
     worker._running = True
 
     noted: list[tuple[tuple[str, str], str]] = []
-    worker._note_clone_state = lambda key, reason: noted.append((key, reason))  # type: ignore[method-assign]
+
+    # Async and kwargs-tolerant since WT-420: _note_clone_state now publishes as well as logs,
+    # and carries the capture metrics the meeting UI draws its progress bar from.
+    async def _note(key: tuple[str, str], reason: str, **_metrics: Any) -> None:
+        noted.append((key, reason))
+
+    worker._note_clone_state = _note  # type: ignore[method-assign]
 
     async def _clone_and_cache(
         _meeting: str, _speaker: str, _audio: bytes, _language: str = "en"
@@ -126,9 +132,13 @@ async def test_a_rejected_clip_reports_why_instead_of_nothing() -> None:
         "production was in for a whole meeting: no clone, and no way to tell that from the "
         "feature being switched off."
     )
-    key, reason = noted[0]
+    # Searched rather than indexed: since WT-420 the buffer reports "capturing" on the way to a
+    # verdict, so the rejection is no longer the first thing noted. What this test is about — that
+    # a refused clip says WHY — is unchanged.
+    verdicts = [(key, reason) for key, reason in noted if reason.startswith("clip_rejected:")]
+    assert verdicts, f"No verdict was reported at all; only saw {[r for _k, r in noted]}"
+    key, reason = verdicts[0]
     assert key == ("m1", "s1")
-    assert reason.startswith("clip_rejected:"), reason
     assert "quiet" in reason, (
         f"The verdict has to name WHICH bar was missed, not merely that one was; got {reason!r}"
     )
