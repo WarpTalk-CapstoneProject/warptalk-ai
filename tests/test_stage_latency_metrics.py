@@ -154,7 +154,12 @@ class _FakeRedis:
     async def hgetall(self, key: object) -> dict[str, str]:
         return self._latency[str(key)]
 
-    async def scan_iter(self, match: str, count: int = 100):  # type: ignore[no-untyped-def]
+    async def scan_iter(  # type: ignore[no-untyped-def]
+        self,
+        match: str,
+        count: int = 100,
+        _type: str | None = None,
+    ):
         if match.startswith(LATENCY_KEY_PREFIX):
             for key in self._latency:
                 yield key
