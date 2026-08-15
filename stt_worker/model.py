@@ -47,6 +47,19 @@ SESSION_IDLE_TIMEOUT_S = 300.0
 # Guard against OpenAI never sending a completed/error event for a commit.
 TRANSCRIBE_EVENT_TIMEOUT_S = 15.0
 
+# Every `filtered_*` line in this module logs at INFO, not DEBUG, and that is deliberate.
+#
+# Production runs at LOG_LEVEL=INFO, so a discard logged at DEBUG is a discard nobody can
+# see. Measured on 15 Aug: 276 `inference_complete` produced 223 `segment_transcribed` —
+# 53 utterances, 19%, removed with no record of which filter took them or why. The report
+# that followed was "có vài câu nói không bắt được transcript nên bị bỏ qua luôn", and there
+# was nothing to answer it with.
+#
+# This is the same defect the tts_worker header describes: an exit that swallows content
+# in silence is indistinguishable from the feature being switched off, and the thresholds
+# above cannot be calibrated against evidence that was never written down. The volume is
+# not a concern — these are tens of lines a day, one per DISCARDED utterance, not per chunk.
+#
 # Which session options each model actually accepts, learned at runtime.
 #
 # These replace a hardcoded model allow-list, and the difference is not cosmetic. The old
@@ -822,7 +835,7 @@ def _filter_segments(
         if permitted_scripts is not None:
             foreign_scripts = _scripts_in(text) - permitted_scripts
             if foreign_scripts:
-                logger.debug(
+                logger.info(
                     "filtered_foreign_script",
                     text=text[:80],
                     scripts=sorted(foreign_scripts),
@@ -855,7 +868,7 @@ def _filter_segments(
             and any(normalized_text in prompt_line for prompt_line in prompt_lines)
         )
         if is_exact_prompt_echo or is_marginal_prompt_fragment:
-            logger.debug("filtered_prompt_echo", text=text[:80])
+            logger.info("filtered_prompt_echo", text=text[:80])
             continue
 
         # gpt-transcribe accepts structured keyword hints but does not currently expose
@@ -872,7 +885,7 @@ def _filter_segments(
             continue
 
         if no_speech > 0.6:
-            logger.debug("filtered_no_speech", text=text, no_speech_prob=round(no_speech, 2))
+            logger.info("filtered_no_speech", text=text, no_speech_prob=round(no_speech, 2))
             continue
 
         # Resolved here, before the confidence gate, because the gate itself is
@@ -924,7 +937,7 @@ def _filter_segments(
         # the calibrated boundary is marginal audio and must not become an off-topic
         # plausible-looking caption.
         if avg_logprob != STT_UNKNOWN_CONFIDENCE and avg_logprob < language_floor:
-            logger.debug(
+            logger.info(
                 "filtered_low_confidence",
                 text=text,
                 logprob=round(avg_logprob, 2),
@@ -944,7 +957,7 @@ def _filter_segments(
             and real_duration_s < _MIN_SPEECH_SECONDS_FOR_LONG_TEXT
             and len(text) > _MAX_CHARS_FOR_SHORT_AUDIO
         ):
-            logger.debug(
+            logger.info(
                 "filtered_text_too_long_for_audio",
                 text=text[:60],
                 duration_s=round(real_duration_s, 2),
@@ -961,11 +974,11 @@ def _filter_segments(
         )
 
         if text_lower in _HALLUCINATIONS_ALWAYS:
-            logger.debug("filtered_hallucination", text=text)
+            logger.info("filtered_hallucination", text=text)
             continue
 
         if blocklist_is_marginal and text_lower in _HALLUCINATIONS_IF_MARGINAL:
-            logger.debug(
+            logger.info(
                 "filtered_hallucination_marginal",
                 text=text,
                 logprob=round(avg_logprob, 2),
@@ -973,13 +986,13 @@ def _filter_segments(
             continue
 
         if any(sub in text_lower for sub in _HALLUCINATION_SUBSTRINGS_ALWAYS):
-            logger.debug("filtered_hallucination_substring", text=text)
+            logger.info("filtered_hallucination_substring", text=text)
             continue
 
         if blocklist_is_marginal and any(
             sub in text_lower for sub in _HALLUCINATION_SUBSTRINGS_IF_MARGINAL
         ):
-            logger.debug(
+            logger.info(
                 "filtered_hallucination_substring_marginal",
                 text=text,
                 logprob=round(avg_logprob, 2),
@@ -1000,7 +1013,7 @@ def _filter_segments(
                 count - 1 for count in sentence_counts.values() if count > 1
             )
             if repeated_sentence_count >= 2:
-                logger.debug(
+                logger.info(
                     "filtered_repeated_sentence_collage",
                     text=text[:80],
                     repeated_sentences=repeated_sentence_count,
@@ -1024,7 +1037,7 @@ def _filter_segments(
         if len(words) >= 4:
             distinct_ratio = len(set(words)) / len(words)
             if distinct_ratio < _MIN_DISTINCT_WORD_RATIO:
-                logger.debug(
+                logger.info(
                     "filtered_repetition",
                     text=text[:50],
                     distinct_ratio=round(distinct_ratio, 2),
@@ -1032,11 +1045,11 @@ def _filter_segments(
                 continue
 
         if re.search(r"(.)\1{3,}", text_lower):
-            logger.debug("filtered_char_repetition", text=text[:50])
+            logger.info("filtered_char_repetition", text=text[:50])
             continue
 
         if text_lower in seen_texts:
-            logger.debug("filtered_duplicate", text=text)
+            logger.info("filtered_duplicate", text=text)
             continue
         seen_texts.add(text_lower)
 

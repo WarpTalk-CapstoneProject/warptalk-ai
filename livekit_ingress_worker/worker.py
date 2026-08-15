@@ -148,6 +148,16 @@ _STORM_COUNTER_KEY_PREFIX = "livekit:ingress:connects:"
 # 15s matches tts_worker/livekit_publisher.py's _REAP_INTERVAL_S — one reap cadence
 # across the pipeline — and bounds the overshoot past the grace period to one tick.
 _IDLE_SWEEP_INTERVAL_S = 15.0
+
+# Room lifecycle states that mean "this meeting is happening right now", used by
+# _rediscover_active_rooms to decide which snapshots are worth reclaiming after a restart.
+#
+# Matched against the `room_status` the backend writes into
+# translationRoom:{id}:audio_routes. Deliberately an allow-list of live states rather than a
+# deny-list of finished ones: a status this worker has never heard of should be left alone,
+# not dialled into. The snapshot key outlives the meeting by its TTL, so without this a
+# restart would reconnect the bot to every meeting that ended in the last twelve hours.
+_LIVE_ROOM_STATUSES = frozenset({"IN_PROGRESS", "AUDIO_ROUTING_ACTIVE"})
 # How long a room may hold zero HUMAN remote participants before the bot leaves.
 #
 # The bot legitimately sits alone twice: between its own connect and the joining human's
@@ -275,8 +285,94 @@ class LiveKitIngressWorker(BaseWorker):
         """Not used, we override _consume_loop for Pub/Sub."""
         pass
 
+    async def _rediscover_active_rooms(self) -> int:
+        """Pick meetings back up after this process restarts mid-call.
+
+        WHAT THIS COSTS WHEN IT IS MISSING
+            15 Aug, 12:17:07 local. The cgroup OOM killer took this worker mid-meeting with
+            two people talking. It restarted eight seconds later, opened its listeners, and
+            then sat completely idle for FOUR MINUTES AND NINETEEN SECONDS while the meeting
+            carried on without it. No transcript, no translation, no dub. It only woke up at
+            12:21:44 because somebody happened to publish a new track.
+
+            The reason is the one this codebase has now hit three times: meeting.track_published
+            arrives over Redis Pub/Sub, and pub/sub has no replay. Every participant in that
+            room had already published, so the event that would have summoned this worker back
+            had come and gone while the process was dead. In a settled meeting it never comes
+            again.
+
+            `_deferred_rooms` exists for the neighbouring case — another replica dying — and
+            the sweeper already retries the claim for everything in it. But it is an in-memory
+            set, so it dies with the process that owns it: the one replica that most needs to
+            recover its rooms is the one that just lost the record of them.
+
+        The durable record already exists and needs no new publisher: the backend writes
+        `translationRoom:{id}:audio_routes` on every route change, carrying `room_status`. That
+        is the same key `_hydrate_room_status` and `_load_route_snapshot` already read. Seeding
+        `_deferred_rooms` from it turns a restart from "silent until someone republishes" into
+        "claimed on the next sweep".
+
+        Never fatal. A worker that cannot enumerate is exactly as capable as one that never
+        tried, and refusing to start would turn a recovery miss into an outage.
+        """
+        try:
+            keys = await self.redis.scan_keys("translationRoom:*:audio_routes")
+        except Exception:
+            self.logger.warning("room_rediscovery_scan_failed", exc_info=True)
+            return 0
+
+        recovered = 0
+        for key in keys:
+            parts = key.split(":")
+            if len(parts) != 3:
+                continue
+            room_name = parts[1]
+            try:
+                cached = await self.redis.get(key)
+                if not cached:
+                    continue
+                if isinstance(cached, bytes):
+                    cached = cached.decode("utf-8")
+                status = json.loads(cached).get("room_status")
+            except Exception:
+                self.logger.warning("room_rediscovery_read_failed", room=room_name, exc_info=True)
+                continue
+
+            # Only rooms that are actually live. An ENDED meeting's snapshot outlives it by
+            # the key's TTL, and claiming those would have this worker dial into finished
+            # rooms on every restart.
+            if not isinstance(status, str) or status not in _LIVE_ROOM_STATUSES:
+                continue
+
+            self._route_states[room_name] = status
+            self._deferred_rooms.add(room_name)
+            recovered += 1
+
+        if recovered:
+            # The sweeper is what turns a deferred room into a connection, and it is started
+            # lazily — without this the seeded set would sit untouched until some other event
+            # happened to start it, which is the very thing that was missing.
+            self._ensure_idle_sweeper()
+            self.logger.warning(
+                "rooms_rediscovered_after_restart",
+                rooms=recovered,
+                scanned=len(keys),
+            )
+            try:
+                await self._claim_deferred_rooms()
+            except Exception:
+                # The sweep will try again in _IDLE_SWEEP_INTERVAL_S; one failed immediate
+                # attempt must not stop the listener from starting.
+                self.logger.warning("room_rediscovery_claim_failed", exc_info=True)
+
+        return recovered
+
     async def _consume_loop(self) -> None:
         """Override to listen to Redis Pub/Sub instead of Streams."""
+        # Before the listener, not after: everything below waits on an event that, for a
+        # meeting already in progress, has already been published and will not repeat.
+        await self._rediscover_active_rooms()
+
         self.logger.info("Starting Redis Pub/Sub listener for meeting.track_published")
 
         while not self._shutdown_event.is_set():

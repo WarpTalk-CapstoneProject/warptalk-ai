@@ -118,6 +118,18 @@ class ProsodyContext:
     def sentences_spoken(self) -> int:
         return self._flushes
 
+    @property
+    def is_closed(self) -> bool:
+        """Whether this context can still speak.
+
+        Public because a context can close itself WITHOUT raising: `_collect` treats the
+        server's `done` as an ordinary end-of-stream, returns the audio it has, and marks the
+        context spent. The caller sees a perfectly successful sentence and has no other way to
+        learn that the next one cannot be spoken on this context — which is exactly how a dead
+        context stayed in the worker's turn map and cost a fallback per turn. See WT-405.
+        """
+        return self._closed
+
     async def speak(
         self,
         text: str,
