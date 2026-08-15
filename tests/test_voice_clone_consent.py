@@ -140,7 +140,15 @@ async def test_another_speakers_consent_does_not_carry() -> None:
 
     consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
 
-    assert (consented, reason) == (False, "not_opted_in")
+    # The boolean is what this test is about, and it is unchanged: borrowing a colleague's
+    # opt-in to capture someone's voice is the one failure here that actually matters.
+    assert consented is False
+
+    # The reason moved from "not_opted_in" to "no_route_for_speaker" deliberately (WT-405).
+    # This speaker has no outgoing route at all, so they have not opted out of anything —
+    # nobody is listening to them in another language. See the production case in
+    # test_a_listener_with_no_outgoing_route_is_not_accused_of_opting_out.
+    assert reason == "no_route_for_speaker"
 
 
 async def test_consent_matching_is_case_insensitive_on_the_user_id() -> None:
@@ -151,3 +159,97 @@ async def test_consent_matching_is_case_insensitive_on_the_user_id() -> None:
     consented, _ = await worker.voice_clone_consent_state(ROOM, SPEAKER)
 
     assert consented is True
+
+
+async def test_a_room_with_no_routes_is_not_reported_as_unknown() -> None:
+    """WT-405 follow-up. `[]` is falsy; "never heard of this room" is a missing key.
+
+    Production, meeting 01a003b5 on 15 Aug: the snapshot at
+    `translationRoom:{id}:audio_routes` was present, intact and freshly generated —
+    `{"routes":[],"room_status":"IN_PROGRESS","translation_active":false}` — because nobody had
+    pressed Start Translation. The worker read it, stored `[]`, and then reported
+    `routes_unknown`, whose own docstring promises "no snapshot to recover them from".
+
+    So the one instrument for diagnosing "voice clone isn't working" was pointing at a
+    broadcast-replay failure that had not occurred, for a room in a perfectly ordinary state.
+    """
+    worker = _worker({ROOM: []})
+
+    consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert consented is False
+    assert reason == "no_routes", (
+        "A room whose routes are known to be empty must not be reported as one we were never "
+        "told about — those have different causes and different fixes."
+    )
+
+
+async def test_a_snapshot_holding_no_routes_is_still_not_unknown() -> None:
+    """The same thing by the other door: recovered from Redis rather than broadcast.
+
+    This is the production path exactly — the room was not in `_room_routes`, the snapshot was
+    read successfully, and it contained an empty list.
+    """
+    worker = _worker({}, snapshot={"routes": []})
+
+    consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert (consented, reason) == (False, "no_routes")
+
+
+async def test_a_genuinely_unknown_room_still_reports_unknown() -> None:
+    """The distinction has to cut both ways, or this just moves the blind spot.
+
+    No entry and no snapshot is the real replay failure the reason code was added for.
+    """
+    worker = _worker({}, snapshot=None)
+
+    consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert (consented, reason) == (False, "routes_unknown")
+
+
+async def test_a_room_with_routes_but_no_opt_in_is_unchanged() -> None:
+    """The existing answer must survive the new branch."""
+    worker = _worker({ROOM: [_route(False)]})
+
+    consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert (consented, reason) == (False, "not_opted_in")
+
+
+OTHER_SPEAKER = "019f0d00-0de0-7000-9000-000000000002"
+
+
+async def test_a_listener_with_no_outgoing_route_is_not_accused_of_opting_out() -> None:
+    """WT-405 follow-up #2. The mislabel that lands on the one person who DID opt in.
+
+    Production, meeting 01a003d5: a single route, src=..0002 -> tgt=..0001. Speaker ..0001 has
+    `voice_clone_enabled = TRUE` in auth.user_settings (set at 05:04:47, two minutes before the
+    meeting) and was still reported `not_opted_in` — because they have no OUTGOING route. They
+    are the listener in this pair, so nothing of theirs is being dubbed, so there is nothing to
+    clone for.
+
+    Reporting that as "did not opt in" tells whoever is debugging "I turned voice clone on and
+    it still does nothing" to go and look at the setting and the route-generation wiring, where
+    they will find everything working exactly as designed.
+    """
+    worker = _worker({ROOM: [_route(True, user_id=OTHER_SPEAKER)]})
+
+    consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert consented is False, "no outgoing route still means no cloning — that part is right"
+    assert reason == "no_route_for_speaker", (
+        "A speaker nobody is listening to was reported as having opted out. That is the one "
+        f"reason code that should mean a user's own choice; got {reason!r}"
+    )
+
+
+async def test_a_speaker_who_really_did_opt_out_still_says_not_opted_in() -> None:
+    """The distinction must cut both ways. A route exists FOR this speaker with the flag off —
+    that genuinely is their choice, and must keep saying so."""
+    worker = _worker({ROOM: [_route(False), _route(True, user_id=OTHER_SPEAKER)]})
+
+    consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert (consented, reason) == (False, "not_opted_in")

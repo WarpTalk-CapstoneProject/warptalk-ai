@@ -327,6 +327,27 @@ class TTSWorker(BaseWorker):
         track: TrackStream | None = None
         try:
             turn = self._turns.get(key)
+            # A context can retire itself without ever raising. `_collect` treats Cartesia's
+            # `done` as an ordinary end of stream: it marks the context closed, breaks, and
+            # returns the audio it collected — so `speak()` SUCCEEDS and the caller never
+            # reaches the except branch that would have called `_end_turn`. The spent context
+            # stayed in this map, and the next sentence for the same key fetched it, found it
+            # not-None, and called `speak()` on it, which raised "ProsodyContext is closed".
+            #
+            # One wasted sentence per `done`, every time — no streaming and a full one-shot
+            # re-synthesis, which is the p95 tail. Production 15 Aug, meeting 01a0033f: 12 of 47
+            # sentences, up to 10.2s each, clustered exactly where the two speakers alternated.
+            # Cartesia ends a context that has been idle, and with two people talking each
+            # speaker's context idles while the other one speaks — so the more natural the
+            # conversation, the more often this fired.
+            #
+            # Checked at acquisition rather than after `speak()` returns, because this is the
+            # one place every reuse passes through: it covers the `done` path and any other
+            # route to a closed context equally, instead of guarding the single case we know
+            # about today.
+            if turn is not None and turn.is_closed:
+                await self._end_turn(key)
+                turn = None
             if turn is None:
                 turn, connection = await synthesizer.open_prosody_context(
                     context_id=f"{translation.speaker_id}:{translation.target_lang}:{voice_key}",
@@ -1014,6 +1035,23 @@ class TTSWorker(BaseWorker):
                             # noise in the pitch estimator rather than a better reference.
                             if not assessment.accepted:
                                 worth_cloning = False
+                                # The last silent exit on this path, and the one that swallowed a
+                                # whole meeting.
+                                #
+                                # WT-405 follow-up. Meeting 01a0033f: two speakers, four minutes,
+                                # 46 dubbed sentences, every one on a stock catalog voice — and
+                                # not a single clone-related line in the log. Consent had passed,
+                                # so the gate above said nothing; the clip was refused here, which
+                                # also said nothing; and the buffer slid and tried again, forever.
+                                # From outside it is indistinguishable from cloning being switched
+                                # off, which is exactly the report we got.
+                                #
+                                # The reason is the point. "too quiet" is a microphone, "too little
+                                # speech" is a room, "clipped" is a gain setting — three different
+                                # conversations with the user, and none of them can start from
+                                # silence. Prefixed so a threshold that turns out to be wrong is
+                                # tuned against measurements rather than guessed at.
+                                self._note_clone_state(key, f"clip_rejected:{assessment.reason}")
                             elif previous_score is None:
                                 worth_cloning = True
                             else:

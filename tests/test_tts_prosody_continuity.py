@@ -28,6 +28,13 @@ class _FakeTurn:
         self.abandoned = False
         self.fail = False
         self.fail_after_streaming = False
+        #: Retire the context on the way out of the NEXT speak(), without raising — the real
+        #: ProsodyContext does this when Cartesia sends `done` (prosody_context.py `_collect`).
+        self.retire_after_speaking = False
+
+    @property
+    def is_closed(self) -> bool:
+        return self.closed
 
     async def speak(
         self,
@@ -37,6 +44,9 @@ class _FakeTurn:
     ) -> tuple[bytes, int]:
         if self.fail:
             raise RuntimeError("socket died")
+        if self.closed:
+            # Exactly what the real one does, and the symptom seen in production.
+            raise RuntimeError("ProsodyContext is closed")
         self.spoken.append((text, generation_config))
         pcm = b"\x01\x02" * 100
         if on_pcm is not None:
@@ -45,6 +55,9 @@ class _FakeTurn:
             # The socket dies with part of the sentence already on the track — the one case
             # the fallback cannot simply be played into.
             raise RuntimeError("socket died mid-sentence")
+        if self.retire_after_speaking:
+            # Cartesia's `done`: this sentence is fine, the NEXT one cannot use this context.
+            self.closed = True
         return b"\x00" * 44 + pcm, 12
 
     async def aclose(self) -> None:
@@ -520,3 +533,73 @@ async def test_the_learned_fit_actually_reaches_cartesias_controls() -> None:
     assert float(after["speed"]) > baseline_speed, (
         "the fit was learned but never reached generation_config — the controller is inert"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_context_cartesia_retired_is_replaced_not_reused() -> None:
+    """WT-405. A context can die WITHOUT raising, and the old code could not tell.
+
+    `_collect` treats Cartesia's `done` as an ordinary end of stream: it marks the context
+    closed, breaks, and returns the audio it has. So `speak()` SUCCEEDS — the caller never
+    reaches the except branch that calls `_end_turn`, and the spent context stays in `_turns`.
+    The next sentence for the same key found it not-None, called `speak()`, and got
+    "ProsodyContext is closed": one wasted sentence per `done`, re-synthesized one-shot with no
+    streaming at all.
+
+    Production, 15 Aug, meeting 01a0033f: 12 of 47 sentences, up to 10.2s each. Cartesia retires
+    an idle context, and with two people in a conversation each speaker's context idles while
+    the other talks — so the more natural the exchange, the more often it fired. That is exactly
+    the report: "nói liên tục 2 người thì ... vẫn đang còn bị chậm".
+    """
+    worker, synth = _worker(continuity=True)
+
+    first = await _say(worker, _msg("Một."))
+    synth.turns[0].retire_after_speaking = True
+    # This sentence still succeeds — it is the one that receives `done`.
+    await _say(worker, _msg("Hai."))
+    assert synth.turns[0].is_closed, "the fake must model a context retired by the server"
+
+    second = await _say(worker, _msg("Ba."))
+
+    assert synth.one_shot_calls == [], (
+        "The sentence after a retired context fell back to one-shot synthesis — no streaming, "
+        "full re-synthesis, and the listener waits for all of it. That is the p95 tail."
+    )
+    assert len(synth.opened) == 2, (
+        f"a retired context must be replaced with a fresh one; opened={synth.opened}"
+    )
+    assert synth.turns[1].spoken, "the third sentence should have been spoken on the NEW context"
+    assert first is not None and second is not None
+
+
+@pytest.mark.asyncio
+async def test_replacing_a_retired_context_releases_its_connection() -> None:
+    """The old socket has to go with it, or every `done` leaks a Cartesia connection for the
+    lifetime of the meeting."""
+    worker, synth = _worker(continuity=True)
+
+    await _say(worker, _msg("Một."))
+    synth.turns[0].retire_after_speaking = True
+    await _say(worker, _msg("Hai."))
+    await _say(worker, _msg("Ba."))
+
+    assert len(synth.connections) == 2, (
+        "A retired context was never replaced, so there is no second connection to check — "
+        f"the spent one was reused instead; connections={len(synth.connections)}"
+    )
+    assert synth.connections[0].closed, "the retired context's connection was left open"
+    assert not synth.connections[1].closed, "the replacement connection must still be live"
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_context_is_still_reused() -> None:
+    """The guard must not become 'open a new context every sentence' — that would silently
+    undo prosodic continuity while every test still passed."""
+    worker, synth = _worker(continuity=True)
+
+    await _say(worker, _msg("Một."))
+    await _say(worker, _msg("Hai."))
+    await _say(worker, _msg("Ba."))
+
+    assert len(synth.opened) == 1, f"one turn, one context; opened={synth.opened}"
+    assert len(synth.turns[0].spoken) == 3
