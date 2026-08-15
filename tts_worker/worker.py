@@ -950,9 +950,7 @@ class TTSWorker(BaseWorker):
                                 # conversations with the user, and none of them can start from
                                 # silence. Prefixed so a threshold that turns out to be wrong is
                                 # tuned against measurements rather than guessed at.
-                                self._note_clone_state(
-                                    key, f"clip_rejected:{assessment.reason}"
-                                )
+                                self._note_clone_state(key, f"clip_rejected:{assessment.reason}")
                             elif previous_score is None:
                                 worth_cloning = True
                             else:
