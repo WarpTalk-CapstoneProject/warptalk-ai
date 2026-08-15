@@ -77,6 +77,10 @@ _MAX_GLOSSARY_CHARS = 240
 # not a second opinion about how many terms are right. That decision belongs at the writer, where
 # workspace and global terms can be told apart.
 _MAX_STT_KEYWORDS = 16
+
+# Long enough to outlive any real meeting, short enough that a finished room's anchor expires on
+# its own. Matches the horizon the other per-room keys use.
+_TRANSCRIPT_ANCHOR_TTL_S = 6 * 60 * 60
 _CONTEXT_MIN_CONFIDENCE = -0.35
 _ACTIVE_TRANSLATION_STATES = {"IN_PROGRESS", "AUDIO_ROUTING_ACTIVE"}
 
@@ -139,6 +143,10 @@ class STTWorker(BaseWorker):
         # memory and mirrored to Redis so a restart or a second replica does not start every
         # speaker from scratch — see _speaker_baseline.
         self._prosody_baselines: dict[tuple[str, str], SpeakerBaseline] = {}
+        # meeting_id -> the millisecond every seat measures this meeting's transcript from.
+        # See _elapsed_ms: this replaced a per-TRACK chunk counter that reset on every
+        # ingress reconnect and sent the transcript clock back to zero mid-meeting.
+        self._transcript_anchors: dict[str, int] = {}
         self._prewarm_listener_task: asyncio.Task[None] | None = None
 
     async def load_model(self) -> None:
@@ -302,6 +310,7 @@ class STTWorker(BaseWorker):
         # reliable signal we get that a meeting is truly done.
         self._stt_prompts.pop(room_id, None)
         getattr(self, "_stt_keywords", {}).pop(room_id, None)
+        getattr(self, "_transcript_anchors", {}).pop(room_id, None)
         getattr(self, "_recent_transcripts", {}).pop(room_id, None)
         self._room_languages.pop(room_id, None)
         stale_speakers = [key for key in self._speaker_locks if key[0] == room_id]
@@ -352,7 +361,7 @@ class STTWorker(BaseWorker):
             is_final=chunk.is_final_chunk,
         )
 
-        chunk_offset_ms = chunk.chunk_index * self.settings.chunk_duration_ms
+        chunk_offset_ms = await self._elapsed_ms(chunk)
         language_hint = _language_hint_for_stt(chunk.language)
         allowed_languages = await self._get_room_languages(chunk.meeting_id)
         keywords = await self._get_stt_keywords(chunk.meeting_id)
@@ -699,6 +708,72 @@ class STTWorker(BaseWorker):
             glossary = cached
 
         return glossary[:_MAX_GLOSSARY_CHARS] or None
+
+    async def _elapsed_ms(self, chunk: AudioChunkMessage) -> int:
+        """How far into the MEETING this chunk is, in milliseconds. WT-421.
+
+        THE BUG THIS REPLACES
+            This was `chunk.chunk_index * chunk_duration_ms` — the chunk's position within its
+            TRACK. `chunk_index` restarts at 0 whenever an ingress track reconnects, so every
+            reconnect sent the transcript's clock back to the beginning of the meeting.
+
+            The web side already knew: dedupeTranscriptSegments carries the comment "Arrival order
+            stays valid when a reconnected ingress track resets startTimeMs". It defends against
+            the symptom. Nothing fixed the cause, and the cause is that a per-track counter was
+            being published under a contract that says "elapsed ms from room start" —
+            TranscriptPanel's `baseTime`.
+
+            Production, 15 Aug: the same sentence was stamped 15:33 for one participant and 15:28
+            for another. Two people who reconnected at different moments drifted by different
+            amounts, and a transcript used as a meeting record stopped being comparable between
+            seats.
+
+        THE ANCHOR
+            The first chunk any worker sees for a room claims the anchor with SET NX, and everyone
+            — every later chunk, every other replica, the worker that restarts mid-meeting — reads
+            back whichever value won. So the offset is stable across reconnects, across replicas
+            and across a redeploy, which the track counter never was.
+
+            It is still an approximation of "room start": the anchor is the first chunk this
+            pipeline saw, not the moment the host pressed Start. That is a smaller and, more
+            importantly, a CONSISTENT error — every seat computes the same number.
+        """
+        # getattr, matching how the other per-room caches in these workers are reached: this is
+        # called from process(), and the test suites construct workers with __new__ rather than
+        # through __init__. A field that only exists on a fully-constructed worker would make
+        # every one of those a crash rather than a measurement.
+        anchors: dict[str, int] | None = getattr(self, "_transcript_anchors", None)
+        if anchors is None:
+            anchors = {}
+            self._transcript_anchors = anchors
+
+        anchor_ms = anchors.get(chunk.meeting_id)
+        if anchor_ms is None:
+            anchor_ms = await self._resolve_transcript_anchor(chunk)
+            anchors[chunk.meeting_id] = anchor_ms
+
+        # Never negative. Clock skew between the gateway and this worker is real, and a negative
+        # offset formats into nonsense on the panel rather than failing loudly.
+        return max(0, chunk.timestamp_ms - anchor_ms)
+
+    async def _resolve_transcript_anchor(self, chunk: AudioChunkMessage) -> int:
+        """The agreed millisecond every seat measures this meeting from."""
+        key = f"translationRoom:{chunk.meeting_id}:transcript_anchor_ms"
+
+        try:
+            await self.redis.set_if_absent(key, str(chunk.timestamp_ms), _TRANSCRIPT_ANCHOR_TTL_S)
+            stored = await self.redis.get(key)
+            if stored is not None:
+                raw = stored.decode() if isinstance(stored, bytes) else stored
+                return int(raw)
+        except (ValueError, TypeError):
+            self.logger.warning("transcript_anchor_unreadable", meeting_id=chunk.meeting_id)
+        except Exception:
+            # Falling back to this chunk keeps the transcript flowing with offsets measured from
+            # here. Wrong by a constant is recoverable; refusing to transcribe is not.
+            self.logger.warning("transcript_anchor_unavailable", meeting_id=chunk.meeting_id)
+
+        return chunk.timestamp_ms
 
     async def _get_room_noise_reduction(self, meeting_id: str) -> str | None:
         """This room's denoising mode, or None to use the worker's default. WT-427.
