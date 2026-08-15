@@ -31,7 +31,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from shared.config import RedisSettings
-from shared.redis_client import RedisStreamClient, _is_per_room_stream
+from shared.redis_client import RedisStreamClient, is_per_room_stream
 
 # A real room id, because the rule that decides expiry parses one. "room1" is not a shape this
 # system ever produces, and a test using it cannot tell a correct rule from a broken one.
@@ -256,7 +256,7 @@ def test_a_shared_stream_is_never_expired(stream: str) -> None:
     Every name here is a real key observed on production. Expiring any of them deletes the
     consumer groups of services that do not rebuild them.
     """
-    assert not _is_per_room_stream(stream), (
+    assert not is_per_room_stream(stream), (
         f"{stream} would be given a TTL — its consumer groups would be deleted with the key"
     )
 
@@ -266,7 +266,7 @@ def test_a_room_stream_is_still_expired(stream: str) -> None:
     # The leak the TTL was added for is real: 70 abandoned room streams, 284 MB, the oldest
     # untouched for ten days, inside a 768 MB Redis running allkeys-lru. Narrowing the rule must
     # not quietly turn the whole thing off.
-    assert _is_per_room_stream(stream)
+    assert is_per_room_stream(stream)
 
 
 def test_something_that_merely_looks_suffixed_is_left_alone() -> None:
@@ -274,7 +274,7 @@ def test_something_that_merely_looks_suffixed_is_left_alone() -> None:
     # Being wrong this way costs disk, which is monitored; being wrong the other way kills a
     # pipeline in silence.
     for stream in ("stt:results:latest", "audio:chunks:v2", "warptalk:latency:tts", "plain"):
-        assert not _is_per_room_stream(stream), stream
+        assert not is_per_room_stream(stream), stream
 
 
 @async_test

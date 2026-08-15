@@ -40,7 +40,7 @@ LATENCY_KEY_PREFIX = "warptalk:latency:"
 LATENCY_KEY_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
-def _is_per_room_stream(stream: str) -> bool:
+def is_per_room_stream(stream: str) -> bool:
     """Whether this stream belongs to ONE room and may therefore be expired.
 
     WT-402. Stream expiry was added to stop abandoned per-room streams filling Redis, and it was
@@ -235,14 +235,14 @@ class RedisStreamClient:
         one publish per speech chunk — and a second round trip here would add latency to the very
         pipeline the leak was already slowing down.
 
-        ONLY PER-ROOM STREAMS. See _is_per_room_stream: this shipped expiring EVERY stream, and
+        ONLY PER-ROOM STREAMS. See is_per_room_stream: this shipped expiring EVERY stream, and
         the global ones are permanent infrastructure whose consumer groups belong to services
         that never rebuild them. An hour without a meeting was enough to delete `translate:results`
         and take `gateway-consumers` with it, after which the gateway threw NOGROUP on every read
         and no translation, dub or assistant reply reached a browser again — while its health
         check stayed green. Found in production the same day it shipped (WT-402).
         """
-        ttl = self._settings.stream_ttl_seconds if _is_per_room_stream(stream) else 0
+        ttl = self._settings.stream_ttl_seconds if is_per_room_stream(stream) else 0
         if ttl <= 0:
             return cast(
                 "bytes | str", await self._retry(self.redis.xadd, stream, cast(Any, redis_data))
