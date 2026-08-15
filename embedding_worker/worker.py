@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from itertools import islice
 from typing import Any, TypeVar, cast
@@ -96,6 +97,20 @@ class EmbeddingWorker(BaseWorker):
             # never reasons about content. Whichever agent extracted a fact puts it in the
             # chunk's `metadata`, and the spread below carries it through untouched — so a
             # chunk with no fact simply has none, rather than this worker inventing one.
+            # When this batch was stored, in epoch milliseconds.
+            #
+            # Nothing in the payload carried a time before this, so the Knowledge page had no
+            # way to answer "what did we learn most recently" and fell back to sorting by the
+            # source's NAME — an index whose newest row could be anywhere in the list.
+            #
+            # Stamped once for the whole batch rather than per chunk: these were indexed by one
+            # call, and per-chunk stamps would order a document's chunks by how fast the
+            # embedding provider replied.
+            #
+            # Written after the metadata spread, so a producer that knows a better time for its
+            # own rows cannot be overwritten by ours — the spread is first, and an explicit key
+            # here wins only where the producer set none.
+            indexed_at = int(time.time() * 1000)
             payloads = [
                 {
                     **chunk.metadata,
@@ -107,6 +122,7 @@ class EmbeddingWorker(BaseWorker):
                     "ai_retrieval": request.ai_retrieval_allowed,
                     "retention_state": request.retention_state,
                     "deletion_state": request.deletion_state,
+                    "indexed_at": chunk.metadata.get("indexed_at", indexed_at),
                 }
                 for chunk in chunks
             ]
