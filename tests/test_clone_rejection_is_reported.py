@@ -79,7 +79,11 @@ def _worker(**overrides: Any) -> tuple[TTSWorker, list[tuple[tuple[str, str], st
     worker._note_clone_state = _note  # type: ignore[method-assign]
 
     async def _clone_and_cache(
-        _meeting: str, _speaker: str, _audio: bytes, _language: str = "en"
+        _meeting: str,
+        _speaker: str,
+        _audio: bytes,
+        _language: str = "en",
+        _sample_rate: int = 16000,
     ) -> None:
         pass
 

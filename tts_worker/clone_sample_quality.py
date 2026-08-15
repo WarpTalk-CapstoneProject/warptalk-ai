@@ -77,6 +77,15 @@ _SATURATING_SPEECH_RATIO = 0.5
 _PITCH_WEIGHT = 0.65
 _SPEECH_WEIGHT = 0.35
 
+# The highest score any clip can reach. Both components are `min(1.0, …)` and the weights sum to
+# one, so the scale is closed at the top by construction rather than by convention.
+#
+# Exported because a caller comparing `score >= best + margin` needs to know when that comparison
+# has become unsatisfiable: a speaker already at 1.0 can never be beaten by any margin, and a
+# worker that keeps re-measuring for an upgrade it cannot earn is doing arithmetic forever. See
+# TtsWorker._consume_audio_for_cloning.
+MAX_SAMPLE_SCORE = 1.0
+
 
 @dataclass(frozen=True)
 class CloneSampleAssessment:
