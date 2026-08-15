@@ -40,6 +40,7 @@ from typing import Any
 
 from billing_worker.db import BillingRepository
 from shared.config import BillingSettings, RedisSettings, WorkerSettings
+from shared.control_markers import is_system_speaker
 from shared.health_probe import heartbeat_key
 from shared.logger import get_logger
 from shared.redis_client import RedisStreamClient
@@ -328,9 +329,54 @@ class BillingSettlementWorker:
     # Per-stream handlers
     # ------------------------------------------------------------------
 
+    def _is_unbillable(self, speaker_id: str | None, meeting_id: str) -> bool:
+        """Whether this event is the platform talking to itself rather than a chargeable use.
+
+        THE FAILURE THIS CLOSES
+            `record_usage_and_charge` does `_as_uuid(user_id)`, and the __MEETING_END__ sentinel
+            carries `speaker_id="system"`. `uuid.UUID("system")` raises, identically on all five
+            deliveries, so the message was dead-lettered — twice per meeting, once on
+            translate:results and once on tts:results. That is the entire content of the
+            `WarpTalkDeadLetterPresent` alert: five meetings, ten entries, one bug.
+
+            translation_worker now drops the sentinel before it can reach either stream, so in
+            practice nothing should arrive here. This stays anyway, because the two guards fail
+            differently: that one stops the waste, and this one stops a malformed speaker id —
+            from any future synthetic event, from a replayed old message, from anything — from
+            becoming a permanent alert that needs a human to drain a stream.
+
+        A REFUSAL, NOT AN ERROR
+            Returning rather than raising is the point. A settlement that cannot name a user is
+            not a failed charge to retry; it is not a charge. Retrying it five times and then
+            paging somebody was the system treating a category error as an outage.
+        """
+        if is_system_speaker(speaker_id):
+            self.logger.debug(
+                "settlement_skipped_system_speaker",
+                translation_room_id=meeting_id,
+            )
+            return True
+
+        try:
+            uuid.UUID(str(speaker_id))
+        except (ValueError, AttributeError, TypeError):
+            # WARNING, not debug: "system" above is expected and silent, but any OTHER
+            # unparseable speaker id means something upstream is emitting a shape nobody
+            # designed, and that is worth a line.
+            self.logger.warning(
+                "settlement_skipped_unparseable_speaker",
+                translation_room_id=meeting_id,
+                speaker_id=speaker_id,
+            )
+            return True
+
+        return False
+
     async def _handle_translation(self, data: Mapping[Any, Any]) -> None:
         msg = TranslationResultMessage.from_redis(data)
         if not msg.translated_text.strip():
+            return
+        if self._is_unbillable(msg.speaker_id, msg.meeting_id):
             return
 
         resolved = await self._resolve_subscription(msg.meeting_id)
@@ -378,6 +424,8 @@ class BillingSettlementWorker:
         if msg.cache_hit:
             return  # reused a previously synthesized clip — no new provider cost incurred
         if not msg.audio_data:
+            return
+        if self._is_unbillable(msg.speaker_id, msg.meeting_id):
             return
 
         resolved = await self._resolve_subscription(msg.meeting_id)

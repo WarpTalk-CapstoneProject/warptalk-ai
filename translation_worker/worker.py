@@ -19,6 +19,7 @@ from typing import Any, cast
 
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
+from shared.control_markers import is_control_marker, is_system_speaker
 from shared.lang import is_same_language
 from shared.schemas import (
     ProsodyEnvelope,
@@ -394,6 +395,23 @@ class TranslationWorker(BaseWorker):
         (meeting_id, target_lang)).
         """
         stt_result = STTResultMessage.from_redis(data)
+
+        # Not speech. `stt:results` carries one synthetic segment per meeting — the
+        # __MEETING_END__ sentinel MeetingRoomService publishes to wake the assistant worker —
+        # and this stage translated it like anything else: one paid LLM call per target
+        # language, whose output ("Meeting end", "Kết thúc cuộc họp") then went to tts_worker
+        # for a paid render and onto the interpreter track, and to billing_worker, which
+        # dead-lettered it twice per meeting because speaker_id="system" is not a UUID.
+        #
+        # Checked FIRST, before the pause and translation-active gates: whether the platform's
+        # own control message gets translated is not a per-room setting.
+        if is_control_marker(stt_result.text) or is_system_speaker(stt_result.speaker_id):
+            self.logger.debug(
+                "control_marker_skipped",
+                meeting_id=stt_result.meeting_id,
+                speaker_id=stt_result.speaker_id,
+            )
+            return
 
         if stt_result.meeting_id in self._paused_rooms:
             return

@@ -20,6 +20,7 @@ from ai_assistant_worker.assistant import MeetingAssistant
 from ai_assistant_worker.summary_templates import format_transcript_line
 from shared.base_worker import BaseWorker
 from shared.config import AssistantSettings, resolve_openai_api_key
+from shared.control_markers import is_control_marker
 from shared.schemas import STTResultMessage
 
 
@@ -69,10 +70,14 @@ class AIAssistantWorker(BaseWorker):
             segments=len(self._transcripts[stt_result.meeting_id]),
         )
 
-        # Check for summary trigger (e.g. meeting end signal)
-        # The backend sends a special "meeting:end" message via Redis
-        # For now, we also support manual trigger via a special text marker
-        if stt_result.text.strip().upper() == "__MEETING_END__":
+        # The meeting-end trigger: MeetingRoomService.EndMeetingAsync publishes a synthetic STT
+        # segment carrying this marker.
+        #
+        # Through the shared predicate rather than an inline comparison, because this worker was
+        # the ONLY one that knew the sentinel was not speech — translation_worker translated it
+        # and tts_worker sang it. Anything reading stt:results has to be able to ask the same
+        # question, and the answer has to be in one place.
+        if is_control_marker(stt_result.text):
             await self._generate_summary(stt_result.meeting_id)
 
     async def _generate_summary(self, meeting_id: str) -> None:

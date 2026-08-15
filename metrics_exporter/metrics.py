@@ -23,9 +23,18 @@ WORKER_HEARTBEATS = (
     "billing",
     "livekit_ingress",
     "security",
+    # Running in production and absent from this list, so a dead suggestion worker was invisible
+    # to WarpTalkAiWorkerMissing — the alert only ever asks about workers it was told to expect.
+    "suggestion",
 )
 
-DEAD_LETTER_SUFFIX = ":dead-letter"
+# BOTH spellings of a parked-message stream.
+#
+# The Python workers publish to `<stream>:dead-letter`; the .NET side uses `<stream>:dlq`, and
+# only the first was matched — so `translationRoom:system_events:dlq`, which exists in production,
+# had no series and could not raise WarpTalkDeadLetterPresent. Half the platform's parked
+# messages were outside the one alert built to find them.
+DEAD_LETTER_SUFFIXES = (":dead-letter", ":dlq")
 
 
 class RedisMetricsClient(Protocol):
@@ -120,7 +129,7 @@ async def collect_metrics(redis: RedisMetricsClient) -> str:
             consumer_lines.append(f"redis_stream_group_consumers{{{labels}}} {consumers}")
             seen.add((stream, name))
 
-        if stream.endswith(DEAD_LETTER_SUFFIX):
+        if stream.endswith(DEAD_LETTER_SUFFIXES):
             dead_letter_lines.append(
                 f'redis_stream_length{{stream="{_label(stream)}"}} {int(await redis.xlen(stream))}'
             )
