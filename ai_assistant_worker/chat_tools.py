@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import httpx
@@ -62,6 +63,11 @@ class ToolContext:
     #: Used to build document links in a created meeting's description. Last and defaulted so
     #: every existing construction site keeps working unchanged.
     workspace_slug: str | None = None
+    #: Only get_platform_analytics reaches these, and only with the caller's own token. Optional
+    #: so a worker that has not been given them simply cannot serve that one tool, rather than
+    #: failing to start.
+    billing_client: httpx.AsyncClient | None = None
+    auth_client: httpx.AsyncClient | None = None
 
 
 @dataclass
@@ -906,6 +912,267 @@ async def _create_meeting(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     )
 
 
+#: Reports get_platform_analytics can fetch, and which client serves each. Kept beside the tool
+#: declaration's enum so the two cannot drift into offering a report nothing can answer.
+PLATFORM_ANALYTICS_REPORTS = ("overview", "revenue", "feedback", "users", "health")
+
+#: The window a feedback report may cover. Matches the server's own cap — asking for more comes
+#: back a validation error, and there is no reason to spend a round trip discovering that.
+PLATFORM_ANALYTICS_MAX_DAYS = 366
+PLATFORM_ANALYTICS_DEFAULT_DAYS = 30
+
+
+def _not_authorized(report: str) -> dict[str, Any]:
+    return {
+        "error": "not_authorized",
+        "report": report,
+        "message": (
+            "Platform analytics require the platform administrator role. Say so plainly; do not "
+            "estimate the figure."
+        ),
+    }
+
+
+async def _admin_get(
+    client: httpx.AsyncClient | None,
+    path: str,
+    ctx: ToolContext,
+    report: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """One admin GET, with the caller's own token and every failure named rather than empty.
+
+    The token is the caller's, never a service credential — the platform admin policy is checked
+    server-side on every one of these paths, so an ordinary user's assistant sees exactly the 403
+    that user would see in a browser. There is no elevation here to get wrong.
+    """
+    if client is None:
+        return {
+            "error": "unavailable",
+            "report": report,
+            "message": "This deployment has no client configured for that report.",
+        }
+
+    try:
+        response = await client.get(path, params=params, headers=_auth_headers(ctx))
+    except Exception:
+        logger.exception("platform_analytics_request_failed", report=report)
+        return {"error": "unavailable", "report": report, "message": "The service did not answer."}
+
+    # 401 as well as 403: an expired token and a missing role are both "you cannot have this",
+    # and neither is a number to guess at.
+    if response.status_code in (401, 403):
+        return _not_authorized(report)
+
+    if response.status_code != 200:
+        logger.warning("platform_analytics_bad_status", report=report, status=response.status_code)
+        return {
+            "error": "unavailable",
+            "report": report,
+            "message": f"The service answered {response.status_code}.",
+        }
+
+    try:
+        return cast("dict[str, Any]", response.json())
+    except ValueError:
+        logger.warning("platform_analytics_bad_body", report=report)
+        return {"error": "unavailable", "report": report, "message": "Unreadable response."}
+
+
+async def _analytics_overview(ctx: ToolContext, _days: int) -> dict[str, Any]:
+    workspaces, meetings = await asyncio.gather(
+        # pageSize 1: the envelope's `total` is the whole answer, and a page of rows would be
+        # tokens spent on data nobody asked for.
+        _admin_get(
+            ctx.workspace_client,
+            "/api/v1/admin/workspaces",
+            ctx,
+            "overview",
+            {"page": 1, "pageSize": 1},
+        ),
+        _admin_get(ctx.translation_room_client, "/api/v1/admin/meetings/counts", ctx, "overview"),
+    )
+
+    if workspaces.get("error"):
+        return workspaces
+
+    result: dict[str, Any] = {"workspaces_total": workspaces.get("total")}
+    if meetings.get("error"):
+        result["meetings_note"] = meetings.get("message")
+    else:
+        result["meetings_live_now"] = meetings.get("liveNow")
+        result["meetings_started_today"] = meetings.get("startedToday")
+    return result
+
+
+async def _analytics_revenue(ctx: ToolContext, _days: int) -> dict[str, Any]:
+    summary = await _admin_get(
+        ctx.billing_client, "/api/v1/admin/subscriptions/summary", ctx, "revenue"
+    )
+    if summary.get("error"):
+        return summary
+
+    # monthlyRecurring is a LIST, one entry per currency, and is never summed across them.
+    # Flattening it to a single number here would invent an exchange rate nobody chose.
+    return {
+        "monthly_recurring": summary.get("monthlyRecurring"),
+        "active": summary.get("activeCount"),
+        "trialing": summary.get("trialingCount"),
+        "cancelling": summary.get("cancellingCount"),
+        "note": (
+            "monthly_recurring is one figure per currency and must be reported per currency. "
+            "Do not add them together."
+        ),
+    }
+
+
+async def _analytics_feedback(ctx: ToolContext, days: int) -> dict[str, Any]:
+    from_at = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    summary = await _admin_get(
+        ctx.translation_room_client,
+        "/api/v1/admin/feedback/summary",
+        ctx,
+        "feedback",
+        {"from": from_at},
+    )
+    if summary.get("error"):
+        return summary
+
+    return {
+        "window_days": days,
+        "responses": summary.get("responseCount"),
+        "meetings_rated": summary.get("ratedMeetings"),
+        "meetings_ended": summary.get("endedMeetings"),
+        "response_rate": summary.get("responseRate"),
+        # responseCount travels with every dimension deliberately: four of the five are optional,
+        # so an average of 4.8 from three people must not be quoted as if it were from three
+        # hundred.
+        "dimensions": summary.get("dimensions"),
+        "note": (
+            "Each dimension's averageRating is over its own responseCount, not over all "
+            "responses. A null averageRating means nobody rated it — not a score of zero. A null "
+            "response_rate means no meeting ended in the window."
+        ),
+    }
+
+
+async def _analytics_users(ctx: ToolContext, _days: int) -> dict[str, Any]:
+    directory = await _admin_get(
+        ctx.auth_client, "/api/v1/admin/users", ctx, "users", {"page": 1, "pageSize": 1}
+    )
+    if directory.get("error"):
+        return directory
+    return {"users_total": directory.get("total")}
+
+
+async def _analytics_health(ctx: ToolContext, _days: int) -> dict[str, Any]:
+    health = await _admin_get(ctx.workspace_client, "/api/v1/admin/platform-health", ctx, "health")
+    if health.get("error"):
+        return health
+
+    # An unreachable metrics store is NOT an outage, and this is the one place the distinction
+    # could be lost — a model handed empty lists would reasonably report that everything is down.
+    if not health.get("monitoringAvailable"):
+        return {
+            "monitoring_available": False,
+            "reason": health.get("monitoringUnavailableReason"),
+            "note": (
+                "Monitoring could not be read. This says NOTHING about whether the platform is "
+                "healthy — report it as 'I cannot see the metrics', not as an outage."
+            ),
+        }
+
+    targets = health.get("targets") or []
+    workers = health.get("workers") or []
+    dead_letters = health.get("deadLetters") or []
+
+    return {
+        "monitoring_available": True,
+        "targets_down": [t.get("job") for t in targets if not t.get("isUp")],
+        "targets_total": len(targets),
+        "workers_at_zero": [w.get("worker") for w in workers if not w.get("replicas")],
+        "firing_alerts": [
+            {"name": a.get("name"), "severity": a.get("severity"), "summary": a.get("summary")}
+            for a in (health.get("alerts") or [])
+        ],
+        "dead_letter_streams": [
+            {"stream": d.get("stream"), "length": d.get("length")}
+            for d in dead_letters
+            if d.get("length")
+        ],
+        "stage_latency_p95_ms": health.get("stageLatencies"),
+    }
+
+
+_ANALYTICS_HANDLERS: dict[str, Callable[[ToolContext, int], Awaitable[dict[str, Any]]]] = {
+    "overview": _analytics_overview,
+    "revenue": _analytics_revenue,
+    "feedback": _analytics_feedback,
+    "users": _analytics_users,
+    "health": _analytics_health,
+}
+
+
+async def _get_platform_analytics(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    raw_reports = (arguments or {}).get("reports") or []
+    if isinstance(raw_reports, str):
+        raw_reports = [raw_reports]
+
+    # Deduplicated, order preserved. A model that asks for "overview, overview, revenue" should
+    # not pay for the first report twice.
+    requested: list[str] = []
+    unknown: list[str] = []
+    for report in raw_reports:
+        name = str(report).strip().lower()
+        if name not in PLATFORM_ANALYTICS_REPORTS:
+            if name and name not in unknown:
+                unknown.append(name)
+            continue
+        if name not in requested:
+            requested.append(name)
+
+    if not requested:
+        return json.dumps(
+            {
+                "error": "no_report_requested",
+                "message": (f"Name at least one report: {', '.join(PLATFORM_ANALYTICS_REPORTS)}."),
+                "unknown_reports": unknown,
+            }
+        )
+
+    days = (arguments or {}).get("days")
+    try:
+        window = int(days) if days is not None else PLATFORM_ANALYTICS_DEFAULT_DAYS
+    except (TypeError, ValueError):
+        window = PLATFORM_ANALYTICS_DEFAULT_DAYS
+    # Clamped rather than rejected: an out-of-range window is a model slip, not a reason to
+    # answer nothing, and the response states which window was actually used.
+    window = max(1, min(window, PLATFORM_ANALYTICS_MAX_DAYS))
+
+    results = await asyncio.gather(
+        *(_ANALYTICS_HANDLERS[name](ctx, window) for name in requested),
+        return_exceptions=True,
+    )
+
+    payload: dict[str, Any] = {}
+    for name, result in zip(requested, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.exception("platform_analytics_report_failed", report=name, exc_info=result)
+            payload[name] = {
+                "error": "unavailable",
+                "report": name,
+                "message": "That report could not be produced.",
+            }
+        else:
+            payload[name] = result
+
+    if unknown:
+        payload["unknown_reports"] = unknown
+
+    return json.dumps(payload)
+
+
 TOOLS: list[ChatTool] = [
     ChatTool(
         name="ask_user",
@@ -1302,6 +1569,54 @@ TOOLS: list[ChatTool] = [
             "required": ["document_id"],
         },
         handler=_get_document,
+    ),
+    ChatTool(
+        name="get_platform_analytics",
+        description=(
+            "Platform-wide figures for a WarpTalk PLATFORM ADMINISTRATOR: workspace and meeting "
+            "counts, recurring revenue, product feedback ratings, sign-ups, and infrastructure "
+            "health. Ask for every report you need in one call — they are fetched together. "
+            "\n\n"
+            "This reads the same admin API the /admin console does, using the asking user's own "
+            "credentials, so it returns data ONLY for someone who holds the platform admin role. "
+            "Anyone else gets not_authorized back, and you must tell them plainly that this is "
+            "restricted — never estimate, extrapolate or invent a platform figure. A report that "
+            "comes back with an error is a report you do not have."
+            "\n\n"
+            "These are PLATFORM totals across every tenant. For one workspace's own meetings use "
+            "list_recent_meetings instead."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "reports": {
+                    "type": "array",
+                    "description": (
+                        "Which figures to fetch. Ask for everything the question needs at once."
+                    ),
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "overview",
+                            "revenue",
+                            "feedback",
+                            "users",
+                            "health",
+                        ],
+                    },
+                    "minItems": 1,
+                },
+                "days": {
+                    "type": "integer",
+                    "description": (
+                        "Window in days for the feedback report, 1-366. Defaults to 30. Ignored "
+                        "by the others, which are point-in-time."
+                    ),
+                },
+            },
+            "required": ["reports"],
+        },
+        handler=_get_platform_analytics,
     ),
 ]
 
