@@ -151,3 +151,60 @@ async def test_consent_matching_is_case_insensitive_on_the_user_id() -> None:
     consented, _ = await worker.voice_clone_consent_state(ROOM, SPEAKER)
 
     assert consented is True
+
+
+async def test_a_room_with_no_routes_is_not_reported_as_unknown() -> None:
+    """WT-405 follow-up. `[]` is falsy; "never heard of this room" is a missing key.
+
+    Production, meeting 01a003b5 on 15 Aug: the snapshot at
+    `translationRoom:{id}:audio_routes` was present, intact and freshly generated —
+    `{"routes":[],"room_status":"IN_PROGRESS","translation_active":false}` — because nobody had
+    pressed Start Translation. The worker read it, stored `[]`, and then reported
+    `routes_unknown`, whose own docstring promises "no snapshot to recover them from".
+
+    So the one instrument for diagnosing "voice clone isn't working" was pointing at a
+    broadcast-replay failure that had not occurred, for a room in a perfectly ordinary state.
+    """
+    worker = _worker({ROOM: []})
+
+    consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert consented is False
+    assert reason == "no_routes", (
+        "A room whose routes are known to be empty must not be reported as one we were never "
+        "told about — those have different causes and different fixes."
+    )
+
+
+async def test_a_snapshot_holding_no_routes_is_still_not_unknown() -> None:
+    """The same thing by the other door: recovered from Redis rather than broadcast.
+
+    This is the production path exactly — the room was not in `_room_routes`, the snapshot was
+    read successfully, and it contained an empty list.
+    """
+    worker = _worker({}, snapshot={"routes": []})
+
+    consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert (consented, reason) == (False, "no_routes")
+
+
+async def test_a_genuinely_unknown_room_still_reports_unknown() -> None:
+    """The distinction has to cut both ways, or this just moves the blind spot.
+
+    No entry and no snapshot is the real replay failure the reason code was added for.
+    """
+    worker = _worker({}, snapshot=None)
+
+    consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert (consented, reason) == (False, "routes_unknown")
+
+
+async def test_a_room_with_routes_but_no_opt_in_is_unchanged() -> None:
+    """The existing answer must survive the new branch."""
+    worker = _worker({ROOM: [_route(False)]})
+
+    consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert (consented, reason) == (False, "not_opted_in")

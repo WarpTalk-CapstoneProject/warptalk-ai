@@ -473,6 +473,9 @@ class BaseWorker(ABC):
         Returns (consented, reason) where reason is one of:
             "consented"      — a current outgoing route for this speaker has VoiceCloneEnabled.
             "not_opted_in"   — routes are known and none of this speaker's has it enabled.
+            "no_routes"      — this room's routes are known and there are NONE. Nobody has
+                               started translation, so there is nothing to dub and nothing to
+                               consent to. A normal state, not a fault.
             "routes_unknown" — no routes for this room, and no snapshot to recover them from.
                                Still fails closed, but now says so instead of looking identical
                                to a deliberate opt-out.
@@ -484,9 +487,22 @@ class BaseWorker(ABC):
             if self.is_voice_clone_consented(room_id, speaker_user_id):
                 return True, "consented"
 
-        if self._room_routes.get(room_id):
-            return False, "not_opted_in"
-        return False, "routes_unknown"
+        # Membership, not truthiness. `_load_route_snapshot` stores whatever the snapshot's
+        # `routes` list contained, and for a room where nobody has pressed Start Translation
+        # that is `[]` — which is falsy, so this used to fall through and report the room as
+        # UNKNOWN even though the snapshot had just been read successfully.
+        #
+        # That is the exact ambiguity these reason codes exist to remove, reappearing one level
+        # down: "I was never told about this room" and "I was told, and there is nothing in it"
+        # are different facts with different fixes, and the first is a bug worth chasing while
+        # the second is Tuesday. Production showed `routes_unknown` for a healthy IN_PROGRESS
+        # meeting whose snapshot was present and intact, which sends whoever reads it hunting a
+        # broadcast-replay failure that did not happen.
+        if room_id not in self._room_routes:
+            return False, "routes_unknown"
+        if not self._room_routes[room_id]:
+            return False, "no_routes"
+        return False, "not_opted_in"
 
     # ------------------------------------------------------------------
     # Abstract interface
