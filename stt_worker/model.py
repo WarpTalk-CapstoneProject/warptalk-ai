@@ -1221,6 +1221,7 @@ class OpenAISTT:
         prompt: str | None,
         allowed_languages: set[str] | None = None,
         keywords: list[str] | None = None,
+        noise_reduction: str | None = None,
     ) -> None:
         """Claim/configure a warm socket when a participant publishes their mic track."""
         await self._get_or_create_session(
@@ -1229,6 +1230,7 @@ class OpenAISTT:
             prompt=prompt,
             allowed_languages=allowed_languages,
             keywords=keywords,
+            noise_reduction=noise_reduction,
         )
 
     async def transcribe(
@@ -1242,6 +1244,7 @@ class OpenAISTT:
         prompt: str | None = None,
         allowed_languages: set[str] | None = None,
         keywords: list[str] | None = None,
+        noise_reduction: str | None = None,
         on_early_segment: Callable[[TranscribedSegment], Awaitable[None]] | None = None,
         on_speculative_segment: Callable[[TranscribedSegment], Awaitable[None]] | None = None,
     ) -> list[TranscribedSegment]:
@@ -1373,6 +1376,7 @@ class OpenAISTT:
                 allowed_languages,
                 keywords,
                 exclude_emitted_from_final=exclude_emitted_from_final,
+                noise_reduction=noise_reduction,
             )
         except Exception as first_error:
             # A capability the API rejected ASYNCHRONOUSLY has to be learned here, because the
@@ -1404,6 +1408,7 @@ class OpenAISTT:
                     allowed_languages,
                     keywords,
                     exclude_emitted_from_final=exclude_emitted_from_final,
+                    noise_reduction=noise_reduction,
                 )
             except Exception as e:
                 logger.error("openai_stt_error", error=str(e))
@@ -1508,6 +1513,7 @@ class OpenAISTT:
         allowed_languages: set[str] | None = None,
         keywords: list[str] | None = None,
         *,
+        noise_reduction: str | None = None,
         exclude_emitted_from_final: bool = True,
     ) -> tuple[str, float]:
         session = await self._get_or_create_session(
@@ -1516,6 +1522,7 @@ class OpenAISTT:
             prompt,
             allowed_languages,
             keywords,
+            noise_reduction=noise_reduction,
         )
         conn = session["conn"]
 
@@ -1616,6 +1623,7 @@ class OpenAISTT:
         prompt: str | None,
         allowed_languages: set[str] | None,
         keywords: list[str],
+        noise_reduction: str | None = None,
     ) -> None:
         """Find the richest session config this model accepts, and remember it.
 
@@ -1642,7 +1650,12 @@ class OpenAISTT:
                             prompt,
                             allowed_languages,
                             keywords,
-                            **flags,
+                            noise_reduction=noise_reduction,
+                            # Named rather than splatted: **flags is dict[str, bool] and would
+                            # otherwise be a candidate for every keyword parameter, including the
+                            # string one added for per-room noise reduction.
+                            structured_context=flags["structured_context"],
+                            logprobs=flags["logprobs"],
                         ),
                     )
                 )
@@ -1689,6 +1702,9 @@ class OpenAISTT:
         prompt: str | None,
         allowed_languages: set[str] | None = None,
         keywords: list[str] | None = None,
+        # Before the `*` on purpose: _degrade_session_config forwards the capability flags as
+        # **dict[str, bool], and a keyword-only str parameter sits inside that splat's target set.
+        noise_reduction: str | None = None,
         *,
         structured_context: bool | None = None,
         logprobs: bool | None = None,
@@ -1732,8 +1748,18 @@ class OpenAISTT:
         # detection accuracy (reducing false positives) and model performance" per
         # OpenAI's own docs. self.noise_reduction == "off" omits the field entirely
         # (server default is no noise reduction).
-        if self.noise_reduction and self.noise_reduction != "off":
-            input_config["noise_reduction"] = {"type": self.noise_reduction}
+        #
+        # WT-427: per ROOM, falling back to the worker's default. One meeting is a headset at a
+        # desk and the next is a laptop across a table, and the same setting cannot be right for
+        # both: the deployment default is "off" precisely because a second denoising pass
+        # distorted clean close-mic speech in replay tests, while a room being picked up from two
+        # metres away needs exactly that pass. A single env var made this an all-or-nothing choice
+        # for the whole platform.
+        effective_noise_reduction = (
+            noise_reduction if noise_reduction is not None else self.noise_reduction
+        )
+        if effective_noise_reduction and effective_noise_reduction != "off":
+            input_config["noise_reduction"] = {"type": effective_noise_reduction}
 
         payload: dict[str, Any] = {
             "type": "transcription",
@@ -1755,6 +1781,7 @@ class OpenAISTT:
         prompt: str | None = None,
         allowed_languages: set[str] | None = None,
         keywords: list[str] | None = None,
+        noise_reduction: str | None = None,
     ) -> dict[str, Any]:
         self._sweep_idle_sessions()
 
@@ -1803,6 +1830,10 @@ class OpenAISTT:
                 or cached.get("prompt") != prompt
                 or cached.get("languages") != languages
                 or cached.get("keywords") != normalized_keywords
+                # In the comparison, not merely in the payload. A room that switches to far-field
+                # mid-meeting keeps a live socket, and a value the update never notices changed is
+                # a setting that silently does nothing until the session happens to be recycled.
+                or cached.get("noise_reduction") != noise_reduction
             )
             if config_changed:
                 await cached["conn"].session.update(
@@ -1813,6 +1844,7 @@ class OpenAISTT:
                             prompt,
                             allowed_languages,
                             list(normalized_keywords),
+                            noise_reduction=noise_reduction,
                         ),
                     )
                 )
@@ -1821,6 +1853,7 @@ class OpenAISTT:
                     prompt=prompt,
                     languages=languages,
                     keywords=normalized_keywords,
+                    noise_reduction=noise_reduction,
                 )
             return cached
 
@@ -1851,6 +1884,7 @@ class OpenAISTT:
                         prompt,
                         allowed_languages,
                         list(normalized_keywords),
+                        noise_reduction=noise_reduction,
                     ),
                 )
             )
@@ -1867,6 +1901,7 @@ class OpenAISTT:
                 prompt,
                 allowed_languages,
                 list(normalized_keywords),
+                noise_reduction,
             )
 
         session = {
@@ -1877,6 +1912,7 @@ class OpenAISTT:
             "prompt": prompt,
             "languages": languages,
             "keywords": normalized_keywords,
+            "noise_reduction": noise_reduction,
         }
         self._sessions[key] = session
         logger.info(

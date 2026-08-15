@@ -356,6 +356,7 @@ class STTWorker(BaseWorker):
         language_hint = _language_hint_for_stt(chunk.language)
         allowed_languages = await self._get_room_languages(chunk.meeting_id)
         keywords = await self._get_stt_keywords(chunk.meeting_id)
+        noise_reduction = await self._get_room_noise_reduction(chunk.meeting_id)
 
         # Measured CONCURRENTLY with recognition, not before it. Transcription is a
         # network round trip of hundreds of milliseconds; the measurement is single-digit
@@ -415,6 +416,7 @@ class STTWorker(BaseWorker):
                 prompt=None,
                 allowed_languages=allowed_languages,
                 keywords=keywords,
+                noise_reduction=noise_reduction,
                 # Realtime delta events carry neither confidence nor no-speech
                 # probability. Publishing them allowed hallucinated partials to reach
                 # translation/UI before the completed event could be validated. They
@@ -697,6 +699,52 @@ class STTWorker(BaseWorker):
             glossary = cached
 
         return glossary[:_MAX_GLOSSARY_CHARS] or None
+
+    async def _get_room_noise_reduction(self, meeting_id: str) -> str | None:
+        """This room's denoising mode, or None to use the worker's default. WT-427.
+
+        WHY PER ROOM
+            The deployment default is "off", and that default is measured: a second denoising pass
+            on top of the browser's own distorted clean close-mic speech in replay tests. It is
+            also wrong for the other half of the estate — a laptop picking a room up from two
+            metres away needs exactly that pass, and without it the transcript degrades into the
+            noise the microphone is hearing.
+
+            One environment variable made that an all-or-nothing choice for the whole platform, so
+            whichever way it was set, half the meetings were configured for the other half's room.
+
+        The key is optional, and a room that never sets it behaves exactly as before.
+        """
+        cache: dict[str, str | None] | None = getattr(self, "_room_noise_reduction", None)
+        if cache is None:
+            cache = {}
+            self._room_noise_reduction = cache
+        if meeting_id in cache:
+            return cache[meeting_id]
+
+        value: str | None = None
+        try:
+            raw = await self.redis.get(f"translationRoom:{meeting_id}:noise_reduction")
+            if raw:
+                decoded = (raw.decode() if isinstance(raw, bytes) else raw).strip().lower()
+                # Only the modes the provider accepts. An unrecognised string would fail the whole
+                # session update, taking the language hint and the keywords down with it — see
+                # _degrade_session_config, which exists because that has happened before.
+                if decoded in {"off", "near_field", "far_field"}:
+                    value = decoded
+                else:
+                    self.logger.warning(
+                        "room_noise_reduction_unrecognised",
+                        meeting_id=meeting_id,
+                        value=decoded,
+                    )
+        except Exception:
+            # A room that cannot be read falls back to the worker default, which is what every
+            # room used before this existed.
+            self.logger.warning("room_noise_reduction_unavailable", meeting_id=meeting_id)
+
+        cache[meeting_id] = value
+        return value
 
     async def _get_stt_keywords(self, meeting_id: str) -> list[str]:
         """Return structured glossary terms for the provider's keyword-bias field."""
