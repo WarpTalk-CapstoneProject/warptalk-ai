@@ -15,6 +15,9 @@ STREAM_KEYS = [
     f"stt:results:{ROOM_ID}".encode(),
     b"stt:dead-letter",
     b"tts:dead-letter",
+    # The .NET spelling. Only ":dead-letter" was matched, so every backend DLQ — this one
+    # exists in production — was outside WarpTalkDeadLetterPresent.
+    b"translationRoom:system_events:dlq",
 ]
 
 GROUPS: dict[str, list[dict[str, Any]]] = {
@@ -29,6 +32,7 @@ GROUPS: dict[str, list[dict[str, Any]]] = {
     "voice:clone_requests": [{"name": "tts-audio-workers", "pending": 0, "lag": 0, "consumers": 1}],
     "stt:dead-letter": [],
     "tts:dead-letter": [],
+    "translationRoom:system_events:dlq": [],
 }
 
 
@@ -62,7 +66,11 @@ class FakeRedis:
             yield key
 
     async def xlen(self, stream: Any) -> int:
-        return {"stt:dead-letter": 2, "tts:dead-letter": 0}[stream]
+        return {
+            "stt:dead-letter": 2,
+            "tts:dead-letter": 0,
+            "translationRoom:system_events:dlq": 7,
+        }[stream]
 
 
 async def test_collect_metrics_reports_lag_pending_heartbeats_and_dead_letters() -> None:
@@ -77,6 +85,7 @@ async def test_collect_metrics_reports_lag_pending_heartbeats_and_dead_letters()
     assert 'redis_keys_count{key="warptalk:worker:heartbeat:stt:*"} 2' in output
     assert 'redis_stream_length{stream="stt:dead-letter"} 2' in output
     assert 'redis_stream_length{stream="tts:dead-letter"} 0' in output
+    assert 'redis_stream_length{stream="translationRoom:system_events:dlq"} 7' in output
     assert redis.scan_calls == [
         ("*", "stream"),
         ("warptalk:worker:heartbeat:*", None),
