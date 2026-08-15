@@ -392,6 +392,11 @@ class ChatAssistantSettings(BaseSettings):
     workspace_service_url: str = "http://localhost:5106"
     transcript_service_url: str = "http://localhost:5103"
     translation_room_service_url: str = "http://localhost:5102"
+    # Reached only by get_platform_analytics, and only ever with the caller's own bearer token —
+    # every path behind these is gated by the platform admin policy server-side, so a normal
+    # user's assistant gets the same 403 they would get from the browser.
+    billing_service_url: str = "http://localhost:5107"
+    auth_service_url: str = "http://localhost:5101"
 
 
 class SuggestionSettings(BaseSettings):

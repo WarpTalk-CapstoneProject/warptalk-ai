@@ -219,6 +219,10 @@ class ChatAssistantWorker(BaseWorker):
         self._workspace_client: httpx.AsyncClient | None = None
         self._transcript_client: httpx.AsyncClient | None = None
         self._translation_room_client: httpx.AsyncClient | None = None
+        # Only get_platform_analytics uses these two, and only with the caller's own token —
+        # every path behind them is gated by the platform admin policy server-side.
+        self._billing_client: httpx.AsyncClient | None = None
+        self._auth_client: httpx.AsyncClient | None = None
 
     async def load_model(self) -> None:
         api_key = resolve_openai_api_key(self.chat_settings.api_key)
@@ -238,6 +242,14 @@ class ChatAssistantWorker(BaseWorker):
             base_url=self.chat_settings.translation_room_service_url,
             timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
         )
+        self._billing_client = httpx.AsyncClient(
+            base_url=self.chat_settings.billing_service_url,
+            timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
+        )
+        self._auth_client = httpx.AsyncClient(
+            base_url=self.chat_settings.auth_service_url,
+            timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
+        )
         self.logger.info("chat_assistant_ready", model=self.chat_settings.model)
 
     async def _cleanup(self) -> None:
@@ -245,6 +257,8 @@ class ChatAssistantWorker(BaseWorker):
             self._workspace_client,
             self._transcript_client,
             self._translation_room_client,
+            self._billing_client,
+            self._auth_client,
         ):
             if client is not None:
                 await client.aclose()
@@ -283,6 +297,8 @@ class ChatAssistantWorker(BaseWorker):
             workspace_client=self._workspace_client,
             transcript_client=self._transcript_client,
             translation_room_client=self._translation_room_client,
+            billing_client=self._billing_client,
+            auth_client=self._auth_client,
             openai_client=self._openai,
             model=self.chat_settings.model,
             redis=self.redis,
