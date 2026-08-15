@@ -62,7 +62,21 @@ _ROOM_LANGUAGES_TTL_S = 15.0
 _RECENT_CONTEXT_SEGMENTS = 4
 _MAX_STT_PROMPT_CHARS = 600
 _MAX_GLOSSARY_CHARS = 240
-_MAX_STT_KEYWORDS = 100
+# WT-426. Was 100, while the writer (GlossaryStartedEventConsumer) only ever sends 10.
+#
+# The gap was not harmless. This is the LAST bound before the list reaches the provider, and a
+# reader more permissive than its writer stops being a bound at all — anything that ever wrote
+# more, by hand or by a future change, would sail straight through.
+#
+# And the list is not free vocabulary. It is a thumb on the scale, and on marginal audio the model
+# resolves ambiguity INTO it: a noisy production meeting on 15 Aug transcribed "voice clone" as
+# "Cũng là ChatGPT" and emitted "WarpTalk, WarpBot, Codex." as an utterance nobody spoke. Every one
+# of those is a glossary term.
+#
+# Deliberately a little above the writer's 10 rather than equal to it: this is a safety ceiling,
+# not a second opinion about how many terms are right. That decision belongs at the writer, where
+# workspace and global terms can be told apart.
+_MAX_STT_KEYWORDS = 16
 _CONTEXT_MIN_CONFIDENCE = -0.35
 _ACTIVE_TRANSLATION_STATES = {"IN_PROGRESS", "AUDIO_ROUTING_ACTIVE"}
 
