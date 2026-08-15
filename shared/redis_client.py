@@ -624,6 +624,16 @@ class RedisStreamClient:
         """Get a key value."""
         return await self.redis.get(key)
 
+    async def delete(self, key: str) -> None:
+        """Drop a key now rather than waiting for its TTL.
+
+        Added for the uploaded voice samples (WT-396): those are biometric audio, the expiry on
+        them is a backstop against a worker that never runs, and anything that finishes with
+        them should say so immediately instead of leaving them in memory for the rest of the
+        hour.
+        """
+        await self.redis.delete(key)
+
     async def scan_keys(self, match: str, count: int = 200) -> list[str]:
         """Every key matching `match`, as decoded strings.
 

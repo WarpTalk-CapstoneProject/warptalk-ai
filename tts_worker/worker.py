@@ -38,6 +38,23 @@ from tts_worker.synthesizer import CartesiaSynthesizer
 # raw PCM frames, not a WAV container).
 _WAV_HEADER_BYTES = 44
 
+# WT-396 — the hand-off for a recording somebody uploaded of themselves.
+#
+# AuthService cannot clone (no Cartesia key, by design) and this side cannot read the bucket the
+# recording lands in (no storage credentials, also by design), so the audio and the answer travel
+# through Redis — the same way the voice catalogue already does in the other direction.
+#
+# The sample key is suffixed with the profile id so WT-402's rule gives it a bounded lifetime
+# automatically: anything whose last segment parses as a UUID expires. It is deleted as soon as
+# the clone finishes either way, because these are biometric bytes and the TTL is the backstop
+# rather than the plan.
+_CLONE_REQUEST_STREAM = "voice:clone_requests"
+_CLONE_SAMPLE_PREFIX = "voice:clone_sample:"
+_CLONE_RESULT_PREFIX = "voice:clone_result:"
+# The answer outlives the audio: somebody may upload and not open the page for days, and losing
+# the id would mean paying Cartesia again for a voice we already made.
+_CLONE_RESULT_TTL_SECONDS = 7 * 24 * 60 * 60
+
 # Cartesia's voices.clone() requires a concrete `language`, but AudioChunkMessage.language
 # defaults to "auto" (STT does language auto-detection, not the audio-chunk producer) — so
 # fall back to "en" for anything Cartesia's SDK wouldn't accept as a real language code.
@@ -146,6 +163,9 @@ class TTSWorker(BaseWorker):
     input_stream = "translate:results"
     consumer_group = "tts-workers"
     _audio_consumer_group = "tts-audio-workers"
+    # WT-396. Its own group, not the audio one: these are two unrelated backlogs, and sharing a
+    # group would make a slow clone hold up live meeting audio behind it.
+    _clone_request_group = "tts-upload-clone-workers"
     _running = True
 
     def __init__(
@@ -180,6 +200,7 @@ class TTSWorker(BaseWorker):
         await self.cartesia.load()
         self.livekit_publisher = LiveKitTTSPublisher(self.settings.livekit)
         asyncio.create_task(self._consume_audio_for_cloning())
+        asyncio.create_task(self._consume_upload_clone_requests())
         self.logger.info("tts_worker_ready", model=self.tts_settings.model)
 
     async def _consume_loop(self) -> None:
@@ -842,6 +863,86 @@ class TTSWorker(BaseWorker):
         if cached:
             return cached.decode() if isinstance(cached, bytes) else cached
         return None
+
+    async def _consume_upload_clone_requests(self) -> None:
+        """Turn recordings people upload of themselves into provider voices (WT-396).
+
+        THE BOUNDARY THIS EXISTS TO CROSS
+            Cloning needs the Cartesia key, which only this side holds; the recording lives in a
+            bucket only AuthService has credentials for. Neither half can do the other's part, so
+            AuthService leaves the audio in Redis under `voice:clone_sample:{profile_id}` and a
+            notice on this stream, and the answer goes back the same way.
+
+            Before this, `CreateProfileAsync` ended at "bytes in a bucket, row marked active".
+            Nothing anywhere could make a voice out of them, so an uploaded profile was listed as
+            ready and every dub still came back in a stock catalogue voice.
+
+        AN ANSWER IS ALWAYS WRITTEN, INCLUDING FOR FAILURE
+            A missing answer is indistinguishable from one still being worked on, and AuthService
+            renders both as "not usable yet" forever. A named failure is what lets the page say
+            the recording could not be turned into a voice.
+        """
+        while self._running:
+            try:
+                async for msg_id, data in self.redis.consume(
+                    stream=_CLONE_REQUEST_STREAM,
+                    group=self._clone_request_group,
+                    consumer=self._consumer_name,
+                    block_ms=5000,
+                    count=1,
+                ):
+                    await self._handle_upload_clone_request(data)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.exception("upload_clone_consumer_error")
+                await asyncio.sleep(1.0)
+
+    async def _handle_upload_clone_request(self, data: dict[bytes, bytes]) -> None:
+        profile_id = _decode_field(data, "profile_id")
+        language = _decode_field(data, "language") or "en"
+        if not profile_id:
+            return
+
+        sample_key = f"{_CLONE_SAMPLE_PREFIX}{profile_id}"
+        result_key = f"{_CLONE_RESULT_PREFIX}{profile_id}"
+
+        async def answer(voice_id: str | None, error: str | None) -> None:
+            # Seven days, because somebody may upload and not open the page for a while, and
+            # losing the id would mean paying Cartesia again for a voice we already made.
+            await self.redis.set_with_ttl(
+                result_key,
+                json.dumps({"voiceId": voice_id, "provider": "cartesia", "error": error}),
+                _CLONE_RESULT_TTL_SECONDS,
+            )
+
+        try:
+            sample = await self.redis.get(sample_key)
+            if not sample:
+                # The audio outlived by its TTL, or the request was replayed after the sample was
+                # collected. Said plainly rather than left pending forever.
+                await answer(None, "the uploaded recording was no longer available to clone")
+                return
+
+            audio = sample.encode("utf-8") if isinstance(sample, str) else sample
+            synthesizer = self._require_cartesia()
+            voice_id = await synthesizer.clone_voice(
+                audio, speaker_label=f"profile-{profile_id[:8]}", language=_clone_language(language)
+            )
+            await answer(voice_id, None)
+            self.logger.info(
+                "uploaded_voice_cloned", profile_id=profile_id, bytes=len(audio), language=language
+            )
+        except Exception as exc:
+            self.logger.exception("uploaded_voice_clone_failed", profile_id=profile_id)
+            await answer(None, str(exc)[:200])
+        finally:
+            # The bytes are biometric data and there is no reason to keep them once we are done
+            # with them, whichever way it went. The TTL is the backstop, not the plan.
+            try:
+                await self.redis.delete(sample_key)
+            except Exception:
+                self.logger.debug("clone_sample_delete_failed", profile_id=profile_id)
 
     async def _consume_audio_for_cloning(self) -> None:
         """Buffer raw audio per speaker; clone voice once enough is collected."""
