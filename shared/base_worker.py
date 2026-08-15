@@ -471,14 +471,17 @@ class BaseWorker(ABC):
             `translationRoom:{id}:audio_routes` as a durable key.
 
         Returns (consented, reason) where reason is one of:
-            "consented"      — a current outgoing route for this speaker has VoiceCloneEnabled.
-            "not_opted_in"   — routes are known and none of this speaker's has it enabled.
-            "no_routes"      — this room's routes are known and there are NONE. Nobody has
-                               started translation, so there is nothing to dub and nothing to
-                               consent to. A normal state, not a fault.
-            "routes_unknown" — no routes for this room, and no snapshot to recover them from.
-                               Still fails closed, but now says so instead of looking identical
-                               to a deliberate opt-out.
+            "consented"             — an outgoing route for this speaker has VoiceCloneEnabled.
+            "not_opted_in"          — this speaker HAS outgoing routes and none has it enabled.
+                                      Their own choice, and the only reason that is one.
+            "no_route_for_speaker"  — the room has routes, but none out of THIS speaker: nobody
+                                      is listening to them in another language, so there is no
+                                      dub to clone for. Says nothing about what they opted into.
+            "no_routes"             — this room's routes are known and there are NONE. Nobody
+                                      has started translation. A normal state, not a fault.
+            "routes_unknown"        — no routes for this room, and no snapshot to recover them
+                                      from. Still fails closed, but now says so instead of
+                                      looking identical to a deliberate opt-out.
         """
         if self.is_voice_clone_consented(room_id, speaker_user_id):
             return True, "consented"
@@ -500,8 +503,27 @@ class BaseWorker(ABC):
         # broadcast-replay failure that did not happen.
         if room_id not in self._room_routes:
             return False, "routes_unknown"
-        if not self._room_routes[room_id]:
+
+        routes = self._room_routes[room_id]
+        if not routes:
             return False, "no_routes"
+
+        # "Nobody is listening to this person" is not "this person said no".
+        #
+        # Production, meeting 01a003d5: one route, src=..0002 -> tgt=..0001. Speaker ..0001 has
+        # voice_clone_enabled = TRUE in auth.user_settings and was still reported `not_opted_in`,
+        # because they have no OUTGOING route — they are the listener here, not the speaker.
+        #
+        # That is the worst version of this mislabel: it accuses the one person who did turn the
+        # feature on of having turned it off, and sends whoever is debugging "I enabled it and it
+        # still does nothing" into the settings and route-generation wiring, where they will find
+        # everything working exactly as designed.
+        if not any(
+            str(route.get("SourceUserId") or "").lower() == speaker_user_id.lower()
+            for route in routes
+        ):
+            return False, "no_route_for_speaker"
+
         return False, "not_opted_in"
 
     # ------------------------------------------------------------------
