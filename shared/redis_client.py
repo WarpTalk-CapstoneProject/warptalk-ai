@@ -624,6 +624,22 @@ class RedisStreamClient:
         """Get a key value."""
         return await self.redis.get(key)
 
+    async def scan_keys(self, match: str, count: int = 200) -> list[str]:
+        """Every key matching `match`, as decoded strings.
+
+        SCAN, never KEYS: KEYS blocks the whole server for the length of the keyspace, and
+        this runs against the same Redis the live audio pipeline is using.
+
+        Deliberately materialised into a list rather than returned as an iterator — the
+        caller is doing crash recovery at startup and needs the whole set before it can
+        decide anything, and the patterns used here match one key per active meeting rather
+        than one per message.
+        """
+        found: list[str] = []
+        async for key in self.redis.scan_iter(match=match, count=count):
+            found.append(key.decode("utf-8") if isinstance(key, bytes) else str(key))
+        return found
+
     async def set_if_absent(self, key: str, value: bytes | str, ttl_seconds: int) -> bool:
         """SET NX EX — returns True only for the caller that created the key.
 
