@@ -447,6 +447,20 @@ class SuggestionSettings(BaseSettings):
 
     # Stage-0 heuristics — reject before spending a single token.
     min_words: int = 5
+    # …except for questions, which are the whole point of the feature and are usually short.
+    #
+    # `min_words: 5` measured against production: 2,214 of 4,622 stored segments (48%) are under
+    # five words, and of the 665 that end in a question mark, 261 (39%) are — including every
+    # example anybody complained about. "JavaScript là gì?" is three words. The gate was
+    # discarding the highest-value case before the decide model was ever asked, and doing it
+    # silently: stage 0 spends no tokens, so it writes no log line, and the only visible symptom
+    # was a badge that had quietly stopped appearing.
+    #
+    # A separate floor rather than a lower global one. Dropping min_words to 2 across the board
+    # would send every "ừ", "okay" and half-heard fragment to the decide model — roughly doubling
+    # the call volume to reach the same handful of suggestions. This buys back the questions and
+    # nothing else.
+    min_question_words: int = 2
     # AVG LOGPROB, not a 0-1 confidence. The `confidence` field on stt:results carries
     # the model's average token logprob straight through, so it is always <= 0 — verified
     # against production data, where 1,422 stored segments span -0.699 to 0.000 and never
