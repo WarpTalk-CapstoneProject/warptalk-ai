@@ -57,7 +57,9 @@ class TestLearnedOverride:
         model._learn_language_evidence(
             ("m", "s"), "en", [_segment("Chào anh", "vi"), _segment("Đổi tên đi", "vi")]
         )
-        assert model._language_override[("m", "s")] == "vi"
+        # The declaration travels with the override: it is the claim being corrected, and the
+        # override lives exactly as long as that claim does.
+        assert model._language_override[("m", "s")] == ("vi", "en")
 
     def test_agreement_resets_the_count(self):
         model = self._model()
@@ -79,3 +81,67 @@ class TestLearnedOverride:
         model = self._model()
         model._learn_language_evidence(("m", "s"), None, [_segment("Chào anh", "vi")] * 3)
         assert model._language_override == {}
+
+
+class TestOverrideRelease:
+    """A learned override lives exactly as long as the declaration it corrected.
+
+    Production meeting 01a00a34 (16 Aug): the override was permanent, so a speaker who joined
+    declared-en/speaking-vi (correctly re-pinned to vi) and then DELIBERATELY picked English in
+    the meeting bar could never get their microphone back. Every English sentence stayed
+    labelled vi, and their vi-listening partner got no translation — source vi, target vi,
+    dropped as same-language. Nothing the person did was recoverable, because the learning loop
+    returns early while an override exists and plain English text carries no unambiguous
+    evidence to contradict it. The only signal strong enough to release it is the one this
+    class pins: the person declaring something new.
+    """
+
+    def _model_with_override(self) -> OpenAISTT:
+        model = OpenAISTT.__new__(OpenAISTT)
+        model._language_evidence = {}
+        model._language_override = {}
+        model._learn_language_evidence(
+            ("m", "s"), "en", [_segment("Chào anh", "vi"), _segment("Đổi tên đi", "vi")]
+        )
+        assert model._language_override[("m", "s")] == ("vi", "en")
+        return model
+
+    def test_the_override_corrects_the_declaration_it_was_learned_against(self):
+        model = self._model_with_override()
+        assert model._apply_language_override(("m", "s"), "en") == "vi"
+        # Still in force: the declaration has not changed.
+        assert ("m", "s") in model._language_override
+
+    def test_a_new_declaration_takes_the_microphone_back(self):
+        model = self._model_with_override()
+        # The production sequence: pinned to vi while declared en, then the speaker picks vi
+        # themselves (declaration now matches what they speak)...
+        assert model._apply_language_override(("m", "s"), "vi") == "vi"
+        assert ("m", "s") not in model._language_override
+        # ...and later picks en again and actually speaks English. With the override released,
+        # the fresh declaration wins — this exact call returned "vi" in production forever.
+        assert model._apply_language_override(("m", "s"), "en") == "en"
+
+    def test_release_also_resets_the_evidence_count(self):
+        model = self._model_with_override()
+        model._language_evidence[("m", "s")] = ("vi", 1)
+        model._apply_language_override(("m", "s"), "vi")
+        # A half-accumulated count from the old declaration must not carry over: the next
+        # override has to be earned against the NEW declaration from zero.
+        assert model._language_evidence == {}
+
+    def test_still_speaking_the_other_language_relearns_the_override(self):
+        model = self._model_with_override()
+        model._apply_language_override(("m", "s"), "ja")  # released
+        # The person declared ja but keeps audibly speaking Vietnamese: same two-segment bar
+        # as the first time, and the override comes back — scoped to the new declaration.
+        model._learn_language_evidence(
+            ("m", "s"), "ja", [_segment("Chào anh", "vi"), _segment("Đổi tên đi", "vi")]
+        )
+        assert model._language_override[("m", "s")] == ("vi", "ja")
+
+    def test_an_uncontradicted_speaker_is_untouched(self):
+        model = OpenAISTT.__new__(OpenAISTT)
+        model._language_evidence = {}
+        model._language_override = {}
+        assert model._apply_language_override(("m", "s"), "en") == "en"
