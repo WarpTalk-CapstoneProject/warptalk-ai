@@ -615,14 +615,58 @@ class TranslationWorker(BaseWorker):
                 valence = None
 
             if translated_text.strip().upper() == OUT_OF_MEETING_SCOPE:
-                self.logger.info(
-                    "background_utterance_suppressed",
+                # SUPPRESSION GETS A SECOND OPINION, WITHOUT THE CONTEXT THAT CAUSED IT.
+                #
+                # This branch used to `continue`, which published nothing for THIS target and
+                # nothing else — so the sentence reached every other listener and vanished for
+                # one. It is judged per target language, in a separate model call per target, so
+                # the same utterance could be in scope for one listener and out of scope for
+                # their neighbour; the transcript still showed the original, which is what made
+                # it read as "roughly one line in ten is not translated".
+                #
+                # Production, 12h: 10 suppressions against 228 translated chunks — 4% — and every
+                # one of them was ordinary meeting speech. "Em mút mic của anh nè, anh có bị mút
+                # không?" is a person asking about their microphone.
+                #
+                # The sentinel is an artefact of the relevance context: it is only offered when
+                # meeting_context is attached (see _select_relevance_context), so the honest test
+                # is whether the sentence is still out of scope WITHOUT it. Genuine background
+                # noise — a television, someone else's conversation — fails that test too and is
+                # still dropped. A real utterance comes back translated and gets delivered.
+                retry_text = ""
+                try:
+                    retry_text, valence = await translator.translate_with_valence(
+                        sentence,
+                        source_lang=stt_result.language,
+                        target_lang=target_lang,
+                        glossary_terms=glossary_terms,
+                        meeting_context=[],
+                    )
+                except Exception:
+                    retry_text, valence = "", None
+
+                if not retry_text.strip() or retry_text.strip().upper() == OUT_OF_MEETING_SCOPE:
+                    self.logger.info(
+                        "background_utterance_suppressed",
+                        meeting_id=stt_result.meeting_id,
+                        source_lang=stt_result.language,
+                        target_lang=target_lang,
+                        original=sentence[:60],
+                        confirmed_without_context=True,
+                    )
+                    continue
+
+                # Warning, not info: a sentence that only looked out of scope because of the
+                # context we attached is a false positive of our own making, and the rate of
+                # them is the thing worth watching.
+                self.logger.warning(
+                    "background_utterance_suppression_overturned",
                     meeting_id=stt_result.meeting_id,
                     source_lang=stt_result.language,
                     target_lang=target_lang,
                     original=sentence[:60],
                 )
-                continue
+                translated_text = retry_text
 
             is_final = (idx == len(sentences) - 1) and stt_result.is_final_chunk
 

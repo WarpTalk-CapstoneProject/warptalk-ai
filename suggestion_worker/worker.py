@@ -41,6 +41,73 @@ _INACTIVE_ROUTE_STATES = frozenset({"PAUSED", "ENDED", "FAILED", "CANCELLED", "T
 # the common path is not one extra Redis round trip per transcript segment.
 _POLICY_REFRESH_SECONDS = 60.0
 
+# Interrogatives that open or close a question without a question mark. Vietnamese marks
+# questions with particles rather than word order, so "gì", "sao", "à" carry the same signal an
+# English "what" or "how" does. Kept deliberately small: this only decides which WORD-COUNT FLOOR
+# a segment is measured against, never whether a suggestion is made — the decide model still has
+# the final say, so a false positive here costs one cheap call and nothing else.
+_QUESTION_MARKS = ("?", "？")
+_QUESTION_WORDS = frozenset(
+    {
+        # Vietnamese
+        "gì",
+        "sao",
+        "nào",
+        "đâu",
+        "ai",
+        "bao",
+        "mấy",
+        "hả",
+        "à",
+        "chưa",
+        "không",
+        "thế",
+        "vậy",
+        "tại",
+        # English
+        "what",
+        "why",
+        "how",
+        "when",
+        "where",
+        "who",
+        "which",
+        "whose",
+        "is",
+        "are",
+        "do",
+        "does",
+        "did",
+        "can",
+        "could",
+        "should",
+        "would",
+        "will",
+    }
+)
+
+
+def _looks_like_question(text: str) -> bool:
+    """Cheap, local, and deliberately generous.
+
+    Punctuation first: production STT does emit question marks (665 of 4,622 stored segments end
+    in one), so it is the strongest signal available for free. The word list is the fallback for
+    the recogniser dropping the mark, which it does on short utterances — exactly the ones this
+    exists to rescue.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.endswith(_QUESTION_MARKS):
+        return True
+
+    words = [word.strip("¿¡.,;:!\"'()[]").casefold() for word in stripped.split()]
+    words = [word for word in words if word]
+    if not words:
+        return False
+    # First or last word: English fronts its interrogatives, Vietnamese ends with a particle.
+    return words[0] in _QUESTION_WORDS or words[-1] in _QUESTION_WORDS
+
 
 class SuggestionWorker(BaseWorker):
     """Inline transcript suggestions — non-blocking, budget-capped, silent by default."""
@@ -183,10 +250,21 @@ class SuggestionWorker(BaseWorker):
         segments with actual content have it set to false. Gating on it would discard
         every real segment and keep only the empty markers. The empty-text check below is
         what filters those markers out.
+
+        A QUESTION IS MEASURED BY A DIFFERENT FLOOR, and that is the whole of this change.
+        The single `min_words: 5` gate rejected 48% of real production segments and 39% of
+        every segment that ends in a question mark — "JavaScript là gì?" is three words. It
+        did so silently, because stage 0 spends no tokens and therefore logs nothing, which
+        is why the badge looked dead rather than starved.
         """
         if not turn.text:
             return False
-        if len(turn.text.split()) < self.suggestion_settings.min_words:
+        floor = (
+            self.suggestion_settings.min_question_words
+            if _looks_like_question(turn.text)
+            else self.suggestion_settings.min_words
+        )
+        if len(turn.text.split()) < floor:
             return False
         return confidence >= self.suggestion_settings.min_stt_confidence
 

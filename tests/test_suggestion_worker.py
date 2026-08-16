@@ -196,6 +196,39 @@ class TestStageZeroGating:
         assert suggester.decide_calls == []
 
     @pytest.mark.asyncio
+    async def test_a_short_question_is_still_considered(self) -> None:
+        # The reason the badge stopped appearing. `min_words: 5` rejected 48% of real
+        # production segments and 39% of every one that ends in a question mark — and it did
+        # so at stage 0, which spends no tokens and therefore logs nothing, so the feature
+        # looked dead rather than starved. "JavaScript là gì?" is three words.
+        worker, _, suggester = build_worker()
+
+        await worker.process(b"1-0", stt_message(text="JavaScript là gì?"))
+
+        assert len(suggester.decide_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_question_without_its_question_mark_is_still_considered(self) -> None:
+        # The recogniser drops the mark on short utterances, which are exactly the ones this
+        # rescues. Vietnamese ends a question with a particle rather than fronting a word.
+        worker, _, suggester = build_worker()
+
+        await worker.process(b"1-0", stt_message(text="Cái này là sao"))
+
+        assert len(suggester.decide_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_short_statement_is_still_dropped(self) -> None:
+        # The question floor must not become a general one: sending every "ừ", "okay" and
+        # half-heard fragment to the decide model roughly doubles the call volume to reach
+        # the same handful of suggestions.
+        worker, _, suggester = build_worker()
+
+        await worker.process(b"1-0", stt_message(text="ừ đúng rồi"))
+
+        assert suggester.decide_calls == []
+
+    @pytest.mark.asyncio
     async def test_low_stt_confidence_is_dropped(self) -> None:
         worker, _, suggester = build_worker()
 

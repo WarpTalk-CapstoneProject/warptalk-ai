@@ -605,6 +605,57 @@ class TestTranslationWorker:
         assert translated_stream_writes == []
         assert list(worker._recent_source_contexts.get("m1", ())) == []
 
+    async def test_a_suppression_the_context_caused_is_overturned_and_delivered(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """The "one line in ten is not translated" report.
+
+        Suppression is judged PER TARGET LANGUAGE, in its own model call, so the same sentence
+        could be out of scope for one listener and in scope for their neighbour — and the branch
+        published nothing at all for the loser. The transcript still showed the original, which is
+        what made it read as an intermittent translation failure. Production, 12h: 10 suppressions
+        against 228 translated chunks, every one of them ordinary meeting speech.
+
+        The sentinel is only offered when meeting_context is attached, so the honest test is
+        whether the sentence is still out of scope without it.
+        """
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"en"}
+
+        async def get_value(key: str):
+            if key.endswith(":meeting_context"):
+                return b"Meeting topic: WarpTalk Docker deployment review."
+            return None
+
+        mock_redis_client._redis.get.side_effect = get_value
+
+        calls: list[list[str]] = []
+
+        async def translate(*args, **kwargs):
+            calls.append(list(kwargs.get("meeting_context") or []))
+            # Out of scope only while the meeting context is attached.
+            if kwargs.get("meeting_context"):
+                return ("[OUT_OF_MEETING_SCOPE]", None)
+            return ("Are you muted?", None)
+
+        worker.translator.translate_with_valence = AsyncMock(side_effect=translate)
+
+        message = self._make_stt_msg(
+            language="vi",
+            text="Em mút mic của anh nè, anh có bị mút không?",
+        )
+        await worker.process(b"msg-overturned", message.to_redis())
+
+        translated_stream_writes = [
+            call
+            for call in mock_redis_client._redis.xadd.call_args_list
+            if "translate:results" in str(call.args[0])
+        ]
+        assert translated_stream_writes, "a real utterance must reach the listener"
+        # The retry is the one without context — that is what makes it a second opinion and not
+        # simply the same question asked twice.
+        assert calls[-1] == []
+
     async def test_validated_final_uses_matching_speculative_translation_without_second_call(
         self, mock_redis_client, worker_settings: WorkerSettings
     ) -> None:
