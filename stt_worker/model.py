@@ -1110,7 +1110,10 @@ class OpenAISTT:
         # `_language_evidence` counts consecutive contradicting segments; `_language_override`
         # is what actually replaces the pinned language once the count is met.
         self._language_evidence: dict[tuple[str, str], tuple[str, int]] = {}
-        self._language_override: dict[tuple[str, str], str] = {}
+        # (spoken language, the declaration it corrects). The declaration is part of the entry
+        # because the override only holds while that declaration stands — a fresh pick in the
+        # meeting bar releases it (see transcribe).
+        self._language_override: dict[tuple[str, str], tuple[str, str | None]] = {}
         self._warm_sessions: deque[dict[str, Any]] = deque()
         # How many warm sockets to keep ready. Set by warm_up() and used by
         # _schedule_warm_refill to replace every socket a speaker claims.
@@ -1292,16 +1295,7 @@ class OpenAISTT:
         # getattr, not attribute access: instances built without __init__ are a supported
         # shape here — see the same guard on _warm_sessions — and this must not be the thing
         # that decides whether transcription runs at all.
-        learned = getattr(self, "_language_override", {}).get((meeting_id, speaker_id))
-        if learned and learned != lang_arg:
-            logger.info(
-                "stt_language_override_applied",
-                meeting_id=meeting_id,
-                speaker_id=speaker_id,
-                declared=lang_arg,
-                speaking=learned,
-            )
-            lang_arg = learned
+        lang_arg = self._apply_language_override((meeting_id, speaker_id), lang_arg)
 
         detected_language = lang_arg or "unknown"
 
@@ -1449,6 +1443,74 @@ class OpenAISTT:
         self._learn_language_evidence((meeting_id, speaker_id), lang_arg, segments)
         return segments
 
+    def _apply_language_override(
+        self,
+        key: tuple[str, str],
+        declared: str | None,
+    ) -> str | None:
+        """The language to pin this chunk's session to: the declaration, unless a learned
+        override still corrects it.
+
+        A FRESH DECLARATION RELEASES THE OVERRIDE.
+
+        The override corrects one specific claim — "declared en while audibly speaking vi" —
+        and it used to outlive that claim: once learned it was permanent for the meeting, and
+        nothing a person did could take their microphone back.
+
+        Production meeting 01a00a34 (16 Aug) is the whole story. A speaker joined declared en,
+        spoke Vietnamese, and the override correctly re-pinned them to vi. They then
+        deliberately picked English in the meeting bar and STARTED SPEAKING ENGLISH — and every
+        English sentence ("I still hear Vietnamese, so I ask in English", "Hello, can you hear
+        me?") kept coming back labelled vi, because the learning loop returns early while an
+        override exists and English text carries none of the unambiguous evidence that could
+        contradict it. Downstream, their vi-listening partner got NO translation at all: source
+        vi, target vi, dropped as same-language. The user's deliberate choice was unrecoverable.
+
+        So the override is scoped to the declaration it corrected. The moment the declared
+        language differs from the one the override was learned against, the person has said
+        something NEW about themselves, and that statement gets the same initial trust a
+        join-time declaration does. If they are still actually speaking something else, the
+        evidence loop simply re-learns — two unambiguous segments, same as the first time.
+        """
+        overrides: dict[tuple[str, str], tuple[str, str | None]] | None = getattr(
+            self, "_language_override", None
+        )
+        if not overrides:
+            return declared
+
+        entry = overrides.get(key)
+        if not entry:
+            return declared
+
+        learned, corrected_declaration = entry
+
+        if declared != corrected_declaration:
+            overrides.pop(key, None)
+            evidence = getattr(self, "_language_evidence", None)
+            if evidence is not None:
+                evidence.pop(key, None)
+            logger.info(
+                "stt_language_override_released",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                was_speaking=learned,
+                old_declaration=corrected_declaration,
+                new_declaration=declared,
+            )
+            return declared
+
+        if learned != declared:
+            logger.info(
+                "stt_language_override_applied",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                declared=declared,
+                speaking=learned,
+            )
+            return learned
+
+        return declared
+
     def _learn_language_evidence(
         self,
         key: tuple[str, str],
@@ -1491,7 +1553,11 @@ class OpenAISTT:
             self._language_evidence[key] = (segment.language, count)
 
             if count >= _LANGUAGE_OVERRIDE_SEGMENTS:
-                self._language_override[key] = segment.language
+                # Stored WITH the declaration it corrects, not alone. transcribe() drops the
+                # override the moment the speaker declares something new — an override that
+                # outlived its declaration is how a deliberate mid-meeting switch to English
+                # stayed pinned to Vietnamese for the rest of the meeting (room 01a00a34).
+                self._language_override[key] = (segment.language, declared)
                 self._language_evidence.pop(key, None)
                 logger.warning(
                     "stt_language_override_learned",
