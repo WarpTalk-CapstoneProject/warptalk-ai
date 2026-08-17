@@ -16,6 +16,7 @@ from ai_assistant_worker.summary_templates import (
     build_system_prompt,
     format_transcript_line,
     resolve_template,
+    spoken_text_only,
 )
 
 
@@ -78,3 +79,45 @@ def test_a_negative_offset_never_reaches_the_model() -> None:
     # Clock skew between segments is real; a negative citation anchor would resolve to
     # nothing on the meeting page.
     assert format_transcript_line(-5, "Tu", "hello").startswith("[t=0]")
+
+
+# WT-478 — a transcript of scaffolding is empty, and the model must never be asked to say so.
+
+
+def test_a_transcript_of_empty_segments_reads_as_empty() -> None:
+    # The exact shape that produced the bug: real timestamps, real speakers, nothing said.
+    # `.strip()` on this string is truthy, which is how it reached the model at all.
+    formatted = "\n".join(
+        [
+            format_transcript_line(0, "Nhi", ""),
+            format_transcript_line(1200, "Ky", "   "),
+        ]
+    )
+    assert formatted.strip(), "precondition: the formatted transcript is not blank"
+    assert spoken_text_only(formatted) == ""
+
+
+def test_the_words_survive_without_their_labels() -> None:
+    formatted = "\n".join(
+        [
+            format_transcript_line(0, "Nhi", "chốt công nợ quý ba"),
+            format_transcript_line(4000, "Ky", ""),
+            format_transcript_line(9000, "Tuan", "gửi hợp đồng chiều nay"),
+        ]
+    )
+    assert spoken_text_only(formatted) == "chốt công nợ quý ba\ngửi hợp đồng chiều nay"
+
+
+def test_a_speaker_named_with_brackets_does_not_eat_the_line() -> None:
+    # The prefix pattern stops at the first "]", so a bracketed display name must not
+    # swallow what was said.
+    assert spoken_text_only("[t=0] [Nhi] xin chào [nội bộ]") == "xin chào [nội bộ]"
+
+
+def test_the_prompt_never_asks_the_model_to_declare_the_transcript_empty() -> None:
+    # This instruction is what let a refusal come back as a summary: the model wrote
+    # "the transcript is empty and contains no substantive meeting content", the call
+    # succeeded, insufficientData stayed False, and the UI rendered it as prose.
+    prompt = build_system_prompt(GENERAL)
+    assert "no substantive content, say so" not in prompt
+    assert "Never claim the transcript is empty" in prompt

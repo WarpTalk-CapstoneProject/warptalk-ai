@@ -23,6 +23,38 @@ from shared.config import AssistantSettings, resolve_openai_api_key
 from shared.control_markers import is_control_marker
 from shared.schemas import STTResultMessage
 
+#: One accumulated STT segment: (speaker, text, timestamp_ms).
+TranscriptSegment = tuple[str, str, int]
+
+
+def substantive_segments(segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+    """The segments that are actually somebody speaking. WT-478.
+
+    Two kinds of non-speech accumulate in this worker's transcript and both used to be
+    formatted and sent to the model:
+
+    1. **Segments with no text.** `format_transcript_line` turns one into ``"[t=0] [Nhi] "`` —
+       non-empty to code, empty to a reader. A transcript of those is truthy to `.strip()`, so
+       it passed the emptiness check, reached the model, and the model reported the transcript
+       was empty. That report was then stored and rendered as the meeting's summary, which is
+       the bug users saw: a transcript full of conversation beside a summary calling it empty.
+       ``summary_template_worker._load_transcript`` has always filtered these when reading the
+       SAVED transcript — the two summary paths disagreeing on what counts as a line is the
+       underlying defect, so this is the same rule applied to the live path.
+    2. **The control marker.** ``process`` appends every segment before it tests for the
+       end-of-meeting marker, so the ``__MEETING_END__`` that triggers summarisation is sitting
+       in the list being summarised. On a short meeting it can be most of what the model is
+       shown, and summarising the sentinel that ends the meeting is never correct.
+
+    Deliberately not a minimum length: the ticket asks for short meetings to be summarised too,
+    so the question is whether anybody said anything, not whether they said enough.
+    """
+    return [
+        (speaker, text, timestamp_ms)
+        for speaker, text, timestamp_ms in segments
+        if text and text.strip() and not is_control_marker(text)
+    ]
+
 
 class AIAssistantWorker(BaseWorker):
     """AI Assistant worker — non-realtime meeting summarization."""
@@ -82,8 +114,12 @@ class AIAssistantWorker(BaseWorker):
 
     async def _generate_summary(self, meeting_id: str) -> None:
         """Generate and publish meeting summary."""
-        segments = self._transcripts.get(meeting_id, [])
+        segments = substantive_segments(self._transcripts.get(meeting_id, []))
         if not segments:
+            # Dropped here as well as on the success path: this method runs once per meeting,
+            # on the end-of-meeting marker, so nothing will ever add to this entry again and
+            # leaving it behind grows the accumulator for the life of the process.
+            self._transcripts.pop(meeting_id, None)
             return
 
         # Format transcript WITH the moment each line was spoken. The timestamp was
@@ -93,7 +129,8 @@ class AIAssistantWorker(BaseWorker):
         # which is rendered the same way: a base time plus a per-segment offset.
         base_ms = min(ts for _, _, ts in segments)
         transcript_lines = [
-            format_transcript_line(ts - base_ms, speaker, text) for speaker, text, ts in segments
+            format_transcript_line(ts - base_ms, speaker, text.strip())
+            for speaker, text, ts in segments
         ]
         transcript_text = "\n".join(transcript_lines)
 

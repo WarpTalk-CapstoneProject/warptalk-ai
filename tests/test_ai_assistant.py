@@ -42,6 +42,34 @@ async def test_generate_structured_summary_returns_insufficient_data_for_empty_t
     assert result["actionItems"] == []
 
 
+async def test_a_transcript_of_empty_segments_is_insufficient_not_summarised() -> None:
+    """WT-478 — the bug, at the layer that decides.
+
+    Timestamps and speaker labels with nothing said between them are truthy to `.strip()`,
+    so this transcript used to reach the model. The model then reported the transcript was
+    empty, the call SUCCEEDED, insufficientData stayed False, and the UI rendered that
+    report as the meeting's summary. The fake client below would answer anything, so if the
+    gate regresses this test fails on the assertion rather than on a missing client.
+    """
+    assistant = _make_assistant_with_fake_client('{"summary": "the model was asked anyway"}')
+
+    result = await assistant.generate_structured_summary("[t=0] [Nhi] \n[t=1200] [Ky]    ")
+
+    assert result["insufficientData"] is True
+    assert result["summary"] == "No transcript content to summarize."
+
+
+async def test_a_short_but_real_transcript_is_still_summarised() -> None:
+    # The other half of the ticket: "kể cả khi nội dung ngắn". Two sentences is a meeting.
+    payload = {"summary": "Nhi confirmed the Q3 receivables.", "decisions": [], "actionItems": []}
+    assistant = _make_assistant_with_fake_client(json.dumps(payload))
+
+    result = await assistant.generate_structured_summary("[t=0] [Nhi] chốt công nợ quý ba")
+
+    assert result["insufficientData"] is False
+    assert result["summary"] == payload["summary"]
+
+
 async def test_generate_structured_summary_parses_model_json() -> None:
     payload = {
         "summary": "The team reviewed the Q3 roadmap.",
