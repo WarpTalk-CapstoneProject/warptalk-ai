@@ -11,7 +11,11 @@ from typing import Any, cast
 
 from openai import AsyncOpenAI
 
-from ai_assistant_worker.summary_templates import build_system_prompt, resolve_template
+from ai_assistant_worker.summary_templates import (
+    build_system_prompt,
+    resolve_template,
+    spoken_text_only,
+)
 from shared.config import AssistantSettings
 from shared.logger import get_logger
 from shared.openai_options import completion_options
@@ -79,7 +83,8 @@ When extracting action items:
         Returns:
             Summary text with key decisions, action items, etc.
         """
-        if not transcript.strip():
+        # WT-478: spoken words, not the formatted string — see generate_structured_summary.
+        if not spoken_text_only(transcript):
             return "No transcript content to summarize."
 
         system_content = self.SYSTEM_PROMPT
@@ -107,7 +112,8 @@ When extracting action items:
         Returns:
             Formatted action items list
         """
-        if not transcript.strip():
+        # WT-478: spoken words, not the formatted string — see generate_structured_summary.
+        if not spoken_text_only(transcript):
             return "No action items found."
 
         system_content = self.SYSTEM_PROMPT
@@ -134,20 +140,6 @@ When extracting action items:
 
         return response.choices[0].message.content or ""
 
-    STRUCTURED_SYSTEM_PROMPT = """You are a professional meeting assistant.
-Analyze the meeting transcript and \
-respond with a single JSON object only (no markdown, no commentary) matching exactly this shape:
-{
-  "summary": "a concise overview paragraph of what the meeting covered",
-  "decisions": ["one string per key decision that was made"],
-  "actionItems": [{"owner": "assignee name, or empty string if unclear", "task": "the action item"}]
-}
-Only include explicit decisions and commitments — do not invent content that
-isn't in the transcript.
-If the transcript is empty or has no substantive content, return a summary
-describing that, and empty arrays
-for decisions and actionItems."""
-
     async def generate_structured_summary(
         self,
         transcript: str,
@@ -171,7 +163,15 @@ for decisions and actionItems."""
             returns a safe fallback dict with insufficientData=True instead of raising —
             callers should never have to special-case exceptions from this method.
         """
-        if not transcript.strip():
+        # WT-478: tested against the SPOKEN WORDS, not the formatted transcript. A transcript
+        # of segments with empty text is a wall of "[t=0] [Nhi] " scaffolding — non-empty to
+        # `.strip()`, empty to a reader. That gap is what sent a contentless transcript to the
+        # model, which correctly reported it was empty; that report then came back as a
+        # normal summary (insufficientData=False) and was rendered to the user as one.
+        #
+        # Emptiness is a decision this code owns. The model is never asked to make it, and the
+        # prompt in build_system_prompt now tells it so — see spoken_text_only.
+        if not spoken_text_only(transcript):
             return {
                 "summary": "No transcript content to summarize.",
                 "decisions": [],
@@ -181,7 +181,7 @@ for decisions and actionItems."""
                 "insufficientData": True,
             }
 
-        # The shape comes from the template, not from a constant. STRUCTURED_SYSTEM_PROMPT
+        # The shape comes from the template, not from a constant. An earlier hardcoded prompt
         # asked for a "concise overview paragraph" and got exactly that — three thin
         # sentences for every meeting, whatever kind of meeting it was.
         template = resolve_template(template_key)

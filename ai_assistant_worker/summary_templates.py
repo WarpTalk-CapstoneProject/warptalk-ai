@@ -19,6 +19,7 @@ CITATIONS
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 
@@ -263,9 +264,11 @@ def build_system_prompt(template: SummaryTemplate) -> str:
 
     lines.append("")
     lines.append(
-        "Write in the language the meeting was held in. If the transcript is empty or has "
-        "no substantive content, say so in the overview and return empty arrays — do not "
-        "pad it."
+        "Write in the language the meeting was held in. Summarise what the transcript "
+        "actually contains, however short that is — two sentences of real content is a "
+        "valid summary. Never claim the transcript is empty or has no substantive "
+        "content: whether there is enough to summarise is decided before you are called, "
+        "so you are only ever given a transcript that has something in it."
     )
     return "\n".join(lines)
 
@@ -279,3 +282,28 @@ def format_transcript_line(at_ms: int, speaker: str, text: str) -> str:
     STT stream and the stored transcript.
     """
     return f"[t={max(at_ms, 0)}] [{speaker}] {text}"
+
+
+#: The `[t=<ms>] [<speaker>] ` that `format_transcript_line` puts in front of every line.
+_TRANSCRIPT_LINE_PREFIX = re.compile(r"^\[t=\d+\]\s*\[[^\]]*\]\s*")
+
+
+def spoken_text_only(transcript: str) -> str:
+    """Just the words people said, with every timestamp and speaker label removed.
+
+    WT-478: `format_transcript_line` emits a NON-EMPTY line even for a segment whose text is
+    empty — `"[t=0] [Nhi] "` is 12 characters of pure scaffolding. A transcript made of those
+    survives a `.strip()` check while containing nothing anybody said, so an emptiness test
+    against the formatted string passes and the model is then asked to summarise punctuation.
+    It answered the only way it could: by reporting the transcript was empty — and that
+    sentence came back as a normal summary, which is what the user saw on screen.
+
+    Emptiness is therefore tested against what this returns, never against the formatted
+    transcript. Deliberately NOT a length threshold: the ticket asks for a summary of short
+    meetings too, so the question is "did anyone say anything", not "did they say enough".
+    """
+    return "\n".join(
+        stripped
+        for line in transcript.splitlines()
+        if (stripped := _TRANSCRIPT_LINE_PREFIX.sub("", line).strip())
+    )
