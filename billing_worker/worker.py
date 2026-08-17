@@ -294,7 +294,22 @@ class BillingSettlementWorker:
         if cached and now - cached[2] < self.settings.subscription_cache_ttl_seconds:
             return cached[0], cached[1]
 
-        raw_room = await self.redis.get(f"meeting:room:{translation_room_id}")
+        # `meeting:room:v2:` — the `v2` is NOT decoration, and dropping it stops all billing.
+        #
+        # MeetingService owns this projection and says so at MeetingRoomService.JoinMeetingAsync:
+        # "Billing and AI workers consume this as the local room -> workspace projection." WT-428
+        # bumped the key to v2 there (entries cached before requires_approval existed deserialize
+        # with proto3's default FALSE, which fails OPEN on an approval gate, so the bump orphans
+        # them rather than trusting them) — and this reader was not bumped with it.
+        #
+        # Nothing writes the unversioned key any more, and the old entries aged out on their 24h
+        # TTL, so every settlement then found no projection, raised, retried and dead-lettered.
+        # Silent, because a dead letter is not an error the meeting can see: the meeting works
+        # perfectly and simply bills nothing.
+        #
+        # The two literals are a contract across two repos with no shared constant to hold them.
+        # If MeetingService versions this key again, this line has to move on the same day.
+        raw_room = await self.redis.get(f"meeting:room:v2:{translation_room_id}")
         if raw_room is None:
             self.logger.warning(
                 "room_projection_missing",
@@ -372,6 +387,37 @@ class BillingSettlementWorker:
 
         return False
 
+    async def _is_external_speaker(self, meeting_id: str, speaker_id: str | None) -> bool:
+        """Whether this speaker was a guest in the room's workspace when they were admitted.
+
+        WT-446: the owner wants external spend separable from a workspace's own, so every usage
+        record carries the fact. TranslationRoomService resolves it once per admission (it is the
+        only service that can — workspace membership is a gRPC hop away from here) and writes it
+        to `translationRoom:<room>:external_participants`, a sibling of the `:languages` hash the
+        rest of the pipeline already reads.
+
+        FAILS TOWARDS "INTERNAL", DELIBERATELY. Redis runs allkeys-lru and evicts live meeting
+        state, so this hash can vanish mid-meeting. A missing field then means "not known to be
+        external", which under-attributes external spend but never invents it, and — crucially —
+        never fails a settlement. Money still moves correctly either way: this flag partitions
+        usage for reporting, it does not price it.
+        """
+        if not speaker_id:
+            return False
+        try:
+            raw = await self.redis.redis.hget(
+                f"translationRoom:{meeting_id}:external_participants",
+                speaker_id,
+            )
+        except Exception:
+            # Attribution is a courtesy; a Redis hiccup must not cost us the usage record.
+            return False
+        if raw is None:
+            return False
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return raw == "1"
+
     async def _handle_translation(self, data: Mapping[Any, Any]) -> None:
         msg = TranslationResultMessage.from_redis(data)
         if not msg.translated_text.strip():
@@ -417,6 +463,13 @@ class BillingSettlementWorker:
             # the extraction above (which only changes what's stored in reference_id /
             # transcript_segment_id).
             idempotency_key=f"{TRANSLATION_CHARGE_TYPE}:{msg.segment_id}:{msg.target_lang}",
+            # WT-446. Rides in `details` rather than as a new settle_usage_charge argument: the
+            # column on usage_records is GENERATED from exactly this key, so the 200-line
+            # settlement function — which decides whether a workspace can pay at all — is not
+            # touched to add a reporting dimension.
+            details={
+                "is_external": await self._is_external_speaker(msg.meeting_id, msg.speaker_id),
+            },
         )
 
     async def _handle_tts(self, data: Mapping[Any, Any]) -> None:
@@ -459,7 +512,12 @@ class BillingSettlementWorker:
             target_language_code=msg.target_lang,
             transcript_segment_id=underlying_segment_id,
             idempotency_key=f"{charge_type}:{msg.segment_id}:{msg.target_lang}",
-            details={"clone_provider": msg.clone_provider, "voice_mode": msg.voice_mode},
+            details={
+                "clone_provider": msg.clone_provider,
+                "voice_mode": msg.voice_mode,
+                # See _handle_translation — the usage_records column is generated from this key.
+                "is_external": await self._is_external_speaker(msg.meeting_id, msg.speaker_id),
+            },
         )
 
     def _register_signal_handlers(self) -> None:

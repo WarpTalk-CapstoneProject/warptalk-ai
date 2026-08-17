@@ -1015,7 +1015,16 @@ class TTSWorker(BaseWorker):
                                 upgrades_used.get(key, 0)
                                 >= self.tts_settings.voice_clone_max_upgrades
                             ):
-                                await self._note_clone_state(key, "cloned_upgrades_exhausted")
+                                # Carries the score it settled on: this is the state a speaker
+                                # is STUCK in, so it is the one that most needs to say whether
+                                # the voice they are stuck with is a good likeness or a weak
+                                # one. `cloned_elsewhere_kept` below stays scoreless because it
+                                # genuinely has none — that clone was made by another replica.
+                                await self._note_clone_state(
+                                    key,
+                                    "cloned_upgrades_exhausted",
+                                    score=cloned_score.get(key),
+                                )
                                 buffers.pop(key, None)
                                 buffer_seconds.pop(key, None)
                                 buffer_lang.pop(key, None)
@@ -1156,6 +1165,7 @@ class TTSWorker(BaseWorker):
                                         # matches, and a header that lies about the rate is how a
                                         # clone comes back chipmunked rather than refused.
                                         chunk.sample_rate,
+                                        assessment.score,
                                     )
                                 )
                             elif assessment.accepted:
@@ -1291,8 +1301,19 @@ class TTSWorker(BaseWorker):
         audio_bytes: bytes,
         language: str = "en",
         sample_rate: int = 16000,
+        score: float | None = None,
     ) -> None:
         """Clone voice via Cartesia and cache voice_id in Redis.
+
+        `score` is the accepted clip's quality, carried through only so the terminal `cloned`
+        state can publish it. Acceptance and quality are two different questions here:
+        `assess_clone_sample` rejects on hard floors (level, speech ratio, energy variation),
+        while a narrow or monotone delivery clears every floor and comes back with a LOW score
+        on purpose — see clone_sample_quality's preamble. Without this the success state went
+        out scoreless and the meeting UI could only say "Your voice is ready", in the same
+        words, for a clip that covers the speaker's whole range and one that barely covers a
+        note of it. "không phải cứ nói vào là ready đâu mà phải có bộ lọc" — the filter ran; it
+        just had no way to say what it found.
 
         `audio_bytes` is the RAW PCM the clone buffer accumulated — headerless 16-bit mono
         samples, exactly what `assess_clone_sample` reads with `np.frombuffer(..., int16)`.
@@ -1327,7 +1348,7 @@ class TTSWorker(BaseWorker):
                 speaker_id=speaker_id,
                 voice_id=voice_id,
             )
-            await self._note_clone_state(key, "cloned")
+            await self._note_clone_state(key, "cloned", score=score)
             await self.redis.publish_system_event(
                 room_id=meeting_id,
                 event_type="voice_clone_ready",
