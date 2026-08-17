@@ -238,13 +238,26 @@ async def run() -> None:
 
 #: A 1x1 transparent PNG and a two-line PDF, small enough to inline and real enough to be parsed.
 #: Nothing here is user content, so the probe can be run against prod credentials safely.
+#: Generated programmatically rather than pasted: a hand-copied base64 blob that does not
+#: decode makes the API answer "does not represent a valid image", which reads exactly like
+#: "this model cannot take images" and is not the same statement at all. Both fixtures below
+#: are real files — a 1x1 truecolour PNG and a one-page PDF with a text object.
 TINY_PNG = (
     "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSu"
+    "QmCC"
 )
 TINY_PDF = (
     "data:application/pdf;base64,"
-    "JVBERi0xLjQKMSAwIG9iago8PC9UeXBlL0NhdGFsb2cvUGFnZXMgMiAwIFI+PgplbmRvYmoKdHJhaWxlcgo8PC9Sb290IDEgMCBSPj4K"
+    "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoK"
+    "PDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUg"
+    "L1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAyMDAgNTBdIC9SZXNvdXJjZXMgPDwgL0ZvbnQgPDwg"
+    "L0YxIDUgMCBSID4+ID4+IC9Db250ZW50cyA0IDAgUiA+PgplbmRvYmoKNCAwIG9iago8PCAvTGVuZ3RoIDQ0ID4+"
+    "CnN0cmVhbQpCVCAvRjEgMTIgVGYgMTAgMjAgVGQgKFdhcnBUYWxrIHByb2JlKSBUaiBFVAplbmRzdHJlYW0KZW5k"
+    "b2JqCjUgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+"
+    "CmVuZG9iagp4cmVmCjAgNgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1"
+    "OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyNDAgMDAwMDAgbiAKMDAwMDAwMDMzNCAwMDAw"
+    "MCBuIAp0cmFpbGVyCjw8IC9TaXplIDYgL1Jvb3QgMSAwIFIgPj4Kc3RhcnR4cmVmCjQwNAolJUVPRgo="
 )
 
 
