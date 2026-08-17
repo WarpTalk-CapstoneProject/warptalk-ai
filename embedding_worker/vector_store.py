@@ -29,8 +29,18 @@ class VectorStore(ABC):
         vector: list[float],
         top_k: int,
         filters: dict[str, Any] | None = None,
+        exclude: dict[str, list[str]] | None = None,
     ) -> list[dict[str, Any]]:
         """Return the top_k nearest payloads (with score) for `vector`.
+
+        `filters` are ANDed exact matches. `exclude` maps a payload key to values that must NOT
+        appear — WT-463 needs it to keep document-sourced chunks out of an unprivileged caller's
+        results, which `filters` alone cannot express.
+
+        The exclusion belongs in the QUERY, not in a pass over the results: post-filtering still
+        spends the top_k budget on points the caller may not see, so a workspace whose best
+        matches are all restricted returns fewer rows the more restricted content it has — which
+        is itself a signal about content the caller was not allowed to learn about.
 
         Must return an empty list — never raise — when the collection doesn't exist yet
         (nothing has been indexed into it), since callers treat "no results" as a normal,
@@ -90,6 +100,7 @@ class QdrantVectorStore(VectorStore):
         vector: list[float],
         top_k: int,
         filters: dict[str, Any] | None = None,
+        exclude: dict[str, list[str]] | None = None,
     ) -> list[dict[str, Any]]:
         client = await self._get_client()
 
@@ -103,13 +114,23 @@ class QdrantVectorStore(VectorStore):
         from qdrant_client import models
 
         query_filter = None
-        if filters:
-            query_filter = models.Filter(
-                must=[
-                    models.FieldCondition(key=key, match=models.MatchValue(value=value))
-                    for key, value in filters.items()
-                ]
-            )
+        # list[Any] rather than list[FieldCondition]: Qdrant's Filter takes a union of condition
+        # types and Python lists are invariant, so a precisely-typed list of one member of that
+        # union is not assignable to it.
+        must: list[Any] = [
+            models.FieldCondition(key=key, match=models.MatchValue(value=value))
+            for key, value in (filters or {}).items()
+        ]
+        # WT-463: `must_not` rather than a filter on the results. Qdrant applies it while
+        # searching, so the top_k the caller asked for is filled entirely with points they are
+        # allowed to see.
+        must_not: list[Any] = [
+            models.FieldCondition(key=key, match=models.MatchValue(value=value))
+            for key, values in (exclude or {}).items()
+            for value in values
+        ]
+        if must or must_not:
+            query_filter = models.Filter(must=must or None, must_not=must_not or None)
 
         result = await client.query_points(
             collection_name=collection,
