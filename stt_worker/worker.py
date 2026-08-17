@@ -362,6 +362,11 @@ class STTWorker(BaseWorker):
         )
 
         chunk_offset_ms = await self._elapsed_ms(chunk)
+        # WT-473: read the anchor _elapsed_ms just resolved, rather than resolving it again.
+        # It caches per meeting, so this is the same value every segment of every chunk sees.
+        # getattr for the same reason _elapsed_ms uses it: the test suites build workers with
+        # __new__, so a field that only exists after __init__ would make each of those a crash.
+        anchor_ms = (getattr(self, "_transcript_anchors", None) or {}).get(chunk.meeting_id, 0)
         language_hint = _language_hint_for_stt(chunk.language)
         allowed_languages = await self._get_room_languages(chunk.meeting_id)
         keywords = await self._get_stt_keywords(chunk.meeting_id)
@@ -488,6 +493,17 @@ class STTWorker(BaseWorker):
                 chunk_index=chunk.chunk_index,
                 is_final_chunk=chunk.is_final_chunk,
                 timestamp_ms=chunk.timestamp_ms,
+                # WT-473: the wall-clock instant start_ms is measured FROM.
+                #
+                # This value already exists here — chunk_offset_ms is derived from it — and was
+                # never published, so start_ms left this worker as a duration with no origin.
+                # A duration with no origin can be compared between seats and lined up against
+                # nothing else, which is why "seek the recording to this line" was unbuildable:
+                # the recording's origin is on the artifact, and this is the other half.
+                #
+                # Sent on every segment because there is no "transcript started" message to
+                # announce it on, and the consumer stores it once regardless.
+                anchor_ms=anchor_ms,
                 # Every segment recognised in this chunk shares the chunk's delivery. The
                 # measurement's granularity is the audio, and splitting it per segment would
                 # be inventing precision that was never measured.

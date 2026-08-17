@@ -176,6 +176,18 @@ class STTResultMessage(BaseModel):
     chunk_index: int = 0
     is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    # WT-473: the WALL-CLOCK instant that start_ms is measured from — the unix ms of the first
+    # audio chunk this pipeline saw for the meeting (see StreamingSTTWorker._elapsed_ms).
+    #
+    # start_ms alone is a duration with no origin, so it can be compared between seats and cannot
+    # be lined up against anything outside the transcript. Aligning a transcript with a RECORDING
+    # needs both origins, and the recording's is stored on the artifact — this is the other half.
+    #
+    # It travels on every segment rather than being announced once because there is no
+    # "transcript started" message to carry it, and the consumer stores it once anyway.
+    #
+    # 0 means "not stated", which is what an older worker's messages carry.
+    anchor_ms: int = 0
     # How the speaker sounded saying this, measured from the audio chunk this segment came out
     # of — the only point in the pipeline where the audio still exists. None when nothing could
     # be measured; see ProsodyEnvelope.
@@ -194,6 +206,7 @@ class STTResultMessage(BaseModel):
             "chunk_index": str(self.chunk_index),
             "is_final_chunk": "1" if self.is_final_chunk else "0",
             "timestamp_ms": str(self.timestamp_ms),
+            "anchor_ms": str(self.anchor_ms),
         }
         # Omitted rather than sent as a neutral placeholder — "not measured" and "measured as
         # ordinary" are different instructions to the synthesizer.
@@ -213,6 +226,7 @@ class STTResultMessage(BaseModel):
             confidence=float(d.get("confidence", "0.0")),
             start_ms=int(d.get("start_ms", "0")),
             end_ms=int(d.get("end_ms", "0")),
+            anchor_ms=int(d.get("anchor_ms", "0")),
             chunk_index=int(d.get("chunk_index", "0")),
             is_final_chunk=d.get("is_final_chunk") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
