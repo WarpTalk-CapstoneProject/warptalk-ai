@@ -316,8 +316,45 @@ GLOBAL_GLOSSARY_COLLECTION_ID = "global_glossary"
 GLOBAL_GLOSSARY_WORKSPACE_SENTINEL = "global"
 
 
+async def _caller_is_privileged(ctx: ToolContext) -> bool:
+    """Whether this caller may reach document-sourced chunks through semantic search (WT-463).
+
+    Resolved from the workspace read, with the CALLER'S OWN bearer token — so the answer is the
+    role the backend attributes to them, not one this worker decided. `GET /workspaces/{id}`
+    returns the requester's own `role` for exactly this reason.
+
+    Fails CLOSED. A failed or unexpected response yields False, which costs an owner some
+    document context in one answer; the opposite default would hand every member the contents of
+    documents they cannot open, which is the bug being fixed.
+
+    Phase 0 shape: coarse, and TRUSTED BY THE SEARCH WORKER because the flag travels in the
+    request this worker writes. That is bounded on purpose — the threat model closed here is
+    "a member uses WarpBot normally", not "an attacker controls the AI worker". Phase 3 moves the
+    decision behind a signed or worker-resolved subject set so the flag stops being self-declared.
+    """
+    try:
+        response = await ctx.workspace_client.get(
+            f"/api/v1/workspaces/{ctx.workspace_id}",
+            headers=_auth_headers(ctx),
+        )
+        if response.status_code != 200:
+            logger.warning("caller_role_lookup_failed", status=response.status_code)
+            return False
+        role = str(response.json().get("role") or "").strip().lower()
+        return role in {"owner", "admin"}
+    except Exception:
+        logger.exception("caller_role_lookup_error")
+        return False
+
+
 async def _run_embedding_search(
-    ctx: ToolContext, *, collection_id: str, workspace_id: str, query: str, top_k: int
+    ctx: ToolContext,
+    *,
+    collection_id: str,
+    workspace_id: str,
+    query: str,
+    top_k: int,
+    privileged: bool,
 ) -> list[dict[str, Any]]:
     """One request/reply round-trip against EmbeddingSearchWorker for a single collection.
 
@@ -333,6 +370,9 @@ async def _run_embedding_search(
         "collection_id": collection_id,
         "query": query,
         "top_k": str(top_k),
+        # WT-463: the search worker treats an absent value as unprivileged, so this must be sent
+        # explicitly on every request rather than only when true.
+        "privileged": "true" if privileged else "false",
         "timestamp_ms": str(int(time.time() * 1000)),
     }
 
@@ -455,6 +495,12 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     # in a separate collection (see constants above), so both are queried and merged — a
     # workspace's own knowledge should never be shadowed by the system baseline, but the
     # baseline is still useful context when the workspace has nothing on the topic itself.
+    # WT-463: resolved once per search, before either query, and applied to the workspace
+    # collection only. The global glossary is published for every workspace by design, so it has
+    # no per-subject dimension to honour — passing the caller's privilege there would imply a
+    # restriction that does not exist.
+    privileged = await _caller_is_privileged(ctx)
+
     try:
         workspace_matches, global_matches = await asyncio.gather(
             _run_embedding_search(
@@ -463,6 +509,7 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
                 workspace_id=ctx.workspace_id,
                 query=query,
                 top_k=top_k,
+                privileged=privileged,
             ),
             _run_embedding_search(
                 ctx,
@@ -470,6 +517,7 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
                 workspace_id=GLOBAL_GLOSSARY_WORKSPACE_SENTINEL,
                 query=query,
                 top_k=top_k,
+                privileged=True,
             ),
         )
     except Exception:
