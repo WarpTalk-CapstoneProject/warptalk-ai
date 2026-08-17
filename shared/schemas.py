@@ -429,6 +429,15 @@ class ChatRequestMessage(BaseModel):
     mentions_json: str = (
         ""  # JSON array of {"entityType", "entityId", "label", "workspaceId"} or "" if none
     )
+    # WT-474: files pasted, dropped or picked in the chat box. A JSON array of
+    # {"name", "mimeType", "dataUrl"} objects — images AND documents. They belong to THIS TURN
+    # ONLY and are never written to history; see _attach_attachments for why that is a deliberate
+    # limit rather than a gap.
+    #
+    # Named images_json for wire compatibility with the field AssistantService already publishes.
+    # Renaming it would need both sides deployed in lockstep, and the shape inside it is what
+    # actually changed.
+    images_json: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -442,6 +451,7 @@ class ChatRequestMessage(BaseModel):
             "history_json": self.history_json,
             "page_context_json": self.page_context_json,
             "mentions_json": self.mentions_json,
+            "images_json": self.images_json,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -458,6 +468,7 @@ class ChatRequestMessage(BaseModel):
             history_json=d.get("history_json", "[]"),
             page_context_json=d.get("page_context_json", ""),
             mentions_json=d.get("mentions_json", ""),
+            images_json=d.get("images_json", ""),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 

@@ -22,6 +22,10 @@ WHAT IT ANSWERS
     3. Which streaming events carry assistant text, and which carry tool arguments?
     4. How is a tool RESULT fed back for the next turn?
     5. What signals "the model is done" versus "it wants a tool"?
+    6. WT-474: does Luna accept `input_image` and `input_file` content parts at all, and in what
+       shape? This one cannot be answered from the code: the worker builds those parts, but nothing
+       in the test suite talks to the live API, so "Luna is multimodal" is an assumption until this
+       probe says otherwise. gpt-4o-mini takes both; a reasoning model is a different question.
 
 Prints event TYPES and shapes, never message content beyond short excerpts, and never
 the API key (read via the same load_dotenv() the workers use).
@@ -214,6 +218,67 @@ async def run() -> None:
             )
         else:
             print("    skipped: the model did not request the tool")
+
+        # WT-474. Asked LAST so a failure here cannot mask the tool-calling answers above, which
+        # are what the agent loop depends on.
+        print("  [4] attachment content parts (WT-474)")
+        await probe_attachment(
+            client,
+            model,
+            "input_image",
+            {"type": "input_image", "image_url": TINY_PNG},
+        )
+        await probe_attachment(
+            client,
+            model,
+            "input_file",
+            {"type": "input_file", "filename": "probe.pdf", "file_data": TINY_PDF},
+        )
+
+
+#: A 1x1 transparent PNG and a two-line PDF, small enough to inline and real enough to be parsed.
+#: Nothing here is user content, so the probe can be run against prod credentials safely.
+TINY_PNG = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
+TINY_PDF = (
+    "data:application/pdf;base64,"
+    "JVBERi0xLjQKMSAwIG9iago8PC9UeXBlL0NhdGFsb2cvUGFnZXMgMiAwIFI+PgplbmRvYmoKdHJhaWxlcgo8PC9Sb290IDEgMCBSPj4K"
+)
+
+
+async def probe_attachment(
+    client: AsyncOpenAI,
+    model: str,
+    label: str,
+    part: dict[str, Any],
+) -> None:
+    """WT-474: ask whether ONE content-part shape is accepted, and print the verdict.
+
+    Non-streaming and unbounded on purpose — the question is whether the request is accepted, not
+    what the answer says, and a 400 arrives faster and more legibly without a stream to unwind.
+    """
+    try:
+        response = await client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Reply with one word: ACCEPTED."},
+                        part,
+                    ],
+                }
+            ],
+            max_output_tokens=32,
+        )
+    except Exception as exc:  # noqa: BLE001 - the message IS the result
+        print(f"    {label:14s} REJECTED — {str(exc)[:220]}")
+        return
+
+    text = getattr(response, "output_text", "") or ""
+    print(f"    {label:14s} accepted — replied {text.strip()[:40]!r}")
 
 
 if __name__ == "__main__":
