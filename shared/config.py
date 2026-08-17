@@ -374,8 +374,18 @@ class ChatAssistantSettings(BaseSettings):
     model_config = {"env_prefix": "ASSISTANT_CHAT_"}
 
     api_key: str = ""
-    model: str = "gpt-4o-mini"
+    # gpt-5.6-luna, matching what production has actually run since v47
+    # (deploy/production/app.compose.yml sets ASSISTANT_CHAT_MODEL). The default said
+    # gpt-4o-mini, so local and CI exercised a DIFFERENT model family from prod — and the two
+    # disagree on things that matter here: Luna is a reasoning model, it refuses `temperature` on
+    # /v1/responses, and it refused function tools on /v1/chat/completions outright, which is the
+    # incident tools/responses_api_probe.py exists to document. A default that does not match the
+    # deployed value is a test suite that cannot see the bug it is meant to catch.
+    model: str = "gpt-5.6-luna"
     max_tokens: int = 1024
+    # Sent only to models that accept it — responses_options() drops it for gpt-5*, which answers
+    # `temperature` with a 400 on this endpoint. Kept configured so pointing the worker back at a
+    # gpt-4 model still behaves as before.
     temperature: float = 0.4
     max_tool_iterations: int = 5
     # OpenAI's HOSTED web_search tool, added to the /v1/responses tool list.

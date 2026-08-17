@@ -429,9 +429,14 @@ class ChatRequestMessage(BaseModel):
     mentions_json: str = (
         ""  # JSON array of {"entityType", "entityId", "label", "workspaceId"} or "" if none
     )
-    # WT-474: images pasted into the chat box, as a JSON array of `data:image/...;base64,...`
-    # strings. They belong to THIS TURN ONLY and are never written to history — see
-    # ChatAssistantWorker._attach_images for why that is a deliberate limit rather than a gap.
+    # WT-474: files pasted, dropped or picked in the chat box. A JSON array of
+    # {"name", "mimeType", "dataUrl"} objects — images AND documents. They belong to THIS TURN
+    # ONLY and are never written to history; see _attach_attachments for why that is a deliberate
+    # limit rather than a gap.
+    #
+    # Named images_json for wire compatibility with the field AssistantService already publishes.
+    # Renaming it would need both sides deployed in lockstep, and the shape inside it is what
+    # actually changed.
     images_json: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 

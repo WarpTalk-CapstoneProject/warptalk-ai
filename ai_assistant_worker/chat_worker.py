@@ -174,86 +174,135 @@ def _format_mentions(mentions_json: str) -> str | None:
 #: no DST, so a fixed offset is exact rather than an approximation.
 WORKSPACE_TIMEZONE = timezone(timedelta(hours=7), "ICT")
 
-#: WT-474. A hard ceiling on what one turn may carry, enforced here as well as in the browser and
+#: WT-474. Hard ceilings on what one turn may carry, enforced here as well as in the browser and
 #: in AssistantService. The browser limit is a courtesy to the user; this one is what protects the
 #: worker, because a Redis Stream field and an OpenAI request both have real limits and a caller
 #: that skipped the UI would otherwise reach them.
-MAX_IMAGES_PER_TURN = 4
-#: ~7MB of base64, which is a little over 5MB of image. Beyond this the request is likelier to be
-#: rejected by OpenAI than to be answered.
-MAX_IMAGE_DATA_URL_CHARS = 7_000_000
+MAX_ATTACHMENTS_PER_TURN = 4
+#: ~7MB of base64, a little over 5MB of file. Beyond this the request is likelier to be rejected by
+#: OpenAI than to be answered.
+MAX_ATTACHMENT_DATA_URL_CHARS = 7_000_000
+
+#: Document types the Responses API takes as `input_file`. Deliberately a WHITELIST: an arbitrary
+#: mime type is either rejected by OpenAI (a confusing 400 for the user) or, worse, silently
+#: ignored — and a user whose attachment was quietly dropped reads the answer as the model lying.
+DOCUMENT_MIME_TYPES = frozenset(
+    {
+        "application/pdf",
+        "text/plain",
+        "text/markdown",
+        "text/csv",
+        "application/json",
+    }
+)
 
 
-def _attach_images(
+def _attach_attachments(
     conversation: list[dict[str, Any]],
-    images_json: str,
+    attachments_json: str,
     logger: Any,
 ) -> None:
-    """WT-474: fold pasted images into the LAST user turn, in place.
+    """WT-474: fold pasted/uploaded files into the LAST user turn, in place.
 
-    Somebody debugging asks "what is wrong with this screen" and the screen is the question. Before
-    this the only way to ask was to describe the screenshot in words, which is exactly the work the
-    model could have done.
+    Somebody debugging asks "what is wrong with this screen" and the screen is the question; the
+    same person asks "does this contract allow X" and the PDF is the question. Before this the only
+    way to ask was to describe the attachment in words, which is exactly the work the model could
+    have done.
 
     WHY THE LAST USER TURN AND NOT A NEW MESSAGE. `/v1/responses` takes multimodal content as a
-    content ARRAY on one message; a separate image-only message would arrive as a turn with no
+    content ARRAY on one message; a separate attachment-only message would arrive as a turn with no
     question in it, and the model answers the text it was given.
 
-    WHY IMAGES ARE NOT PERSISTED. They are attached to this request and never written into
-    `history_json`, so a follow-up question cannot see the picture. That is a deliberate limit, not
-    an oversight:
+    WHY NOTHING IS PERSISTED. Attachments ride along with this request and are never written into
+    `history_json`, so a follow-up question cannot see them. That is a deliberate limit:
 
-      - An image stored against a conversation becomes a new kind of workspace content, and every
+      - A file stored against a conversation becomes a new kind of workspace content, and every
         kind of workspace content has to answer to the visibility model WT-463 is still defining.
-        Adding one before that model exists is how a surface ends up outside it — the same way
+        Adding one before that model exists is how a surface ends up outside it - the same way
         `semantic_search` ended up bypassing the document ACL.
-      - History is replayed on every turn. A 5MB data URL in it would be re-sent, and re-billed, for
-        the rest of the conversation.
+      - History is replayed on every turn. A 5MB data URL in it would be re-sent, and re-billed,
+        for the rest of the conversation.
 
-    So the contract is: an image answers the question it was pasted with. The UI says so.
+    So the contract is: an attachment answers the question it was sent with. The UI says so.
 
-    Non-image and oversized entries are DROPPED rather than failing the turn. The user's question is
-    still a question, and refusing to answer it because one attachment was malformed serves nobody —
-    but each drop is logged, because a silently ignored screenshot looks like a model that cannot
-    see.
+    Unusable entries are DROPPED rather than failing the turn. The user's question is still a
+    question, and refusing to answer it because one attachment was malformed serves nobody - but
+    each drop is logged, because a silently ignored file looks like a model that cannot read.
     """
-    if not images_json:
+    if not attachments_json:
         return
 
     try:
-        raw = json.loads(images_json)
+        raw = json.loads(attachments_json)
     except json.JSONDecodeError:
-        logger.warning("chat_images_unparseable")
+        logger.warning("chat_attachments_unparseable")
         return
 
     if not isinstance(raw, list):
-        logger.warning("chat_images_not_a_list")
+        logger.warning("chat_attachments_not_a_list")
         return
 
-    accepted: list[str] = []
-    for entry in raw[:MAX_IMAGES_PER_TURN]:
-        if not isinstance(entry, str) or not entry.startswith("data:image/"):
-            logger.warning("chat_image_rejected", reason="not_an_image_data_url")
+    parts_to_add: list[dict[str, Any]] = []
+    for original in raw[:MAX_ATTACHMENTS_PER_TURN]:
+        # Accepts a bare data-URL string as well as the object form. The first cut of this feature
+        # published plain strings, and a message already sitting on the stream when the worker
+        # restarts must not be dropped for using the older shape.
+        entry = (
+            {"dataUrl": original, "name": "", "mimeType": ""}
+            if isinstance(original, str)
+            else original
+        )
+        if not isinstance(entry, dict):
+            logger.warning("chat_attachment_rejected", reason="not_an_object")
             continue
-        if len(entry) > MAX_IMAGE_DATA_URL_CHARS:
-            logger.warning("chat_image_rejected", reason="too_large", chars=len(entry))
+
+        data_url = entry.get("dataUrl")
+        if not isinstance(data_url, str) or not data_url.startswith("data:"):
+            logger.warning("chat_attachment_rejected", reason="not_a_data_url")
             continue
-        accepted.append(entry)
+        if len(data_url) > MAX_ATTACHMENT_DATA_URL_CHARS:
+            logger.warning("chat_attachment_rejected", reason="too_large", chars=len(data_url))
+            continue
 
-    if len(raw) > MAX_IMAGES_PER_TURN:
-        logger.warning("chat_images_truncated", received=len(raw), kept=MAX_IMAGES_PER_TURN)
+        # The mime type is read off the data URL itself, never from the caller-supplied field: the
+        # two can disagree, and the bytes are the only side that decides how OpenAI reads them.
+        mime = data_url[5 : data_url.find(";")] if ";" in data_url else ""
 
-    if not accepted:
+        if mime.startswith("image/"):
+            parts_to_add.append({"type": "input_image", "image_url": data_url})
+            continue
+
+        if mime in DOCUMENT_MIME_TYPES:
+            name = entry.get("name")
+            parts_to_add.append(
+                {
+                    "type": "input_file",
+                    # Required by the API, and also the only handle the model has for referring to
+                    # one document among several.
+                    "filename": name if isinstance(name, str) and name else "attachment",
+                    "file_data": data_url,
+                }
+            )
+            continue
+
+        logger.warning("chat_attachment_rejected", reason="unsupported_type", mime=mime)
+
+    if len(raw) > MAX_ATTACHMENTS_PER_TURN:
+        logger.warning(
+            "chat_attachments_truncated", received=len(raw), kept=MAX_ATTACHMENTS_PER_TURN
+        )
+
+    if not parts_to_add:
         return
 
     # The last USER turn, not the last turn: a tool result or an assistant reply can be last, and
-    # hanging an image off either would put it where the model does not read it as the question.
+    # hanging an attachment off either puts it where the model does not read it as the question.
     target = next(
         (turn for turn in reversed(conversation) if turn.get("role") == "user"),
         None,
     )
     if target is None:
-        logger.warning("chat_images_dropped", reason="no_user_turn")
+        logger.warning("chat_attachments_dropped", reason="no_user_turn")
         return
 
     text = target.get("content")
@@ -261,14 +310,12 @@ def _attach_images(
     if isinstance(text, str) and text.strip():
         parts.append({"type": "input_text", "text": text})
     elif isinstance(text, list):
-        # Already multimodal — keep whatever is there and append.
+        # Already multimodal - keep whatever is there and append.
         parts.extend(cast(list[dict[str, Any]], text))
 
-    for image in accepted:
-        parts.append({"type": "input_image", "image_url": image})
-
+    parts.extend(parts_to_add)
     target["content"] = parts
-    logger.info("chat_images_attached", count=len(accepted))
+    logger.info("chat_attachments_attached", count=len(parts_to_add))
 
 
 def _now_message(now: datetime | None = None) -> str:
@@ -456,7 +503,7 @@ class ChatAssistantWorker(BaseWorker):
         conversation: list[dict[str, Any]] = [
             {"role": turn.get("role"), "content": turn.get("content")} for turn in history
         ]
-        _attach_images(conversation, request.images_json, self.logger)
+        _attach_attachments(conversation, request.images_json, self.logger)
 
         tool_schemas: list[dict[str, Any]] = [t.to_openai_schema() for t in TOOLS]
 
