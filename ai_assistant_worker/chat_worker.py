@@ -174,6 +174,102 @@ def _format_mentions(mentions_json: str) -> str | None:
 #: no DST, so a fixed offset is exact rather than an approximation.
 WORKSPACE_TIMEZONE = timezone(timedelta(hours=7), "ICT")
 
+#: WT-474. A hard ceiling on what one turn may carry, enforced here as well as in the browser and
+#: in AssistantService. The browser limit is a courtesy to the user; this one is what protects the
+#: worker, because a Redis Stream field and an OpenAI request both have real limits and a caller
+#: that skipped the UI would otherwise reach them.
+MAX_IMAGES_PER_TURN = 4
+#: ~7MB of base64, which is a little over 5MB of image. Beyond this the request is likelier to be
+#: rejected by OpenAI than to be answered.
+MAX_IMAGE_DATA_URL_CHARS = 7_000_000
+
+
+def _attach_images(
+    conversation: list[dict[str, Any]],
+    images_json: str,
+    logger: Any,
+) -> None:
+    """WT-474: fold pasted images into the LAST user turn, in place.
+
+    Somebody debugging asks "what is wrong with this screen" and the screen is the question. Before
+    this the only way to ask was to describe the screenshot in words, which is exactly the work the
+    model could have done.
+
+    WHY THE LAST USER TURN AND NOT A NEW MESSAGE. `/v1/responses` takes multimodal content as a
+    content ARRAY on one message; a separate image-only message would arrive as a turn with no
+    question in it, and the model answers the text it was given.
+
+    WHY IMAGES ARE NOT PERSISTED. They are attached to this request and never written into
+    `history_json`, so a follow-up question cannot see the picture. That is a deliberate limit, not
+    an oversight:
+
+      - An image stored against a conversation becomes a new kind of workspace content, and every
+        kind of workspace content has to answer to the visibility model WT-463 is still defining.
+        Adding one before that model exists is how a surface ends up outside it — the same way
+        `semantic_search` ended up bypassing the document ACL.
+      - History is replayed on every turn. A 5MB data URL in it would be re-sent, and re-billed, for
+        the rest of the conversation.
+
+    So the contract is: an image answers the question it was pasted with. The UI says so.
+
+    Non-image and oversized entries are DROPPED rather than failing the turn. The user's question is
+    still a question, and refusing to answer it because one attachment was malformed serves nobody —
+    but each drop is logged, because a silently ignored screenshot looks like a model that cannot
+    see.
+    """
+    if not images_json:
+        return
+
+    try:
+        raw = json.loads(images_json)
+    except json.JSONDecodeError:
+        logger.warning("chat_images_unparseable")
+        return
+
+    if not isinstance(raw, list):
+        logger.warning("chat_images_not_a_list")
+        return
+
+    accepted: list[str] = []
+    for entry in raw[:MAX_IMAGES_PER_TURN]:
+        if not isinstance(entry, str) or not entry.startswith("data:image/"):
+            logger.warning("chat_image_rejected", reason="not_an_image_data_url")
+            continue
+        if len(entry) > MAX_IMAGE_DATA_URL_CHARS:
+            logger.warning("chat_image_rejected", reason="too_large", chars=len(entry))
+            continue
+        accepted.append(entry)
+
+    if len(raw) > MAX_IMAGES_PER_TURN:
+        logger.warning("chat_images_truncated", received=len(raw), kept=MAX_IMAGES_PER_TURN)
+
+    if not accepted:
+        return
+
+    # The last USER turn, not the last turn: a tool result or an assistant reply can be last, and
+    # hanging an image off either would put it where the model does not read it as the question.
+    target = next(
+        (turn for turn in reversed(conversation) if turn.get("role") == "user"),
+        None,
+    )
+    if target is None:
+        logger.warning("chat_images_dropped", reason="no_user_turn")
+        return
+
+    text = target.get("content")
+    parts: list[dict[str, Any]] = []
+    if isinstance(text, str) and text.strip():
+        parts.append({"type": "input_text", "text": text})
+    elif isinstance(text, list):
+        # Already multimodal — keep whatever is there and append.
+        parts.extend(cast(list[dict[str, Any]], text))
+
+    for image in accepted:
+        parts.append({"type": "input_image", "image_url": image})
+
+    target["content"] = parts
+    logger.info("chat_images_attached", count=len(accepted))
+
 
 def _now_message(now: datetime | None = None) -> str:
     """Tell the model what "today" is.
@@ -360,6 +456,7 @@ class ChatAssistantWorker(BaseWorker):
         conversation: list[dict[str, Any]] = [
             {"role": turn.get("role"), "content": turn.get("content")} for turn in history
         ]
+        _attach_images(conversation, request.images_json, self.logger)
 
         tool_schemas: list[dict[str, Any]] = [t.to_openai_schema() for t in TOOLS]
 
