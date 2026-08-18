@@ -363,6 +363,48 @@ class TestTranslationResultMessage:
         assert "source_stt_confidence" not in payload
         assert TranslationResultMessage.from_redis(payload).source_stt_confidence is None
 
+    def test_latency_survives_the_round_trip(self) -> None:
+        """The number translation_worker measured has to reach TranscriptService intact.
+
+        transcript.translation_contents.latency_ms and TranslationContent.LatencyMs both existed
+        from the start and were NULL on all 3803 rows ever written, because the worker measured
+        the duration, logged it, and dropped it at the process boundary. Carrying it on the
+        message is the whole of the fix, so this asserts the carrying.
+        """
+        payload = TranslationResultMessage(
+            segment_id="seg-123",
+            meeting_id="meeting-123",
+            speaker_id="speaker-1",
+            original_text="Hello",
+            translated_text="Xin chao",
+            source_lang="en",
+            target_lang="vi",
+            latency_ms=734,
+        ).to_redis()
+
+        assert payload["latency_ms"] == "734"
+        assert TranslationResultMessage.from_redis(payload).latency_ms == 734
+
+    def test_unmeasured_latency_is_omitted_rather_than_zero(self) -> None:
+        """Nothing translated means no duration to report — and 0 is not that.
+
+        The empty-sentence flush publishes a message no translator ever touched. Sending 0 for it
+        would land a real-looking measurement in the column and drag down every average computed
+        over it, which is worse than the NULL this replaces.
+        """
+        payload = TranslationResultMessage(
+            segment_id="seg-123",
+            meeting_id="meeting-123",
+            speaker_id="speaker-1",
+            original_text="",
+            translated_text="",
+            source_lang="en",
+            target_lang="vi",
+        ).to_redis()
+
+        assert "latency_ms" not in payload
+        assert TranslationResultMessage.from_redis(payload).latency_ms is None
+
 
 class TestOptionalConfidence:
     """WT-277: every flavour of "the producer told us nothing" must collapse to None."""
