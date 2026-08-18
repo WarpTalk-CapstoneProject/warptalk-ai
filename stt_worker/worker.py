@@ -65,6 +65,18 @@ def _extract_speaker_key(
 # prompt) so a newly joined speaker's language is picked up within a few seconds.
 _ROOM_LANGUAGES_TTL_S = 15.0
 
+# Denoising modes the provider accepts. An unrecognised string fails the WHOLE session update,
+# taking the language hint and the keywords down with it — _degrade_session_config exists because
+# that has happened before.
+_NOISE_REDUCTION_MODES = {"off", "near_field", "far_field"}
+# Denoising is re-read on a short TTL, and that is a FIX rather than a tuning choice.
+#
+# It used to be cached for as long as the worker remembered the room, which silently cancelled the
+# mid-meeting change OpenAISTT._get_or_create_session goes out of its way to support: that method
+# compares `noise_reduction` and issues a session.update on the LIVE socket when it differs, and
+# nothing could ever hand it a different value. Two halves of one feature, disagreeing.
+_NOISE_REDUCTION_TTL_S = 5.0
+
 _RECENT_CONTEXT_SEGMENTS = 4
 _MAX_STT_PROMPT_CHARS = 600
 _MAX_GLOSSARY_CHARS = 240
@@ -457,8 +469,13 @@ class STTWorker(BaseWorker):
         getattr(self, "_transcript_anchors", {}).pop(room_id, None)
         getattr(self, "_recent_transcripts", {}).pop(room_id, None)
         self._room_languages.pop(room_id, None)
+        getattr(self, "_room_noise_reduction", {}).pop(room_id, None)
         # Same reasoning as the four above: one entry per (meeting, speaker) whose turn was
         # open when the room ended, held forever otherwise.
+        for noise_key in [
+            k for k in getattr(self, "_speaker_noise_reduction", {}) if k[0] == room_id
+        ]:
+            self._speaker_noise_reduction.pop(noise_key, None)
         for streamed_key in [k for k in getattr(self, "_streamed_turns", {}) if k[0] == room_id]:
             self._streamed_turns.pop(streamed_key, None)
         stale_speakers = [key for key in self._speaker_locks if key[0] == room_id]
@@ -513,7 +530,7 @@ class STTWorker(BaseWorker):
         language_hint = _language_hint_for_stt(chunk.language)
         allowed_languages = await self._get_room_languages(chunk.meeting_id)
         keywords = await self._get_stt_keywords(chunk.meeting_id)
-        noise_reduction = await self._get_room_noise_reduction(chunk.meeting_id)
+        noise_reduction = await self._get_noise_reduction(chunk.meeting_id, chunk.speaker_id)
 
         # Measured CONCURRENTLY with recognition, not before it. Transcription is a
         # network round trip of hundreds of milliseconds; the measurement is single-digit
@@ -955,8 +972,32 @@ class STTWorker(BaseWorker):
 
         return chunk.timestamp_ms
 
+    async def _read_noise_reduction(self, key: str, meeting_id: str) -> str | None:
+        """One validated denoising mode from one Redis key. None when unset or unusable.
+
+        None means "no answer here", not "off" — an explicit "off" is a real answer and has to
+        outrank a room-wide setting, which is why the two are kept distinguishable.
+        """
+        try:
+            raw = await self.redis.get(key)
+        except Exception:
+            # Falls through to the caller's next source and ultimately to the worker default,
+            # which is what every room used before this existed. A settings lookup is never
+            # allowed to stop a transcript.
+            self.logger.warning("room_noise_reduction_unavailable", meeting_id=meeting_id)
+            return None
+        if not raw:
+            return None
+        decoded = (raw.decode() if isinstance(raw, bytes) else raw).strip().lower()
+        if decoded in _NOISE_REDUCTION_MODES:
+            return decoded
+        self.logger.warning(
+            "room_noise_reduction_unrecognised", meeting_id=meeting_id, value=decoded
+        )
+        return None
+
     async def _get_room_noise_reduction(self, meeting_id: str) -> str | None:
-        """This room's denoising mode, or None to use the worker's default. WT-427.
+        """This ROOM's denoising mode, or None to use the worker's default. WT-427.
 
         WHY PER ROOM
             The deployment default is "off", and that default is measured: a second denoising pass
@@ -970,36 +1011,71 @@ class STTWorker(BaseWorker):
 
         The key is optional, and a room that never sets it behaves exactly as before.
         """
-        cache: dict[str, str | None] | None = getattr(self, "_room_noise_reduction", None)
+        cache: dict[str, tuple[str | None, float]] | None = getattr(
+            self, "_room_noise_reduction", None
+        )
         if cache is None:
             cache = {}
             self._room_noise_reduction = cache
-        if meeting_id in cache:
-            return cache[meeting_id]
 
-        value: str | None = None
-        try:
-            raw = await self.redis.get(f"translationRoom:{meeting_id}:noise_reduction")
-            if raw:
-                decoded = (raw.decode() if isinstance(raw, bytes) else raw).strip().lower()
-                # Only the modes the provider accepts. An unrecognised string would fail the whole
-                # session update, taking the language hint and the keywords down with it — see
-                # _degrade_session_config, which exists because that has happened before.
-                if decoded in {"off", "near_field", "far_field"}:
-                    value = decoded
-                else:
-                    self.logger.warning(
-                        "room_noise_reduction_unrecognised",
-                        meeting_id=meeting_id,
-                        value=decoded,
-                    )
-        except Exception:
-            # A room that cannot be read falls back to the worker default, which is what every
-            # room used before this existed.
-            self.logger.warning("room_noise_reduction_unavailable", meeting_id=meeting_id)
+        now = time.monotonic()
+        cached = cache.get(meeting_id)
+        if cached is not None and now - cached[1] < _NOISE_REDUCTION_TTL_S:
+            return cached[0]
 
-        cache[meeting_id] = value
+        value = await self._read_noise_reduction(
+            f"translationRoom:{meeting_id}:noise_reduction", meeting_id
+        )
+        cache[meeting_id] = (value, now)
         return value
+
+    async def _get_noise_reduction(self, meeting_id: str, speaker_id: str) -> str | None:
+        """The denoising mode for THIS SPEAKER's microphone, or None for the worker default.
+
+        WHY THE SPEAKER OUTRANKS THE ROOM
+            Denoising describes a MICROPHONE, not a meeting. The room-level key came first and is
+            the honest default for a room whose participants are all in the same acoustic
+            situation, but the case that needs it most is the mixed one: one person on a headset,
+            one person on a laptop two metres from a fan. A single room-wide value is wrong for
+            one of them whichever way it is set, and the transcription session is already keyed
+            per (meeting, speaker) — so the room was never the finest grain available.
+
+            An explicit "off" on a speaker therefore beats a room set to far_field, and vice
+            versa. That is the whole point of a personal override.
+
+        Falls back to the room key, then to the deployment default. A meeting where nobody has
+        chosen anything behaves exactly as it did before either key existed.
+        """
+        cache: dict[tuple[str, str], tuple[str | None, float]] | None = getattr(
+            self, "_speaker_noise_reduction", None
+        )
+        if cache is None:
+            cache = {}
+            self._speaker_noise_reduction = cache
+
+        # LOWER-CASED, and this is not cosmetic. speaker_id is the auth user id as LiveKit
+        # reported it, and its casing does not reliably match the GUID the backend writes —
+        # base_worker.is_voice_clone_consented compares SourceUserId with .lower() on both sides
+        # for exactly this reason. Redis keys are case-sensitive, so an un-normalised id is a
+        # write half that silently never meets its reader, which is the failure this whole change
+        # exists to end.
+        normalized_speaker = speaker_id.lower()
+
+        now = time.monotonic()
+        key = (meeting_id, normalized_speaker)
+        cached = cache.get(key)
+        if cached is not None and now - cached[1] < _NOISE_REDUCTION_TTL_S:
+            mine = cached[0]
+        else:
+            mine = await self._read_noise_reduction(
+                f"translationRoom:{meeting_id}:participant:{normalized_speaker}:noise_reduction",
+                meeting_id,
+            )
+            cache[key] = (mine, now)
+
+        if mine is not None:
+            return mine
+        return await self._get_room_noise_reduction(meeting_id)
 
     async def _get_stt_keywords(self, meeting_id: str) -> list[str]:
         """Return structured glossary terms for the provider's keyword-bias field."""
