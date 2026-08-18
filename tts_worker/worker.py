@@ -28,7 +28,7 @@ from shared import isochrony
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
 from shared.lang import base_language, is_same_language
-from shared.prosody import Arousal, Delivery, Valence, to_generation_config
+from shared.prosody import SPEED_MAX, Arousal, Delivery, Valence, to_generation_config
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
 from tts_worker.clone_sample_quality import MAX_SAMPLE_SCORE, assess_clone_sample
 from tts_worker.livekit_publisher import LiveKitTTSPublisher, TrackStream
@@ -265,6 +265,32 @@ def _extract_tts_key(
     )
 
 
+# How far behind a dub may fall before it is read faster to catch up. WT-528.
+#
+# TWO WAYS TO BE BEHIND, AND THEY ARE THE SAME PROBLEM
+#     * Out of order — this sentence belongs EARLIER in the speaker's timeline than one already
+#       spoken. The per-key lock preserves the order messages arrive in, but that order is set by
+#       when each translation finished upstream, and translation runs concurrently: a long
+#       sentence loses the race to a short one spoken after it. Testers described exactly this —
+#       "voice clone đoạn dưới trước rồi ngược lên đoạn trên".
+#     * Simply slow — translation took a long time, so the dub starts well after the speaker
+#       finished, and every sentence behind it inherits the delay because the key is serialized.
+#
+# Both mean the dub is running behind the conversation, and reading the backlog at normal pace
+# keeps it behind. Speaking a late line FASTER is what lets the gap close instead of persist.
+#
+# ON_TIME_MS is a budget, not a target: a sentence translated within it was never behind, so no
+# adjustment is made and the call is byte-for-byte what it was before this existed.
+_CATCH_UP_ON_TIME_MS = 1500
+# Lag at which the full boost applies. Between the two the ramp is linear, so a dub that is
+# slightly behind is only slightly quicker — a step change would be audible as the pace jumping.
+_CATCH_UP_FULL_LAG_MS = 4000
+# Deliberately well under shared.prosody.SPEED_MAX (1.5). This multiplies the speaker's own
+# measured rate, so it has to leave room for someone who already talks fast, and a dub that
+# outruns comprehension has not caught up with anything.
+_CATCH_UP_MAX_SPEED = 1.25
+
+
 class TTSWorker(BaseWorker):
     """Text-to-Speech worker using Cartesia Sonic Turbo."""
 
@@ -295,6 +321,10 @@ class TTSWorker(BaseWorker):
         # (meeting_id, speaker_id, target_lang) -> lock serializing that key's own
         # messages — see _consume_loop for why.
         self._key_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        # The furthest-along sentence this key has already SPOKEN, by its position in the
+        # speaker's own timeline. Read and written only while that key's lock is held, so a
+        # plain dict is safe for the same reason `_turns` below is.
+        self._spoken_start_ms: dict[tuple[str, str, str], int] = {}
         # One in-flight spoken turn per (meeting, speaker, language, voice). The per-key lock
         # above is what makes a plain dict safe here: a key's sentences are processed one at a
         # time, so a turn can never be pushed into concurrently.
@@ -398,6 +428,14 @@ class TTSWorker(BaseWorker):
         stale_keys = [key for key in self._key_locks if key[0] == room_id]
         for key in stale_keys:
             self._key_locks.pop(key, None)
+        # Same lifetime as the locks. A room that ends and is somehow seen again must not judge
+        # its first sentence as late against a timeline from the previous meeting.
+        #
+        # getattr for the same reason `_turns` below uses it: the tests build workers with
+        # __new__ and never run __init__.
+        spoken: dict[tuple[str, str, str], int] = getattr(self, "_spoken_start_ms", {})
+        for key in [key for key in spoken if key[0] == room_id]:
+            spoken.pop(key, None)
         # getattr, because the tests build workers with __new__ and never run __init__ — the
         # same guard the rest of this codebase uses for that pattern. A worker with no turns
         # dict has no turns to abandon.
@@ -639,8 +677,26 @@ class TTSWorker(BaseWorker):
             translation.meeting_id, translation.speaker_id, translation.target_lang
         )
 
+        # Once per message, not once per voice variant: the variants are the same sentence
+        # rendered in different voices, so the second one must not be judged as arriving after
+        # the first and read faster for it.
+        lag_ms = self._catch_up_lag_ms(translation)
+        if lag_ms > 0:
+            self.logger.info(
+                "dub_running_behind",
+                meeting_id=translation.meeting_id,
+                speaker_id=translation.speaker_id,
+                target_lang=translation.target_lang,
+                segment_id=translation.segment_id,
+                lag_ms=lag_ms,
+                start_ms=translation.start_ms,
+                translation_latency_ms=translation.latency_ms,
+            )
+
         for voice_id, voice_type, voice_key in variants:
-            await self._synthesize_and_publish(translation, text, voice_id, voice_type, voice_key)
+            await self._synthesize_and_publish(
+                translation, text, voice_id, voice_type, voice_key, lag_ms=lag_ms
+            )
 
         # Exactly once per message regardless of how many voice variants rendered —
         # billing_worker/TranscriptRedisConsumerService key off this event, not off
@@ -797,8 +853,17 @@ class TTSWorker(BaseWorker):
         voice_id: str,
         voice_type: str,
         voice_key: str,
+        lag_ms: int = 0,
     ) -> None:
-        generation_config = self._generation_config(translation)
+        # Catch-up is folded in HERE rather than inside _generation_config, because that method
+        # answers "what did we measure about this speaker's delivery" and the answer is often
+        # nothing. How far behind the dub is running is known either way, so it must be able to
+        # produce a config where prosody produced None. See _with_catch_up.
+        #
+        # It also has to land before _cache_key below: the key already includes
+        # generation_config, so a sped-up render and a normal one cannot collide, and a line
+        # cached while the room was keeping up is not replayed at the wrong pace later.
+        generation_config = self._with_catch_up(self._generation_config(translation), lag_ms)
 
         cache_key = self._cache_key(
             speaker_id=translation.speaker_id,
@@ -1904,6 +1969,67 @@ class TTSWorker(BaseWorker):
             # genuinely slowed down still sounds like they slowed down, inside a slot that fits.
             speed_center=isochrony.speed_center(self._dub_fit(translation)),
         )
+
+    def _catch_up_lag_ms(self, translation: TranslationResultMessage) -> int:
+        """How far behind the conversation this sentence is, in milliseconds. WT-528.
+
+        Records this sentence's position as the furthest spoken for its key, so the NEXT one is
+        judged against it. Called once per message, from process(), under that key's lock — which
+        is what makes the read-then-write safe without a second lock of its own.
+
+        Zero is the normal answer and it means "make no adjustment".
+        """
+        # getattr + assign back, matching `_turns`: the tests build workers with __new__ and
+        # never run __init__, and this one is written to as well as read.
+        timeline: dict[tuple[str, str, str], int] = getattr(self, "_spoken_start_ms", None) or {}
+        self._spoken_start_ms = timeline
+
+        key = self._fit_key(translation)
+        spoken = timeline.get(key)
+
+        # Out of order: a sentence that belongs before one already spoken. Its whole gap is lag,
+        # because everything between the two has already been said and it is arriving into a
+        # conversation that has moved on.
+        out_of_order_ms = 0 if spoken is None else max(0, spoken - translation.start_ms)
+
+        # Simply slow. Only the part of the translation that overran the budget counts: a sentence
+        # inside it was never behind, and charging the whole duration as lag would speed up every
+        # dub in a healthy meeting.
+        overrun_ms = max(0, (translation.latency_ms or 0) - _CATCH_UP_ON_TIME_MS)
+
+        # The larger, not the sum. They are two measurements of the same delay from different
+        # ends — a slow translation is usually also what pushed the sentence out of order — and
+        # adding them would double-count it.
+        timeline[key] = max(spoken or 0, translation.start_ms)
+        return max(out_of_order_ms, overrun_ms)
+
+    @staticmethod
+    def _with_catch_up(
+        generation_config: dict[str, float | str] | None, lag_ms: int
+    ) -> dict[str, float | str] | None:
+        """Raise the delivery speed in proportion to how far behind the dub is. WT-528.
+
+        Returns the config UNCHANGED when there is no lag, including None — a meeting that is
+        keeping up makes exactly the Cartesia call it made before this existed, and prosody's own
+        rule that silence is the honest thing to say about unmeasured delivery is preserved.
+
+        When there IS lag the config may be created from nothing, because being behind is a fact
+        about this dub that is known regardless of whether the speaker's prosody was measurable.
+        """
+        if lag_ms <= 0:
+            return generation_config
+
+        ramp = min(1.0, lag_ms / _CATCH_UP_FULL_LAG_MS)
+        multiplier = 1.0 + ramp * (_CATCH_UP_MAX_SPEED - 1.0)
+
+        base = dict(generation_config) if generation_config else {}
+        # Multiplies whatever speed was already decided — the speaker's own measured rate through
+        # isochrony's centre — rather than replacing it, so a slow talker who is behind still
+        # sounds like a slow talker, just less far behind.
+        current_speed = base.get("speed", 1.0)
+        speed = min(SPEED_MAX, float(cast(float, current_speed)) * multiplier)
+        base["speed"] = round(speed, 3)
+        return base
 
     def _fit_key(self, translation: TranslationResultMessage) -> tuple[str, str, str]:
         """Fit is per (meeting, speaker, target language). Not global: how much longer a dub
