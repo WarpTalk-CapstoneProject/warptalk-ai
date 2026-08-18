@@ -17,6 +17,8 @@ from openai import AsyncOpenAI
 from shared.config import TranslationSettings
 from shared.logger import get_logger
 from shared.openai_options import completion_options
+from translation_worker import valence as valence_mod
+from translation_worker.transcript_guardian import guardian_instruction
 
 logger = get_logger(__name__)
 OUT_OF_MEETING_SCOPE = "[OUT_OF_MEETING_SCOPE]"
@@ -602,6 +604,22 @@ class OpenAITranslator:
         glossary_terms: list[dict[str, str]] | None = None,
         meeting_context: list[str] | None = None,
     ) -> str:
+        """The translation alone. See `translate_with_valence` for the sentiment that came
+        with it — this discards it, so every existing caller keeps the contract it was written
+        against."""
+        translated, _valence = await self.translate_with_valence(
+            text, source_lang, target_lang, glossary_terms, meeting_context
+        )
+        return translated
+
+    async def translate_with_valence(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        glossary_terms: list[dict[str, str]] | None = None,
+        meeting_context: list[str] | None = None,
+    ) -> tuple[str, valence_mod.Valence | None]:
         """Translate text using OpenAI chat completion.
 
         Args:
@@ -613,16 +631,17 @@ class OpenAITranslator:
                 active glossary; translation falls back to the plain proper-nouns exception.
 
         Returns:
-            Translated text string
+            (translated text, valence) — valence is None whenever the model said nothing
+            trustworthy about sentiment, which the pipeline reads as NOT DETERMINED.
         """
         if not text.strip():
-            return ""
+            return "", None
 
         # Skip if same language
         src = source_lang.split("-")[0]
         tgt = target_lang.split("-")[0]
         if src == tgt:
-            return text
+            return text, None
 
         src_name = _lang_name(src)
         tgt_name = _lang_name(tgt)
@@ -654,6 +673,9 @@ class OpenAITranslator:
         system_prompt = _SYSTEM_PROMPT + _asr_repair_clause(relevant_glossary, meeting_context)
         if meeting_context:
             system_prompt += _CONTEXT_RELEVANCE_INSTRUCTION
+        # One extra token at the end of a call that is already being made — this is why valence
+        # no longer costs the round trip that got it deferred. See translation_worker/valence.py.
+        system_prompt += valence_mod.INSTRUCTION
         if getattr(self, "realtime_model", ""):
             try:
                 result = await self._translate_realtime(user_message, system_prompt)
@@ -675,14 +697,57 @@ class OpenAITranslator:
             )
             result = (response.choices[0].message.content or "").strip()
 
+        # Split BEFORE anything else sees the reply. The marker must never reach the transcript,
+        # the dub, or the out-of-scope check below it.
+        result, valence = valence_mod.split_valence(result)
+
         logger.debug(
             "translation_complete",
             src=src_name,
             tgt=tgt_name,
             input_chars=len(text),
             output_chars=len(result),
+            valence=valence or "",
         )
-        return result
+        return result, valence
+
+    async def polish(self, text: str, language: str) -> str:
+        """Tidy a same-language transcript line: casing, punctuation, spacing, fillers.
+
+        Returns the ORIGINAL text on any failure, and never raises. A passthrough line is
+        already correct and already publishable — the tidy-up is a bonus, and it must not be
+        able to delay or drop a transcript that would otherwise have gone out untouched.
+
+        The caller is still expected to run the result through
+        `transcript_guardian.choose_transcript`: this method promises only that it asked; that
+        function is what verifies the model did what it was told. See the module docstring
+        there for why an instruction alone is not enough.
+        """
+        if not text.strip():
+            return text
+
+        try:
+            response = await self._create_with_retry(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": guardian_instruction(language)},
+                    {"role": "user", "content": text},
+                ],
+                # Bounded by the input: a formatting pass cannot legitimately need much more
+                # room than it was given, and a cap is the cheapest guard against a model that
+                # starts writing an essay.
+                **self._completion_options(min(self.max_tokens, len(text) + 128)),
+            )
+            polished = (response.choices[0].message.content or "").strip()
+        except Exception as exc:
+            logger.warning(
+                "transcript_polish_failed",
+                language=language,
+                error=repr(exc),
+            )
+            return text
+
+        return polished or text
 
     async def translate_batch(
         self,

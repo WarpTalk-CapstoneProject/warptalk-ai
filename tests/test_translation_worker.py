@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from shared.config import TranslationSettings, WorkerSettings
-from shared.schemas import STT_UNKNOWN_CONFIDENCE, STTResultMessage
+from shared.schemas import STT_UNKNOWN_CONFIDENCE, ProsodyEnvelope, STTResultMessage
 from translation_worker.translator import (
     OpenAITranslator,
     _build_glossary_block,
@@ -386,12 +386,14 @@ class TestTranslateBatch:
         # Model only returned 1 line for 2 inputs — malformed batch response.
         mock_response.choices[0].message.content = "[1] Xin chào"
         translator._client.chat.completions.create = AsyncMock(return_value=mock_response)
-        translator.translate = AsyncMock(side_effect=["Xin chào", "Thế giới"])
+        translator.translate_with_valence = AsyncMock(
+            side_effect=[("Xin chào", None), ("Thế giới", None)]
+        )
 
         result = await translator.translate_batch(["Hello", "World"], "en", "vi")
 
         assert result == ["Xin chào", "Thế giới"]
-        assert translator.translate.await_count == 2
+        assert translator.translate_with_valence.await_count == 2
 
 
 class TestTranslationWorker:
@@ -414,7 +416,7 @@ class TestTranslationWorker:
         worker.worker_name = "translation"
         mock_translator = MagicMock()
         mock_translator.model = "gpt-4.1-mini"
-        mock_translator.translate = AsyncMock(return_value="Xin chào")
+        mock_translator.translate_with_valence = AsyncMock(return_value=("Xin chào", None))
         mock_translator.translate_batch = AsyncMock(return_value=[])
         worker.translator = mock_translator
         return worker
@@ -427,6 +429,39 @@ class TestTranslationWorker:
             language=language,
             confidence=0.95,
         )
+
+    async def test_delivery_is_carried_to_every_translation_of_a_segment(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """This worker is the courier for prosody, not a source of it.
+
+        How something was said is settled at the audio, one stage upstream, and translating
+        the words cannot change it. If it is dropped here the measurement is dead — the TTS
+        worker reads this message and nothing else.
+        """
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
+        stt = self._make_stt_msg(language="en").model_copy(
+            update={
+                "prosody": ProsodyEnvelope(
+                    pitch_lift=1.3, pitch_variation=1.5, energy_ratio=1.4, arousal="high"
+                )
+            }
+        )
+
+        await worker.process(b"msg-1", stt.to_redis())
+
+        published = [
+            c.args[1]
+            for c in mock_redis_client._redis.xadd.call_args_list
+            if "translate:results" in str(c.args[0])
+        ]
+        assert published
+        for payload in published:
+            envelope = ProsodyEnvelope.from_wire(payload.get("prosody"))
+            assert envelope is not None
+            assert envelope.arousal == "high"
+            assert envelope.pitch_lift == pytest.approx(1.3)
 
     async def test_same_language_listener_gets_nothing_published(
         self, mock_redis_client, worker_settings: WorkerSettings
@@ -465,7 +500,8 @@ class TestTranslationWorker:
         await worker.process(b"msg-1", self._make_stt_msg(language="en").to_redis())
 
         published = [
-            c.kwargs.get("target_lang") for c in worker.translator.translate.call_args_list
+            c.kwargs.get("target_lang")
+            for c in worker.translator.translate_with_valence.call_args_list
         ]
         assert published == ["vi"]
 
@@ -507,7 +543,7 @@ class TestTranslationWorker:
 
         await worker.process(b"msg-1", self._make_stt_msg(language="en").to_redis())
 
-        worker.translator.translate.assert_called()
+        worker.translator.translate_with_valence.assert_called()
 
     async def test_default_fallback_language_is_en(
         self, mock_redis_client, worker_settings: WorkerSettings
@@ -521,7 +557,7 @@ class TestTranslationWorker:
         await worker.process(b"msg-1", self._make_stt_msg(language="vi").to_redis())
 
         # Translator called with target_lang="en"
-        call_kwargs = worker.translator.translate.call_args
+        call_kwargs = worker.translator.translate_with_valence.call_args
         target = call_kwargs.kwargs.get("target_lang") or call_kwargs[1].get("target_lang")
         assert target == "en"
 
@@ -551,7 +587,9 @@ class TestTranslationWorker:
             return None
 
         mock_redis_client._redis.get.side_effect = get_value
-        worker.translator.translate = AsyncMock(return_value="[OUT_OF_MEETING_SCOPE]")
+        worker.translator.translate_with_valence = AsyncMock(
+            return_value=("[OUT_OF_MEETING_SCOPE]", None)
+        )
 
         message = self._make_stt_msg(
             language="vi",
@@ -567,6 +605,57 @@ class TestTranslationWorker:
         assert translated_stream_writes == []
         assert list(worker._recent_source_contexts.get("m1", ())) == []
 
+    async def test_a_suppression_the_context_caused_is_overturned_and_delivered(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """The "one line in ten is not translated" report.
+
+        Suppression is judged PER TARGET LANGUAGE, in its own model call, so the same sentence
+        could be out of scope for one listener and in scope for their neighbour — and the branch
+        published nothing at all for the loser. The transcript still showed the original, which is
+        what made it read as an intermittent translation failure. Production, 12h: 10 suppressions
+        against 228 translated chunks, every one of them ordinary meeting speech.
+
+        The sentinel is only offered when meeting_context is attached, so the honest test is
+        whether the sentence is still out of scope without it.
+        """
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"en"}
+
+        async def get_value(key: str):
+            if key.endswith(":meeting_context"):
+                return b"Meeting topic: WarpTalk Docker deployment review."
+            return None
+
+        mock_redis_client._redis.get.side_effect = get_value
+
+        calls: list[list[str]] = []
+
+        async def translate(*args, **kwargs):
+            calls.append(list(kwargs.get("meeting_context") or []))
+            # Out of scope only while the meeting context is attached.
+            if kwargs.get("meeting_context"):
+                return ("[OUT_OF_MEETING_SCOPE]", None)
+            return ("Are you muted?", None)
+
+        worker.translator.translate_with_valence = AsyncMock(side_effect=translate)
+
+        message = self._make_stt_msg(
+            language="vi",
+            text="Em mút mic của anh nè, anh có bị mút không?",
+        )
+        await worker.process(b"msg-overturned", message.to_redis())
+
+        translated_stream_writes = [
+            call
+            for call in mock_redis_client._redis.xadd.call_args_list
+            if "translate:results" in str(call.args[0])
+        ]
+        assert translated_stream_writes, "a real utterance must reach the listener"
+        # The retry is the one without context — that is what makes it a second opinion and not
+        # simply the same question asked twice.
+        assert calls[-1] == []
+
     async def test_validated_final_uses_matching_speculative_translation_without_second_call(
         self, mock_redis_client, worker_settings: WorkerSettings
     ) -> None:
@@ -574,8 +663,8 @@ class TestTranslationWorker:
         worker._speculative_translations = {}
         mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"en"}
         mock_redis_client._redis.get.return_value = None
-        worker.translator.translate = AsyncMock(
-            return_value="Today we deploy Docker on Kubernetes."
+        worker.translator.translate_with_valence = AsyncMock(
+            return_value=("Today we deploy Docker on Kubernetes.", None)
         )
 
         await worker._prefetch_from_event(
@@ -586,8 +675,8 @@ class TestTranslationWorker:
                 "language": "vi",
             }
         )
-        worker.translator.translate.assert_awaited_once()
-        worker.translator.translate.reset_mock()
+        worker.translator.translate_with_valence.assert_awaited_once()
+        worker.translator.translate_with_valence.reset_mock()
 
         message = self._make_stt_msg(
             language="vi",
@@ -595,7 +684,7 @@ class TestTranslationWorker:
         )
         await worker.process(b"msg-final", message.to_redis())
 
-        worker.translator.translate.assert_not_awaited()
+        worker.translator.translate_with_valence.assert_not_awaited()
         published = [
             call.args[1]
             for call in mock_redis_client._redis.xadd.call_args_list
@@ -622,13 +711,13 @@ class TestTranslationWorker:
         """
         worker = self._make_worker(mock_redis_client, worker_settings)
         mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
-        worker.translator.translate = AsyncMock(return_value="Xin chào")
+        worker.translator.translate_with_valence = AsyncMock(return_value=("Xin chào", None))
         worker.translator.translate_batch = AsyncMock(return_value=["Bạn khỏe không"])
 
         msg = self._make_stt_msg(language="en", text="Hello there. How are you?")
         await worker.process(b"msg-1", msg.to_redis())
 
-        worker.translator.translate.assert_awaited_once_with(
+        worker.translator.translate_with_valence.assert_awaited_once_with(
             "Hello there.",
             source_lang="en",
             target_lang="vi",
@@ -763,7 +852,7 @@ class TestTranslationWorker:
         msg = self._make_stt_msg(language="en", text="Hello there.")
         await worker.process(b"msg-1", msg.to_redis())
 
-        worker.translator.translate.assert_awaited_once_with(
+        worker.translator.translate_with_valence.assert_awaited_once_with(
             "Hello there.",
             source_lang="en",
             target_lang="vi",
@@ -845,7 +934,7 @@ class TestTranslationWorker:
         message.meeting_id = "m1"
         await worker.process(b"msg-1", message.to_redis())
 
-        assert worker.translator.translate.await_args.kwargs["meeting_context"] == [
+        assert worker.translator.translate_with_valence.await_args.kwargs["meeting_context"] == [
             "Review the validator.",
             "Meeting topic: WarpTalk code review.",
         ]
@@ -881,7 +970,7 @@ class TestTranslationWorker:
         second.meeting_id = "meeting-b"
         await worker.process(b"msg-b", second.to_redis())
 
-        calls = worker.translator.translate.await_args_list
+        calls = worker.translator.translate_with_valence.await_args_list
         assert calls[0].kwargs["meeting_context"] == []
         assert calls[1].kwargs["meeting_context"] == []
 
@@ -889,7 +978,9 @@ class TestTranslationWorker:
         follow_up.meeting_id = "meeting-a"
         await worker.process(b"msg-c", follow_up.to_redis())
 
-        context = worker.translator.translate.await_args_list[-1].kwargs["meeting_context"]
+        context = worker.translator.translate_with_valence.await_args_list[-1].kwargs[
+            "meeting_context"
+        ]
         assert context == ["Review the validator."]
         assert "Approve the pull request." not in context
 

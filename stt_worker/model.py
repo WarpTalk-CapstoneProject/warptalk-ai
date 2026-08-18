@@ -47,6 +47,19 @@ SESSION_IDLE_TIMEOUT_S = 300.0
 # Guard against OpenAI never sending a completed/error event for a commit.
 TRANSCRIBE_EVENT_TIMEOUT_S = 15.0
 
+# Every `filtered_*` line in this module logs at INFO, not DEBUG, and that is deliberate.
+#
+# Production runs at LOG_LEVEL=INFO, so a discard logged at DEBUG is a discard nobody can
+# see. Measured on 15 Aug: 276 `inference_complete` produced 223 `segment_transcribed` —
+# 53 utterances, 19%, removed with no record of which filter took them or why. The report
+# that followed was "có vài câu nói không bắt được transcript nên bị bỏ qua luôn", and there
+# was nothing to answer it with.
+#
+# This is the same defect the tts_worker header describes: an exit that swallows content
+# in silence is indistinguishable from the feature being switched off, and the thresholds
+# above cannot be calibrated against evidence that was never written down. The volume is
+# not a concern — these are tens of lines a day, one per DISCARDED utterance, not per chunk.
+#
 # Which session options each model actually accepts, learned at runtime.
 #
 # These replace a hardcoded model allow-list, and the difference is not cosmetic. The old
@@ -88,6 +101,33 @@ def _supports_structured_context(model: str) -> bool:
 def _supports_logprobs(model: str) -> bool:
     """Whether `model` accepts the transcription-logprobs include selector."""
     return _LOGPROBS_SUPPORT.get(model, True)
+
+
+def _demote_capability_from_error(model: str, error_text: str) -> str | None:
+    """
+    Record a capability the Realtime API rejected on the STREAM rather than on session.update.
+
+    Returns the name of what was demoted, or None if the error is about something else — an
+    audio problem, a disconnect, a timeout — none of which say anything about what this model
+    accepts, and demoting on those would strip the language hint off a model that handles it.
+
+    Matching is on the parameter name inside the API's own wording ("The 'languages' parameter
+    is not supported for this model."). Deliberately narrow: a broad `"languages" in error`
+    would match a transcript that happens to contain the word.
+    """
+    lowered = error_text.lower()
+    if "not supported" not in lowered and "invalid_parameter" not in lowered:
+        return None
+
+    if "'languages'" in lowered or '"languages"' in lowered or "'keywords'" in lowered:
+        _STRUCTURED_CONTEXT_SUPPORT[model] = False
+        return "structured_context"
+
+    if "logprob" in lowered:
+        _LOGPROBS_SUPPORT[model] = False
+        return "logprobs"
+
+    return None
 
 
 def reset_capability_memo() -> None:
@@ -175,35 +215,6 @@ _LANG_NAME_TO_CODE: dict[str, str] = {
 # en had every segment dropped.
 _DEFAULT_ALLOWED_LANGUAGES = {"vi", "en"}
 
-# Languages written in Latin script. The cross-script hallucination guard
-# (_FOREIGN_SCRIPT_RE) only makes sense for these: a speaker we know is speaking a
-# Latin-script language never legitimately produces Thai/Hangul/CJK/Kana. For a speaker
-# whose declared language IS one of those scripts, that same text is correct output and
-# must NOT be filtered — applying the guard unconditionally is what would silently drop
-# a legitimate Japanese/Korean/Chinese/Thai speaker.
-_LATIN_SCRIPT_LANGUAGES = {
-    "en",
-    "vi",
-    "fr",
-    "de",
-    "es",
-    "pt",
-    "it",
-    "id",
-    "ms",
-    "nl",
-    "pl",
-    "tr",
-    "sv",
-    "da",
-    "no",
-    "fi",
-    "cs",
-    "sk",
-    "hr",
-    "ro",
-    "hu",
-}
 
 # Vietnamese-UNIQUE characters only.
 #
@@ -239,6 +250,64 @@ _HANGUL_RE = re.compile(r"[가-힣ᄀ-ᇿ]")
 _KANA_RE = re.compile(r"[぀-ヿ]")
 _HAN_RE = re.compile(r"[一-鿿]")
 _THAI_RE = re.compile(r"[฀-๿]")
+_ARABIC_RE = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
+_CYRILLIC_RE = re.compile(r"[Ѐ-ӿԀ-ԯ]")
+_HEBREW_RE = re.compile(r"[֐-׿]")
+_DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
+_GREEK_RE = re.compile(r"[Ͱ-Ͽἀ-῿]")
+
+# Which writing systems each language is actually written in.
+#
+# A room that declared its languages has declared its writing systems too, and that is a
+# far stronger filter than a blocklist of the scripts somebody happened to think of. The
+# blocklist this replaced named Thai, Hangul, CJK and Kana — so Arabic, which is what
+# production actually produced in a Vietnamese/Japanese room, was never on it.
+#
+# Absent from this table means Latin, which covers every remaining language the product
+# offers.
+_LANGUAGE_SCRIPTS: dict[str, frozenset[str]] = {
+    "ja": frozenset({"kana", "han"}),
+    "zh": frozenset({"han"}),
+    "ko": frozenset({"hangul", "han"}),
+    "th": frozenset({"thai"}),
+    "ar": frozenset({"arabic"}),
+    "he": frozenset({"hebrew"}),
+    "ru": frozenset({"cyrillic"}),
+    "uk": frozenset({"cyrillic"}),
+    "bg": frozenset({"cyrillic"}),
+    "hi": frozenset({"devanagari"}),
+    "mr": frozenset({"devanagari"}),
+    "el": frozenset({"greek"}),
+}
+
+_SCRIPT_DETECTORS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("hangul", _HANGUL_RE),
+    ("kana", _KANA_RE),
+    ("han", _HAN_RE),
+    ("thai", _THAI_RE),
+    ("arabic", _ARABIC_RE),
+    ("cyrillic", _CYRILLIC_RE),
+    ("hebrew", _HEBREW_RE),
+    ("devanagari", _DEVANAGARI_RE),
+    ("greek", _GREEK_RE),
+)
+
+
+def _scripts_in(text: str) -> set[str]:
+    """Non-Latin writing systems present in `text`.
+
+    Latin is not reported and never filtered on. It is the script every code-switched
+    English product term arrives in — "deploy the backend API" inside a Vietnamese
+    sentence is the thing this product is for, not a defect to be filtered out.
+    """
+    return {name for name, pattern in _SCRIPT_DETECTORS if pattern.search(text)}
+
+
+def _allowed_scripts(languages: set[str]) -> set[str]:
+    scripts: set[str] = set()
+    for language in languages:
+        scripts |= _LANGUAGE_SCRIPTS.get(base_language(language), frozenset())
+    return scripts
 
 
 def _detect_script_language(text: str) -> str | None:
@@ -261,6 +330,42 @@ def _detect_script_language(text: str) -> str | None:
         # Han with no kana. Japanese written purely in kanji exists but is vanishingly
         # rare in conversational speech, so Chinese is the better call.
         return "zh"
+    return None
+
+
+def _detect_unambiguous_language(text: str) -> str | None:
+    """The language the TEXT proves, or None when the text proves nothing.
+
+    Two signals, both of which this module already documents as unambiguous:
+    a non-Latin writing system, and the Vietnamese-unique character class.
+
+    WHY BOTH, IN ONE PLACE
+      `_detect_script_language` returns None for Latin script — it says so in its own
+      docstring — so it can never separate Vietnamese from English. The evidence that CAN
+      separate them lived only inside `_guess_language_from_text`, which by design runs
+      only when the speaker declared no language at all.
+
+      So for a speaker who declared one, the declaration was the last word even against
+      proof to the contrary. A participant whose profile said `en` and who spoke Vietnamese
+      for a whole meeting had every segment labelled `en`; the translator then ran en→vi
+      over text that was already Vietnamese, and the "translation" was nonsense.
+
+      A declaration is a statement of intent, and people get it wrong — this exact meeting
+      is the evidence. Absence of evidence is a reason to trust the declaration.
+      CONTRADICTION is not.
+
+    Returns None for ordinary Latin text, where a declaration remains the best information
+    available and must keep winning.
+    """
+    script_language = _detect_script_language(text)
+    if script_language:
+        return script_language
+
+    # The character class no other Latin-script language uses — see _VI_UNIQUE_CHAR_RE for
+    # why it is this narrow, and for the Spanish/French false positives that made it so.
+    if _VI_UNIQUE_CHAR_RE.search(text):
+        return "vi"
+
     return None
 
 
@@ -297,16 +402,15 @@ def _guess_language_from_text(text: str, allowed: set[str] | None = None) -> str
     return "en"
 
 
-_FOREIGN_SCRIPT_RE = re.compile(
-    r"[฀-๿"  # Thai
-    r"가-힣"  # Hangul syllables
-    r"一-鿿"  # CJK unified ideographs
-    r"぀-ヿ]"  # Hiragana/Katakana
-)
-
 # Even the fastest human speech in any language doesn't clear ~30 chars/sec, so this
 # pair (< 0.5s of real audio, yet > 20 chars of text) only fires on the classic
 # Whisper-family hallucination pattern: a full phrase invented over near-silence/noise.
+# How many CONSECUTIVE segments must contradict a speaker's declared language before the
+# session is re-pinned to what they are actually speaking. Two, not one: the evidence itself is
+# unambiguous, so this guards only against a stray mis-transcription, and every extra segment of
+# patience is another chunk decoded with the wrong language.
+_LANGUAGE_OVERRIDE_SEGMENTS = 2
+
 _MIN_SPEECH_SECONDS_FOR_LONG_TEXT = 0.5
 _MAX_CHARS_FOR_SHORT_AUDIO = 20
 
@@ -660,42 +764,58 @@ def _filter_segments(
     if lang_code:
         allowed.add(lang_code)
 
-    if language_known and lang_code not in allowed:
-        logger.debug(
-            "filtered_wrong_language",
-            detected=detected_language,
-            code=lang_code,
-            allowed=sorted(allowed),
-        )
-        return []
+    # There WAS a "reject the whole batch if its language is not allowed" check here. It
+    # could never fire: `lang_code` is the speaker's declared language and the two lines
+    # above had just added it to `allowed`, so the condition was always false. Worse, it
+    # read as the thing enforcing "only the room's languages" while enforcing nothing —
+    # which is why a room configured for vi + ja was showing Arabic. Enforcement is the
+    # script allow-list below, which tests the TEXT rather than a label that was assigned
+    # from the speaker's profile before anyone looked at what they said.
 
-    # The cross-script guard is only valid when the speaker's declared language is
-    # Latin-script; for a declared CJK/Thai/Hangul language that script is legitimate.
+    # WHAT THE ROOM MAY CONTAIN, AS AN ALLOW-LIST
     #
-    # When the per-utterance language is unknown (speaker joined with speak_language left
-    # on "auto" — see TranslationRoomHub.SetSpeakLanguage/JoinTranslationRoom — so there's
-    # no session-level hint at all), still apply the guard IF every language this meeting
-    # has actually declared (allowed, computed above) is Latin-script: nobody in the room
-    # is expected to produce Thai/Hangul/CJK/Kana regardless of which Latin-script language
-    # this particular speaker turns out to be using, so a hallucinated foreign-script
-    # segment is still safe to drop. If the room has a real CJK/Thai speaker declared,
-    # skip the guard here — there's no way to tell whose script is legitimate without a
-    # known per-segment language, and dropping could silently eat that speaker's real
-    # transcript.
+    # A room that declared vi + ja declared two writing systems: Latin and Japanese. Text
+    # in any other is not that room's speech, whoever the model thinks was talking. So the
+    # scripts of the DECLARED languages are what a segment is checked against.
     #
-    # `languages_declared` is what makes this fail OPEN. Before it, a room that had not
-    # yet published its language set fell back to the assumed vi/en allow-list, both
-    # Latin, and the guard therefore switched itself on — so every Japanese, Korean,
-    # Chinese or Thai utterance in that window was dropped in full, as "foreign script",
-    # in a room that had simply not finished announcing itself. Losing a speaker's entire
-    # transcript is a far worse outcome than letting a rare cross-script hallucination
-    # through, so an ASSUMED allow-list no longer arms the guard; only a declared one does.
-    apply_foreign_script_guard = (language_known and lang_code in _LATIN_SCRIPT_LANGUAGES) or (
-        not language_known
-        and languages_declared
-        and bool(allowed)
-        and all(lang in _LATIN_SCRIPT_LANGUAGES for lang in allowed)
-    )
+    # This replaces a blocklist — Thai, Hangul, CJK, Kana — which failed in both
+    # directions at once, and production hit both:
+    #
+    #   Arabic was never on the list, so it was never dropped. A Vietnamese/Japanese room
+    #   showed Arabic transcript lines.
+    #
+    #   The list armed only for a Latin-declared speaker, so a speaker registered as
+    #   Vietnamese who READ JAPANESE ALOUD had every kanji segment deleted as "foreign
+    #   script" — in a room that had declared Japanese. That is the report "đọc Kanji thì
+    #   không bắt transcript", and it was this guard doing it.
+    #
+    # Latin is never filtered on: it is the script code-switched English arrives in, and
+    # "deploy the backend API" inside a Vietnamese sentence is the product working.
+    #
+    # PRECEDENCE: the room, then the speaker, then nothing.
+    #
+    #   The room declared its languages   -> those scripts. This is what fixes the report:
+    #                                        a vi-registered speaker reading Japanese in a
+    #                                        room that declared ja is speaking one of the
+    #                                        room's languages, and the speaker's own
+    #                                        profile must not overrule the room's set.
+    #   Only the speaker's is known       -> that speaker's scripts. The room's set is
+    #                                        cached for 15s and can be briefly empty; in
+    #                                        that window the speaker's declaration is the
+    #                                        only evidence there is, and it is better than
+    #                                        none.
+    #   Neither                           -> filter nothing. An ASSUMED vi/en allow-list
+    #                                        once armed this guard and deleted a real
+    #                                        Japanese speaker's entire transcript in a room
+    #                                        that had simply not finished announcing
+    #                                        itself. Losing a speaker beats letting a rare
+    #                                        cross-script hallucination through.
+    if languages_declared:
+        permitted_scripts: set[str] | None = _allowed_scripts(allowed)
+    elif lang_code:
+        permitted_scripts = _allowed_scripts({lang_code})
+    else:
+        permitted_scripts = None
 
     results: list[TranscribedSegment] = []
     seen_texts: set[str] = set()
@@ -710,14 +830,18 @@ def _filter_segments(
         if not text:
             continue
 
-        # A speaker we already know is speaking a Latin-script language never
-        # legitimately produces Thai/Hangul/CJK/Kana characters, so this is a
-        # high-precision way to catch the residual cross-script hallucination — and to
-        # enforce "no language mixing": a segment whose script doesn't match the
-        # speaker's one declared language is dropped rather than emitted.
-        if apply_foreign_script_guard and _FOREIGN_SCRIPT_RE.search(text):
-            logger.debug("filtered_foreign_script", text=text)
-            continue
+        # The room said which languages it contains. A writing system belonging to none of
+        # them is not this room's speech.
+        if permitted_scripts is not None:
+            foreign_scripts = _scripts_in(text) - permitted_scripts
+            if foreign_scripts:
+                logger.info(
+                    "filtered_foreign_script",
+                    text=text[:80],
+                    scripts=sorted(foreign_scripts),
+                    declared=sorted(allowed),
+                )
+                continue
 
         # Realtime completed events expose token logprobs when explicitly requested in
         # the session include list. transcribe() averages those into avg_logprob;
@@ -744,7 +868,7 @@ def _filter_segments(
             and any(normalized_text in prompt_line for prompt_line in prompt_lines)
         )
         if is_exact_prompt_echo or is_marginal_prompt_fragment:
-            logger.debug("filtered_prompt_echo", text=text[:80])
+            logger.info("filtered_prompt_echo", text=text[:80])
             continue
 
         # gpt-transcribe accepts structured keyword hints but does not currently expose
@@ -761,14 +885,48 @@ def _filter_segments(
             continue
 
         if no_speech > 0.6:
-            logger.debug("filtered_no_speech", text=text, no_speech_prob=round(no_speech, 2))
+            logger.info("filtered_no_speech", text=text, no_speech_prob=round(no_speech, 2))
             continue
 
         # Resolved here, before the confidence gate, because the gate itself is
         # per-language: models are measurably less confident in some languages than
         # others at identical audio quality, so one shared floor discards more real
         # speech from the languages it already handles worst.
-        seg_lang = lang_code or _guess_language_from_text(text, allowed)
+        # Writing system first, declared language second.
+        #
+        # `lang_code` is what the SPEAKER REGISTERED, not what the model heard — the
+        # Realtime completed event carries no language field, so every segment used to be
+        # labelled with the speaker's profile language no matter what they actually said.
+        # A Vietnamese-registered speaker reading Japanese produced segments labelled `vi`,
+        # which then went to the translator as vi→ja and came back as nonsense, and which
+        # no language filter could ever reject because the label was allowed by
+        # construction.
+        #
+        # Script evidence does not have that problem: kana is Japanese whatever the
+        # profile says. It is used when present and the declared language is kept
+        # otherwise, so Latin-script speech — where script proves nothing — behaves
+        # exactly as before.
+        # Evidence, then the declaration, then a guess.
+        #
+        # This used to read `_detect_script_language(text) or lang_code or ...`, which looks
+        # like the same order but is not: _detect_script_language is blind to Latin script, so
+        # for a vi/en room the first term was ALWAYS None and the declaration always won.
+        # _detect_unambiguous_language adds the Vietnamese-unique evidence that was previously
+        # locked inside the no-declaration fallback path.
+        seg_lang = (
+            _detect_unambiguous_language(text)
+            or lang_code
+            or _guess_language_from_text(text, allowed)
+        )
+        if lang_code and seg_lang != lang_code:
+            # Worth a line in the log: the speaker's profile and their actual speech disagree,
+            # which is a setup mistake they cannot see and which degrades their transcription
+            # badly — STT is pinned to the declared language on the session.
+            logger.info(
+                "stt_declared_language_contradicted",
+                speaker_declared=lang_code,
+                text_evidence=seg_lang,
+            )
         language_floor = (min_avg_logprob_by_language or {}).get(
             base_language(seg_lang),
             min_avg_logprob,
@@ -779,7 +937,7 @@ def _filter_segments(
         # the calibrated boundary is marginal audio and must not become an off-topic
         # plausible-looking caption.
         if avg_logprob != STT_UNKNOWN_CONFIDENCE and avg_logprob < language_floor:
-            logger.debug(
+            logger.info(
                 "filtered_low_confidence",
                 text=text,
                 logprob=round(avg_logprob, 2),
@@ -799,7 +957,7 @@ def _filter_segments(
             and real_duration_s < _MIN_SPEECH_SECONDS_FOR_LONG_TEXT
             and len(text) > _MAX_CHARS_FOR_SHORT_AUDIO
         ):
-            logger.debug(
+            logger.info(
                 "filtered_text_too_long_for_audio",
                 text=text[:60],
                 duration_s=round(real_duration_s, 2),
@@ -816,11 +974,11 @@ def _filter_segments(
         )
 
         if text_lower in _HALLUCINATIONS_ALWAYS:
-            logger.debug("filtered_hallucination", text=text)
+            logger.info("filtered_hallucination", text=text)
             continue
 
         if blocklist_is_marginal and text_lower in _HALLUCINATIONS_IF_MARGINAL:
-            logger.debug(
+            logger.info(
                 "filtered_hallucination_marginal",
                 text=text,
                 logprob=round(avg_logprob, 2),
@@ -828,13 +986,13 @@ def _filter_segments(
             continue
 
         if any(sub in text_lower for sub in _HALLUCINATION_SUBSTRINGS_ALWAYS):
-            logger.debug("filtered_hallucination_substring", text=text)
+            logger.info("filtered_hallucination_substring", text=text)
             continue
 
         if blocklist_is_marginal and any(
             sub in text_lower for sub in _HALLUCINATION_SUBSTRINGS_IF_MARGINAL
         ):
-            logger.debug(
+            logger.info(
                 "filtered_hallucination_substring_marginal",
                 text=text,
                 logprob=round(avg_logprob, 2),
@@ -855,7 +1013,7 @@ def _filter_segments(
                 count - 1 for count in sentence_counts.values() if count > 1
             )
             if repeated_sentence_count >= 2:
-                logger.debug(
+                logger.info(
                     "filtered_repeated_sentence_collage",
                     text=text[:80],
                     repeated_sentences=repeated_sentence_count,
@@ -879,7 +1037,7 @@ def _filter_segments(
         if len(words) >= 4:
             distinct_ratio = len(set(words)) / len(words)
             if distinct_ratio < _MIN_DISTINCT_WORD_RATIO:
-                logger.debug(
+                logger.info(
                     "filtered_repetition",
                     text=text[:50],
                     distinct_ratio=round(distinct_ratio, 2),
@@ -887,11 +1045,11 @@ def _filter_segments(
                 continue
 
         if re.search(r"(.)\1{3,}", text_lower):
-            logger.debug("filtered_char_repetition", text=text[:50])
+            logger.info("filtered_char_repetition", text=text[:50])
             continue
 
         if text_lower in seen_texts:
-            logger.debug("filtered_duplicate", text=text)
+            logger.info("filtered_duplicate", text=text)
             continue
         seen_texts.add(text_lower)
 
@@ -939,6 +1097,23 @@ class OpenAISTT:
         self._client: AsyncOpenAI | None = None
         # (meeting_id, speaker_id) -> {"manager": ..., "conn": ..., "last_used": float}
         self._sessions: dict[tuple[str, str], dict[str, Any]] = {}
+        # WHAT THIS SPEAKER IS ACTUALLY SPEAKING, when it contradicts what they declared.
+        #
+        # STT is pinned to the declared language on the session, so a participant who picks
+        # the wrong one in their profile gets a whole meeting of mistranscription and no sign
+        # of why: the audio is Vietnamese, the decoder is told to expect English, and the words
+        # come back fluent-looking and wrong. It is a setup mistake, invisible to the person
+        # making it, and it cannot be fixed by anything downstream — once the decoder has
+        # mis-heard a word, the word is gone.
+        #
+        # So the evidence is allowed to correct the declaration, after it has been consistent.
+        # `_language_evidence` counts consecutive contradicting segments; `_language_override`
+        # is what actually replaces the pinned language once the count is met.
+        self._language_evidence: dict[tuple[str, str], tuple[str, int]] = {}
+        # (spoken language, the declaration it corrects). The declaration is part of the entry
+        # because the override only holds while that declaration stands — a fresh pick in the
+        # meeting bar releases it (see transcribe).
+        self._language_override: dict[tuple[str, str], tuple[str, str | None]] = {}
         self._warm_sessions: deque[dict[str, Any]] = deque()
         # How many warm sockets to keep ready. Set by warm_up() and used by
         # _schedule_warm_refill to replace every socket a speaker claims.
@@ -1049,6 +1224,7 @@ class OpenAISTT:
         prompt: str | None,
         allowed_languages: set[str] | None = None,
         keywords: list[str] | None = None,
+        noise_reduction: str | None = None,
     ) -> None:
         """Claim/configure a warm socket when a participant publishes their mic track."""
         await self._get_or_create_session(
@@ -1057,6 +1233,7 @@ class OpenAISTT:
             prompt=prompt,
             allowed_languages=allowed_languages,
             keywords=keywords,
+            noise_reduction=noise_reduction,
         )
 
     async def transcribe(
@@ -1070,8 +1247,10 @@ class OpenAISTT:
         prompt: str | None = None,
         allowed_languages: set[str] | None = None,
         keywords: list[str] | None = None,
+        noise_reduction: str | None = None,
         on_early_segment: Callable[[TranscribedSegment], Awaitable[None]] | None = None,
         on_speculative_segment: Callable[[TranscribedSegment], Awaitable[None]] | None = None,
+        streamed_epoch: int | None = None,
     ) -> list[TranscribedSegment]:
         """Transcribe raw audio bytes via the OpenAI Realtime API.
 
@@ -1109,6 +1288,16 @@ class OpenAISTT:
             return []
 
         lang_arg = language if language and language != "auto" else None
+
+        # An override earned from this speaker's own speech outranks their profile. It is only
+        # ever set after several consecutive segments carried unambiguous evidence of another
+        # language (see _learn_language_evidence), and it re-pins the realtime session through
+        # the ordinary language-change path in _get_or_create_session.
+        # getattr, not attribute access: instances built without __init__ are a supported
+        # shape here — see the same guard on _warm_sessions — and this must not be the thing
+        # that decides whether transcription runs at all.
+        lang_arg = self._apply_language_override((meeting_id, speaker_id), lang_arg)
+
         detected_language = lang_arg or "unknown"
 
         async def _emit_early(sentence_text: str) -> None:
@@ -1182,10 +1371,32 @@ class OpenAISTT:
                 allowed_languages,
                 keywords,
                 exclude_emitted_from_final=exclude_emitted_from_final,
+                noise_reduction=noise_reduction,
+                streamed_epoch=streamed_epoch,
             )
-        except Exception:
+        except Exception as first_error:
+            # A capability the API rejected ASYNCHRONOUSLY has to be learned here, because the
+            # degradation ladder in _apply_session_config cannot see it. That ladder catches an
+            # exception from `session.update`; the Realtime API accepts the update, says nothing,
+            # and then rejects every transcription on the stream with an `error` event — which
+            # arrives as the RuntimeError being handled right now. The memo was therefore written
+            # as "supported", the retry below rebuilt an identical session, and it failed
+            # identically. Production ran 304 chunks through that loop in 45 minutes without one
+            # word of transcript: every audio chunk in every meeting, silently, for as long as the
+            # model was configured.
+            demoted = _demote_capability_from_error(self.model, str(first_error))
+            if demoted:
+                logger.warning(
+                    "stt_capability_demoted_from_stream_error",
+                    model=self.model,
+                    unsupported=demoted,
+                    meeting_id=meeting_id,
+                )
             logger.warning("realtime_session_retry", meeting_id=meeting_id, speaker_id=speaker_id)
             self._sessions.pop(key, None)
+            # No streamed_epoch on this path, deliberately: the line above threw the session
+            # away, and with it the buffer the frames were appended to. This retry must send the
+            # audio itself, which is what omitting the epoch makes it do.
             try:
                 text, avg_logprob = await self._transcribe_via_session(
                     key,
@@ -1196,6 +1407,7 @@ class OpenAISTT:
                     allowed_languages,
                     keywords,
                     exclude_emitted_from_final=exclude_emitted_from_final,
+                    noise_reduction=noise_reduction,
                 )
             except Exception as e:
                 logger.error("openai_stt_error", error=str(e))
@@ -1220,7 +1432,7 @@ class OpenAISTT:
         # audio actually backing this specific text, making the check in _filter_segments
         # more lenient than perfectly accurate. That's the safe direction: it only ever
         # risks missing a hallucination, never dropping real trailing speech.
-        return _filter_segments(
+        segments = _filter_segments(
             segments_dicts,
             detected_language,
             chunk_offset_ms,
@@ -1230,6 +1442,137 @@ class OpenAISTT:
             keywords=keywords,
             min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
         )
+        # Learned from the COMPLETED path only. Early and speculative segments are provisional
+        # by construction, and re-pinning a session on a guess that a later completed event
+        # withdraws would be worse than the mislabelling this exists to fix.
+        self._learn_language_evidence((meeting_id, speaker_id), lang_arg, segments)
+        return segments
+
+    def _apply_language_override(
+        self,
+        key: tuple[str, str],
+        declared: str | None,
+    ) -> str | None:
+        """The language to pin this chunk's session to: the declaration, unless a learned
+        override still corrects it.
+
+        A FRESH DECLARATION RELEASES THE OVERRIDE.
+
+        The override corrects one specific claim — "declared en while audibly speaking vi" —
+        and it used to outlive that claim: once learned it was permanent for the meeting, and
+        nothing a person did could take their microphone back.
+
+        Production meeting 01a00a34 (16 Aug) is the whole story. A speaker joined declared en,
+        spoke Vietnamese, and the override correctly re-pinned them to vi. They then
+        deliberately picked English in the meeting bar and STARTED SPEAKING ENGLISH — and every
+        English sentence ("I still hear Vietnamese, so I ask in English", "Hello, can you hear
+        me?") kept coming back labelled vi, because the learning loop returns early while an
+        override exists and English text carries none of the unambiguous evidence that could
+        contradict it. Downstream, their vi-listening partner got NO translation at all: source
+        vi, target vi, dropped as same-language. The user's deliberate choice was unrecoverable.
+
+        So the override is scoped to the declaration it corrected. The moment the declared
+        language differs from the one the override was learned against, the person has said
+        something NEW about themselves, and that statement gets the same initial trust a
+        join-time declaration does. If they are still actually speaking something else, the
+        evidence loop simply re-learns — two unambiguous segments, same as the first time.
+        """
+        overrides: dict[tuple[str, str], tuple[str, str | None]] | None = getattr(
+            self, "_language_override", None
+        )
+        if not overrides:
+            return declared
+
+        entry = overrides.get(key)
+        if not entry:
+            return declared
+
+        learned, corrected_declaration = entry
+
+        if declared != corrected_declaration:
+            overrides.pop(key, None)
+            evidence = getattr(self, "_language_evidence", None)
+            if evidence is not None:
+                evidence.pop(key, None)
+            logger.info(
+                "stt_language_override_released",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                was_speaking=learned,
+                old_declaration=corrected_declaration,
+                new_declaration=declared,
+            )
+            return declared
+
+        if learned != declared:
+            logger.info(
+                "stt_language_override_applied",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                declared=declared,
+                speaking=learned,
+            )
+            return learned
+
+        return declared
+
+    def _learn_language_evidence(
+        self,
+        key: tuple[str, str],
+        declared: str | None,
+        segments: list[TranscribedSegment],
+    ) -> None:
+        """Let a speaker's actual speech correct the language they declared.
+
+        Only unambiguous evidence counts — a non-Latin writing system, or the Vietnamese-unique
+        character class — so ordinary Latin text never moves this. `_filter_segments` has
+        already resolved each segment's language through `_detect_unambiguous_language`, so a
+        label that differs from `declared` IS that evidence.
+
+        CONSECUTIVE, not cumulative. One contradicting segment in an otherwise consistent
+        meeting is far more likely to be a stray mis-transcription than a person switching
+        language mid-sentence, and re-pinning the session on it would trade a rare wrong label
+        for a whole chunk of wrong audio. Any segment that agrees with the declaration resets
+        the count to zero.
+        """
+        if not declared or not segments:
+            return
+
+        # Lazily created for the same reason transcribe() reads them with getattr: an instance
+        # may exist without __init__ having run.
+        if getattr(self, "_language_evidence", None) is None:
+            self._language_evidence = {}
+        if getattr(self, "_language_override", None) is None:
+            self._language_override = {}
+
+        if key in self._language_override:
+            return
+
+        for segment in segments:
+            if segment.language == declared:
+                self._language_evidence.pop(key, None)
+                continue
+
+            previous_language, count = self._language_evidence.get(key, (segment.language, 0))
+            count = count + 1 if previous_language == segment.language else 1
+            self._language_evidence[key] = (segment.language, count)
+
+            if count >= _LANGUAGE_OVERRIDE_SEGMENTS:
+                # Stored WITH the declaration it corrects, not alone. transcribe() drops the
+                # override the moment the speaker declares something new — an override that
+                # outlived its declaration is how a deliberate mid-meeting switch to English
+                # stayed pinned to Vietnamese for the rest of the meeting (room 01a00a34).
+                self._language_override[key] = (segment.language, declared)
+                self._language_evidence.pop(key, None)
+                logger.warning(
+                    "stt_language_override_learned",
+                    meeting_id=key[0],
+                    speaker_id=key[1],
+                    declared=declared,
+                    speaking=segment.language,
+                    after_segments=count,
+                )
+                return
 
     async def _transcribe_via_session(
         self,
@@ -1241,7 +1584,9 @@ class OpenAISTT:
         allowed_languages: set[str] | None = None,
         keywords: list[str] | None = None,
         *,
+        noise_reduction: str | None = None,
         exclude_emitted_from_final: bool = True,
+        streamed_epoch: int | None = None,
     ) -> tuple[str, float]:
         session = await self._get_or_create_session(
             key,
@@ -1249,17 +1594,36 @@ class OpenAISTT:
             prompt,
             allowed_languages,
             keywords,
+            noise_reduction=noise_reduction,
         )
         conn = session["conn"]
 
-        # Ingress has already assembled a VAD-bounded speech utterance.
-        # Sending that as ten-to-fifteen separately awaited 100ms websocket messages
-        # added pure transport overhead before the model could start. Keep a conservative
-        # 2s raw-PCM cap for unusually long replay/test chunks; production uses one append.
-        append_bytes = REALTIME_SAMPLE_RATE * 2 * 2
-        for i in range(0, len(pcm_24k), append_bytes):
-            frame = pcm_24k[i : i + append_bytes]
-            await conn.input_audio_buffer.append(audio=base64.b64encode(frame).decode())
+        # ALREADY IN THE BUFFER? Then commit it rather than sending it twice.
+        #
+        # When STT_STREAMING_ENABLED is on, the frames of this turn were appended by
+        # `append_streamed_audio` while the speaker was still talking — so by the time this runs
+        # the model has already heard the utterance and the commit below is all that is left.
+        # That is the entire latency win: what used to be "send five seconds, then wait for the
+        # model to hear it" becomes "say go".
+        #
+        # The epoch check is what makes it safe. `append_streamed_audio` returns the epoch its
+        # audio landed in, and a session recreated since then — a language change, an idle
+        # sweep, a restart — took that buffer with it. A mismatch therefore falls through to the
+        # ordinary append below, which is exactly the behaviour this method had before streaming
+        # existed. Wrong here means slow; it never means silent.
+        already_buffered = streamed_epoch is not None and int(session.get("epoch", 0)) == int(
+            streamed_epoch
+        )
+
+        if not already_buffered:
+            # Ingress has already assembled a VAD-bounded speech utterance.
+            # Sending that as ten-to-fifteen separately awaited 100ms websocket messages
+            # added pure transport overhead before the model could start. Keep a conservative
+            # 2s raw-PCM cap for unusually long replay/test chunks; production uses one append.
+            append_bytes = REALTIME_SAMPLE_RATE * 2 * 2
+            for i in range(0, len(pcm_24k), append_bytes):
+                frame = pcm_24k[i : i + append_bytes]
+                await conn.input_audio_buffer.append(audio=base64.b64encode(frame).decode())
 
         await conn.input_audio_buffer.commit()
         session["last_used"] = time.monotonic()
@@ -1349,6 +1713,7 @@ class OpenAISTT:
         prompt: str | None,
         allowed_languages: set[str] | None,
         keywords: list[str],
+        noise_reduction: str | None = None,
     ) -> None:
         """Find the richest session config this model accepts, and remember it.
 
@@ -1375,7 +1740,12 @@ class OpenAISTT:
                             prompt,
                             allowed_languages,
                             keywords,
-                            **flags,
+                            noise_reduction=noise_reduction,
+                            # Named rather than splatted: **flags is dict[str, bool] and would
+                            # otherwise be a candidate for every keyword parameter, including the
+                            # string one added for per-room noise reduction.
+                            structured_context=flags["structured_context"],
+                            logprobs=flags["logprobs"],
                         ),
                     )
                 )
@@ -1422,6 +1792,9 @@ class OpenAISTT:
         prompt: str | None,
         allowed_languages: set[str] | None = None,
         keywords: list[str] | None = None,
+        # Before the `*` on purpose: _degrade_session_config forwards the capability flags as
+        # **dict[str, bool], and a keyword-only str parameter sits inside that splat's target set.
+        noise_reduction: str | None = None,
         *,
         structured_context: bool | None = None,
         logprobs: bool | None = None,
@@ -1465,8 +1838,18 @@ class OpenAISTT:
         # detection accuracy (reducing false positives) and model performance" per
         # OpenAI's own docs. self.noise_reduction == "off" omits the field entirely
         # (server default is no noise reduction).
-        if self.noise_reduction and self.noise_reduction != "off":
-            input_config["noise_reduction"] = {"type": self.noise_reduction}
+        #
+        # WT-427: per ROOM, falling back to the worker's default. One meeting is a headset at a
+        # desk and the next is a laptop across a table, and the same setting cannot be right for
+        # both: the deployment default is "off" precisely because a second denoising pass
+        # distorted clean close-mic speech in replay tests, while a room being picked up from two
+        # metres away needs exactly that pass. A single env var made this an all-or-nothing choice
+        # for the whole platform.
+        effective_noise_reduction = (
+            noise_reduction if noise_reduction is not None else self.noise_reduction
+        )
+        if effective_noise_reduction and effective_noise_reduction != "off":
+            input_config["noise_reduction"] = {"type": effective_noise_reduction}
 
         payload: dict[str, Any] = {
             "type": "transcription",
@@ -1488,6 +1871,7 @@ class OpenAISTT:
         prompt: str | None = None,
         allowed_languages: set[str] | None = None,
         keywords: list[str] | None = None,
+        noise_reduction: str | None = None,
     ) -> dict[str, Any]:
         self._sweep_idle_sessions()
 
@@ -1536,6 +1920,10 @@ class OpenAISTT:
                 or cached.get("prompt") != prompt
                 or cached.get("languages") != languages
                 or cached.get("keywords") != normalized_keywords
+                # In the comparison, not merely in the payload. A room that switches to far-field
+                # mid-meeting keeps a live socket, and a value the update never notices changed is
+                # a setting that silently does nothing until the session happens to be recycled.
+                or cached.get("noise_reduction") != noise_reduction
             )
             if config_changed:
                 await cached["conn"].session.update(
@@ -1546,6 +1934,7 @@ class OpenAISTT:
                             prompt,
                             allowed_languages,
                             list(normalized_keywords),
+                            noise_reduction=noise_reduction,
                         ),
                     )
                 )
@@ -1554,6 +1943,7 @@ class OpenAISTT:
                     prompt=prompt,
                     languages=languages,
                     keywords=normalized_keywords,
+                    noise_reduction=noise_reduction,
                 )
             return cached
 
@@ -1584,6 +1974,7 @@ class OpenAISTT:
                         prompt,
                         allowed_languages,
                         list(normalized_keywords),
+                        noise_reduction=noise_reduction,
                     ),
                 )
             )
@@ -1600,16 +1991,24 @@ class OpenAISTT:
                 prompt,
                 allowed_languages,
                 list(normalized_keywords),
+                noise_reduction,
             )
 
+        # Bumped per CREATED session, never on a config update — an update keeps the same
+        # socket and therefore the same input_audio_buffer, while a new session throws that
+        # buffer away. Audio streamed into one epoch must never be committed under another;
+        # see append_streamed_audio.
+        self._session_epoch = getattr(self, "_session_epoch", 0) + 1
         session = {
             "manager": manager,
             "conn": conn,
+            "epoch": self._session_epoch,
             "last_used": time.monotonic(),
             "language": language,
             "prompt": prompt,
             "languages": languages,
             "keywords": normalized_keywords,
+            "noise_reduction": noise_reduction,
         }
         self._sessions[key] = session
         logger.info(
@@ -1621,6 +2020,62 @@ class OpenAISTT:
             keyword_count=len(normalized_keywords),
         )
         return session
+
+    async def append_streamed_audio(
+        self,
+        key: tuple[str, str],
+        pcm_bytes: bytes,
+        sample_rate: int,
+    ) -> int | None:
+        """Push one frame of live speech into this speaker's OPEN session buffer.
+
+        Returns the session epoch the audio landed in, or None when there was nothing to append
+        to. The epoch is the whole safety mechanism: `transcribe` will only commit without
+        re-sending the audio if the session it resolves is still that same one. A session
+        recreated in between (a language change, an idle sweep, a restart) took the buffer with
+        it, so the caller falls back to sending the audio the way it always did — which is why
+        the worst case of every failure in this path is the latency this feature exists to
+        remove, never a lost sentence.
+
+        DELIBERATELY DOES NOT CREATE A SESSION. Creating one here would mean guessing this
+        speaker's language, prompt and keywords from a frame — and a session pinned to the wrong
+        language transcribes the rest of the meeting badly and silently. `process` owns session
+        lifecycle; this only ever borrows one that already exists, which in practice the
+        track-published prewarm has already opened.
+        """
+        session = getattr(self, "_sessions", {}).get(key)
+        if session is None:
+            return None
+
+        try:
+            pcm_24k = _resample_pcm16(pcm_bytes, sample_rate, REALTIME_SAMPLE_RATE)
+            await session["conn"].input_audio_buffer.append(
+                audio=base64.b64encode(pcm_24k).decode()
+            )
+        except Exception:
+            # A frame that does not land is not an error anybody needs to act on: the closed
+            # utterance still carries the whole turn. Debug, because this fires per 96ms window.
+            logger.debug("stt_stream_append_failed", meeting_id=key[0], exc_info=True)
+            return None
+
+        session["last_used"] = time.monotonic()
+        return int(session.get("epoch", 0))
+
+    async def discard_streamed_audio(self, key: tuple[str, str]) -> None:
+        """Throw away whatever has been appended but never committed for this speaker.
+
+        Called when a turn ends without a chunk to commit it — an utterance too short to
+        publish, a lost frame, an ingress that died mid-turn. Without it those samples stay in
+        the buffer and are transcribed as the opening of the NEXT turn, which is a defect that
+        compounds: every abandoned fragment makes the following utterance wronger.
+        """
+        session = getattr(self, "_sessions", {}).get(key)
+        if session is None:
+            return
+        try:
+            await session["conn"].input_audio_buffer.clear()
+        except Exception:
+            logger.debug("stt_stream_clear_failed", meeting_id=key[0], exc_info=True)
 
     def _sweep_idle_sessions(self) -> None:
         now = time.monotonic()

@@ -6,15 +6,27 @@ TTFA: 40ms (Sonic Turbo). Voice cloning: 10-15s audio sample → voice_id via AP
 
 from __future__ import annotations
 
+import asyncio
 import io
+import time
+from collections import deque
+from contextlib import suppress
 from typing import Any, cast
 
 from cartesia import AsyncCartesia
 
 from shared.lang import base_language
 from shared.logger import get_logger
+from tts_worker.prosody_context import SENTENCE_TIMEOUT_SECONDS, ProsodyContext
 
 logger = get_logger(__name__)
+
+# How long a pooled connection may sit unused before it is assumed dead.
+#
+# Not tuned against a documented Cartesia idle timeout, because there is not one to tune
+# against — it is a deliberately short guess in the safe direction. Discarding a live
+# connection costs one background dial; handing over a dead one costs a spoken sentence.
+WARM_CONNECTION_MAX_IDLE_SECONDS = 90.0
 
 
 class CartesiaSynthesizer:
@@ -49,10 +61,170 @@ class CartesiaSynthesizer:
         # this is the whole of the available range, not a tuned number.
         self.speed = speed
         self._client: AsyncCartesia | None = None
+        #: Open, unused websocket connections, newest last. See warm_up.
+        self._warm_connections: deque[tuple[Any, float]] = deque()
+        self._warm_target = 0
+        self._warm_refill_task: asyncio.Task[None] | None = None
 
     async def load(self) -> None:
         self._client = AsyncCartesia(api_key=self.api_key)
         logger.info("cartesia_ready", model=self.model, sample_rate=self.sample_rate)
+
+    async def _open_warm_connection(self) -> tuple[Any, float]:
+        client = self._require_client()
+        connection = await client.tts.websocket_connect().enter()
+        return connection, time.monotonic()
+
+    async def warm_up(self, pool_size: int = 2) -> None:
+        """Dial Cartesia before anybody speaks, so the first sentence does not pay for it.
+
+        WHAT THIS IS WORTH, MEASURED (2026-08-18, tools/probe_tts_first_audio.py)
+            Time to the listener's first audio sample, on the websocket path production runs:
+
+                cold context (dial + generate)   p50 0.669s
+                warm context (generate only)     p50 0.180s
+
+            The gap is the dial, and it was measured on its own at p50 **427.6ms**, against
+            `connection.context(...)` at **0.1ms** — the context is pure local bookkeeping. So
+            roughly three quarters of what a listener waits for on the first sentence of every
+            turn is a TCP+TLS+websocket handshake that could have happened at any earlier
+            moment.
+
+            That is also why swapping TTS model does nothing here: sonic-3.5 is already the
+            fastest of the four that exist (0.669s cold, 0.180s warm) AND the only fast one that
+            speaks Vietnamese at all — sonic-2 and sonic-turbo answer "Invalid language for
+            model" for every Vietnamese sentence.
+
+        SAME SHAPE AS OpenAISTT.warm_up, deliberately. That pool exists for the identical
+        reason on the identical kind of socket, and it already learned the lesson this would
+        otherwise have to learn again: a pool filled once at startup is a pool that helps the
+        first few speakers a process ever sees and nobody afterwards. Hence _schedule_warm_refill.
+
+        A CONNECTION, NOT A CONTEXT. A context needs a voice, a language and a model, none of
+        which are known before a translation arrives. A connection needs none of them, so this
+        can run at startup and serve whatever the meeting turns out to need.
+        """
+        self._warm_target = max(0, pool_size)
+        if self._warm_target == 0:
+            return
+
+        opened = await asyncio.gather(
+            *(self._open_warm_connection() for _ in range(self._warm_target)),
+            return_exceptions=True,
+        )
+        for result in opened:
+            if isinstance(result, BaseException):
+                logger.warning("cartesia_warm_connection_failed", error=str(result))
+            else:
+                self._warm_connections.append(result)
+        logger.info("cartesia_pool_warmed", connections=len(self._warm_connections))
+
+    def _schedule_warm_refill(self) -> None:
+        """Top the pool back up off the caller's critical path."""
+        if self._warm_target <= 0 or self._client is None:
+            return
+        existing = self._warm_refill_task
+        if existing is not None and not existing.done():
+            return
+        self._warm_refill_task = asyncio.create_task(self._refill_warm_connections())
+
+    async def _refill_warm_connections(self) -> None:
+        while len(self._warm_connections) < self._warm_target:
+            try:
+                self._warm_connections.append(await self._open_warm_connection())
+            except Exception as exc:  # noqa: BLE001 - a provider hiccup must not kill the worker
+                # Stop rather than spin: the next claim schedules another attempt, so an outage
+                # costs cold dials, never a reconnect loop.
+                logger.warning("cartesia_warm_refill_failed", error=str(exc))
+                return
+
+    def _take_warm_connection(self) -> Any | None:
+        """A pooled connection young enough to still be open, or None.
+
+        AGE IS CHECKED HERE RATHER THAN ON A TIMER, and that is the whole staleness policy.
+        A websocket left idle is eventually closed by the far end, and handing a dead one to a
+        turn would cost that sentence a fallback — which is WORSE than today, where the dial is
+        at least fresh. Discarding on the way out means a quiet meeting simply pays what it pays
+        now, while a busy one keeps drawing from a pool that traffic itself keeps fresh.
+        """
+        while self._warm_connections:
+            connection, opened_at = self._warm_connections.popleft()
+            if time.monotonic() - opened_at <= WARM_CONNECTION_MAX_IDLE_SECONDS:
+                return connection
+            # Closing is fire-and-forget: the caller is on the hot path of a spoken sentence.
+            asyncio.create_task(self._close_quietly(connection))
+        return None
+
+    @staticmethod
+    async def _close_quietly(connection: Any) -> None:
+        with suppress(Exception):
+            await connection.close()
+
+    async def close(self) -> None:
+        """Drain the pool. Stops refilling first, or the task races shutdown and reopens
+        sockets nobody will ever close."""
+        self._warm_target = 0
+        refill = self._warm_refill_task
+        if refill is not None and not refill.done():
+            refill.cancel()
+            with suppress(asyncio.CancelledError):
+                await refill
+
+        connections = [connection for connection, _opened_at in self._warm_connections]
+        self._warm_connections.clear()
+        await asyncio.gather(
+            *(self._close_quietly(connection) for connection in connections),
+            return_exceptions=True,
+        )
+
+    async def open_prosody_context(
+        self,
+        *,
+        context_id: str,
+        language: str,
+        voice_id: str | None = None,
+    ) -> tuple[ProsodyContext, Any]:
+        """A single prosodic thread for one spoken turn — see tts_worker/prosody_context.py.
+
+        Returns the context AND the connection that owns it, because the caller has to keep the
+        connection alive for the whole turn and close it afterwards; a context outliving its
+        socket is just a closed socket with extra steps.
+
+        Raw PCM rather than a WAV container: this is a stream, so there is no total length to
+        put in a header up front. ProsodyContext re-wraps each sentence in the 44-byte header
+        the publish path expects, so nothing downstream can tell the difference.
+
+        THE DIAL IS THE EXPENSIVE PART AND IT IS TAKEN FROM THE POOL WHEN THERE IS ONE.
+        `websocket_connect().enter()` measured p50 427.6ms; `connection.context(...)` measured
+        0.1ms. So a pooled connection turns a ~0.67s wait for the first audio into ~0.18s, and
+        an empty pool simply behaves exactly as this method did before — see warm_up.
+        """
+        client = self._require_client()
+        connection = self._take_warm_connection()
+        if connection is None:
+            connection = await client.tts.websocket_connect().enter()
+        # Scheduled whether or not one was taken: an empty pool is the case that most needs
+        # refilling, and a claim is the only signal that this worker is actually busy.
+        self._schedule_warm_refill()
+        context = connection.context(
+            context_id=context_id,
+            # Belt and braces with ProsodyContext's own asyncio.timeout: this one is the SDK's
+            # and may abort a wedged read closer to the socket, the other one is ours and is
+            # what actually guarantees the caller gets an exception it can fall back from.
+            timeout=SENTENCE_TIMEOUT_SECONDS,
+            model_id=self.model,
+            voice=cast(Any, {"id": voice_id or self._default_voice_id(language)}),
+            language=cast(Any, language),
+            output_format=cast(
+                Any,
+                {
+                    "container": "raw",
+                    "sample_rate": self.sample_rate,
+                    "encoding": "pcm_s16le",
+                },
+            ),
+        )
+        return ProsodyContext(context, self.sample_rate), connection
 
     async def clone_voice(
         self, audio_bytes: bytes, speaker_label: str, language: str = "en"
@@ -88,6 +260,7 @@ class CartesiaSynthesizer:
         text: str,
         language: str,
         voice_id: str | None = None,
+        generation_config: dict[str, float | str] | None = None,
     ) -> tuple[bytes, int, str]:
         """Synthesize text to speech.
 
@@ -95,6 +268,10 @@ class CartesiaSynthesizer:
             text: Text to synthesize
             language: ISO 639-1 language code (e.g. "en", "vi")
             voice_id: Cartesia voice_id from clone_voice(); None uses Cartesia default
+            generation_config: Cartesia's delivery controls — {"speed": float in [0.6, 1.5],
+                "volume": float, "emotion": str}. Built from the speaker's measured prosody
+                (shared/prosody.py) and omitted entirely when nothing was measured, so an
+                unmeasured utterance is synthesized exactly as it was before this existed.
 
         Returns:
             Tuple of (wav_bytes, duration_ms, resolved_voice_id). resolved_voice_id is
@@ -119,6 +296,15 @@ class CartesiaSynthesizer:
         # object with __aiter__ method, got coroutine". Cartesia was unreachable/misconfigured
         # before now, so neither mistake had ever been exercised end-to-end.
         client = self._require_client()
+        # `speed` (the ModelSpeed enum below) and `generation_config["speed"]` are two separate
+        # inputs and both are sent. The enum measurably does nothing on sonic-3.5 — four renders
+        # each of slow/normal/fast gave 6120/6200/5960ms medians against a 5680–6560ms spread —
+        # but it is not inert on every Cartesia model, so dropping it would be a silent
+        # behaviour change for anyone running one where it works.
+        extra: dict[str, Any] = {}
+        if generation_config:
+            extra["generation_config"] = cast(Any, generation_config)
+
         stream = await client.tts.bytes(
             model_id=self.model,
             transcript=text,
@@ -133,6 +319,7 @@ class CartesiaSynthesizer:
             ),
             language=language,
             speed=cast(Any, self.speed),
+            **extra,
         )
         chunks: list[bytes] = [chunk async for chunk in stream]
         audio_bytes: bytes = b"".join(chunks)
@@ -211,6 +398,78 @@ class CartesiaSynthesizer:
             logger.exception("cartesia_list_voices_failed", language=language)
             return []
         return voices
+
+    async def list_owned_voices(self, max_scanned: int = 5000) -> list[dict[str, Any]]:
+        """Voices this ACCOUNT owns — the ones we created, not the public library.
+
+        `is_owner=True` is the whole difference from `list_voices`, which asks for the
+        opposite. That one is looking for something to speak with, so it filters by language
+        and stops at a handful; this one is looking for something to DELETE, so it filters by
+        nothing and returns `created_at` and `name` — the caller decides what is garbage and
+        cannot do that without seeing every candidate.
+
+        Best-effort, same as `list_voices`: any failure returns [] rather than raising, which
+        makes the sweep a no-op for this cycle instead of taking the worker down.
+        """
+        voices: list[dict[str, Any]] = []
+        try:
+            client = self._require_client()
+            async for voice in client.voices.list(is_owner=True, limit=100):
+                voices.append(
+                    {
+                        "id": voice.id,
+                        "name": voice.name or "",
+                        "created_at": voice.created_at,
+                    }
+                )
+                if len(voices) >= max_scanned:
+                    logger.warning("cartesia_list_owned_voices_scan_capped", scanned=len(voices))
+                    break
+        except Exception:
+            logger.exception("cartesia_list_owned_voices_failed")
+            return []
+        return voices
+
+    async def delete_voice(self, voice_id: str) -> bool:
+        """Remove one voice from this account. True when it is gone.
+
+        Best-effort by the same rule as the two list calls: a failure here leaves a voice in
+        the account until the next sweep, which is exactly the state the sweep started from.
+        Nothing a cleanup path does is worth raising into its caller.
+
+        A voice that is already gone answers 404 and counts as failure here, which is
+        harmless — the sweep will not see it again to retry.
+        """
+        try:
+            await self._require_client().voices.delete(voice_id)
+        except Exception:
+            logger.warning("cartesia_delete_voice_failed", voice_id=voice_id, exc_info=True)
+            return False
+        logger.info("cartesia_voice_deleted", voice_id=voice_id)
+        return True
+
+    async def rename_voice(self, voice_id: str, name: str) -> bool:
+        """Rename one voice in this account. True when the new name is stored.
+
+        NOT best-effort, unlike `delete_voice` and the list calls beside it, and the difference
+        decides whether a voice leaks. The orphan sweep judges a voice by its NAME
+        (`_IN_MEETING_VOICE_PREFIX`), so this rename is the only thing that takes a carried-over
+        clone out of the sweep's sights. Its caller must not hand the voice to AuthService unless
+        this returned True: a stored profile pointing at a voice still named `speaker-` is a row
+        that goes dead in 24 hours, and the person it belongs to would hear a stranger.
+
+        So the answer is reported honestly and the caller decides, rather than being swallowed
+        into a shrug the way a cleanup failure can be.
+        """
+        try:
+            await self._require_client().voices.update(voice_id, name=name)
+        except Exception:
+            logger.warning(
+                "cartesia_rename_voice_failed", voice_id=voice_id, name=name, exc_info=True
+            )
+            return False
+        logger.info("cartesia_voice_renamed", voice_id=voice_id, name=name)
+        return True
 
     def _require_client(self) -> AsyncCartesia:
         if self._client is None:

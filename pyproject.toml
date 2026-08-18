@@ -68,6 +68,10 @@ dev = [
     "ruff>=0.1",
     "mypy>=1.8",
     "asyncpg-stubs>=0.30.2",
+    # Vocoder for tools/probe_world_roundtrip.py only. DEV, never a worker dependency: the
+    # probe asks whether reshaping Cartesia'"'"'s pitch after the fact is affordable, and the
+    # production images must not grow a native C++ vocoder to answer a question.
+    "pyworld>=0.3.5",
 ]
 
 # Production App VMs have no GPU. Pin Linux Torch packages to the official

@@ -79,13 +79,21 @@ def _build_worker(
 
 
 def _request(
-    *, origin: str = "assistant", page_context_json: str = "", mentions_json: str = ""
+    *,
+    origin: str = "assistant",
+    page_context_json: str = "",
+    mentions_json: str = "",
+    # WT-474. Present with its real default rather than left off: the worker reads
+    # `request.images_json` directly, so a stand-in that omits it passes here and would hide the
+    # day the field stops being optional. ChatRequestMessage defaults it to "".
+    images_json: str = "",
 ) -> Any:
     return SimpleNamespace(
         request_id="req-1",
         origin=origin,
         page_context_json=page_context_json,
         mentions_json=mentions_json,
+        images_json=images_json,
     )
 
 

@@ -119,6 +119,23 @@ class EmbeddingSearchRequest(BaseModel):
     collection_id: str
     query: str
     top_k: int = 5
+    # WT-463 phase 0. Who is asking — until now, nobody.
+    #
+    # The search filtered on workspace_id and ai_retrieval alone. `ai_retrieval` is a real gate
+    # but a GLOBAL one: it says whether the AI may use a resource at all, for everyone. It has no
+    # per-subject dimension, so a document that is AI-retrievable was retrievable by every member
+    # of the workspace regardless of who was allowed to open it — and documents carry a genuine
+    # per-subject ACL (WorkspaceDocumentAccessPolicy) that the REST path enforces and this path
+    # did not. The result: ask WarpBot, receive passages from a document you cannot open.
+    #
+    # `privileged` is deliberately coarse for phase 0. The honest fix is the resource's own ACL
+    # travelling in the vector payload (phase 2) so the filter is per-subject; that needs a
+    # re-index of everything already stored. This closes the bypass in the meantime, and the
+    # field it introduces is the one phase 3 replaces with a resolved subject set.
+    #
+    # DEFAULT FALSE. An older or hand-built request that omits it is treated as unprivileged, so
+    # the failure mode of a missing field is "sees less" rather than "sees everything".
+    privileged: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -128,6 +145,7 @@ class EmbeddingSearchRequest(BaseModel):
             "collection_id": self.collection_id,
             "query": self.query,
             "top_k": str(self.top_k),
+            "privileged": _bool_to_redis(self.privileged),
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -140,6 +158,8 @@ class EmbeddingSearchRequest(BaseModel):
             collection_id=d["collection_id"],
             query=d.get("query", ""),
             top_k=int(d.get("top_k", "5")),
+            # "false" on absence, matching the field's default: unknown is not privileged.
+            privileged=_redis_to_bool(d.get("privileged", "false")),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 

@@ -11,11 +11,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from shared.config import STTSettings, WorkerSettings
-from shared.schemas import STT_UNKNOWN_CONFIDENCE, AudioChunkMessage
+from shared.prosody import SpeakerBaseline
+from shared.schemas import STT_UNKNOWN_CONFIDENCE, AudioChunkMessage, ProsodyEnvelope
 from stt_worker import worker as stt_worker_module
 from stt_worker.model import (
     OpenAISTT,
     TranscribedSegment,
+    _demote_capability_from_error,
     _filter_segments,
     _guess_language_from_text,
     _normalize_language,
@@ -277,6 +279,65 @@ class TestOpenAISTT:
         assert transcription["languages"] == ["vi", "en"]
         # Structured context and confidence are independent — this model should get both.
         assert "include" in payload
+
+    def test_a_stream_reported_rejection_demotes_the_capability(self) -> None:
+        """The production outage of 2026-08-13, in one assertion.
+
+        The Realtime API ACCEPTED `session.update` carrying `languages`, said nothing, and then
+        rejected every transcription on the stream with an error event. The degradation ladder
+        only watches for an exception from `session.update`, so it recorded the capability as
+        supported; the retry rebuilt an identical session and failed identically. 304 audio
+        chunks in 45 minutes produced not one word of transcript, in every meeting at once, with
+        the UI showing translation as running the whole time.
+        """
+        reset_capability_memo()
+        error = (
+            "realtime_transcription_error: RealtimeErrorEvent(error=RealtimeError("
+            "message=\"The 'languages' parameter is not supported for this model.\", "
+            "type='invalid_request_error', code='invalid_parameter'))"
+        )
+
+        assert (
+            _demote_capability_from_error("gpt-4o-mini-transcribe", error) == "structured_context"
+        )
+
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.model = "gpt-4o-mini-transcribe"
+        stt.noise_reduction = "off"
+        payload = stt._session_payload(
+            language="vi",
+            prompt="WarpTalk meeting.",
+            allowed_languages={"vi", "en"},
+            keywords=["Codex"],
+        )
+        transcription = payload["audio"]["input"]["transcription"]
+        # The rebuilt session drops what was refused and keeps the documented singular hint,
+        # which is the whole point: degrade, do not go silent.
+        assert "languages" not in transcription
+        assert "keywords" not in transcription
+        assert transcription["language"] == "vi"
+        assert transcription["prompt"] == "WarpTalk meeting."
+
+    def test_an_unrelated_failure_does_not_strip_the_language_hint(self) -> None:
+        """A disconnect says nothing about what the model accepts.
+
+        Demoting on every error would quietly cost every model its language hint after one
+        network blip — the same silent degradation in the other direction.
+        """
+        reset_capability_memo()
+        for unrelated in (
+            "realtime_connection_closed_before_completed",
+            "asyncio.TimeoutError",
+            "RealtimeError(message='Audio buffer is empty', "
+            "code='input_audio_buffer_commit_empty')",
+        ):
+            assert _demote_capability_from_error("gpt-4o-mini-transcribe", unrelated) is None
+
+    def test_the_word_languages_in_a_transcript_is_not_a_capability_signal(self) -> None:
+        """Someone saying "this model is not supported" out loud must not disable anything."""
+        reset_capability_memo()
+        spoken = "the languages we support are not supported by that vendor"
+        assert _demote_capability_from_error("gpt-4o-mini-transcribe", spoken) is None
 
     async def test_rejected_session_degrades_one_rung_and_is_remembered(self) -> None:
         """Degrading must keep the prompt and the language hint, and learn from it.
@@ -961,8 +1022,12 @@ class TestFilterSegments:
         assert len(result) == 1
 
     def test_latin_speaker_foreign_script_filtered(self) -> None:
-        """A speaker declared in a Latin-script language emitting CJK/Kana text is the
-        model mixing languages mid-utterance — drop it to enforce "no mixing"."""
+        """With no room language set at all, the speaker's own declaration is the only
+        evidence there is, and CJK from a declared English speaker is the model mixing
+        languages mid-utterance. Dropped.
+
+        This is the WEAKEST of the three precedence cases — see the room-declared tests
+        below for the one that governs when a room has announced itself."""
         segs = [_segment("こんにちは")]
         result = _filter_segments(segs, "en", 0)
         assert result == []
@@ -1200,6 +1265,61 @@ class TestFilterSegments:
         segs = [_segment("This is a perfectly reasonable sentence for a few seconds of speech")]
         result = _filter_segments(segs, "en", 0, real_duration_s=3.0)
         assert len(result) == 1
+
+
+class TestRoomDeclaredLanguagesAreTheAllowList:
+    """A room that configured Vietnamese and Japanese must show Vietnamese and Japanese.
+
+    It was showing neither reliably: Arabic lines appeared in the transcript, and a
+    speaker registered as Vietnamese who read Japanese aloud had every kanji segment
+    deleted. Both came from the same place — a BLOCKLIST of four scripts that armed on the
+    speaker's profile language. Arabic was not on the list, so it was never dropped;
+    Japanese was, so it always was.
+    """
+
+    def test_a_script_no_declared_language_uses_is_dropped(self) -> None:
+        # The reported failure, verbatim in shape: a vi+ja room, Arabic on screen.
+        segs = [_segment("مرحبا كيف حالك اليوم")]
+        assert _filter_segments(segs, "vi", 0, allowed_languages={"vi", "ja"}) == []
+
+    def test_the_room_outranks_the_speakers_own_profile(self) -> None:
+        """The kanji case. The speaker is registered Vietnamese and is reading Japanese in
+        a room that DECLARED Japanese, so it is one of the room's languages and the
+        speaker's profile does not get to overrule that."""
+        segs = [_segment("今日の会議は九時からです")]
+        result = _filter_segments(segs, "vi", 0, allowed_languages={"vi", "ja"})
+
+        assert len(result) == 1
+        # …and it is labelled by what was WRITTEN, not by what the speaker registered.
+        # Labelled `vi` it would have gone to the translator as vi->ja and come back as
+        # nonsense, which is the garbage in the reported transcript.
+        assert result[0].language == "ja"
+
+    def test_code_switched_english_is_never_filtered(self) -> None:
+        # Latin is not filtered on at all: English product terms inside a Vietnamese
+        # sentence are the product working, not a language leak.
+        segs = [_segment("Mình sẽ deploy cái backend API này lên staging")]
+        result = _filter_segments(segs, "vi", 0, allowed_languages={"vi", "ja"})
+        assert len(result) == 1
+
+    def test_a_declared_language_is_kept_in_every_script_it_uses(self) -> None:
+        # Japanese is kana AND kanji. A rule that admitted one and not the other would
+        # chop real sentences in half.
+        for text in ("ひらがな", "カタカナ", "漢字", "今日はミーティングです"):
+            segs = [_segment(text)]
+            assert len(_filter_segments(segs, "ja", 0, allowed_languages={"vi", "ja"})) == 1, text
+
+    def test_cyrillic_and_hangul_are_dropped_from_a_vi_ja_room(self) -> None:
+        for text in ("Привет как дела сегодня", "안녕하세요 오늘 회의"):
+            segs = [_segment(text)]
+            assert _filter_segments(segs, "vi", 0, allowed_languages={"vi", "ja"}) == [], text
+
+    def test_an_undeclared_room_still_filters_nothing(self) -> None:
+        """The fail-open case, kept deliberately. A room whose language set has not been
+        published yet must not have a real speaker's transcript deleted on an assumption —
+        that regression cost a Japanese speaker every line they said."""
+        segs = [_segment("こんにちは")]
+        assert len(_filter_segments(segs, "unknown", 0)) == 1
 
 
 class TestNormalizeLanguage:
@@ -1601,6 +1721,270 @@ class TestSTTWorker:
 
         langs = await worker._get_room_languages("m1")
         assert langs == {"vi", "en", "ja"}
+
+    async def test_a_language_the_room_was_configured_for_counts_even_if_nobody_speaks_it(
+        self, mock_redis_client
+    ) -> None:
+        """The reported room, exactly: configured vi + ja, and BOTH people speak Vietnamese
+        because Japanese is what one of them LISTENS in.
+
+        On speak-languages alone the set is {vi}, so Japanese — the language the host
+        configured and the room exists to produce — counted as foreign to the room, and
+        every kanji segment was deleted as a cross-script hallucination.
+        """
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {}
+        mock_redis_client._redis.hgetall.return_value = {b"user-1": b"vi", b"user-2": b"vi"}
+        mock_redis_client._redis.get.return_value = json.dumps(
+            {"room_status": "IN_PROGRESS", "room_languages": ["vi", "ja"]}
+        ).encode()
+
+        assert await worker._get_room_languages("m1") == {"vi", "ja"}
+
+    async def test_a_speaker_who_joined_speaking_something_else_still_counts(
+        self, mock_redis_client
+    ) -> None:
+        # The union, not a replacement. Someone speaking Korean in a vi+ja room is really
+        # speaking Korean, and the configured set is not a reason to delete them.
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {}
+        mock_redis_client._redis.hgetall.return_value = {b"user-1": b"ko"}
+        mock_redis_client._redis.get.return_value = json.dumps(
+            {"room_languages": ["vi", "ja"]}
+        ).encode()
+
+        assert await worker._get_room_languages("m1") == {"vi", "ja", "ko"}
+
+    async def test_an_old_payload_without_room_languages_still_works(
+        self, mock_redis_client
+    ) -> None:
+        """A room whose audio_routes payload was published before this field existed. It
+        must degrade to the previous behaviour, not to an empty set — an empty set turns
+        filtering off, and a stale payload is not a reason to stop enforcing anything."""
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {}
+        mock_redis_client._redis.hgetall.return_value = {b"user-1": b"vi"}
+        mock_redis_client._redis.get.return_value = json.dumps(
+            {"room_status": "IN_PROGRESS"}
+        ).encode()
+
+        assert await worker._get_room_languages("m1") == {"vi"}
+
+    async def test_an_unreadable_payload_does_not_take_the_room_down(
+        self, mock_redis_client
+    ) -> None:
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {}
+        mock_redis_client._redis.hgetall.return_value = {b"user-1": b"vi"}
+        mock_redis_client._redis.get.return_value = b"{not json"
+
+        assert await worker._get_room_languages("m1") == {"vi"}
+
+
+def _pcm_tone(hz: float, seconds: float = 1.0, amplitude: float = 0.4) -> bytes:
+    """Raw 16-bit PCM at a known pitch and loudness — the format AudioChunkMessage.audio_data
+    actually carries (livekit_ingress publishes bytes(pcm), no WAV container)."""
+    import numpy as np
+
+    t = np.linspace(0, seconds, int(16000 * seconds), endpoint=False)
+    wave = np.sin(2 * np.pi * hz * t) + 0.3 * np.sin(2 * np.pi * 2 * hz * t)
+    wave = amplitude * wave / np.abs(wave).max()
+    return (wave * 32767).astype("<i2").tobytes()
+
+
+def _pcm_tone(hz: float, seconds: float = 1.0, amplitude: float = 0.4) -> bytes:
+    """Raw 16-bit PCM at a known pitch and loudness — the format AudioChunkMessage.audio_data
+    actually carries (livekit_ingress publishes bytes(pcm), no WAV container)."""
+    import numpy as np
+
+    t = np.linspace(0, seconds, int(16000 * seconds), endpoint=False)
+    wave = np.sin(2 * np.pi * hz * t) + 0.3 * np.sin(2 * np.pi * 2 * hz * t)
+    wave = amplitude * wave / np.abs(wave).max()
+    return (wave * 32767).astype("<i2").tobytes()
+
+
+class TestProsodyMeasurement:
+    """The audio exists in exactly one message on this bus, so if delivery is not measured
+    here it cannot be recovered anywhere downstream — the text is all that survives.
+
+    These pin what reaches the next stage: a measurement when there is one, silence when
+    there is not, and a transcript either way.
+    """
+
+    def _make_worker(self, mock_redis_client, worker_settings, **settings_overrides) -> STTWorker:
+        worker = STTWorker.__new__(STTWorker)
+        worker.settings = worker_settings
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker.stt_settings = STTSettings(**settings_overrides)
+        worker._paused_rooms = set()
+        worker._stt_prompts = {}
+        worker._stt_keywords = {}
+        worker._room_languages = {}
+        worker._prosody_baselines = {}
+        worker.model = MagicMock()
+        worker.model.transcribe = AsyncMock(
+            return_value=[
+                TranscribedSegment(
+                    text="Hello", language="en", confidence=-0.25, start_ms=0, end_ms=1000
+                )
+            ]
+        )
+        return worker
+
+    def _published_stt_payloads(self, mock_redis_client) -> list[dict]:
+        return [
+            call.kwargs.get("fields", call.args[1] if len(call.args) > 1 else {})
+            for call in mock_redis_client._redis.xadd.call_args_list
+            if "stt:results" in str(call.args[0])
+        ]
+
+    async def _process_tone(self, worker, mock_redis_client, hz: float, amplitude: float) -> dict:
+        mock_redis_client._redis.xadd.reset_mock()
+        chunk = AudioChunkMessage(
+            meeting_id="meeting-1",
+            speaker_id="speaker-1",
+            chunk_index=0,
+            audio_data=_pcm_tone(hz, amplitude=amplitude),
+            language="en",
+        )
+        await worker.process(b"msg-1", chunk.to_redis())
+        payloads = self._published_stt_payloads(mock_redis_client)
+        assert payloads, "expected an stt:results publish"
+        return payloads[0]
+
+    async def test_an_unheard_speaker_gets_no_delivery_attached(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings)
+
+        payload = await self._process_tone(worker, mock_redis_client, 130.0, 0.4)
+
+        # Nothing is known about how this person normally sounds, so nothing can be said
+        # about how this utterance differs from it. The field is absent, and the dub is
+        # synthesized exactly as it was before this feature existed.
+        assert "prosody" not in payload
+        assert payload["text"] == "Hello"
+
+    async def test_a_louder_higher_utterance_is_reported_against_the_speakers_own_normal(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        # Three quiet, low utterances are what "normally" means for this speaker.
+        for _ in range(3):
+            await self._process_tone(worker, mock_redis_client, 120.0, 0.2)
+
+        payload = await self._process_tone(worker, mock_redis_client, 170.0, 0.6)
+
+        envelope = ProsodyEnvelope.from_wire(payload["prosody"])
+        assert envelope is not None
+        assert envelope.pitch_lift > 1.0
+        assert envelope.energy_ratio > 1.0
+        assert envelope.arousal == "high"
+        # Never guessed from sound. Nothing upstream has read the words.
+        assert envelope.valence == ""
+
+    async def test_an_utterance_is_compared_before_it_becomes_the_normal(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        """The fold-in order is the whole difference between detecting a raised voice and
+        half-cancelling it. Folded first, a shout would partly redefine the baseline it is
+        then measured against, and every strong utterance would report as weaker than it was.
+        """
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        worker._prosody_baselines[("meeting-1", "speaker-1")] = SpeakerBaseline(
+            pitch_median_hz=100.0, pitch_iqr_hz=8.0, rms=0.1, speech_rate=1.0, sample_count=5
+        )
+
+        payload = await self._process_tone(worker, mock_redis_client, 130.0, 0.4)
+
+        envelope = ProsodyEnvelope.from_wire(payload["prosody"])
+        assert envelope is not None
+        # 130 Hz against a 100 Hz normal is 1.3. Folding first would have moved the normal to
+        # 106 Hz and reported ~1.23 — a real utterance understated by its own measurement.
+        assert envelope.pitch_lift == pytest.approx(1.3, abs=0.03)
+        # …and the normal has moved now that the comparison is done.
+        assert worker._prosody_baselines[("meeting-1", "speaker-1")].pitch_median_hz > 100.0
+
+    async def test_the_normal_is_persisted_so_a_restart_does_not_start_over(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings)
+
+        await self._process_tone(worker, mock_redis_client, 130.0, 0.4)
+
+        setex_keys = [str(call.args[0]) for call in mock_redis_client._redis.setex.call_args_list]
+        assert "prosody:baseline:meeting-1:speaker-1" in setex_keys
+
+    async def test_a_stored_normal_is_read_back_for_a_speaker_this_worker_has_not_heard(
+        self, mock_redis_client, worker_settings
+    ) -> None:
+        # The case a second replica (or a restarted one) lands in mid-meeting: without this
+        # the speaker would silently start over and lose three utterances of delivery.
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.get.return_value = json.dumps(
+            {
+                "pitch_median_hz": 100.0,
+                "pitch_iqr_hz": 8.0,
+                "rms": 0.1,
+                "speech_rate": 1.0,
+                "sample_count": 5,
+            }
+        ).encode()
+
+        payload = await self._process_tone(worker, mock_redis_client, 130.0, 0.4)
+
+        assert ProsodyEnvelope.from_wire(payload["prosody"]) is not None
+
+    async def test_a_failed_measurement_costs_the_delivery_and_nothing_else(
+        self, mock_redis_client, worker_settings, monkeypatch
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        worker._prosody_baselines[("meeting-1", "speaker-1")] = SpeakerBaseline(
+            pitch_median_hz=100.0, pitch_iqr_hz=8.0, rms=0.1, speech_rate=1.0, sample_count=5
+        )
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("numpy went wrong")
+
+        monkeypatch.setattr(stt_worker_module, "measure", explode)
+
+        payload = await self._process_tone(worker, mock_redis_client, 130.0, 0.4)
+
+        # The transcript is the product. Tone is a decoration on it, and a decoration must
+        # never be able to take the thing it decorates down with it.
+        assert payload["text"] == "Hello"
+        assert "prosody" not in payload
+
+    async def test_the_feature_can_be_turned_off_without_touching_anything_else(
+        self, mock_redis_client, worker_settings, monkeypatch
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings, prosody_enabled=False)
+        worker._prosody_baselines[("meeting-1", "speaker-1")] = SpeakerBaseline(
+            pitch_median_hz=100.0, pitch_iqr_hz=8.0, rms=0.1, speech_rate=1.0, sample_count=5
+        )
+        called = False
+
+        def spy(*args, **kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("measure() must not run when the feature is off")
+
+        monkeypatch.setattr(stt_worker_module, "measure", spy)
+
+        payload = await self._process_tone(worker, mock_redis_client, 130.0, 0.4)
+
+        assert not called
+        assert "prosody" not in payload
+        assert payload["text"] == "Hello"
 
 
 class TestConsumeLoopConcurrency:

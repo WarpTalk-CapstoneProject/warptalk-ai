@@ -39,9 +39,44 @@ class RedisSettings(BaseSettings):
     # normal long-poll does not become a retry storm under load.
     socket_timeout: float = 15.0
     socket_connect_timeout: float = 5.0
-    stream_maxlen: int = 1000  # MAXLEN ~ for XADD trimming
+    # A COUNT, and the entries it counts are audio. One tts:results entry carries ~113 KB of
+    # WAV, so 1000 of them is a 113 MB ceiling for ONE stream — and there is a set of these per
+    # room. On 2026-08-14 that filled a 768 MB production Redis to 93%, and `allkeys-lru` then
+    # began deleting live meetings' streams to make room. See stream_ttl_seconds below.
+    stream_maxlen: int = 200
     retry_max_attempts: int = 5
     retry_base_delay: float = 0.5
+
+    # How long a stream may sit unwritten before Redis drops it. Refreshed on every publish, so
+    # it only elapses after a stream has genuinely gone quiet.
+    #
+    # WHY THIS EXISTS
+    #   Nothing deleted a room's streams. `_cleanup_room` releases the LiveKit lease and the
+    #   in-process state and never touches Redis, and no other path does either — so every
+    #   meeting ever held left `audio:chunks:{room}`, `stt:results:{room}`, `translate:results:
+    #   {room}` and `tts:results:{room}` behind forever. Production held 70 such keys, 284 MB,
+    #   the oldest untouched for 10 days.
+    #
+    #   A TTL rather than a delete-on-terminal-event because the event is not reliable: the
+    #   ingress worker's terminal-status hook only fires when the backend publishes
+    #   AUDIO_ROUTES_UPDATED with a terminal status, which it suppresses for a room that never
+    #   had audio routes. Anything that depends on a message arriving leaks whenever it does
+    #   not. A refreshed TTL needs no message at all.
+    #
+    #   One hour: far longer than any late consumer, reclaim or dead-letter pass (the longest is
+    #   the 60s reclaim idle window), and short enough that a day's meetings cannot accumulate.
+    stream_ttl_seconds: int = 3600
+
+    # A consumer group that has stopped advancing must not pin the trim floor forever.
+    #
+    # `_trim_stream_without_losing_unconsumed_entries` trims to `min(last-delivered)` across all
+    # groups, which is right for a group that is merely slow and catastrophic for one that is
+    # gone. In production `billing-stt-workers` last read `stt:results` on 2026-08-10 and had
+    # held the floor of that stream for four days by 2026-08-14 — the safety check had become
+    # the leak. Past this age a group is treated as dead for trimming purposes and said so out
+    # loud, because losing unread entries for a consumer that is not consuming is the lesser
+    # harm and the silence is what let it run for four days.
+    stream_group_stale_after_seconds: int = 3600
 
 
 class LiveKitSettings(BaseSettings):
@@ -60,6 +95,23 @@ class WorkerSettings(BaseSettings):
     model_config = {"env_prefix": ""}
 
     log_level: str = "INFO"
+    # Send audio to STT WHILE the speaker is talking, instead of only once they stop.
+    #
+    # WHAT IT BUYS
+    #   Today nothing happens until VAD closes a turn: for a five-second sentence the pipeline
+    #   does zero work for five seconds and then does ~2.6s of work. The Realtime API already
+    #   separates `input_audio_buffer.append` from `.commit`, so the audio can arrive as it is
+    #   spoken and the commit at turn end finds the model has already heard it.
+    #
+    # DARK BY DEFAULT, like prosody_continuity before it and for the same reason: this changes
+    # when audio reaches a vendor, and the only honest way to learn what that does to
+    # transcription quality is to measure a real room with it on and off. Turning it on is a
+    # separate, deliberate decision.
+    #
+    # Read by BOTH the ingress worker (which publishes the frames) and the STT worker (which
+    # consumes them), so it lives on the shared settings rather than on either one.
+    stt_streaming_enabled: bool = False
+
     # Max only for uninterrupted speech; ordinary short turns still flush on VAD silence.
     # Six seconds gives the model enough lexical context for natural Vietnamese sentences
     # containing English technical terms without adding delay after an ordinary pause.
@@ -148,6 +200,19 @@ class STTSettings(BaseSettings):
     # Warm WebSockets are claimed by the first active speakers so their first utterance
     # does not pay the ~1–2s Realtime connection handshake.
     realtime_pool_size: int = 4
+    # Measure HOW an utterance was said and attach it to the transcript segment, so the dub can
+    # be delivered the way the speaker delivered it (shared/prosody.py).
+    #
+    # Off is a real position, not a placeholder: the measurement is ~3ms of CPU per second of
+    # audio (14ms for a full 6s chunk, benchmarked), and a deployment that finds that too
+    # expensive should be able to drop it without redeploying anything else. Turning it off
+    # removes the `prosody` field from stt:results; every consumer already treats that field as
+    # optional, so the pipeline reverts to exactly its pre-prosody behaviour.
+    prosody_enabled: bool = True
+    # A speaker's rolling normal lives for this long after their last utterance. Meeting-scoped
+    # on purpose — a different room means a different microphone, and a baseline built in one is
+    # not a description of how they sound in the other.
+    prosody_baseline_ttl_seconds: int = 21600  # 6h
 
 
 class TranslationSettings(BaseSettings):
@@ -230,7 +295,60 @@ class TTSSettings(BaseSettings):
     # Defaults to fast: a dub has to land inside the gap the speaker left, and at normal it
     # consistently finished after they had already moved on. Overridable as TTS_SPEED.
     speed: str = "fast"
-    voice_clone_min_seconds: float = 10.0  # Buffer threshold before calling /voices/clone
+    # Raised from 10.0. Ten seconds is Cartesia's floor, not a good reference: it is whatever
+    # the speaker happened to say first, which is usually "alo alo, nghe rõ không". Twenty
+    # seconds of ACCEPTED speech (see tts_worker/clone_sample_quality.py) is enough for the
+    # clone to carry a person's timbre rather than their microphone check.
+    voice_clone_min_seconds: float = 20.0
+    # How much audio may be held while waiting for a clip that passes the quality gate. Rejected
+    # audio slides out of the front of the buffer; without a cap a speaker in a noisy room would
+    # accumulate the whole meeting in memory and never clone.
+    voice_clone_max_buffer_seconds: float = 90.0
+    # WT-371 #9: how many times a speaker's clone may be REPLACED by a better sample within one
+    # meeting. Cloning used to happen exactly once, from the first clip that passed the gate, and
+    # the worker then stopped listening — so the voice was locked to whatever register the speaker
+    # happened to open in. Raise or crack your voice and the clone stopped being you.
+    #
+    # One upgrade, not unlimited: each re-clone is a paid Cartesia call, and the synthesised voice
+    # audibly changes when it lands. One is enough to escape a bad opening clip; more would be a
+    # voice that keeps shifting under the listener.
+    # Speak the sentences of one turn through a single Cartesia context, so prosody carries
+    # across them instead of every sentence being an independent generation — see
+    # tts_worker/prosody_context.py.
+    #
+    # ON as of 2026-08-14, at the owner's instruction, having shipped dark in v79 first.
+    #
+    # What made it safe to flip was not time passing — it was closing the one failure the
+    # fallback could not catch. Every ERROR degrades to the one-shot path, but a socket that
+    # stays up and simply never sends flush_done raises nothing: the worker holds a
+    # per-(speaker, language) lock while a sentence synthesises, so a wedged read would have
+    # stopped that speaker's dub for the rest of the meeting, silently. ProsodyContext now
+    # bounds every sentence (SENTENCE_TIMEOUT_SECONDS) so a hang becomes an exception, which
+    # the fallback does catch.
+    #
+    # Still overridable per deployment as TTS_PROSODY_CONTINUITY=false — the path has now run
+    # in production, but it has still never been listened to, and turning it off must not
+    # require a rebuild.
+    prosody_continuity: bool = True
+    # WT-397. Push each Cartesia chunk onto the LiveKit track as it arrives instead of holding
+    # the whole sentence — the wait this removes is most of the `tts_synthesis` stage measured
+    # at p50 1.00s on 43 production segments.
+    #
+    # ON from the start, unlike prosody_continuity, because the two are not comparable risks.
+    # That one was an unexercised WebSocket protocol; this one is buffering arithmetic behind a
+    # Protocol seam, and every branch of it — clean stream, context lost mid-sentence, context
+    # lost before the first chunk — is covered by tests that run in CI.
+    #
+    # What CI still cannot answer is whether a real AudioSource stays fed when audio is handed
+    # over in small pieces rather than one buffer. Cartesia generates well ahead of real time,
+    # so it should; TTS_STREAM_TO_LIVEKIT=false is here so that being wrong costs an env var
+    # and a restart rather than a release.
+    stream_to_livekit: bool = True
+    voice_clone_max_upgrades: int = 1
+    # How much better a later clip must score before it is worth replacing a working clone. Small
+    # gains are noise in the estimator, and re-cloning for them would change the voice people are
+    # listening to in exchange for nothing.
+    voice_clone_upgrade_margin: float = 0.15
     min_clone_chars: int = 8
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
@@ -244,6 +362,46 @@ class TTSSettings(BaseSettings):
     # Cartesia's public library doesn't churn often — cache the per-language catalog
     # in Redis this long before re-fetching, to avoid a /voices call on every miss.
     voice_catalog_cache_ttl_seconds: int = 21600  # 6h
+
+    # How many Cartesia websocket connections to hold open, ready for the next spoken sentence.
+    #
+    # MEASURED, not guessed (tools/probe_tts_first_audio.py, 2026-08-18): dialling Cartesia costs
+    # p50 427.6ms and building the context on an already-open connection costs 0.1ms, so this is
+    # roughly three quarters of what a listener waits for on the FIRST sentence of every turn —
+    # 0.669s cold against 0.180s warm, confirmed end to end at 0.721s -> 0.251s.
+    #
+    # Two rather than STT's four: a connection is claimed per spoken TURN, not per utterance, and
+    # a turn lasts seconds. Two covers two speakers starting at once, which is already the
+    # uncommon case, and the pool refills in the background the moment one is taken.
+    tts_warm_pool_size: int = 2
+
+    # Delete in-meeting clones from the Cartesia account once nothing can reach them.
+    #
+    # Every in-meeting clone creates a real voice in the account, and until this existed
+    # nothing ever removed one: `_clone_and_cache` caches the id at
+    # `voice:{meeting}:{speaker}` for `voice_clone_key_ttl_seconds` and then forgets it,
+    # while the voice itself stays. An upgrade (`voice_clone_max_upgrades`) orphans the
+    # previous one the same way, mid-meeting.
+    #
+    # A periodic sweep rather than a delete at end-of-meeting, because the sweep is the only
+    # form that also collects what has ALREADY leaked, and because deleting a voice while a
+    # meeting might still be speaking through it is a far worse failure than keeping one a
+    # few hours too long. See TTSWorker._sweep_orphan_voices for the rest of the reasoning.
+    orphan_voice_sweep_enabled: bool = True
+    orphan_voice_sweep_interval_seconds: int = 21600  # 6h
+    # How old an in-meeting clone must be before it is considered unreachable.
+    #
+    # NOT a tuning knob: the only pointer to one of these voices is the Redis key
+    # `voice:{meeting}:{speaker}`, whose TTL is `voice_clone_key_ttl_seconds` (12h) and is set
+    # once at clone time rather than refreshed. Twelve hours after it was made, no meeting can
+    # reach it by any path. This is that bound doubled, so the sweep is wrong only if the TTL
+    # above changes without this changing with it.
+    orphan_voice_min_age_seconds: int = 86400  # 24h
+    # Deliver the dub the way the speaker delivered it, using the prosody measured upstream
+    # (STT_PROSODY_ENABLED) and carried on the translation message. Independent of the STT flag
+    # so the measurement and its use can be turned off separately — which is what makes an A/B
+    # possible without stopping the measurement.
+    prosody_enabled: bool = True
 
 
 class AssistantSettings(BaseSettings):
@@ -268,10 +426,27 @@ class ChatAssistantSettings(BaseSettings):
     model_config = {"env_prefix": "ASSISTANT_CHAT_"}
 
     api_key: str = ""
-    model: str = "gpt-4o-mini"
+    # gpt-5.6-luna, matching what production has actually run since v47
+    # (deploy/production/app.compose.yml sets ASSISTANT_CHAT_MODEL). The default said
+    # gpt-4o-mini, so local and CI exercised a DIFFERENT model family from prod — and the two
+    # disagree on things that matter here: Luna is a reasoning model, it refuses `temperature` on
+    # /v1/responses, and it refused function tools on /v1/chat/completions outright, which is the
+    # incident tools/responses_api_probe.py exists to document. A default that does not match the
+    # deployed value is a test suite that cannot see the bug it is meant to catch.
+    model: str = "gpt-5.6-luna"
     max_tokens: int = 1024
+    # Sent only to models that accept it — responses_options() drops it for gpt-5*, which answers
+    # `temperature` with a 400 on this endpoint. Kept configured so pointing the worker back at a
+    # gpt-4 model still behaves as before.
     temperature: float = 0.4
     max_tool_iterations: int = 5
+    # OpenAI's HOSTED web_search tool, added to the /v1/responses tool list.
+    #
+    # No new vendor and no new key: it runs on the same credentials this worker already uses,
+    # and OpenAI executes it server-side, so nothing here dispatches it. It costs per call,
+    # which is the only reason it is a switch at all — `ASSISTANT_CHAT_WEB_SEARCH_ENABLED=false`
+    # turns it off with no rebuild.
+    web_search_enabled: bool = True
     # Flush a streamed chunk to Redis every N characters rather than per-token — keeps
     # Redis Stream / SignalR traffic bounded, matching the rest of the pipeline's coarse
     # buffered-unit convention (STT/TTS/AI-assistant results are never per-token either).
@@ -279,6 +454,11 @@ class ChatAssistantSettings(BaseSettings):
     workspace_service_url: str = "http://localhost:5106"
     transcript_service_url: str = "http://localhost:5103"
     translation_room_service_url: str = "http://localhost:5102"
+    # Reached only by get_platform_analytics, and only ever with the caller's own bearer token —
+    # every path behind these is gated by the platform admin policy server-side, so a normal
+    # user's assistant gets the same 403 they would get from the browser.
+    billing_service_url: str = "http://localhost:5107"
+    auth_service_url: str = "http://localhost:5101"
 
 
 class SuggestionSettings(BaseSettings):
@@ -329,6 +509,20 @@ class SuggestionSettings(BaseSettings):
 
     # Stage-0 heuristics — reject before spending a single token.
     min_words: int = 5
+    # …except for questions, which are the whole point of the feature and are usually short.
+    #
+    # `min_words: 5` measured against production: 2,214 of 4,622 stored segments (48%) are under
+    # five words, and of the 665 that end in a question mark, 261 (39%) are — including every
+    # example anybody complained about. "JavaScript là gì?" is three words. The gate was
+    # discarding the highest-value case before the decide model was ever asked, and doing it
+    # silently: stage 0 spends no tokens, so it writes no log line, and the only visible symptom
+    # was a badge that had quietly stopped appearing.
+    #
+    # A separate floor rather than a lower global one. Dropping min_words to 2 across the board
+    # would send every "ừ", "okay" and half-heard fragment to the decide model — roughly doubling
+    # the call volume to reach the same handful of suggestions. This buys back the questions and
+    # nothing else.
+    min_question_words: int = 2
     # AVG LOGPROB, not a 0-1 confidence. The `confidence` field on stt:results carries
     # the model's average token logprob straight through, so it is always <= 0 — verified
     # against production data, where 1,422 stored segments span -0.699 to 0.000 and never

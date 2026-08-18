@@ -9,6 +9,7 @@ from shared.schemas import (
     AudioChunkMessage,
     ChatRequestMessage,
     ChatResultMessage,
+    ProsodyEnvelope,
     STTResultMessage,
     SuggestionResultMessage,
     TranslationResultMessage,
@@ -230,6 +231,81 @@ class TestSTTResultMessage:
         assert msg.segment_id  # Should be auto-generated UUID
 
 
+class TestProsodyOnTheWire:
+    """How an utterance was said, carried from the audio to the synthesizer.
+
+    The pipeline throws away delivery at the STT boundary. These pin the two properties the
+    carrying depends on: an unmeasured message says nothing at all (rather than claiming
+    neutral), and a malformed one costs the dub its delivery and nothing else.
+    """
+
+    def _envelope(self) -> ProsodyEnvelope:
+        return ProsodyEnvelope(
+            pitch_lift=1.24,
+            pitch_variation=1.55,
+            energy_ratio=1.4,
+            rate_ratio=1.15,
+            arousal="high",
+            valence="positive",
+        )
+
+    def test_unmeasured_prosody_is_absent_not_neutral(self) -> None:
+        payload = STTResultMessage(
+            meeting_id="m1", speaker_id="s1", text="hi", language="en"
+        ).to_redis()
+
+        # A "neutral" placeholder would tell the TTS worker to send speed=1.0/volume=1.0 to
+        # Cartesia for a speaker nobody has measured. Absence is what makes it send nothing.
+        assert "prosody" not in payload
+        assert STTResultMessage.from_redis(payload).prosody is None
+
+    def test_stt_result_roundtrips_delivery(self) -> None:
+        original = STTResultMessage(
+            meeting_id="m1", speaker_id="s1", text="hi", language="en", prosody=self._envelope()
+        )
+
+        restored = STTResultMessage.from_redis(original.to_redis())
+
+        assert restored.prosody is not None
+        assert restored.prosody.pitch_lift == pytest.approx(1.24)
+        assert restored.prosody.energy_ratio == pytest.approx(1.4)
+        assert restored.prosody.arousal == "high"
+        assert restored.prosody.valence == "positive"
+
+    def test_translation_result_carries_it_unchanged(self) -> None:
+        original = TranslationResultMessage(
+            segment_id="seg-1",
+            meeting_id="m1",
+            speaker_id="s1",
+            original_text="xin chào",
+            translated_text="hello",
+            source_lang="vi",
+            target_lang="en",
+            prosody=self._envelope(),
+        )
+
+        restored = TranslationResultMessage.from_redis(original.to_redis())
+
+        assert restored.prosody == original.prosody
+
+    @pytest.mark.parametrize("raw", ["", "not json", "{}", '{"pl":"abc"}', "[1,2,3]"])
+    def test_a_broken_envelope_is_dropped_rather_than_raised(self, raw: str) -> None:
+        # Delivery is a decoration on the audio. Losing it must never be able to take the
+        # meeting's transcript or dub with it, so decoding cannot raise for any input.
+        assert ProsodyEnvelope.from_wire(raw) is None
+
+    def test_a_message_with_a_broken_envelope_still_parses(self) -> None:
+        payload = STTResultMessage(
+            meeting_id="m1", speaker_id="s1", text="hi", language="en"
+        ).to_redis()
+        payload["prosody"] = "{corrupt"
+
+        restored = STTResultMessage.from_redis(payload)
+
+        assert restored.text == "hi"
+        assert restored.prosody is None
+
+
 class TestTranslationResultMessage:
     """TranslationResultMessage tests."""
 
@@ -286,6 +362,48 @@ class TestTranslationResultMessage:
 
         assert "source_stt_confidence" not in payload
         assert TranslationResultMessage.from_redis(payload).source_stt_confidence is None
+
+    def test_latency_survives_the_round_trip(self) -> None:
+        """The number translation_worker measured has to reach TranscriptService intact.
+
+        transcript.translation_contents.latency_ms and TranslationContent.LatencyMs both existed
+        from the start and were NULL on all 3803 rows ever written, because the worker measured
+        the duration, logged it, and dropped it at the process boundary. Carrying it on the
+        message is the whole of the fix, so this asserts the carrying.
+        """
+        payload = TranslationResultMessage(
+            segment_id="seg-123",
+            meeting_id="meeting-123",
+            speaker_id="speaker-1",
+            original_text="Hello",
+            translated_text="Xin chao",
+            source_lang="en",
+            target_lang="vi",
+            latency_ms=734,
+        ).to_redis()
+
+        assert payload["latency_ms"] == "734"
+        assert TranslationResultMessage.from_redis(payload).latency_ms == 734
+
+    def test_unmeasured_latency_is_omitted_rather_than_zero(self) -> None:
+        """Nothing translated means no duration to report — and 0 is not that.
+
+        The empty-sentence flush publishes a message no translator ever touched. Sending 0 for it
+        would land a real-looking measurement in the column and drag down every average computed
+        over it, which is worse than the NULL this replaces.
+        """
+        payload = TranslationResultMessage(
+            segment_id="seg-123",
+            meeting_id="meeting-123",
+            speaker_id="speaker-1",
+            original_text="",
+            translated_text="",
+            source_lang="en",
+            target_lang="vi",
+        ).to_redis()
+
+        assert "latency_ms" not in payload
+        assert TranslationResultMessage.from_redis(payload).latency_ms is None
 
 
 class TestOptionalConfidence:

@@ -65,6 +65,80 @@ async def test_subscription_resolution_uses_redis_room_projection_not_foreign_da
     worker.db.resolve_subscription.assert_awaited_once_with(workspace_id)
 
 
+async def test_subscription_resolution_reads_the_versioned_projection_key() -> None:
+    """The key is a cross-repo contract, and nothing was pinning it.
+
+    MeetingService owns `meeting:room:v2:<id>` and bumped it to v2 in WT-428. This reader kept
+    asking for the unversioned key; nothing writes that any more, so every settlement found no
+    projection, raised, retried and dead-lettered — while the meeting itself worked perfectly and
+    simply billed nothing.
+
+    The two tests either side of this one both stub `redis.get` with a blanket AsyncMock, so they
+    pass whatever key is asked for. That is why the break was invisible. This one asserts the
+    string.
+    """
+    room_id = str(uuid.uuid4())
+    workspace_id = str(uuid.uuid4())
+    worker = BillingSettlementWorker.__new__(BillingSettlementWorker)
+    worker._subscription_cache = {}
+    worker.settings = MagicMock()
+    worker.settings.subscription_cache_ttl_seconds = 300
+    worker.redis = MagicMock()
+    worker.redis.get = AsyncMock(
+        return_value=(f'{{"WorkspaceId":"{workspace_id}","Status":"IN_PROGRESS"}}').encode()
+    )
+    worker.db = MagicMock()
+    worker.db.resolve_subscription = AsyncMock(return_value=(uuid.uuid4(), uuid.UUID(workspace_id)))
+
+    await worker._resolve_subscription(room_id)
+
+    worker.redis.get.assert_awaited_once_with(f"meeting:room:v2:{room_id}")
+
+
+def _externality_worker(hget_result: object) -> BillingSettlementWorker:
+    worker = BillingSettlementWorker.__new__(BillingSettlementWorker)
+    worker.redis = MagicMock()
+    worker.redis.redis = MagicMock()
+    if isinstance(hget_result, Exception):
+        worker.redis.redis.hget = AsyncMock(side_effect=hget_result)
+    else:
+        worker.redis.redis.hget = AsyncMock(return_value=hget_result)
+    return worker
+
+
+async def test_a_guest_speaker_is_attributed_as_external() -> None:
+    worker = _externality_worker(b"1")
+
+    assert await worker._is_external_speaker("room-1", "speaker-1") is True
+    worker.redis.redis.hget.assert_awaited_once_with(
+        "translationRoom:room-1:external_participants", "speaker-1"
+    )
+
+
+async def test_a_member_speaker_is_not_external() -> None:
+    assert await _externality_worker(b"0")._is_external_speaker("room-1", "speaker-1") is False
+
+
+async def test_an_evicted_or_absent_field_attributes_as_internal() -> None:
+    # Redis runs allkeys-lru and drops live meeting state. Under-attributing external spend is
+    # tolerable; inventing it, or failing the settlement, is not.
+    assert await _externality_worker(None)._is_external_speaker("room-1", "speaker-1") is False
+
+
+async def test_a_redis_failure_never_costs_the_usage_record() -> None:
+    worker = _externality_worker(ConnectionError("redis is down"))
+
+    assert await worker._is_external_speaker("room-1", "speaker-1") is False
+
+
+async def test_a_missing_speaker_id_is_not_external() -> None:
+    # The __MEETING_END__ sentinel and friends reach here with no usable speaker.
+    worker = _externality_worker(b"1")
+
+    assert await worker._is_external_speaker("room-1", None) is False
+    worker.redis.redis.hget.assert_not_awaited()
+
+
 async def test_subscription_resolution_fails_when_room_projection_is_missing() -> None:
     room_id = str(uuid.uuid4())
     worker = BillingSettlementWorker.__new__(BillingSettlementWorker)

@@ -22,6 +22,10 @@ WHAT IT ANSWERS
     3. Which streaming events carry assistant text, and which carry tool arguments?
     4. How is a tool RESULT fed back for the next turn?
     5. What signals "the model is done" versus "it wants a tool"?
+    6. WT-474: does Luna accept `input_image` and `input_file` content parts at all, and in what
+       shape? This one cannot be answered from the code: the worker builds those parts, but nothing
+       in the test suite talks to the live API, so "Luna is multimodal" is an assumption until this
+       probe says otherwise. gpt-4o-mini takes both; a reasoning model is a different question.
 
 Prints event TYPES and shapes, never message content beyond short excerpts, and never
 the API key (read via the same load_dotenv() the workers use).
@@ -214,6 +218,80 @@ async def run() -> None:
             )
         else:
             print("    skipped: the model did not request the tool")
+
+        # WT-474. Asked LAST so a failure here cannot mask the tool-calling answers above, which
+        # are what the agent loop depends on.
+        print("  [4] attachment content parts (WT-474)")
+        await probe_attachment(
+            client,
+            model,
+            "input_image",
+            {"type": "input_image", "image_url": TINY_PNG},
+        )
+        await probe_attachment(
+            client,
+            model,
+            "input_file",
+            {"type": "input_file", "filename": "probe.pdf", "file_data": TINY_PDF},
+        )
+
+
+#: A 1x1 transparent PNG and a two-line PDF, small enough to inline and real enough to be parsed.
+#: Nothing here is user content, so the probe can be run against prod credentials safely.
+#: Generated programmatically rather than pasted: a hand-copied base64 blob that does not
+#: decode makes the API answer "does not represent a valid image", which reads exactly like
+#: "this model cannot take images" and is not the same statement at all. Both fixtures below
+#: are real files — a 1x1 truecolour PNG and a one-page PDF with a text object.
+TINY_PNG = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSu"
+    "QmCC"
+)
+TINY_PDF = (
+    "data:application/pdf;base64,"
+    "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoK"
+    "PDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUg"
+    "L1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAyMDAgNTBdIC9SZXNvdXJjZXMgPDwgL0ZvbnQgPDwg"
+    "L0YxIDUgMCBSID4+ID4+IC9Db250ZW50cyA0IDAgUiA+PgplbmRvYmoKNCAwIG9iago8PCAvTGVuZ3RoIDQ0ID4+"
+    "CnN0cmVhbQpCVCAvRjEgMTIgVGYgMTAgMjAgVGQgKFdhcnBUYWxrIHByb2JlKSBUaiBFVAplbmRzdHJlYW0KZW5k"
+    "b2JqCjUgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+"
+    "CmVuZG9iagp4cmVmCjAgNgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1"
+    "OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyNDAgMDAwMDAgbiAKMDAwMDAwMDMzNCAwMDAw"
+    "MCBuIAp0cmFpbGVyCjw8IC9TaXplIDYgL1Jvb3QgMSAwIFIgPj4Kc3RhcnR4cmVmCjQwNAolJUVPRgo="
+)
+
+
+async def probe_attachment(
+    client: AsyncOpenAI,
+    model: str,
+    label: str,
+    part: dict[str, Any],
+) -> None:
+    """WT-474: ask whether ONE content-part shape is accepted, and print the verdict.
+
+    Non-streaming and unbounded on purpose — the question is whether the request is accepted, not
+    what the answer says, and a 400 arrives faster and more legibly without a stream to unwind.
+    """
+    try:
+        response = await client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Reply with one word: ACCEPTED."},
+                        part,
+                    ],
+                }
+            ],
+            max_output_tokens=32,
+        )
+    except Exception as exc:  # noqa: BLE001 - the message IS the result
+        print(f"    {label:14s} REJECTED — {str(exc)[:220]}")
+        return
+
+    text = getattr(response, "output_text", "") or ""
+    print(f"    {label:14s} accepted — replied {text.strip()[:40]!r}")
 
 
 if __name__ == "__main__":

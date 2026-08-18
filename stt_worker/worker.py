@@ -18,7 +18,20 @@ from typing import Any
 
 from shared.base_worker import BaseWorker
 from shared.config import STTSettings, resolve_openai_api_key
-from shared.schemas import AudioChunkMessage, STTResultMessage
+from shared.prosody import (
+    SpeakerBaseline,
+    measure,
+    pcm16_to_float,
+    to_delivery,
+    update_baseline,
+)
+from shared.schemas import (
+    STT_FRAME_STREAM,
+    AudioChunkMessage,
+    AudioFrameMessage,
+    ProsodyEnvelope,
+    STTResultMessage,
+)
 from shared.text_utils import split_into_sentences
 from stt_worker.model import OpenAISTT, _normalize_language
 
@@ -52,10 +65,40 @@ def _extract_speaker_key(
 # prompt) so a newly joined speaker's language is picked up within a few seconds.
 _ROOM_LANGUAGES_TTL_S = 15.0
 
+# Denoising modes the provider accepts. An unrecognised string fails the WHOLE session update,
+# taking the language hint and the keywords down with it — _degrade_session_config exists because
+# that has happened before.
+_NOISE_REDUCTION_MODES = {"off", "near_field", "far_field"}
+# Denoising is re-read on a short TTL, and that is a FIX rather than a tuning choice.
+#
+# It used to be cached for as long as the worker remembered the room, which silently cancelled the
+# mid-meeting change OpenAISTT._get_or_create_session goes out of its way to support: that method
+# compares `noise_reduction` and issues a session.update on the LIVE socket when it differs, and
+# nothing could ever hand it a different value. Two halves of one feature, disagreeing.
+_NOISE_REDUCTION_TTL_S = 5.0
+
 _RECENT_CONTEXT_SEGMENTS = 4
 _MAX_STT_PROMPT_CHARS = 600
 _MAX_GLOSSARY_CHARS = 240
-_MAX_STT_KEYWORDS = 100
+# WT-426. Was 100, while the writer (GlossaryStartedEventConsumer) only ever sends 10.
+#
+# The gap was not harmless. This is the LAST bound before the list reaches the provider, and a
+# reader more permissive than its writer stops being a bound at all — anything that ever wrote
+# more, by hand or by a future change, would sail straight through.
+#
+# And the list is not free vocabulary. It is a thumb on the scale, and on marginal audio the model
+# resolves ambiguity INTO it: a noisy production meeting on 15 Aug transcribed "voice clone" as
+# "Cũng là ChatGPT" and emitted "WarpTalk, WarpBot, Codex." as an utterance nobody spoke. Every one
+# of those is a glossary term.
+#
+# Deliberately a little above the writer's 10 rather than equal to it: this is a safety ceiling,
+# not a second opinion about how many terms are right. That decision belongs at the writer, where
+# workspace and global terms can be told apart.
+_MAX_STT_KEYWORDS = 16
+
+# Long enough to outlive any real meeting, short enough that a finished room's anchor expires on
+# its own. Matches the horizon the other per-room keys use.
+_TRANSCRIPT_ANCHOR_TTL_S = 6 * 60 * 60
 _CONTEXT_MIN_CONFIDENCE = -0.35
 _ACTIVE_TRANSLATION_STATES = {"IN_PROGRESS", "AUDIO_ROUTING_ACTIVE"}
 
@@ -114,6 +157,18 @@ class STTWorker(BaseWorker):
         # (meeting_id, speaker_id) -> lock serializing THAT speaker's own chunks — see
         # _consume_loop for why.
         self._speaker_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # (meeting_id, speaker_id) -> (turn_id, session epoch, next expected seq) for a turn
+        # whose frames have been appended but which no chunk has committed yet. Absent means
+        # the buffer cannot be trusted — see _append_speech_frame.
+        self._streamed_turns: dict[tuple[str, str], tuple[str, int, int]] = {}
+        # (meeting_id, speaker_id) -> how that speaker normally sounds in THIS room. Held in
+        # memory and mirrored to Redis so a restart or a second replica does not start every
+        # speaker from scratch — see _speaker_baseline.
+        self._prosody_baselines: dict[tuple[str, str], SpeakerBaseline] = {}
+        # meeting_id -> the millisecond every seat measures this meeting's transcript from.
+        # See _elapsed_ms: this replaced a per-TRACK chunk counter that reset on every
+        # ingress reconnect and sent the transcript clock back to zero mid-meeting.
+        self._transcript_anchors: dict[str, int] = {}
         self._prewarm_listener_task: asyncio.Task[None] | None = None
 
     async def load_model(self) -> None:
@@ -127,6 +182,140 @@ class STTWorker(BaseWorker):
         await self.model.load()
         await self.model.warm_up(pool_size=self.stt_settings.realtime_pool_size)
         self._prewarm_listener_task = asyncio.create_task(self._listen_for_track_prewarm())
+        # Started unconditionally, and that is the point of flash mode being per ROOM.
+        #
+        # It used to be gated on `settings.stt_streaming_enabled`, which made the deployment
+        # default a hard ceiling: with it false — the shipping default — no room could ever turn
+        # streaming on, because the loop that consumes the frames did not exist. The producer
+        # (livekit_ingress_worker._flash_mode_enabled) is where the decision now lives, so a room
+        # with flash mode off simply publishes nothing and this loop blocks on an empty stream,
+        # which costs one idle XREAD.
+        self._frame_consumer_task = asyncio.create_task(self._consume_speech_frames())
+
+    async def _consume_speech_frames(self) -> None:
+        """Append live speech to each speaker's open session WHILE they are still talking.
+
+        WHAT THIS BUYS
+            Without it the pipeline is deaf until VAD closes a turn: a five-second sentence
+            produces zero work for five seconds and then ~2.6s of it. The Realtime API separates
+            `input_audio_buffer.append` from `.commit`, so the audio can arrive as it is spoken
+            and the commit in `process` finds a model that has already heard it.
+
+        THIS LOOP NEVER TRANSCRIBES. It appends, and nothing else. Every decision that produces
+        output — prosody, the transcript anchor, language override, the confidence and
+        hallucination gates, what reaches `stt:results` — stays exactly where it was, on the
+        `audio:chunks` message. That is deliberate: a frame carries no confidence signal and no
+        no-speech probability, and a pipeline that published from frames is the one that put
+        hallucinated partials in front of users (see on_early_segment, kept at None).
+
+        FAILURE IS ALWAYS BACKWARDS, NEVER SIDEWAYS. A frame that does not arrive, a session
+        that does not exist yet, a Redis hiccup — each costs the latency this feature was going
+        to save and nothing else, because the closed utterance still carries the whole turn's
+        audio and `transcribe` falls back to sending it.
+        """
+        group = "stt-frame-workers"
+        while not self._shutdown_event.is_set():
+            try:
+                async for _msg_id, data in self.redis.consume(
+                    stream=STT_FRAME_STREAM,
+                    group=group,
+                    consumer=self._consumer_name,
+                    block_ms=2000,
+                    count=16,
+                ):
+                    await self._append_speech_frame(data)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.exception("stt_frame_consumer_error")
+                await asyncio.sleep(1.0)
+
+    async def _append_speech_frame(self, data: dict[bytes, bytes]) -> None:
+        try:
+            frame = AudioFrameMessage.from_redis(data)
+        except Exception:
+            self.logger.debug("stt_frame_unreadable", exc_info=True)
+            return
+
+        key = (frame.meeting_id, frame.speaker_id)
+        streaming: dict[tuple[str, str], tuple[str, int, int]] | None = getattr(
+            self, "_streamed_turns", None
+        )
+        if streaming is None:
+            streaming = {}
+            self._streamed_turns = streaming
+
+        # A NEW TURN ARRIVING WHILE THE PREVIOUS ONE IS STILL OPEN means that previous turn will
+        # never be committed — the utterance was too short for ingress to publish, or its chunk
+        # was lost, or ingress died mid-turn. Its samples are still sitting in the buffer, and
+        # left there they are transcribed as the opening of THIS turn. That defect compounds:
+        # every abandoned fragment makes the next utterance wronger.
+        #
+        # One rule, no extra protocol. A marker message from ingress would have covered only the
+        # case ingress knows about.
+        async def abandon(reason: str, **fields: Any) -> None:
+            """Stop trusting this speaker's buffer, and empty it.
+
+            THE RULE THIS ENFORCES, AND WHY IT IS ABSOLUTE
+                A commit is only safe if the buffer holds the WHOLE turn and nothing else. A
+                turn missing one frame does not fail loudly — it transcribes with a hole and
+                publishes the result as authoritative, which is the confident-fluent-wrong
+                failure this pipeline has repeatedly proven nobody spots from the outside.
+
+                So every way a frame can fail to land ends here: no session, a refused append, a
+                gap in the sequence, a commit already in flight. Forgetting the turn makes
+                `process` send the audio itself — the pre-streaming path — and clearing the
+                buffer stops the partial from being read as the opening of the next turn.
+            """
+            streaming.pop(key, None)
+            await self._require_model().discard_streamed_audio(key)
+            self.logger.info(
+                "stt_stream_turn_abandoned",
+                reason=reason,
+                meeting_id=frame.meeting_id,
+                speaker_id=frame.speaker_id,
+                **fields,
+            )
+
+        previous = streaming.get(key)
+        if previous is not None and previous[0] != frame.turn_id:
+            # The previous turn will never be committed: too short for ingress to publish, or
+            # its chunk was lost, or ingress died mid-turn.
+            await abandon("previous_turn_never_committed", abandoned_turn=previous[0])
+            previous = None
+
+        # A GAP MEANS THE BUFFER IS NO LONGER THE TURN. `seq` exists for exactly this: the
+        # stream guarantees order, not delivery, and publish_ephemeral trims unread frames on
+        # purpose rather than growing Redis. A dropped frame must therefore be visible here, not
+        # discovered as a hole in a published sentence.
+        expected_seq = previous[2] if previous is not None else 0
+        if frame.seq != expected_seq:
+            await abandon("frame_gap", expected_seq=expected_seq, got_seq=frame.seq)
+            return
+
+        # A COMMIT FOR THIS SPEAKER IS IN FLIGHT. `_consume_loop`'s own docstring says why this
+        # lock exists: two things using one reused WebSocket session at once interleave the
+        # transcription stream. Appending mid-commit would put this frame — which belongs to the
+        # NEXT turn — inside the one being committed.
+        #
+        # Skipped rather than awaited: this loop serves every speaker in every room, and blocking
+        # it behind one speaker's commit (bounded by TRANSCRIBE_EVENT_TIMEOUT_S = 15s) would stall
+        # the frames of all the others.
+        lock = self._speaker_locks.setdefault(key, asyncio.Lock())
+        if lock.locked():
+            await abandon("commit_in_flight")
+            return
+
+        async with lock:
+            epoch = await self._require_model().append_streamed_audio(
+                key, frame.audio_data, frame.sample_rate
+            )
+        if epoch is None:
+            # No session yet (the prewarm has not opened one), or the append was refused.
+            # Either way this turn is no longer whole.
+            await abandon("append_failed")
+            return
+        streaming[key] = (frame.turn_id, epoch, frame.seq + 1)
 
     async def _listen_for_track_prewarm(self) -> None:
         """Prepare the speaker's Realtime socket during room join, before first speech."""
@@ -277,11 +466,26 @@ class STTWorker(BaseWorker):
         # reliable signal we get that a meeting is truly done.
         self._stt_prompts.pop(room_id, None)
         getattr(self, "_stt_keywords", {}).pop(room_id, None)
+        getattr(self, "_transcript_anchors", {}).pop(room_id, None)
         getattr(self, "_recent_transcripts", {}).pop(room_id, None)
         self._room_languages.pop(room_id, None)
+        getattr(self, "_room_noise_reduction", {}).pop(room_id, None)
+        # Same reasoning as the four above: one entry per (meeting, speaker) whose turn was
+        # open when the room ended, held forever otherwise.
+        for noise_key in [
+            k for k in getattr(self, "_speaker_noise_reduction", {}) if k[0] == room_id
+        ]:
+            self._speaker_noise_reduction.pop(noise_key, None)
+        for streamed_key in [k for k in getattr(self, "_streamed_turns", {}) if k[0] == room_id]:
+            self._streamed_turns.pop(streamed_key, None)
         stale_speakers = [key for key in self._speaker_locks if key[0] == room_id]
         for key in stale_speakers:
             self._speaker_locks.pop(key, None)
+        # Baselines are per (meeting, speaker) and describe a microphone in a room that no
+        # longer exists. The Redis copy expires on its own TTL; this is the in-process one.
+        baselines = self._baselines()
+        for key in [key for key in baselines if key[0] == room_id]:
+            baselines.pop(key, None)
 
     async def _cleanup(self) -> None:
         task = getattr(self, "_prewarm_listener_task", None)
@@ -322,10 +526,20 @@ class STTWorker(BaseWorker):
             is_final=chunk.is_final_chunk,
         )
 
-        chunk_offset_ms = chunk.chunk_index * self.settings.chunk_duration_ms
+        chunk_offset_ms = await self._elapsed_ms(chunk)
         language_hint = _language_hint_for_stt(chunk.language)
         allowed_languages = await self._get_room_languages(chunk.meeting_id)
         keywords = await self._get_stt_keywords(chunk.meeting_id)
+        noise_reduction = await self._get_noise_reduction(chunk.meeting_id, chunk.speaker_id)
+
+        # Measured CONCURRENTLY with recognition, not before it. Transcription is a
+        # network round trip of hundreds of milliseconds; the measurement is single-digit
+        # milliseconds of CPU in a thread. Started here and collected after, it costs the
+        # pipeline no wall-clock at all — which is the only way a delivery feature earns its
+        # place in front of a live meeting.
+        prosody_task: asyncio.Task[ProsodyEnvelope | None] | None = None
+        if self.stt_settings.prosody_enabled:
+            prosody_task = asyncio.create_task(self._measure_prosody(chunk))
 
         t0 = time.monotonic()
         try:
@@ -363,6 +577,37 @@ class STTWorker(BaseWorker):
                     inference_offset_ms=int((time.monotonic() - t0) * 1000),
                 )
 
+            # THE COMMIT SIDE OF STREAMING. `_append_speech_frame` put this turn's audio into
+            # the session while the speaker was still producing it; this hands `transcribe` the
+            # epoch it landed in so the commit can happen without sending the audio a second
+            # time. Popped rather than read: this turn ends here either way, and a stale entry
+            # would let the NEXT turn commit against an epoch that no longer describes it.
+            #
+            # None whenever anything at all was different — streaming off, no frames arrived, an
+            # older ingress that sends no turn_id — and None means "send the audio", which is
+            # exactly what this method did before any of this existed.
+            # getattr, matching every other per-room cache reached from process(): the test
+            # suites build workers with __new__ rather than through __init__, and a field that
+            # only exists on a fully-constructed worker would make each of those a crash.
+            streamed_turns: dict[tuple[str, str], tuple[str, int, int]] = getattr(
+                self, "_streamed_turns", {}
+            )
+            streamed = streamed_turns.pop((chunk.meeting_id, chunk.speaker_id), None)
+            streamed_epoch = (
+                streamed[1] if streamed is not None and streamed[0] == chunk.turn_id else None
+            )
+            if streamed is not None and streamed_epoch is None:
+                # Frames were appended under a DIFFERENT turn than the one this chunk closes, so
+                # they belong to a turn nothing will commit. Left in the buffer they would be
+                # transcribed as the opening of this one.
+                await model.discard_streamed_audio((chunk.meeting_id, chunk.speaker_id))
+                self.logger.info(
+                    "stt_stream_turn_mismatch",
+                    meeting_id=chunk.meeting_id,
+                    buffered_turn=streamed[0],
+                    chunk_turn=chunk.turn_id,
+                )
+
             segments = await model.transcribe(
                 chunk.audio_data,
                 sample_rate=chunk.sample_rate,
@@ -376,12 +621,14 @@ class STTWorker(BaseWorker):
                 prompt=None,
                 allowed_languages=allowed_languages,
                 keywords=keywords,
+                noise_reduction=noise_reduction,
                 # Realtime delta events carry neither confidence nor no-speech
                 # probability. Publishing them allowed hallucinated partials to reach
                 # translation/UI before the completed event could be validated. They
                 # may only warm the private speculative translation cache below.
                 on_early_segment=None,
                 on_speculative_segment=publish_speculative,
+                streamed_epoch=streamed_epoch,
             )
         except Exception as exc:
             await self.redis.publish_system_event(
@@ -403,6 +650,11 @@ class STTWorker(BaseWorker):
             )
             segments = []
         inference_ms = int((time.monotonic() - t0) * 1000)
+
+        # Awaited even when recognition failed, so the task is never left orphaned — and its
+        # baseline update is still worth keeping: the speaker did speak, whatever the model
+        # made of it.
+        prosody = await prosody_task if prosody_task is not None else None
 
         self.logger.info(
             "inference_complete",
@@ -433,6 +685,10 @@ class STTWorker(BaseWorker):
                 chunk_index=chunk.chunk_index,
                 is_final_chunk=chunk.is_final_chunk,
                 timestamp_ms=chunk.timestamp_ms,
+                # Every segment recognised in this chunk shares the chunk's delivery. The
+                # measurement's granularity is the audio, and splitting it per segment would
+                # be inventing precision that was never measured.
+                prosody=prosody,
             )
 
             await self.publish("stt:results", chunk.meeting_id, result.to_redis())
@@ -464,6 +720,128 @@ class STTWorker(BaseWorker):
                 timestamp_ms=chunk.timestamp_ms,
             )
             await self.publish("stt:results", chunk.meeting_id, result.to_redis())
+
+    async def _measure_prosody(self, chunk: AudioChunkMessage) -> ProsodyEnvelope | None:
+        """How this chunk was said, relative to how this speaker normally says things.
+
+        Returns None whenever there is nothing honest to report — unusable audio, or a speaker
+        the room has not heard enough of yet. None is not a failure and not "neutral": it means
+        the field is omitted, and the TTS worker then synthesizes exactly as it did before this
+        feature existed.
+
+        Never raises. A meeting must not lose its transcript because a measurement of tone went
+        wrong, so every failure here degrades to None and is logged.
+        """
+        try:
+            pcm = pcm16_to_float(chunk.audio_data)
+            # measure() is a per-frame Python loop over numpy — ~14ms for a full 6s chunk. Off
+            # the event loop so it cannot stall the other speakers being handled concurrently.
+            features = await asyncio.to_thread(measure, pcm, chunk.sample_rate)
+            if not features.is_usable:
+                return None
+
+            key = (chunk.meeting_id, chunk.speaker_id)
+            baseline = await self._speaker_baseline(key)
+
+            # Compare FIRST, then fold in. The other order would let a shout become part of the
+            # normal it is being measured against, and every strong utterance would partly
+            # cancel its own detection.
+            delivery = to_delivery(features, baseline)
+            await self._store_baseline(key, update_baseline(baseline, features))
+
+            if not delivery.is_measured:
+                return None
+
+            return ProsodyEnvelope(
+                pitch_lift=delivery.pitch_lift,
+                pitch_variation=delivery.pitch_variation,
+                energy_ratio=delivery.energy_ratio,
+                rate_ratio=delivery.rate_ratio,
+                arousal=delivery.arousal,
+                # Left empty on purpose: valence is a judgement about the words, and this worker
+                # has only heard the sound. See ProsodyEnvelope.valence.
+                valence="",
+            )
+        except Exception:
+            self.logger.warning(
+                "prosody_measurement_failed",
+                meeting_id=chunk.meeting_id,
+                speaker_id=chunk.speaker_id,
+                chunk_index=chunk.chunk_index,
+                exc_info=True,
+            )
+            return None
+
+    def _baselines(self) -> dict[tuple[str, str], SpeakerBaseline]:
+        """The in-process baseline table, created on demand — same defensive shape as
+        `_route_states` below, and for the same reason: workers built without __init__."""
+        baselines: dict[tuple[str, str], SpeakerBaseline] | None = getattr(
+            self, "_prosody_baselines", None
+        )
+        if baselines is None:
+            baselines = {}
+            self._prosody_baselines = baselines
+        return baselines
+
+    def _baseline_key(self, key: tuple[str, str]) -> str:
+        meeting_id, speaker_id = key
+        return f"prosody:baseline:{meeting_id}:{speaker_id}"
+
+    async def _speaker_baseline(self, key: tuple[str, str]) -> SpeakerBaseline:
+        """This speaker's rolling normal, from memory or (once) from Redis.
+
+        Redis is what makes the baseline survive a worker restart and lets a second replica
+        pick up a speaker mid-meeting without starting their normal over. Two replicas holding
+        the same speaker can lose an update to each other; that is accepted rather than locked
+        against, because the value is an exponential moving average whose whole purpose is to
+        be insensitive to any single sample.
+        """
+        baselines = self._baselines()
+        cached = baselines.get(key)
+        if cached is not None:
+            return cached
+
+        baseline = SpeakerBaseline()
+        try:
+            raw = await self.redis.get(self._baseline_key(key))
+            if raw:
+                d = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                baseline = SpeakerBaseline(
+                    pitch_median_hz=float(d["pitch_median_hz"]),
+                    pitch_iqr_hz=float(d["pitch_iqr_hz"]),
+                    rms=float(d["rms"]),
+                    speech_rate=float(d["speech_rate"]),
+                    sample_count=int(d["sample_count"]),
+                )
+        except Exception:
+            # A corrupt or unreachable baseline means this speaker starts over, which costs
+            # them MIN_BASELINE_SAMPLES utterances of plain delivery. Nothing else.
+            self.logger.warning("prosody_baseline_read_failed", exc_info=True)
+
+        baselines[key] = baseline
+        return baseline
+
+    async def _store_baseline(self, key: tuple[str, str], baseline: SpeakerBaseline) -> None:
+        self._baselines()[key] = baseline
+        try:
+            await self.redis.set_with_ttl(
+                self._baseline_key(key),
+                json.dumps(
+                    {
+                        "pitch_median_hz": round(baseline.pitch_median_hz, 3),
+                        "pitch_iqr_hz": round(baseline.pitch_iqr_hz, 3),
+                        "rms": round(baseline.rms, 6),
+                        "speech_rate": round(baseline.speech_rate, 4),
+                        "sample_count": baseline.sample_count,
+                    },
+                    separators=(",", ":"),
+                ),
+                self.stt_settings.prosody_baseline_ttl_seconds,
+            )
+        except Exception:
+            # In-memory copy is already updated, so this worker keeps working; only the
+            # hand-over to a restart or a sibling replica is lost.
+            self.logger.warning("prosody_baseline_write_failed", exc_info=True)
 
     async def _translation_state_allows_stt(self, meeting_id: str) -> bool:
         """Reject queued audio when the authoritative room state is known inactive.
@@ -527,6 +905,177 @@ class STTWorker(BaseWorker):
             glossary = cached
 
         return glossary[:_MAX_GLOSSARY_CHARS] or None
+
+    async def _elapsed_ms(self, chunk: AudioChunkMessage) -> int:
+        """How far into the MEETING this chunk is, in milliseconds. WT-421.
+
+        THE BUG THIS REPLACES
+            This was `chunk.chunk_index * chunk_duration_ms` — the chunk's position within its
+            TRACK. `chunk_index` restarts at 0 whenever an ingress track reconnects, so every
+            reconnect sent the transcript's clock back to the beginning of the meeting.
+
+            The web side already knew: dedupeTranscriptSegments carries the comment "Arrival order
+            stays valid when a reconnected ingress track resets startTimeMs". It defends against
+            the symptom. Nothing fixed the cause, and the cause is that a per-track counter was
+            being published under a contract that says "elapsed ms from room start" —
+            TranscriptPanel's `baseTime`.
+
+            Production, 15 Aug: the same sentence was stamped 15:33 for one participant and 15:28
+            for another. Two people who reconnected at different moments drifted by different
+            amounts, and a transcript used as a meeting record stopped being comparable between
+            seats.
+
+        THE ANCHOR
+            The first chunk any worker sees for a room claims the anchor with SET NX, and everyone
+            — every later chunk, every other replica, the worker that restarts mid-meeting — reads
+            back whichever value won. So the offset is stable across reconnects, across replicas
+            and across a redeploy, which the track counter never was.
+
+            It is still an approximation of "room start": the anchor is the first chunk this
+            pipeline saw, not the moment the host pressed Start. That is a smaller and, more
+            importantly, a CONSISTENT error — every seat computes the same number.
+        """
+        # getattr, matching how the other per-room caches in these workers are reached: this is
+        # called from process(), and the test suites construct workers with __new__ rather than
+        # through __init__. A field that only exists on a fully-constructed worker would make
+        # every one of those a crash rather than a measurement.
+        anchors: dict[str, int] | None = getattr(self, "_transcript_anchors", None)
+        if anchors is None:
+            anchors = {}
+            self._transcript_anchors = anchors
+
+        anchor_ms = anchors.get(chunk.meeting_id)
+        if anchor_ms is None:
+            anchor_ms = await self._resolve_transcript_anchor(chunk)
+            anchors[chunk.meeting_id] = anchor_ms
+
+        # Never negative. Clock skew between the gateway and this worker is real, and a negative
+        # offset formats into nonsense on the panel rather than failing loudly.
+        return max(0, chunk.timestamp_ms - anchor_ms)
+
+    async def _resolve_transcript_anchor(self, chunk: AudioChunkMessage) -> int:
+        """The agreed millisecond every seat measures this meeting from."""
+        key = f"translationRoom:{chunk.meeting_id}:transcript_anchor_ms"
+
+        try:
+            await self.redis.set_if_absent(key, str(chunk.timestamp_ms), _TRANSCRIPT_ANCHOR_TTL_S)
+            stored = await self.redis.get(key)
+            if stored is not None:
+                raw = stored.decode() if isinstance(stored, bytes) else stored
+                return int(raw)
+        except (ValueError, TypeError):
+            self.logger.warning("transcript_anchor_unreadable", meeting_id=chunk.meeting_id)
+        except Exception:
+            # Falling back to this chunk keeps the transcript flowing with offsets measured from
+            # here. Wrong by a constant is recoverable; refusing to transcribe is not.
+            self.logger.warning("transcript_anchor_unavailable", meeting_id=chunk.meeting_id)
+
+        return chunk.timestamp_ms
+
+    async def _read_noise_reduction(self, key: str, meeting_id: str) -> str | None:
+        """One validated denoising mode from one Redis key. None when unset or unusable.
+
+        None means "no answer here", not "off" — an explicit "off" is a real answer and has to
+        outrank a room-wide setting, which is why the two are kept distinguishable.
+        """
+        try:
+            raw = await self.redis.get(key)
+        except Exception:
+            # Falls through to the caller's next source and ultimately to the worker default,
+            # which is what every room used before this existed. A settings lookup is never
+            # allowed to stop a transcript.
+            self.logger.warning("room_noise_reduction_unavailable", meeting_id=meeting_id)
+            return None
+        if not raw:
+            return None
+        decoded = (raw.decode() if isinstance(raw, bytes) else raw).strip().lower()
+        if decoded in _NOISE_REDUCTION_MODES:
+            return decoded
+        self.logger.warning(
+            "room_noise_reduction_unrecognised", meeting_id=meeting_id, value=decoded
+        )
+        return None
+
+    async def _get_room_noise_reduction(self, meeting_id: str) -> str | None:
+        """This ROOM's denoising mode, or None to use the worker's default. WT-427.
+
+        WHY PER ROOM
+            The deployment default is "off", and that default is measured: a second denoising pass
+            on top of the browser's own distorted clean close-mic speech in replay tests. It is
+            also wrong for the other half of the estate — a laptop picking a room up from two
+            metres away needs exactly that pass, and without it the transcript degrades into the
+            noise the microphone is hearing.
+
+            One environment variable made that an all-or-nothing choice for the whole platform, so
+            whichever way it was set, half the meetings were configured for the other half's room.
+
+        The key is optional, and a room that never sets it behaves exactly as before.
+        """
+        cache: dict[str, tuple[str | None, float]] | None = getattr(
+            self, "_room_noise_reduction", None
+        )
+        if cache is None:
+            cache = {}
+            self._room_noise_reduction = cache
+
+        now = time.monotonic()
+        cached = cache.get(meeting_id)
+        if cached is not None and now - cached[1] < _NOISE_REDUCTION_TTL_S:
+            return cached[0]
+
+        value = await self._read_noise_reduction(
+            f"translationRoom:{meeting_id}:noise_reduction", meeting_id
+        )
+        cache[meeting_id] = (value, now)
+        return value
+
+    async def _get_noise_reduction(self, meeting_id: str, speaker_id: str) -> str | None:
+        """The denoising mode for THIS SPEAKER's microphone, or None for the worker default.
+
+        WHY THE SPEAKER OUTRANKS THE ROOM
+            Denoising describes a MICROPHONE, not a meeting. The room-level key came first and is
+            the honest default for a room whose participants are all in the same acoustic
+            situation, but the case that needs it most is the mixed one: one person on a headset,
+            one person on a laptop two metres from a fan. A single room-wide value is wrong for
+            one of them whichever way it is set, and the transcription session is already keyed
+            per (meeting, speaker) — so the room was never the finest grain available.
+
+            An explicit "off" on a speaker therefore beats a room set to far_field, and vice
+            versa. That is the whole point of a personal override.
+
+        Falls back to the room key, then to the deployment default. A meeting where nobody has
+        chosen anything behaves exactly as it did before either key existed.
+        """
+        cache: dict[tuple[str, str], tuple[str | None, float]] | None = getattr(
+            self, "_speaker_noise_reduction", None
+        )
+        if cache is None:
+            cache = {}
+            self._speaker_noise_reduction = cache
+
+        # LOWER-CASED, and this is not cosmetic. speaker_id is the auth user id as LiveKit
+        # reported it, and its casing does not reliably match the GUID the backend writes —
+        # base_worker.is_voice_clone_consented compares SourceUserId with .lower() on both sides
+        # for exactly this reason. Redis keys are case-sensitive, so an un-normalised id is a
+        # write half that silently never meets its reader, which is the failure this whole change
+        # exists to end.
+        normalized_speaker = speaker_id.lower()
+
+        now = time.monotonic()
+        key = (meeting_id, normalized_speaker)
+        cached = cache.get(key)
+        if cached is not None and now - cached[1] < _NOISE_REDUCTION_TTL_S:
+            mine = cached[0]
+        else:
+            mine = await self._read_noise_reduction(
+                f"translationRoom:{meeting_id}:participant:{normalized_speaker}:noise_reduction",
+                meeting_id,
+            )
+            cache[key] = (mine, now)
+
+        if mine is not None:
+            return mine
+        return await self._get_room_noise_reduction(meeting_id)
 
     async def _get_stt_keywords(self, meeting_id: str) -> list[str]:
         """Return structured glossary terms for the provider's keyword-bias field."""
@@ -597,28 +1146,73 @@ class STTWorker(BaseWorker):
                 window.append(cleaned)
 
     async def _get_room_languages(self, meeting_id: str) -> set[str]:
-        """The set of languages this meeting is allowed to produce — the distinct
-        profile speak-languages of its currently-joined participants.
+        """Every language this meeting may contain.
 
-        Read from the Redis hash `translationRoom:{meeting_id}:speak_languages`
-        (userId -> normalized speak language), which TranslationRoomHub.JoinTranslationRoom
-        populates and OnDisconnected/Leave clears. This is the "languages present in the
-        meeting" set the room declares implicitly by who is in it — no separate config
-        needed. Empty set ⇒ nothing declared yet; _filter_segments falls back to its
-        default and always keeps the speaker's own hint language, so transcript is never
-        dropped just because this hash hasn't populated.
+        TWO SOURCES, AND THE SECOND ONE IS THE ANSWER TO A REAL BUG
+            `speak_languages` is what the people currently in the room are SPEAKING —
+            written by TranslationRoomHub.JoinTranslationRoom, cleared on leave.
+
+            `room_languages` is what the room was CONFIGURED for — its SourceLanguage plus
+            TargetLanguages, published on the audio_routes payload by
+            AudioRouteCacheService.
+
+            They are not the same set, and using only the first is what produced the
+            report. A room configured Vietnamese + Japanese, where both participants SPEAK
+            Vietnamese and one LISTENS in Japanese, has speak_languages = {vi}. Japanese —
+            which the host explicitly configured, and which the room exists to produce —
+            was not in the set, so STT treated Japanese characters as foreign to the room
+            and deleted every one of them. "Đọc Kanji thì không bắt transcript."
+
+            The union is the honest set: a language is possible here if somebody is
+            speaking it OR the room was set up for it.
+
+        Empty set ⇒ nothing declared yet, and _filter_segments then filters nothing rather
+        than filtering on an assumption.
         """
         now = time.monotonic()
         cached = self._room_languages.get(meeting_id)
         if cached is not None and now - cached[1] < _ROOM_LANGUAGES_TTL_S:
             return cached[0]
 
-        raw = await self.redis.hgetall(f"translationRoom:{meeting_id}:speak_languages")
         langs: set[str] = set()
+
+        raw = await self.redis.hgetall(f"translationRoom:{meeting_id}:speak_languages")
         for value in (raw or {}).values():
             code = value.decode() if isinstance(value, bytes) else value
             code = _normalize_language(code.strip()) if code else ""
             if code and code != "auto":
                 langs.add(code)
+
+        langs |= await self._get_configured_room_languages(meeting_id)
+
         self._room_languages[meeting_id] = (langs, now)
         return langs
+
+    async def _get_configured_room_languages(self, meeting_id: str) -> set[str]:
+        """The room's own language configuration, from the audio_routes payload.
+
+        Same key `_translation_state_allows_stt` already reads, so this adds no round trip
+        beyond the one this worker was making anyway. Best-effort: an unreadable or
+        older-format payload (one published before `room_languages` existed) yields an
+        empty set and the speak-languages half stands alone, which is exactly the previous
+        behaviour.
+        """
+        try:
+            raw = await self.redis.get(f"translationRoom:{meeting_id}:audio_routes")
+            if not raw:
+                return set()
+            payload = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            configured = payload.get("room_languages") or payload.get("roomLanguages") or []
+            langs = set()
+            for value in configured:
+                if not isinstance(value, str):
+                    continue
+                code = _normalize_language(value.strip())
+                if code and code != "auto":
+                    langs.add(code)
+            return langs
+        except Exception:
+            self.logger.warning(
+                "room_configured_languages_unreadable", meeting_id=meeting_id, exc_info=True
+            )
+            return set()

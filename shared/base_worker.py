@@ -282,6 +282,89 @@ class BaseWorker(ABC):
         except Exception as error:
             self.logger.warning("failed_to_parse_route_event", error=str(error))
 
+    async def _load_route_snapshot(self, room_id: str) -> bool:
+        """Re-read a room's route state from Redis, into the in-memory caches.
+
+        WHY THIS EXISTS
+            `_translation_active`, `_route_states` and `_room_routes` were populated ONLY by the
+            AUDIO_ROUTES_UPDATED pub/sub event. Pub/sub has no replay: a worker that was not
+            subscribed at the instant the backend published — because it was restarting, which is
+            what every deploy does to every worker — never learns the state and has no way to ask.
+
+            For `_is_translation_active` that is not a degraded answer, it is a WRONG one. An
+            unknown room falls through to a status lookup that is also empty, and the gate in
+            translation_worker then reads False and drops every STT result for a live meeting,
+            permanently, behind a `logger.debug` that INFO-level production never prints. The dub
+            simply stops and nothing anywhere says so.
+
+            The comment on `_handle_route_update_message` claims a missing field must not be read
+            as False because it "would silently stop translating for the whole fleet during a
+            rolling deploy". That reasoning is right and the protection was incomplete: it guards
+            the field being absent from a message, not the message being missed entirely.
+
+            Nothing new has to be published for this. The backend already writes the identical
+            payload to `translationRoom:{id}:audio_routes` as a durable key — same `routes`, same
+            `room_status`, same `translation_active` — and `_get_target_languages` has always read
+            its own state from Redis rather than waiting to be told. This closes the asymmetry.
+
+        Returns True when a snapshot was found and applied.
+        """
+        try:
+            raw = await self.redis.get(f"translationRoom:{room_id}:audio_routes")
+        except Exception as error:
+            self.logger.warning("route_snapshot_read_failed", room_id=room_id, error=str(error))
+            return False
+
+        if not raw:
+            return False
+
+        try:
+            snapshot = json.loads(raw)
+        except (ValueError, TypeError) as error:
+            self.logger.warning("route_snapshot_parse_failed", room_id=room_id, error=str(error))
+            return False
+
+        if not isinstance(snapshot, dict):
+            return False
+
+        if isinstance(snapshot.get("routes"), list):
+            self._room_routes[room_id] = snapshot["routes"]
+
+        status = snapshot.get("room_status")
+        if isinstance(status, str) and status:
+            self._route_states[room_id] = status
+            if status == "PAUSED":
+                self._paused_rooms.add(room_id)
+
+        translation_active = snapshot.get("translation_active")
+        if isinstance(translation_active, bool):
+            self._translation_active[room_id] = translation_active
+
+        self.logger.info(
+            "route_snapshot_recovered",
+            room_id=room_id,
+            room_status=status,
+            translation_active=translation_active,
+        )
+        return True
+
+    async def _translation_active_for(self, room_id: str) -> bool:
+        """`_is_translation_active`, but allowed to go and find out.
+
+        The sync version can only answer from what a broadcast happened to deliver. This one
+        recovers the snapshot from Redis on a miss, so a worker that restarted mid-meeting picks
+        the meeting back up instead of staying deaf to it until the room ends.
+        """
+        if room_id in getattr(self, "_translation_active", {}):
+            return self._translation_active[room_id]
+
+        if await self._load_route_snapshot(room_id):
+            return self._is_translation_active(room_id)
+
+        # No snapshot at all. Fall back to the sync answer, which errs towards translating when a
+        # status is known — the pre-existing rolling-deploy behaviour, deliberately unchanged.
+        return self._is_translation_active(room_id)
+
     def _is_translation_active(self, room_id: str) -> bool:
         """Whether someone has actually started translation for this room.
 
@@ -344,6 +427,145 @@ class BaseWorker(ABC):
             and bool(route.get("VoiceCloneEnabled"))
             for route in routes
         )
+
+    def chosen_dub_voice(self, room_id: str, speaker_user_id: str) -> str | None:
+        """The voice this speaker asked to be dubbed in, or None to clone them live (WT-396).
+
+        Read from the same route snapshot as the consent gate above, and matched the same way —
+        on SourceUserId, because routes are keyed by participant id in Postgres while the AI
+        pipeline knows people by auth user id.
+
+        None on an unknown room, exactly like is_voice_clone_consented, but for the opposite
+        reason: there the unknown answer must fail closed because it guards biometric processing,
+        here it simply means nobody has told us a preference yet and the pipeline should do what
+        it always did. Missing the field entirely is also None — an older backend does not send
+        it, and during a rolling deploy half the fleet is talking to one that does not.
+        """
+        for route in self._room_routes.get(room_id, []):
+            if str(route.get("SourceUserId") or "").lower() != speaker_user_id.lower():
+                continue
+            voice_id = route.get("SourceDubVoiceId")
+            if voice_id:
+                return str(voice_id)
+        return None
+
+    def carried_clone(self, room_id: str, speaker_user_id: str) -> tuple[str | None, float | None]:
+        """The voice this speaker was cloned into in an EARLIER meeting, and how good it was.
+
+        WHY THIS IS NOT `chosen_dub_voice` (WT-B)
+            They arrive on the same route and look alike, and merging them would break the
+            feature permanently. A dub voice is a DELIBERATE PICK: the speaker went to the
+            picker and named a voice, so the worker must stop capturing and never overwrite it.
+            A carried-over clone is the opposite — it is a starting point the worker is supposed
+            to keep improving on, and reading it as a pick would freeze every speaker at the
+            first clone they ever earned, which is the state this whole feature exists to end.
+
+        THE SCORE IS THE BAR, AND ABSENT IS NOT ZERO
+            It is the quality of the clip the carried voice was built from, and the next clip
+            has to beat it by the upgrade margin to replace it. Missing means nobody measured
+            it — an old row, or an uploaded recording — and it comes back as None so the caller
+            treats the bar as unset rather than as zero, which would invite replacement by
+            literally any clip that passed the floors.
+
+        Missing fields are None throughout, for the same reason `chosen_dub_voice` tolerates
+        them: during a rolling deploy half the fleet is talking to a backend that does not send
+        this yet, and the honest reading of "not told" is "no carried clone".
+        """
+        for route in self._room_routes.get(room_id, []):
+            if str(route.get("SourceUserId") or "").lower() != speaker_user_id.lower():
+                continue
+            voice_id = route.get("SourceAutoCloneVoiceId")
+            if not voice_id:
+                continue
+            raw_score = route.get("SourceAutoCloneScore")
+            score: float | None = None
+            if raw_score is not None and raw_score != "":
+                try:
+                    score = float(raw_score)
+                except (TypeError, ValueError):
+                    # An unreadable score is not a zero one. Keeping the voice and dropping the
+                    # bar means the next good clip can still replace it, which is the safe way
+                    # to be wrong here.
+                    score = None
+            return str(voice_id), score
+        return None, None
+
+    async def voice_clone_consent_state(
+        self, room_id: str, speaker_user_id: str
+    ) -> tuple[bool, str]:
+        """`is_voice_clone_consented`, allowed to go and find out — and to say which answer it gave.
+
+        THE ASYMMETRY THIS CLOSES
+            The sync version fails closed on an unknown room, which is right: never clone a voice
+            without a confirmed opt-in. But it cannot tell "this speaker did not opt in" apart from
+            "this worker has never been told anything about this room", and those are different
+            facts with different fixes.
+
+            `_room_routes` is populated only by the AUDIO_ROUTES_UPDATED pub/sub broadcast, and
+            pub/sub has no replay. Every deploy restarts every worker, so a worker that comes up
+            mid-meeting never learns that room's routes and answers "no consent" for the rest of
+            the meeting — silently, for every speaker in it. That is exactly the failure
+            `_translation_active_for` was added to close for the translation gate; the consent gate
+            reads the same cache and never got the same treatment.
+
+            The snapshot needs nothing new: the backend already writes the identical payload to
+            `translationRoom:{id}:audio_routes` as a durable key.
+
+        Returns (consented, reason) where reason is one of:
+            "consented"             — an outgoing route for this speaker has VoiceCloneEnabled.
+            "not_opted_in"          — this speaker HAS outgoing routes and none has it enabled.
+                                      Their own choice, and the only reason that is one.
+            "no_route_for_speaker"  — the room has routes, but none out of THIS speaker: nobody
+                                      is listening to them in another language, so there is no
+                                      dub to clone for. Says nothing about what they opted into.
+            "no_routes"             — this room's routes are known and there are NONE. Nobody
+                                      has started translation. A normal state, not a fault.
+            "routes_unknown"        — no routes for this room, and no snapshot to recover them
+                                      from. Still fails closed, but now says so instead of
+                                      looking identical to a deliberate opt-out.
+        """
+        if self.is_voice_clone_consented(room_id, speaker_user_id):
+            return True, "consented"
+
+        if room_id not in self._room_routes and await self._load_route_snapshot(room_id):
+            if self.is_voice_clone_consented(room_id, speaker_user_id):
+                return True, "consented"
+
+        # Membership, not truthiness. `_load_route_snapshot` stores whatever the snapshot's
+        # `routes` list contained, and for a room where nobody has pressed Start Translation
+        # that is `[]` — which is falsy, so this used to fall through and report the room as
+        # UNKNOWN even though the snapshot had just been read successfully.
+        #
+        # That is the exact ambiguity these reason codes exist to remove, reappearing one level
+        # down: "I was never told about this room" and "I was told, and there is nothing in it"
+        # are different facts with different fixes, and the first is a bug worth chasing while
+        # the second is Tuesday. Production showed `routes_unknown` for a healthy IN_PROGRESS
+        # meeting whose snapshot was present and intact, which sends whoever reads it hunting a
+        # broadcast-replay failure that did not happen.
+        if room_id not in self._room_routes:
+            return False, "routes_unknown"
+
+        routes = self._room_routes[room_id]
+        if not routes:
+            return False, "no_routes"
+
+        # "Nobody is listening to this person" is not "this person said no".
+        #
+        # Production, meeting 01a003d5: one route, src=..0002 -> tgt=..0001. Speaker ..0001 has
+        # voice_clone_enabled = TRUE in auth.user_settings and was still reported `not_opted_in`,
+        # because they have no OUTGOING route — they are the listener here, not the speaker.
+        #
+        # That is the worst version of this mislabel: it accuses the one person who did turn the
+        # feature on of having turned it off, and sends whoever is debugging "I enabled it and it
+        # still does nothing" into the settings and route-generation wiring, where they will find
+        # everything working exactly as designed.
+        if not any(
+            str(route.get("SourceUserId") or "").lower() == speaker_user_id.lower()
+            for route in routes
+        ):
+            return False, "no_route_for_speaker"
+
+        return False, "not_opted_in"
 
     # ------------------------------------------------------------------
     # Abstract interface

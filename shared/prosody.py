@@ -14,6 +14,28 @@ WHAT IS AND IS NOT POSSIBLE
     not help, because there is nowhere to put it. What this module does instead is measure the
     delivery, reduce it to those three controls, and pass them along.
 
+HOW MUCH OF IT SURVIVES ON THE MODEL THIS PRODUCT SHIPS
+    Measured 2026-08-13 against the live API, same sentence, median of three renders:
+
+        control          sonic-3 (en)              sonic-3.5 (en)      sonic-3.5 (vi)
+        speed 0.6        9567 ms  (1.70x longer)   6800 ms  (1.18x)    4960 ms  (1.19x)
+        speed 1.0        5619 ms                   5760 ms             4160 ms
+        speed 1.5        3436 ms  (1.64x shorter)  5600 ms  (1.03x)    3680 ms  (1.13x)
+        volume 0.6       rms 0.0564                rms 0.0884          rms 0.0887
+        volume 2.0       rms 0.2124  (3.8x)        rms 0.2626  (3.0x)  rms 0.3050  (3.4x)
+
+    So: volume is honoured almost literally everywhere. Speed is honoured almost literally on
+    sonic-3 and heavily damped on sonic-3.5 — a request to slow down 40% buys 18%, and a request
+    to speed up 50% buys almost nothing. TTS_MODEL is sonic-3.5 because it is the model with
+    Vietnamese, so the tempo half of this module currently lands as a nudge rather than a match.
+    That is a property of the model, not a defect here: the ratios sent are the true ones, and
+    they will land in full the day sonic-3 (or its successor) covers the target languages.
+
+    The older `speed` ENUM ("slow"/"normal"/"fast", TTSSettings.speed) does nothing at all on
+    sonic-3.5 — four renders each gave medians of 6120/6200/5960 ms with a per-case spread of
+    5680–6560, i.e. the setting is inside the noise. It is still sent, because it is not inert
+    on every model and removing it would be a silent behaviour change on models where it works.
+
 EVERYTHING IS RELATIVE TO THE SPEAKER
     Adult male F0 typically sits around 85–180 Hz and adult female around 165–255 Hz. An
     absolute rule like "above 200 Hz means excited" therefore classifies most women as
@@ -52,7 +74,13 @@ import numpy.typing as npt
 SPEED_MIN = 0.6
 SPEED_MAX = 1.5
 VOLUME_MIN = 0.5
-VOLUME_MAX = 1.5
+# 2.0, not 1.5. The 1.5 was SPEED_MAX copied one line down: the verified rejection quoted above
+# is `speed must be between 0.600000 and 1.500000`, which says nothing about volume. Cartesia's
+# accepted volume range is [0.5, 2.0] — the SDK's own GenerationConfig carries it, and the
+# measured table at the top of this file records a successful render AT volume 2.0 on all three
+# model/language combinations. So a third of the available dynamic range was being clamped away
+# by a constant that contradicted this module's own measurements.
+VOLUME_MAX = 2.0
 
 # Human speech only. Anything outside is a measurement artifact — a bad frame, a cough, or the
 # autocorrelation locking onto a harmonic — and letting it into the median drags the baseline.
@@ -315,19 +343,99 @@ def _ratio(value: float, reference: float) -> float:
 
 # Arousal decides how activated the delivery was; valence decides which side of activated it is
 # on. Neither is enough alone, which is why this is a table rather than a threshold.
-_EMOTION_TABLE: dict[tuple[Arousal, Valence], str] = {
-    ("high", "positive"): "excited",
-    ("high", "negative"): "frustrated",
-    ("high", "neutral"): "surprised",
-    ("low", "positive"): "content",
-    ("low", "negative"): "sad",
-    ("low", "neutral"): "calm",
+#
+# Each cell is a LADDER, mildest first, and the rung is chosen by how far past its band the
+# delivery actually went — see `_intensity`. Two coarse three-way axes can only ever name six
+# feelings, but the pipeline measures `pitch_lift` and `energy_ratio` continuously and then
+# throws the magnitude away by bucketing; the ladders spend that magnitude instead of inventing
+# a third axis to justify more labels.
+#
+# THE SAFETY PROPERTY THAT MAKES THIS WORTH DOING
+#     Every rung within a cell is the SAME feeling at a different strength. So an error in the
+#     rung is "excited" where "happy" was meant — one step along one scale. It can never be
+#     "angry" where "happy" was meant, because that would take an error in valence, which no
+#     amount of intensity can produce. The tier boundaries are exactly as uncalibrated as the
+#     bands they sit on (see the comment above HIGH_PITCH_LIFT); ordering them this way is what
+#     keeps that uncalibration cheap.
+#
+# Every name below is copied from cartesia.types.GenerationConfig's own Literal — the SDK is the
+# authority, not the docs page. Cartesia states that an emotion outside its list is "not
+# supported, and results are not guaranteed", so an invented name fails silently and strangely
+# rather than loudly.
+# Rung 0 of every ladder is EXACTLY the label this table produced before the ladders existed.
+# That is not a coincidence to preserve tests — it is what makes this a strict extension: the
+# ladder can only ever add a stronger word for a stronger delivery, and can never re-label an
+# ordinary one. Reordering a rung 0 is a behaviour change and should be argued for on its own.
+_EMOTION_LADDERS: dict[tuple[Arousal, Valence], tuple[str, ...]] = {
+    ("high", "positive"): ("excited", "elated", "euphoric"),
+    ("high", "negative"): ("frustrated", "angry", "outraged"),
+    ("high", "neutral"): ("surprised", "amazed"),
+    ("low", "positive"): ("content", "peaceful", "serene"),
+    ("low", "negative"): ("sad", "dejected"),
+    ("low", "neutral"): ("calm", "tired"),
 }
+
+# How far past its band a delivery has to go to reach full intensity. A ratio 40% beyond the
+# threshold is emphatic by any reading; beyond that the ladder has nothing further to say.
+_FULL_INTENSITY_MARGIN = 0.40
+
+# Intensity needed to climb to rung 1, then rung 2. Deliberately NOT an even split of the range.
+#
+# This module's stated principle is that wrong is worse than neutral, and the bands these rungs
+# sit on are uncalibrated. Even thirds would put an ordinary emphatic sentence — the common case —
+# on the middle rung, so "angry" would become the routine label for anyone who raised their voice
+# while saying something negative. Biasing the steps late keeps the mild rung as the default and
+# reserves the strong ones for deliveries that are extreme by this speaker's own standard.
+#
+# The practical effect: a delivery around half-intensity keeps exactly the label this table
+# produced before the ladders existed. The ladder only ever ADDS a stronger word for a stronger
+# delivery; it never re-labels an ordinary one.
+_LADDER_STEPS = (0.5, 0.9)
+
+
+def _intensity(delivery: Delivery) -> float:
+    """0..1 — how far past its own band this delivery went.
+
+    Measured on the two features the bands are drawn from, taking the STRONGER of the two: a
+    speaker can be emphatic mostly in pitch or mostly in loudness, and requiring both to agree
+    is the job of `to_delivery`, which has already been done by the time this runs.
+
+    Returns 0.0 for a delivery with no arousal, where no ladder is consulted anyway.
+    """
+    if delivery.arousal == "high":
+        excess = max(
+            delivery.pitch_lift - HIGH_PITCH_LIFT,
+            delivery.energy_ratio - HIGH_ENERGY_RATIO,
+        )
+    elif delivery.arousal == "low":
+        excess = max(
+            LOW_PITCH_LIFT - delivery.pitch_lift,
+            LOW_ENERGY_RATIO - delivery.energy_ratio,
+        )
+    else:
+        return 0.0
+
+    if math.isnan(excess):
+        return 0.0
+    return max(0.0, min(1.0, excess / _FULL_INTENSITY_MARGIN))
+
+
+def _emotion_for(delivery: Delivery, valence: Valence) -> str | None:
+    ladder = _EMOTION_LADDERS.get((delivery.arousal, valence))
+    if ladder is None:
+        return None
+
+    intensity = _intensity(delivery)
+    rung = 0
+    for index, step in enumerate(_LADDER_STEPS[: len(ladder) - 1], start=1):
+        if intensity >= step:
+            rung = index
+    return ladder[rung]
 
 
 def to_generation_config(
     delivery: Delivery,
-    valence: Valence = "neutral",
+    valence: Valence | None = None,
     *,
     speed_center: float = 1.0,
 ) -> dict[str, float | str]:
@@ -338,6 +446,12 @@ def to_generation_config(
     rather than wrongly angry. The emotion label is the only categorical judgement here, and it
     is omitted entirely when the delivery is ordinary, because "neutral" is what the model
     already does and sending it adds a claim without adding information.
+
+    `valence=None` means NOT DETERMINED, which is the pipeline's actual state today: nothing
+    upstream reads the words for sentiment yet. It is not the same as "neutral", and it must not
+    collapse into it — ("high", "neutral") would label an emphatic speaker "surprised", which is
+    a guess about their feelings made from loudness alone. Unknown valence yields no emotion at
+    all, and the delivery still carries through speed and volume.
     """
     speed = _clamp(speed_center * delivery.rate_ratio, SPEED_MIN, SPEED_MAX)
     volume = _clamp(delivery.energy_ratio, VOLUME_MIN, VOLUME_MAX)
@@ -347,9 +461,10 @@ def to_generation_config(
         "volume": round(volume, 3),
     }
 
-    emotion = _EMOTION_TABLE.get((delivery.arousal, valence))
-    if emotion is not None:
-        config["emotion"] = emotion
+    if valence is not None:
+        emotion = _emotion_for(delivery, valence)
+        if emotion is not None:
+            config["emotion"] = emotion
 
     return config
 

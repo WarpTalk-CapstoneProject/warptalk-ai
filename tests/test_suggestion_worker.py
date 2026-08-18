@@ -196,6 +196,39 @@ class TestStageZeroGating:
         assert suggester.decide_calls == []
 
     @pytest.mark.asyncio
+    async def test_a_short_question_is_still_considered(self) -> None:
+        # The reason the badge stopped appearing. `min_words: 5` rejected 48% of real
+        # production segments and 39% of every one that ends in a question mark — and it did
+        # so at stage 0, which spends no tokens and therefore logs nothing, so the feature
+        # looked dead rather than starved. "JavaScript là gì?" is three words.
+        worker, _, suggester = build_worker()
+
+        await worker.process(b"1-0", stt_message(text="JavaScript là gì?"))
+
+        assert len(suggester.decide_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_question_without_its_question_mark_is_still_considered(self) -> None:
+        # The recogniser drops the mark on short utterances, which are exactly the ones this
+        # rescues. Vietnamese ends a question with a particle rather than fronting a word.
+        worker, _, suggester = build_worker()
+
+        await worker.process(b"1-0", stt_message(text="Cái này là sao"))
+
+        assert len(suggester.decide_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_short_statement_is_still_dropped(self) -> None:
+        # The question floor must not become a general one: sending every "ừ", "okay" and
+        # half-heard fragment to the decide model roughly doubles the call volume to reach
+        # the same handful of suggestions.
+        worker, _, suggester = build_worker()
+
+        await worker.process(b"1-0", stt_message(text="ừ đúng rồi"))
+
+        assert suggester.decide_calls == []
+
+    @pytest.mark.asyncio
     async def test_low_stt_confidence_is_dropped(self) -> None:
         worker, _, suggester = build_worker()
 
@@ -387,6 +420,46 @@ class TestPublish:
         assert payload["language"] == "vi"
         assert payload["detail"] == "Deadline được nhắc tới nhưng không có owner."
         assert payload["token_count"] == "150", "decide + generate tokens are billed together"
+
+    @pytest.mark.asyncio
+    async def test_fact_without_documents_is_declined_before_the_slot_is_claimed(self) -> None:
+        """WT-371 Bug 6.
+
+        "fact" is defined as a figure or reference THE MEETING'S OWN DOCUMENTS cover. With no
+        documents attached there is nothing to ground it in and the only thing the model can do
+        is recall a plausible number — which reaches the participants looking exactly like a
+        sourced one.
+
+        Asserted before the claim, not just before the publish: burning the 45s cooldown slot
+        would silence every other category in the room to produce nothing.
+        """
+        suggester = approving_suggester()
+        suggester.decision = SuggestionDecision(
+            should_suggest=True, category="fact", confidence=0.9, token_count=40
+        )
+        worker, redis, _ = build_worker(suggester=suggester)
+
+        await worker.process(b"1-0", stt_message())
+
+        assert suggester.generate_calls == 0
+        assert redis.published == []
+        assert redis.values == {}, "no cooldown slot may be claimed"
+
+    @pytest.mark.asyncio
+    async def test_fact_with_documents_is_allowed_through(self) -> None:
+        """The negative control: the rule above must gate on the DOCUMENTS, not on the
+        category. Declining every "fact" would look identical in the test above."""
+        suggester = approving_suggester()
+        suggester.decision = SuggestionDecision(
+            should_suggest=True, category="fact", confidence=0.9, token_count=40
+        )
+        worker, redis, _ = build_worker(suggester=suggester)
+        redis.values["meeting:room-1:context_snapshot"] = "Q3 revenue: 1.2M USD"
+
+        await worker.process(b"1-0", stt_message())
+
+        assert suggester.generate_calls == 1
+        assert len(redis.published) > 0
 
     @pytest.mark.asyncio
     async def test_content_is_truncated_to_the_strip_width(self) -> None:

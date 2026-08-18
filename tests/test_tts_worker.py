@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from shared.config import TTSSettings, WorkerSettings
-from shared.schemas import TranslationResultMessage
+from shared.schemas import ProsodyEnvelope, TranslationResultMessage
 from tts_worker.synthesizer import CartesiaSynthesizer
 from tts_worker.worker import TTSWorker
 
@@ -19,7 +20,18 @@ def _make_worker(mock_redis_client, worker_settings, tts_settings=None, consente
     worker.settings = worker_settings
     worker.redis = mock_redis_client
     worker.logger = MagicMock()
-    worker.tts_settings = tts_settings or TTSSettings()
+    # Pinned to the one-shot HTTP path, deliberately.
+    #
+    # Nothing in this file is ABOUT transport — these tests cover voice resolution, publishing,
+    # metadata, LiveKit fan-out and prosody reaching generation_config, all of which are the
+    # same either way. Pinning keeps them asserting on `cartesia.synthesize` instead of
+    # re-plumbing every assertion through a WebSocket context for no gain in what they check.
+    #
+    # The default is now True, so the OTHER path is covered elsewhere and deliberately:
+    # tests/test_tts_prosody_continuity.py drives it in both states, and
+    # tests/test_prosody_context.py asserts generation_config reaches the push. Neither path is
+    # untested; they are tested where each belongs.
+    worker.tts_settings = tts_settings or TTSSettings(prosody_continuity=False)
     worker._route_states = {}
     # Voice-clone consent gate reads _room_routes (populated in real usage by
     # AudioRouteCacheService's AUDIO_ROUTES_UPDATED broadcast — see
@@ -723,3 +735,153 @@ class TestVoiceVariantFanOut:
 
         assert worker.cartesia.synthesize.await_count == 1
         assert worker.livekit_publisher.publish_pcm.await_count == 1
+
+
+class TestProsodyReachesTheSynthesizer:
+    """The last leg: a delivery measured at the microphone has to arrive as Cartesia's
+    generation_config, or every stage before it was bookkeeping."""
+
+    def _msg_with_delivery(self, **overrides) -> TranslationResultMessage:
+        envelope = ProsodyEnvelope(
+            pitch_lift=1.25,
+            pitch_variation=1.5,
+            energy_ratio=1.4,
+            rate_ratio=1.2,
+            arousal="high",
+            **overrides,
+        )
+        msg = _make_msg()
+        return msg.model_copy(update={"prosody": envelope})
+
+    async def test_measured_delivery_arrives_as_generation_config(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = _make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
+
+        await worker.process(b"msg-1", self._msg_with_delivery().to_redis())
+
+        _, kwargs = worker.cartesia.synthesize.call_args
+        config = kwargs.get("generation_config")
+        assert config == {"speed": 1.2, "volume": 1.4}
+
+    async def test_no_emotion_is_claimed_without_a_reading_of_the_words(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        # Arousal alone cannot tell delight from anger. Until something upstream supplies
+        # valence, the label is left off rather than guessed from loudness.
+        worker = _make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
+
+        await worker.process(b"msg-1", self._msg_with_delivery().to_redis())
+
+        _, kwargs = worker.cartesia.synthesize.call_args
+        assert "emotion" not in kwargs["generation_config"]
+
+    async def test_valence_when_supplied_names_the_emotion(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        # Wired now so the day something reads the words, nothing else has to change.
+        worker = _make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
+
+        await worker.process(b"msg-1", self._msg_with_delivery(valence="negative").to_redis())
+
+        _, kwargs = worker.cartesia.synthesize.call_args
+        assert kwargs["generation_config"]["emotion"] == "frustrated"
+
+    async def test_an_unmeasured_line_sends_no_controls_at_all(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = _make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
+
+        await worker.process(b"msg-1", _make_msg().to_redis())
+
+        _, kwargs = worker.cartesia.synthesize.call_args
+        # Not {"speed": 1.0, "volume": 1.0}. "Nothing was measured" and "measured as
+        # ordinary" are different instructions, and only one of them is true here.
+        assert kwargs.get("generation_config") is None
+
+    async def test_the_use_of_prosody_can_be_turned_off_independently(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        # Separate from STT_PROSODY_ENABLED on purpose: measuring and using are different
+        # decisions, and keeping them apart is what makes an A/B possible.
+        worker = _make_worker(
+            mock_redis_client,
+            worker_settings,
+            # prosody_continuity pinned for the same reason as the factory default above: this
+            # test is about prosody_enabled, and passing tts_settings explicitly would
+            # otherwise opt back into the WebSocket path and change what synthesize sees.
+            tts_settings=TTSSettings(prosody_enabled=False, prosody_continuity=False),
+        )
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
+
+        await worker.process(b"msg-1", self._msg_with_delivery().to_redis())
+
+        _, kwargs = worker.cartesia.synthesize.call_args
+        assert kwargs.get("generation_config") is None
+
+
+class TestProsodyAwareCache:
+    """A cache keyed on text alone would silently undo the whole feature: the first way a
+    phrase was said would be replayed for every later way of saying it."""
+
+    def test_the_same_words_said_differently_are_different_entries(self) -> None:
+        shouted = TTSWorker._cache_key(
+            speaker_id="s1",
+            target_lang="en",
+            text="okay",
+            voice_mode="cloned:v1",
+            generation_config={"speed": 1.3, "volume": 1.5},
+        )
+        murmured = TTSWorker._cache_key(
+            speaker_id="s1",
+            target_lang="en",
+            text="okay",
+            voice_mode="cloned:v1",
+            generation_config={"speed": 0.9, "volume": 0.7},
+        )
+
+        assert shouted != murmured
+
+    def test_the_same_delivery_shares_one_entry_whatever_the_key_order(self) -> None:
+        first = TTSWorker._cache_key(
+            speaker_id="s1",
+            target_lang="en",
+            text="okay",
+            voice_mode="cloned:v1",
+            generation_config={"speed": 1.3, "volume": 1.5},
+        )
+        second = TTSWorker._cache_key(
+            speaker_id="s1",
+            target_lang="en",
+            text="okay",
+            voice_mode="cloned:v1",
+            generation_config={"volume": 1.5, "speed": 1.3},
+        )
+
+        assert first == second
+
+    def test_a_line_with_no_delivery_keeps_the_key_it_already_had(self) -> None:
+        # Every warm entry in production was written under the old key. Appending an empty
+        # separator would have invalidated all of them on deploy for no benefit.
+        with_argument = TTSWorker._cache_key(
+            speaker_id="s1",
+            target_lang="en",
+            text="okay",
+            voice_mode="cloned:v1",
+            generation_config=None,
+        )
+        legacy = TTSWorker._cache_key(
+            speaker_id="s1", target_lang="en", text="okay", voice_mode="cloned:v1"
+        )
+
+        assert with_argument == legacy
+        assert legacy == "tts:cache:" + hashlib.sha256(b"s1|en|okay|cloned:v1").hexdigest()

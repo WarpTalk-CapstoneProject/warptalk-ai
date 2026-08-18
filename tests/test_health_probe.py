@@ -99,3 +99,31 @@ async def test_health_probe_fails_when_heartbeat_is_stale(monkeypatch) -> None:
         patch("shared.health_probe.time.time", return_value=1000),
     ):
         assert await check_worker() is False
+
+
+# ── a traceback that reaches the log ─────────────────────────────────────────────────────────
+
+
+def test_logging_is_configured_to_render_tracebacks() -> None:
+    """`logger.exception(...)` has to produce a stack, not the word `true`.
+
+    structlog only MARKS an event as carrying an exception; a processor has to turn that mark
+    into text. With none, the JSON renderer serialised the flag — production logs read
+    `"exc_info": true` and the exception, its type and its stack were gone. tts_worker logged
+    exactly that on every sentence for two releases (WT-400) while the reason stayed invisible,
+    and finding it in the end needed a probe against the live vendor API.
+    """
+    import structlog
+
+    from shared.logger import setup_logging
+
+    setup_logging("INFO")
+    processors = structlog.get_config()["processors"]
+
+    assert structlog.processors.format_exc_info in processors, (
+        "no processor renders exc_info — every traceback in every worker is discarded"
+    )
+    renderers = [structlog.processors.JSONRenderer, structlog.dev.ConsoleRenderer]
+    assert processors.index(structlog.processors.format_exc_info) < min(
+        i for i, p in enumerate(processors) if isinstance(p, tuple(renderers))
+    ), "exc_info is rendered after the output is already serialised"

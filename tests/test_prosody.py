@@ -14,10 +14,12 @@ import numpy.typing as npt
 import pytest
 
 from shared.prosody import (
+    _EMOTION_LADDERS,
     MIN_BASELINE_SAMPLES,
     NEUTRAL_DELIVERY,
     SPEED_MAX,
     SPEED_MIN,
+    VOLUME_MAX,
     Delivery,
     ProsodyFeatures,
     SpeakerBaseline,
@@ -167,6 +169,28 @@ class TestGenerationConfig:
         whisper = Delivery(0.9, 0.8, 0.35, 0.9, "low")
         assert float(to_generation_config(whisper)["volume"]) < 1.0
 
+    def test_undetermined_valence_is_not_neutral_valence(self) -> None:
+        """The pipeline's real state today: nothing has read the words for sentiment.
+
+        Collapsing that into "neutral" would reach ("high", "neutral") in the table and label
+        an emphatic speaker "surprised" — a claim about their feelings inferred from loudness
+        alone. Unknown must produce no label at all.
+        """
+        emphatic = Delivery(1.3, 1.5, 1.4, 1.2, "high")
+
+        assert "emotion" not in to_generation_config(emphatic)
+        assert "emotion" not in to_generation_config(emphatic, None)
+        assert to_generation_config(emphatic, "neutral")["emotion"] == "surprised"
+
+    def test_delivery_still_carries_without_any_valence(self) -> None:
+        # The half that needs no reading of the words must not be held hostage to the half
+        # that does — an unlabelled utterance is still dubbed faster and louder if that is how
+        # it was said.
+        config = to_generation_config(Delivery(1.3, 1.5, 1.4, 1.25, "high"))
+
+        assert config["speed"] == pytest.approx(1.25)
+        assert config["volume"] == pytest.approx(1.4)
+
 
 class TestPcmConversion:
     def test_round_trips_amplitude(self) -> None:
@@ -180,3 +204,94 @@ class TestPcmConversion:
         pcm = (tone(130.0) * 32767).astype("<i2").tobytes()
         features = measure(pcm16_to_float(pcm), SAMPLE_RATE)
         assert features.pitch_median_hz == pytest.approx(130.0, rel=0.05)
+
+
+class TestEmotionLadders:
+    """Two coarse three-way axes can only name six feelings. The pipeline measures pitch and
+    energy continuously and then throws the magnitude away by bucketing; the ladders spend that
+    magnitude instead of inventing a third axis to justify more labels.
+    """
+
+    def _high(self, pitch_lift: float, energy_ratio: float) -> Delivery:
+        return Delivery(pitch_lift, 1.5, energy_ratio, 1.0, "high")
+
+    def test_the_ladder_only_adds_to_what_was_there_before(self) -> None:
+        """Rung 0 of every cell is the label the flat table produced.
+
+        This is the property that makes the change safe to ship: an ordinary emphatic sentence
+        keeps exactly the word it had, and only a delivery that is extreme by this speaker's own
+        standard reaches a stronger one.
+        """
+        ordinary = self._high(1.30, 1.40)
+
+        assert to_generation_config(ordinary, "positive")["emotion"] == "excited"
+        assert to_generation_config(ordinary, "negative")["emotion"] == "frustrated"
+        assert to_generation_config(ordinary, "neutral")["emotion"] == "surprised"
+
+    def test_a_far_stronger_delivery_reaches_a_stronger_word(self) -> None:
+        mild = self._high(1.15, 1.28)
+        extreme = self._high(1.60, 1.75)
+
+        assert to_generation_config(mild, "negative")["emotion"] == "frustrated"
+        assert to_generation_config(extreme, "negative")["emotion"] == "outraged"
+
+    def test_climbing_is_monotone(self) -> None:
+        # A stronger delivery must never produce a milder word. Without this the ladder could
+        # be non-monotone at a boundary and nobody would notice.
+        ladder = ("frustrated", "angry", "outraged")
+        seen = [
+            ladder.index(
+                str(
+                    to_generation_config(self._high(1.12 + step, 1.25 + step), "negative")[
+                        "emotion"
+                    ]
+                )
+            )
+            for step in (0.0, 0.1, 0.2, 0.3, 0.4, 0.6)
+        ]
+
+        assert seen == sorted(seen), f"rung went backwards as delivery got stronger: {seen}"
+
+    def test_an_error_in_intensity_never_changes_the_feeling(self) -> None:
+        """The safety property. Every rung within a cell is the same feeling at a different
+        strength, so a mis-tiered label is one step along one scale — never 'angry' where
+        'happy' was meant, which would take an error in valence that no intensity can produce.
+        """
+        positive_words = {
+            str(to_generation_config(self._high(1.12 + s, 1.25 + s), "positive")["emotion"])
+            for s in (0.0, 0.2, 0.4, 0.8)
+        }
+        negative_words = {
+            str(to_generation_config(self._high(1.12 + s, 1.25 + s), "negative")["emotion"])
+            for s in (0.0, 0.2, 0.4, 0.8)
+        }
+
+        assert positive_words & negative_words == set()
+
+    def test_every_label_is_one_cartesia_actually_accepts(self) -> None:
+        """Cartesia says an emotion outside its list is 'not supported, and results are not
+        guaranteed' — so an invented name fails silently and strangely rather than loudly.
+        The SDK's own Literal is the authority here, not the docs page."""
+        from cartesia.types.generation_config import GenerationConfig
+
+        accepted = set(GenerationConfig.model_fields["emotion"].annotation.__args__[0].__args__)
+        for ladder in _EMOTION_LADDERS.values():
+            for word in ladder:
+                assert word in accepted, f"{word!r} is not in Cartesia's emotion vocabulary"
+
+    def test_a_neutral_delivery_still_gets_no_label_at_all(self) -> None:
+        # The ladders must not have accidentally given the neutral cells a rung.
+        assert "emotion" not in to_generation_config(
+            Delivery(1.0, 1.0, 1.0, 1.0, "neutral"), "positive"
+        )
+
+
+class TestVolumeRange:
+    def test_volume_may_use_the_range_the_api_actually_accepts(self) -> None:
+        """VOLUME_MAX was 1.5 — SPEED_MAX copied one line down. The verified rejection quoted in
+        this module is about `speed`; Cartesia accepts volume in [0.5, 2.0], and the measured
+        table at the top of the module records a successful render AT 2.0."""
+        assert VOLUME_MAX == 2.0
+
+        shouted = Delivery(1.3, 1.5, 3.0, 1.0, "high")
+        assert float(to_generation_config(shouted)["volume"]) == 2.0

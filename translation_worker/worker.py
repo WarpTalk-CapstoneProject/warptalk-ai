@@ -19,10 +19,40 @@ from typing import Any, cast
 
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
+from shared.control_markers import is_control_marker, is_system_speaker
 from shared.lang import is_same_language
-from shared.schemas import STTResultMessage, TranslationResultMessage, optional_confidence
+from shared.schemas import (
+    ProsodyEnvelope,
+    STTResultMessage,
+    TranslationResultMessage,
+    optional_confidence,
+)
 from shared.text_utils import split_into_sentences
+from translation_worker.transcript_guardian import choose_transcript
 from translation_worker.translator import OUT_OF_MEETING_SCOPE, OpenAITranslator
+from translation_worker.valence import Valence
+
+# What a translation task yields: the text, and the sentiment of what was said — or None when
+# the model said nothing trustworthy about it. Carried together so a speculative hit keeps its
+# valence instead of silently losing it, which is how a wired feature becomes an unwired one.
+_Translated = tuple[str, "Valence | None"]
+
+
+def _with_valence(
+    envelope: ProsodyEnvelope | None, valence: Valence | None
+) -> ProsodyEnvelope | None:
+    """The measured delivery, plus the sentiment of what was said.
+
+    Returns the envelope UNCHANGED when there is no valence — including when there is no
+    envelope at all. An absent envelope means the STT worker could not honestly measure this
+    speaker yet, and inventing one here just to carry a sentiment would tell the TTS worker that
+    a delivery was measured when none was: every ratio would be a default 1.0 presented as a
+    reading. Valence rides along with a measurement; it does not manufacture one.
+    """
+    if envelope is None or valence is None:
+        return envelope
+    return envelope.model_copy(update={"valence": valence})
+
 
 _CONTEXT_STOPWORDS = {
     "and",
@@ -103,6 +133,10 @@ class TranslationWorker(BaseWorker):
     # deterministic LiveKit replay). Keep one bounded speculative slot alive long
     # enough to reuse that result instead of cancelling it and paying a second call.
     _SPECULATIVE_TIMEOUT_SECONDS = 1.5
+    # The same-language tidy-up's whole latency budget. Passthrough used to publish with no
+    # network call at all, so this is the amount of delay a nicer-looking transcript is worth;
+    # past it the raw recogniser text goes out unchanged.
+    _POLISH_TIMEOUT_SECONDS = 1.5
 
     def __init__(
         self,
@@ -122,7 +156,7 @@ class TranslationWorker(BaseWorker):
         self._recent_source_contexts: dict[str, deque[str]] = {}
         self._speculative_translations: dict[
             tuple[str, str, str, str],
-            tuple[asyncio.Task[str], float],
+            tuple[asyncio.Task[_Translated], float],
         ] = {}
         self._speculative_semaphore = asyncio.Semaphore(1)
         self._speculative_listener_task: asyncio.Task[None] | None = None
@@ -209,7 +243,7 @@ class TranslationWorker(BaseWorker):
             cache = {}
             self._speculative_translations = cache
 
-        tasks: list[asyncio.Task[str]] = []
+        tasks: list[asyncio.Task[_Translated]] = []
         now = time.monotonic()
         semaphore = getattr(self, "_speculative_semaphore", None)
         if semaphore is None:
@@ -238,11 +272,11 @@ class TranslationWorker(BaseWorker):
                 async def run_speculative(
                     sentence_text: str = sentence,
                     language_target: str = target_lang,
-                ) -> str:
+                ) -> _Translated:
                     async with semaphore:
                         try:
                             async with asyncio.timeout(self._SPECULATIVE_TIMEOUT_SECONDS):
-                                return await translator.translate(
+                                return await translator.translate_with_valence(
                                     sentence_text,
                                     source_lang=source_lang,
                                     target_lang=language_target,
@@ -257,7 +291,9 @@ class TranslationWorker(BaseWorker):
                                 "speculative_translation_abandoned",
                                 meeting_id=meeting_id,
                             )
-                            return ""
+                            # Empty text is the caller's signal to translate for real; the
+                            # valence beside it is None because nothing was read.
+                            return "", None
 
                 task = asyncio.create_task(run_speculative())
                 cache[key] = (task, now)
@@ -279,11 +315,11 @@ class TranslationWorker(BaseWorker):
         speaker_id: str,
         target_lang: str,
         text: str,
-    ) -> asyncio.Task[str] | None:
+    ) -> asyncio.Task[_Translated] | None:
         cache = cast(
             dict[
                 tuple[str, str, str, str],
-                tuple[asyncio.Task[str], float],
+                tuple[asyncio.Task[_Translated], float],
             ],
             getattr(self, "_speculative_translations", {}),
         )
@@ -360,6 +396,23 @@ class TranslationWorker(BaseWorker):
         """
         stt_result = STTResultMessage.from_redis(data)
 
+        # Not speech. `stt:results` carries one synthetic segment per meeting — the
+        # __MEETING_END__ sentinel MeetingRoomService publishes to wake the assistant worker —
+        # and this stage translated it like anything else: one paid LLM call per target
+        # language, whose output ("Meeting end", "Kết thúc cuộc họp") then went to tts_worker
+        # for a paid render and onto the interpreter track, and to billing_worker, which
+        # dead-lettered it twice per meeting because speaker_id="system" is not a UUID.
+        #
+        # Checked FIRST, before the pause and translation-active gates: whether the platform's
+        # own control message gets translated is not a per-room setting.
+        if is_control_marker(stt_result.text) or is_system_speaker(stt_result.speaker_id):
+            self.logger.debug(
+                "control_marker_skipped",
+                meeting_id=stt_result.meeting_id,
+                speaker_id=stt_result.speaker_id,
+            )
+            return
+
         if stt_result.meeting_id in self._paused_rooms:
             return
 
@@ -371,8 +424,16 @@ class TranslationWorker(BaseWorker):
         # It belongs here instead. STT now runs for any live meeting, which is what fills
         # the transcript panel, and this stage — the one that actually spends a translation
         # and a dubbed voice — stays closed until the room reports translation active.
-        if not self._is_translation_active(stt_result.meeting_id):
-            self.logger.debug(
+        # `_translation_active_for`, not `_is_translation_active`: the async one recovers the
+        # room's route snapshot from Redis when no broadcast has been seen for it. A worker that
+        # restarted mid-meeting — which is what a deploy does — otherwise reads False here for a
+        # room that is actively translating and drops every result until the room ends.
+        if not await self._translation_active_for(stt_result.meeting_id):
+            # INFO, not debug. This is the one branch that discards a paid-for STT result, and at
+            # production's INFO level the debug line was invisible: the pipeline went silent with
+            # no record of the decision anywhere. WT-373 was diagnosed from Redis stream offsets
+            # because these logs did not exist.
+            self.logger.info(
                 "translation_skipped_not_started",
                 meeting_id=stt_result.meeting_id,
             )
@@ -413,6 +474,7 @@ class TranslationWorker(BaseWorker):
                         translator_model=self._require_translator().model,
                         source_segment_id=stt_result.segment_id,
                         chunk_index=stt_result.chunk_index,
+                        prosody=stt_result.prosody,
                     )
                     await self.publish(
                         "translate:results", stt_result.meeting_id, result.to_redis()
@@ -455,7 +517,7 @@ class TranslationWorker(BaseWorker):
         # worker translated Vietnamese into Vietnamese, paying for a model call to produce
         # a sentence it already had.
         passthrough = is_same_language(stt_result.language, target_lang)
-        first_task: asyncio.Task[str] | None = None
+        first_task: asyncio.Task[_Translated] | None = None
         rest_task: asyncio.Task[list[str]] | None = None
         rest_results: list[str] | None = None
         speculative_hit = False
@@ -472,7 +534,7 @@ class TranslationWorker(BaseWorker):
             speculative_hit = first_task is not None
             if first_task is None:
                 first_task = asyncio.create_task(
-                    translator.translate(
+                    translator.translate_with_valence(
                         sentences[0],
                         source_lang=stt_result.language,
                         target_lang=target_lang,
@@ -507,15 +569,34 @@ class TranslationWorker(BaseWorker):
             chunk_segment_id = f"{stt_result.segment_id}-{target_lang}-c{idx}"
 
             if passthrough:
-                translated_text = sentence
+                # Same language as the speaker, so there is nothing to translate — but the text
+                # is raw recogniser output: no sentence casing, little punctuation, and every
+                # "ờ"/"à" that was actually said. A same-language pass makes it read like
+                # writing. See transcript_guardian for why the result is verified rather than
+                # trusted, and why a failed verification keeps the original instead of
+                # publishing a fluent guess.
+                # BOUNDED, because this path used to cost nothing at all.
+                #
+                # Passthrough previously forwarded the sentence with no network call, so adding
+                # one puts a model round-trip in front of a line that used to publish instantly.
+                # Tidier text is not worth a transcript that lags the speaker, so the tidy-up
+                # gets a small budget and the raw sentence goes out the moment it is exceeded.
+                try:
+                    async with asyncio.timeout(self._POLISH_TIMEOUT_SECONDS):
+                        polished = await translator.polish(sentence, stt_result.language)
+                except Exception:
+                    polished = sentence
+
+                translated_text = choose_transcript(sentence, polished, stt_result.language)
+                valence = None
             elif idx == 0:
                 assert first_task is not None
                 try:
-                    translated_text = await first_task
+                    translated_text, valence = await first_task
                 except Exception:
-                    translated_text = ""
+                    translated_text, valence = "", None
                 if not translated_text:
-                    translated_text = await translator.translate(
+                    translated_text, valence = await translator.translate_with_valence(
                         sentence,
                         source_lang=stt_result.language,
                         target_lang=target_lang,
@@ -527,18 +608,79 @@ class TranslationWorker(BaseWorker):
                     assert rest_task is not None
                     rest_results = await rest_task
                 translated_text = rest_results[idx - 1]
+                # translate_batch does not ask for a marker: its reply is a numbered list, and a
+                # per-line marker would be one more thing for the line parser to get wrong. The
+                # sentences after the first therefore carry no valence, which the pipeline reads
+                # as NOT DETERMINED — the same as before this existed.
+                valence = None
 
             if translated_text.strip().upper() == OUT_OF_MEETING_SCOPE:
-                self.logger.info(
-                    "background_utterance_suppressed",
+                # SUPPRESSION GETS A SECOND OPINION, WITHOUT THE CONTEXT THAT CAUSED IT.
+                #
+                # This branch used to `continue`, which published nothing for THIS target and
+                # nothing else — so the sentence reached every other listener and vanished for
+                # one. It is judged per target language, in a separate model call per target, so
+                # the same utterance could be in scope for one listener and out of scope for
+                # their neighbour; the transcript still showed the original, which is what made
+                # it read as "roughly one line in ten is not translated".
+                #
+                # Production, 12h: 10 suppressions against 228 translated chunks — 4% — and every
+                # one of them was ordinary meeting speech. "Em mút mic của anh nè, anh có bị mút
+                # không?" is a person asking about their microphone.
+                #
+                # The sentinel is an artefact of the relevance context: it is only offered when
+                # meeting_context is attached (see _select_relevance_context), so the honest test
+                # is whether the sentence is still out of scope WITHOUT it. Genuine background
+                # noise — a television, someone else's conversation — fails that test too and is
+                # still dropped. A real utterance comes back translated and gets delivered.
+                retry_text = ""
+                try:
+                    retry_text, valence = await translator.translate_with_valence(
+                        sentence,
+                        source_lang=stt_result.language,
+                        target_lang=target_lang,
+                        glossary_terms=glossary_terms,
+                        meeting_context=[],
+                    )
+                except Exception:
+                    retry_text, valence = "", None
+
+                if not retry_text.strip() or retry_text.strip().upper() == OUT_OF_MEETING_SCOPE:
+                    self.logger.info(
+                        "background_utterance_suppressed",
+                        meeting_id=stt_result.meeting_id,
+                        source_lang=stt_result.language,
+                        target_lang=target_lang,
+                        original=sentence[:60],
+                        confirmed_without_context=True,
+                    )
+                    continue
+
+                # Warning, not info: a sentence that only looked out of scope because of the
+                # context we attached is a false positive of our own making, and the rate of
+                # them is the thing worth watching.
+                self.logger.warning(
+                    "background_utterance_suppression_overturned",
                     meeting_id=stt_result.meeting_id,
                     source_lang=stt_result.language,
                     target_lang=target_lang,
                     original=sentence[:60],
                 )
-                continue
+                translated_text = retry_text
 
             is_final = (idx == len(sentences) - 1) and stt_result.is_final_chunk
+
+            # How long this sentence took to become available, from the start of the stage.
+            #
+            # Measured once and used twice — on the message and on the log line below — so the
+            # number a dashboard sees and the number a log search finds cannot drift apart.
+            #
+            # Measured from `translation_started` rather than per-call on purpose: the sentences
+            # are translated concurrently (sentence 0 alone, 1..N-1 in one batch), so a per-call
+            # timer would report the batch's own duration and hide the wait in front of it. What a
+            # listener experiences is the whole interval before their sentence arrived, which is
+            # what this is.
+            sentence_latency_ms = int((time.monotonic() - translation_started) * 1000)
 
             result = TranslationResultMessage(
                 segment_id=chunk_segment_id,
@@ -560,6 +702,17 @@ class TranslationWorker(BaseWorker):
                 translator_model=translator.model,
                 source_segment_id=stt_result.segment_id,
                 chunk_index=stt_result.chunk_index,
+                # Delivery is carried, not derived: how the speaker sounded is settled upstream
+                # at the audio, and translating the words does not change it. VALENCE is the one
+                # part that cannot come from the audio — anger and delight look alike on pitch
+                # and energy — so it is folded in here, from the model that actually read the
+                # sentence. See translation_worker/valence.py.
+                prosody=_with_valence(stt_result.prosody, valence),
+                # Carried so TranscriptService can finally fill translation_contents.latency_ms.
+                # The column and its C# property have existed all along and were NULL on every
+                # row ever written, which is why "translation is sometimes slow" has never been
+                # answerable after the fact.
+                latency_ms=sentence_latency_ms,
             )
 
             # Publish IMMEDIATELY so TTS can synthesize while next chunk is translated
@@ -575,7 +728,7 @@ class TranslationWorker(BaseWorker):
                 original=sentence[:60],
                 translated=translated_text[:60],
                 speculative_hit=speculative_hit if idx == 0 else False,
-                stage_latency_ms=int((time.monotonic() - translation_started) * 1000),
+                stage_latency_ms=sentence_latency_ms,
                 pipeline_latency_ms=max(0, int(time.time() * 1000) - stt_result.timestamp_ms),
             )
         return published_any

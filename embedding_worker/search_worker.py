@@ -24,6 +24,32 @@ from shared.config import EmbeddingSettings, VectorDbSettings
 
 RESULT_TTL_SECONDS = 30
 
+# WT-463 phase 0. What an unprivileged caller may not reach through semantic search.
+#
+# THE HOLE THIS PLUGS
+#   The filter here was `workspace_id` + `ai_retrieval` and nothing else. `ai_retrieval` is a real
+#   gate but a GLOBAL one — it decides whether the AI may use a resource at all, for everyone, and
+#   has no per-subject dimension. Documents DO have a per-subject ACL
+#   (WorkspaceDocumentAccessPolicy, enforced by DocumentAccessEvaluator on every REST read), and
+#   this path never consulted it. So a member could ask WarpBot a question and receive passages
+#   from a document they are not allowed to open.
+#
+# WHY BY SOURCE TYPE, WHICH IS BLUNT
+#   Filtering by the document's actual ACL requires that ACL to be IN the vector payload, and
+#   nothing indexed so far carries it — a per-subject filter would need a re-index of everything
+#   already stored (phase 2). Excluding the class outright is lossy for members, and it is correct
+#   in the only direction that matters here: it can hide something a member was entitled to, never
+#   reveal something they were not.
+#
+#   `meeting_summary` is deliberately NOT in this list, though its artifacts have their own access
+#   levels (HOST_ONLY / ALL_PARTICIPANTS). That is a second, real instance of the same bug; it is
+#   recorded in WT-463 rather than fixed by widening a blunt instrument here.
+#
+# WHAT STAYS REACHABLE
+#   transcript, glossary_term, global_glossary_term, meeting_summary — everything a workspace
+#   member can already read through the product's own surfaces.
+UNPRIVILEGED_EXCLUDED_SOURCES: dict[str, list[str]] = {"source_type": ["document"]}
+
 
 class EmbeddingSearchWorker(BaseWorker):
     """Consumes semantic-search requests and replies via a per-job Redis list key."""
@@ -73,6 +99,7 @@ class EmbeddingSearchWorker(BaseWorker):
                 vector=vectors[0],
                 top_k=request.top_k,
                 filters={"workspace_id": request.workspace_id, "ai_retrieval": True},
+                exclude=None if request.privileged else UNPRIVILEGED_EXCLUDED_SOURCES,
             )
             await self._reply(result_key, {"matches": matches})
         except Exception as exc:

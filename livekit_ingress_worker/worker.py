@@ -9,6 +9,7 @@ import copy
 import json
 import random
 import time
+import uuid
 from collections import deque
 from contextlib import suppress
 from typing import Any
@@ -21,11 +22,38 @@ from redis.exceptions import RedisError
 
 from livekit_ingress_worker.near_field_gate import NearFieldGate
 from shared.base_worker import BaseWorker
-from shared.schemas import AudioChunkMessage
+from shared.schemas import (
+    STT_FRAME_STREAM,
+    STT_FRAME_STREAM_MAXLEN,
+    AudioChunkMessage,
+    AudioFrameMessage,
+)
 
 SILERO_VAD_REPOSITORY = "snakers4/silero-vad:v6.2.1"
-MIN_VAD_SPEECH_FRAMES = 3
-VAD_WINDOW_SAMPLES = 512 * MIN_VAD_SPEECH_FRAMES
+
+# How long one VAD decision covers. Three exact Silero frames (3 x 32ms = 96ms) is the
+# smallest window that can carry any majority at all.
+VAD_WINDOW_FRAMES = 3
+
+# How many of those frames must clear the threshold for the window to count as speech.
+#
+# WT-371 #7. This used to BE the window length — `VAD_WINDOW_SAMPLES = 512 * MIN_VAD_SPEECH_FRAMES`
+# with the check `speech_frames >= MIN_VAD_SPEECH_FRAMES`. One constant set both, so the rule was
+# never "some evidence"; it was UNANIMITY. Every frame in the window had to clear the threshold,
+# and the knob could not express anything else: raising it grew the window by exactly as much as
+# it raised the bar.
+#
+# Unanimity is the wrong rule for the start of an utterance, which is exactly where speech is
+# least confident — a breath before the first vowel, an unvoiced consonant, a word begun partway
+# through a window. One such frame rejected the whole 96ms, so onsets were routinely classified as
+# silence and detection waited for the next window. Which is the reported symptom: speech register-
+# ing late, and registering better when there is background noise keeping every frame's
+# probability up.
+#
+# A majority still rejects the isolated spike the original docstring was written to reject.
+MIN_VAD_SPEECH_FRAMES = 2
+
+VAD_WINDOW_SAMPLES = 512 * VAD_WINDOW_FRAMES
 VAD_WINDOW_MS = VAD_WINDOW_SAMPLES * 1000 // 16000
 
 # Bot participant identities used elsewhere in this pipeline — this worker's own
@@ -126,6 +154,16 @@ _STORM_COUNTER_KEY_PREFIX = "livekit:ingress:connects:"
 # 15s matches tts_worker/livekit_publisher.py's _REAP_INTERVAL_S — one reap cadence
 # across the pipeline — and bounds the overshoot past the grace period to one tick.
 _IDLE_SWEEP_INTERVAL_S = 15.0
+
+# Room lifecycle states that mean "this meeting is happening right now", used by
+# _rediscover_active_rooms to decide which snapshots are worth reclaiming after a restart.
+#
+# Matched against the `room_status` the backend writes into
+# translationRoom:{id}:audio_routes. Deliberately an allow-list of live states rather than a
+# deny-list of finished ones: a status this worker has never heard of should be left alone,
+# not dialled into. The snapshot key outlives the meeting by its TTL, so without this a
+# restart would reconnect the bot to every meeting that ended in the last twelve hours.
+_LIVE_ROOM_STATUSES = frozenset({"IN_PROGRESS", "AUDIO_ROUTING_ACTIVE"})
 # How long a room may hold zero HUMAN remote participants before the bot leaves.
 #
 # The bot legitimately sits alone twice: between its own connect and the joining human's
@@ -182,6 +220,37 @@ def _parse_track_published_event(
     if not isinstance(track_id, str) or not track_id:
         return None
     return room_name, participant_identity, track_id
+
+
+# WT-B/flash mode — the per-room switch for streaming audio during speech.
+#
+# Accepted spellings are generous on purpose: this key is written by the backend today and by a
+# person with redis-cli during an incident tomorrow, and a switch that silently ignores "true"
+# is worse than one that accepts it.
+_FLASH_MODE_ON = {"on", "true", "1", "enabled", "yes"}
+_FLASH_MODE_OFF = {"off", "false", "0", "disabled", "no"}
+# Short enough that a toggle feels immediate, long enough that a busy room does not read Redis
+# once per speaker per sentence.
+_FLASH_MODE_CACHE_SECONDS = 3.0
+
+# The ingress energy floor: below this, a chunk is noise rather than speech.
+#
+# It is the ONLY always-on audio gate here — near_field_gate_enabled defaults to False — so it is
+# the one thing that can discard a real utterance before STT ever sees it.
+#
+# MEASURED, not guessed (tools/probe_energy_floor.py, 2026-08-18). Against speech whose own RMS is
+# 0.2005 the floor leaves:
+#
+#     3000ms utterance  ->  -19.1 dB of headroom
+#      288ms utterance  ->  -14.6 dB of headroom
+#
+# Same speaker, same distance, 4.6 dB apart — most of one distance doubling — purely because the
+# RMS was taken over the whole chunk, and a chunk carries vad_pre_speech_ms plus
+# vad_silence_hangover_ms (192 + 576 = 768ms) of padding around the speech. The shorter the
+# utterance, the more of that padding is averaged in, and the stricter the gate silently becomes.
+# It was therefore hardest on exactly the short acknowledgements vad_min_speech_ms was lowered
+# to keep.
+_ENERGY_FLOOR_RMS = 0.02
 
 
 class LiveKitIngressWorker(BaseWorker):
@@ -253,8 +322,94 @@ class LiveKitIngressWorker(BaseWorker):
         """Not used, we override _consume_loop for Pub/Sub."""
         pass
 
+    async def _rediscover_active_rooms(self) -> int:
+        """Pick meetings back up after this process restarts mid-call.
+
+        WHAT THIS COSTS WHEN IT IS MISSING
+            15 Aug, 12:17:07 local. The cgroup OOM killer took this worker mid-meeting with
+            two people talking. It restarted eight seconds later, opened its listeners, and
+            then sat completely idle for FOUR MINUTES AND NINETEEN SECONDS while the meeting
+            carried on without it. No transcript, no translation, no dub. It only woke up at
+            12:21:44 because somebody happened to publish a new track.
+
+            The reason is the one this codebase has now hit three times: meeting.track_published
+            arrives over Redis Pub/Sub, and pub/sub has no replay. Every participant in that
+            room had already published, so the event that would have summoned this worker back
+            had come and gone while the process was dead. In a settled meeting it never comes
+            again.
+
+            `_deferred_rooms` exists for the neighbouring case — another replica dying — and
+            the sweeper already retries the claim for everything in it. But it is an in-memory
+            set, so it dies with the process that owns it: the one replica that most needs to
+            recover its rooms is the one that just lost the record of them.
+
+        The durable record already exists and needs no new publisher: the backend writes
+        `translationRoom:{id}:audio_routes` on every route change, carrying `room_status`. That
+        is the same key `_hydrate_room_status` and `_load_route_snapshot` already read. Seeding
+        `_deferred_rooms` from it turns a restart from "silent until someone republishes" into
+        "claimed on the next sweep".
+
+        Never fatal. A worker that cannot enumerate is exactly as capable as one that never
+        tried, and refusing to start would turn a recovery miss into an outage.
+        """
+        try:
+            keys = await self.redis.scan_keys("translationRoom:*:audio_routes")
+        except Exception:
+            self.logger.warning("room_rediscovery_scan_failed", exc_info=True)
+            return 0
+
+        recovered = 0
+        for key in keys:
+            parts = key.split(":")
+            if len(parts) != 3:
+                continue
+            room_name = parts[1]
+            try:
+                cached = await self.redis.get(key)
+                if not cached:
+                    continue
+                if isinstance(cached, bytes):
+                    cached = cached.decode("utf-8")
+                status = json.loads(cached).get("room_status")
+            except Exception:
+                self.logger.warning("room_rediscovery_read_failed", room=room_name, exc_info=True)
+                continue
+
+            # Only rooms that are actually live. An ENDED meeting's snapshot outlives it by
+            # the key's TTL, and claiming those would have this worker dial into finished
+            # rooms on every restart.
+            if not isinstance(status, str) or status not in _LIVE_ROOM_STATUSES:
+                continue
+
+            self._route_states[room_name] = status
+            self._deferred_rooms.add(room_name)
+            recovered += 1
+
+        if recovered:
+            # The sweeper is what turns a deferred room into a connection, and it is started
+            # lazily — without this the seeded set would sit untouched until some other event
+            # happened to start it, which is the very thing that was missing.
+            self._ensure_idle_sweeper()
+            self.logger.warning(
+                "rooms_rediscovered_after_restart",
+                rooms=recovered,
+                scanned=len(keys),
+            )
+            try:
+                await self._claim_deferred_rooms()
+            except Exception:
+                # The sweep will try again in _IDLE_SWEEP_INTERVAL_S; one failed immediate
+                # attempt must not stop the listener from starting.
+                self.logger.warning("room_rediscovery_claim_failed", exc_info=True)
+
+        return recovered
+
     async def _consume_loop(self) -> None:
         """Override to listen to Redis Pub/Sub instead of Streams."""
+        # Before the listener, not after: everything below waits on an event that, for a
+        # meeting already in progress, has already been published and will not repeat.
+        await self._rediscover_active_rooms()
+
         self.logger.info("Starting Redis Pub/Sub listener for meeting.track_published")
 
         while not self._shutdown_event.is_set():
@@ -712,20 +867,77 @@ class LiveKitIngressWorker(BaseWorker):
         idle_rooms: list[str] = []
         occupied = 0
         humans = 0
+        reattached_readers = 0
+
+        lost: list[str] = []
 
         for room_name, room in list(self.rooms.items()):
             try:
-                # A handle we hold on a room LiveKit already dropped bills nothing, but it
-                # is not occupied either — let the same grace window retire it.
-                count = self._human_participant_count(room) if room.isconnected() else 0
+                connected = room.isconnected()
+                count = self._human_participant_count(room) if connected else 0
             except Exception:
                 self.logger.warning("idle_sweep_room_probe_failed", room=room_name, exc_info=True)
+                continue
+
+            # WT-395 — a connection we lost is NOT an empty room, and must not be retired by
+            # the path that retires empty ones.
+            #
+            # This branch used to fall through to `count = 0`, on the reasoning that a handle
+            # LiveKit already dropped bills nothing. True for the cost question WT-314 was
+            # about, and wrong for this one: retiring is only safe if something re-joins, and
+            # nothing does. `_release_idle_room` discards the room from `_deferred_rooms` too,
+            # and the only other way back is a `meeting.track_published` event — which, as the
+            # comment on `_deferred_rooms` says, in a room where everyone has already
+            # published is never.
+            #
+            # So one dropped connection ended audio ingestion for the rest of the meeting.
+            # Production 2026-08-14, room 01a00058: both speakers' transcripts stopped within
+            # four seconds of each other at 13:01 and never resumed, while the room and the
+            # translation session stayed alive until 13:11. Nothing failed loudly; the meeting
+            # simply stopped being heard.
+            #
+            # Requeued instead. `_claim_deferred_rooms` runs immediately after this sweep in
+            # the same tick and re-dials, so the cost is one sweep interval of lost audio
+            # rather than the remainder of the meeting. Ownership is dropped first because the
+            # claim is what that path gates on.
+            if not connected:
+                self.rooms.pop(room_name, None)
+                self._room_last_occupied.pop(room_name, None)
+                self._cancel_room_audio_tasks(room_name)
+                self._deferred_rooms.add(room_name)
+                lost.append(room_name)
                 continue
 
             if count > 0:
                 self._room_last_occupied[room_name] = now
                 occupied += 1
                 humans += count
+
+                # WT-404 — a connected room with people in it is not the same as a room being
+                # HEARD, and until now nothing checked the difference.
+                #
+                # `process_audio_track` ends silently when its AudioStream ends without raising:
+                # the task completes, `_forget_audio_task` drops it, and the only trace is one
+                # INFO line. `_start_audio_task` is called from exactly two places — the
+                # `track_subscribed` event and joining a room — so if LiveKit does not fire a
+                # fresh subscribe for that track, that speaker is never read again.
+                #
+                # Production 2026-08-14, room 01a0015d: audio reached `audio:chunks` for 76
+                # seconds of an eight-minute meeting and then stopped, while this very sweep went
+                # on reporting the room connected and occupied. One transcript segment was saved.
+                # The listener still heard dubbed audio, so nothing looked broken from outside.
+                #
+                # Idempotent by construction: `_start_audio_task` returns False for a live reader
+                # on the same track, so this only ever fills a genuine gap.
+                reattached = self._start_pending_audio_tasks(room_name, room)
+                if reattached:
+                    reattached_readers += reattached
+                    self.logger.warning(
+                        "audio_reader_reattached",
+                        room=room_name,
+                        readers=reattached,
+                        detail="a speaker in a live room had no audio reader",
+                    )
                 continue
 
             last_occupied = self._room_last_occupied.setdefault(room_name, now)
@@ -734,15 +946,25 @@ class LiveKitIngressWorker(BaseWorker):
 
         # The reason WT-314 ran undetected is that a leaked bot is completely silent. This
         # is the gauge that makes a recurrence visible in logs instead of on the invoice.
-        if self.rooms or idle_rooms:
+        if self.rooms or idle_rooms or lost:
             self.logger.info(
                 "livekit_ingress_room_census",
                 connected_rooms=len(self.rooms),
                 occupied_rooms=occupied,
                 human_participants=humans,
                 releasing_idle_rooms=len(idle_rooms),
+                requeued_lost_rooms=len(lost),
+                # WT-404. The census reported a healthy room throughout a meeting nobody was
+                # being heard in. This is the number that would have shown it.
+                reattached_readers=reattached_readers,
                 idle_releases_total=self._idle_releases_total,
             )
+
+        for room_name in lost:
+            # Warning, not info: losing the connection to a live meeting is the failure this
+            # branch exists to catch, and it left no trace at all before today.
+            self.logger.warning("livekit_room_connection_lost_requeued", room=room_name)
+            await self._release_room_ownership(room_name)
 
         for room_name in idle_rooms:
             # Strong reference held for the task's whole life. asyncio keeps only a weak
@@ -886,10 +1108,13 @@ class LiveKitIngressWorker(BaseWorker):
     ) -> float:
         """Run Silero VAD and reject isolated probability spikes.
 
-        Silero requires 512-sample (32ms) frames. We process all frames
-        in the window, but require roughly 96ms of speech evidence before returning
-        the strongest probability. A single noisy frame must not classify the window
-        as speech.
+        Silero requires 512-sample (32ms) frames. Every frame in the window is scored, and the
+        window counts as speech once MIN_VAD_SPEECH_FRAMES of them clear the threshold — a
+        majority, so one noisy frame cannot classify the window as speech and one weak frame
+        cannot disqualify it.
+
+        The evidence bar and the window length are separate constants on purpose; see
+        MIN_VAD_SPEECH_FRAMES for what happened when they were the same one.
         """
         model = vad_model or self._require_vad_model()
         max_prob = 0.0
@@ -908,6 +1133,9 @@ class LiveKitIngressWorker(BaseWorker):
         """Stream audio from LiveKit, gate with VAD, publish only speech chunks."""
         audio_stream = rtc.AudioStream(track)
         sample_rate = self.SAMPLE_RATE
+        # Distinguishes a reader somebody stopped from one that stopped itself — see the finally
+        # block. Without it both ended on the same INFO line and WT-404 was invisible.
+        cancelled = False
 
         # VAD configuration from settings
         vad_threshold = self.settings.vad_threshold
@@ -939,6 +1167,16 @@ class LiveKitIngressWorker(BaseWorker):
         # missed/fragmented speech. Each track owns an independent cloned state machine.
         track_vad_model = copy.deepcopy(self._require_vad_model())
 
+        # Streaming state. A TURN is the audio that the NEXT audio:chunks message will commit
+        # — so it is rotated by a max-chunk flush as well as by silence, because both publish a
+        # chunk and both therefore end a commit boundary on the STT side.
+        # Decided at each speech onset (see _flash_mode_enabled), not once here: this is a
+        # switch somebody flips mid-meeting and then listens for.
+        streaming = False
+        turn_id = ""
+        frame_seq = 0
+        streamed_bytes = 0
+
         # State
         raw_buffer = bytearray()  # Incoming raw resampled audio
         speech_buffer = bytearray()  # Audio collected during speech
@@ -946,6 +1184,10 @@ class LiveKitIngressWorker(BaseWorker):
             maxlen=max(1, pre_speech_samples * 2 // (vad_window_samples * 2))
         )  # Rolling pre-speech windows (in bytes, 2 bytes/sample)
         is_speaking = False
+        # Samples in speech_buffer that VAD actually called speech — excludes the pre-speech
+        # padding and the hangover tail. This, not the buffer length, is what the minimum-speech
+        # gate weighs; see where it is compared for what the buffer length let through.
+        speech_samples = 0
         silence_counter = 0
         chunk_index = 0
         resampler = None
@@ -977,6 +1219,7 @@ class LiveKitIngressWorker(BaseWorker):
                     speech_buffer = bytearray()
                     pre_speech_ring.clear()
                     is_speaking = False
+                    speech_samples = 0
                     silence_counter = 0
                     track_vad_model.reset_states()
                     continue
@@ -1016,7 +1259,7 @@ class LiveKitIngressWorker(BaseWorker):
                     window_data = bytes(raw_buffer[:window_bytes])
                     raw_buffer = raw_buffer[window_bytes:]
 
-                    # Run VAD on this 500ms window
+                    # Run VAD on this ~96ms window (VAD_WINDOW_FRAMES exact Silero frames).
                     window_pcm = np.frombuffer(window_data, dtype=np.int16)
                     window_f32 = window_pcm.astype(np.float32) / 32768.0
                     vad_prob = self._run_vad_on_window(
@@ -1031,6 +1274,12 @@ class LiveKitIngressWorker(BaseWorker):
                             # Speech onset — prepend pre-speech ring buffer
                             is_speaking = True
                             speech_buffer = bytearray()
+                            speech_samples = 0
+                            streaming = await self._flash_mode_enabled(room_name)
+                            if streaming:
+                                turn_id = uuid.uuid4().hex
+                                frame_seq = 0
+                                streamed_bytes = 0
                             for pre_window in pre_speech_ring:
                                 speech_buffer.extend(pre_window)
                             self.logger.info(
@@ -1041,11 +1290,28 @@ class LiveKitIngressWorker(BaseWorker):
                             )
 
                         speech_buffer.extend(window_data)
+                        speech_samples += len(window_data) // 2
                         silence_counter = 0
 
-                        # Check max chunk length — publish if exceeded
-                        speech_samples = len(speech_buffer) // 2
-                        if speech_samples >= max_chunk_samples:
+                        # The pre-speech ring goes out with the first frame rather than being
+                        # skipped: it is the word onset the ring exists to preserve, and a
+                        # session that never hears it transcribes a clipped first syllable.
+                        if streaming and len(speech_buffer) > streamed_bytes:
+                            await self._publish_speech_frame(
+                                room_name,
+                                speaker_id,
+                                turn_id,
+                                frame_seq,
+                                bytes(speech_buffer[streamed_bytes:]),
+                                sample_rate,
+                            )
+                            frame_seq += 1
+                            streamed_bytes = len(speech_buffer)
+
+                        # Max chunk length is about the SIZE of what gets sent, so it weighs the
+                        # whole buffer — padding included. Only the minimum-speech gate below asks
+                        # the different question of whether anyone actually spoke.
+                        if len(speech_buffer) // 2 >= max_chunk_samples:
                             await self._publish_speech_chunk(
                                 room_name,
                                 speaker_id,
@@ -1053,9 +1319,22 @@ class LiveKitIngressWorker(BaseWorker):
                                 chunk_index,
                                 sample_rate,
                                 near_field_gate=near_field_gate,
+                                turn_id=turn_id,
+                                speech_samples=speech_samples,
                             )
                             chunk_index += 1
+                            # The SPEAKER has not stopped, but the commit boundary has moved:
+                            # STT will commit everything appended so far when it sees the chunk
+                            # above, so what comes next belongs to a new turn.
+                            if streaming:
+                                turn_id = uuid.uuid4().hex
+                                frame_seq = 0
+                                streamed_bytes = 0
                             speech_buffer = bytearray()
+                            # Still mid-utterance — the speaker has simply run past the maximum
+                            # chunk length. The accumulated speech went out with the chunk, so the
+                            # remainder starts its own count.
+                            speech_samples = 0
 
                     else:
                         # No speech in this window
@@ -1064,8 +1343,17 @@ class LiveKitIngressWorker(BaseWorker):
                             speech_buffer.extend(window_data)  # Keep recording during pauses
 
                             if silence_counter >= silence_hangover_windows:
-                                # End of speech — publish if long enough
-                                speech_samples = len(speech_buffer) // 2
+                                # End of speech — publish if there was enough SPEECH in it.
+                                #
+                                # WT-371 #7: this measured the whole buffer, which by this point
+                                # also holds the pre-speech padding and the entire 576ms hangover.
+                                # A 100ms cough therefore arrived at the gate as ~870ms and sailed
+                                # past a 288ms minimum. What reached Whisper was a fragment of
+                                # non-speech with no confidence signal of its own — the exact input
+                                # it invents fluent sentences from (see test_vad_threshold_default).
+                                #
+                                # The padding still ships; it is just no longer counted as evidence
+                                # that somebody spoke.
                                 if speech_samples >= min_speech_samples:
                                     await self._publish_speech_chunk(
                                         room_name,
@@ -1074,6 +1362,8 @@ class LiveKitIngressWorker(BaseWorker):
                                         chunk_index,
                                         sample_rate,
                                         near_field_gate=near_field_gate,
+                                        turn_id=turn_id,
+                                        speech_samples=speech_samples,
                                     )
                                     chunk_index += 1
                                 else:
@@ -1082,20 +1372,55 @@ class LiveKitIngressWorker(BaseWorker):
                                         samples=speech_samples,
                                         min_required=min_speech_samples,
                                     )
+                                    # No chunk is coming for this turn, so nothing will commit
+                                    # the frames already appended for it. Nothing is published to
+                                    # say so either: the STT side notices that the next turn_id
+                                    # arrived without the previous one ever being committed and
+                                    # clears the buffer itself. That one rule also covers a lost
+                                    # frame and an ingress that died mid-turn, which a marker
+                                    # message would not.
 
+                                # Closed either way — a published chunk commits this turn, and an
+                                # unpublished one is discarded by the rule above. Both end it.
+                                turn_id = ""
+                                frame_seq = 0
+                                streamed_bytes = 0
                                 is_speaking = False
                                 speech_buffer = bytearray()
+                                speech_samples = 0
                                 silence_counter = 0
-                                track_vad_model.reset_states()
+                                # WT-371 #7: the VAD state is NOT reset here any more.
+                                #
+                                # Silero is recurrent. Resetting it discards everything it has
+                                # learned about this microphone and this room, and its first frames
+                                # after a reset are its least reliable — which is precisely the
+                                # moment the next utterance begins. Doing it after EVERY utterance
+                                # meant every sentence in a conversation was judged by a cold model,
+                                # so the first word registered late or not at all, and registered
+                                # better when background noise kept the probabilities up. That is
+                                # the reported symptom, and it is self-inflicted.
+                                #
+                                # A reset is right where the audio genuinely discontinues: a new
+                                # track (above) and a pause/resume (which discards the buffers for
+                                # the same reason). A pause between two sentences is not a
+                                # discontinuity — it is the signal Silero is built to model.
                         else:
                             # Store in pre-speech ring for next onset
                             pre_speech_ring.append(window_data)
 
+        except asyncio.CancelledError:
+            # Somebody decided this reader should stop — the speaker left, the room was
+            # released, or a republished track replaced it. Expected, and told apart from the
+            # case below on purpose (WT-404).
+            cancelled = True
+            raise
         except Exception:
             self.logger.exception("process_audio_track_error", track_sid=track.sid)
         finally:
-            # Publish any remaining speech buffer
-            if speech_buffer and len(speech_buffer) // 2 >= min_speech_samples:
+            # Publish any remaining speech buffer. Gated on the speech in it, for the same reason
+            # the end-of-utterance path is: the track can end on a hangover tail, and buffer
+            # length would count that padding as somebody having spoken.
+            if speech_buffer and speech_samples >= min_speech_samples:
                 await self._publish_speech_chunk(
                     room_name,
                     speaker_id,
@@ -1103,13 +1428,160 @@ class LiveKitIngressWorker(BaseWorker):
                     chunk_index,
                     sample_rate,
                     near_field_gate=near_field_gate,
+                    speech_samples=speech_samples,
                 )
-            self.logger.info("stopped_audio_stream_processing", track_sid=track.sid)
+            if cancelled:
+                self.logger.info("stopped_audio_stream_processing", track_sid=track.sid)
+            else:
+                # THE LINE THAT WAS MISSING. An AudioStream that ends on its own is how a
+                # speaker stops being heard while the room stays connected and the census keeps
+                # reporting it healthy — the whole of WT-404. It was logged at INFO, in the same
+                # words as an ordinary cancellation, so it could happen mid-meeting and read as
+                # routine teardown.
+                #
+                # Not an error: a track really does end when somebody leaves, and the sweep will
+                # simply find nothing to re-attach. It is a warning because in a room that is
+                # still live it means somebody has gone silent.
+                self.logger.warning(
+                    "audio_stream_ended_on_its_own",
+                    room=room_name,
+                    speaker_id=speaker_id,
+                    track_sid=track.sid,
+                    detail="the reader stopped without being cancelled; "
+                    "the idle sweep re-attaches if the track is still published",
+                )
 
     def _require_vad_model(self) -> Any:
         if self._vad_model is None:
             raise RuntimeError("Silero VAD model is not loaded")
         return self._vad_model
+
+    async def _speaker_language(self, room_name: str, speaker_id: str) -> str:
+        """This speaker's own chosen speak-language, or "auto".
+
+        TranslationRoomHub.JoinTranslationRoom persists it (see NormalizeLanguageCode there)
+        keyed by userId, which is the same value LiveKit uses as participant.identity and
+        therefore as speaker_id here. Falls back to "auto" — STT's own guess — only if the
+        speaker somehow is not registered yet.
+
+        Extracted so the streamed frames and the closed utterance cannot disagree about it: a
+        frame appended under one language and committed under another is a session pinned to the
+        wrong language for that turn.
+        """
+        try:
+            raw_language = await self.redis.hget(
+                f"translationRoom:{room_name}:speak_languages", speaker_id
+            )
+        except RedisError:
+            self.logger.warning(
+                "speak_language_lookup_failed",
+                room=room_name,
+                speaker_id=speaker_id,
+                exc_info=True,
+            )
+            return "auto"
+        if not raw_language:
+            return "auto"
+        return raw_language.decode() if isinstance(raw_language, bytes) else raw_language
+
+    async def _flash_mode_enabled(self, room_name: str) -> bool:
+        """Whether THIS room streams audio while the speaker is still talking (flash mode).
+
+        WHY PER ROOM, AND WHY IT IS READ HERE RATHER THAN ONCE PER TRACK
+            One environment variable makes this an all-or-nothing choice for the whole platform,
+            which is the same trap WT-427 documented for denoising: whichever way it is set, half
+            the estate is configured for the other half. It is also the only way to A/B the thing
+            in a real meeting — one room on, one room off, same build.
+
+            Read at SPEECH ONSET, not once when the track opens. A person toggling it mid-meeting
+            expects the next thing they say to be affected; captured at track open it would do
+            nothing until they rejoined, which reads as a dead switch.
+
+        WHY THE VALUE IS HELD FOR THE WHOLE UTTERANCE
+            A turn that starts streaming must finish streaming. Flipping mid-utterance would send
+            the STT side a turn whose frames stop partway, which its own gap check would then have
+            to throw away — so a toggle takes effect on the next thing the speaker says, at most a
+            sentence later.
+
+        Falls back to the deployment default on anything unexpected, which is what every room did
+        before this key existed.
+        """
+        cache: dict[str, tuple[float, bool]] | None = getattr(self, "_flash_mode_cache", None)
+        if cache is None:
+            cache = {}
+            self._flash_mode_cache = cache
+
+        now = time.monotonic()
+        cached = cache.get(room_name)
+        # Short, unlike WT-427's permanent per-room cache, because this one is behind a switch a
+        # person flips DURING a meeting and then listens for. Three seconds keeps a toggle feeling
+        # immediate while still collapsing the per-turn reads of a room full of people.
+        if cached is not None and now - cached[0] < _FLASH_MODE_CACHE_SECONDS:
+            return cached[1]
+
+        value = self.settings.stt_streaming_enabled
+        try:
+            raw = await self.redis.get(f"translationRoom:{room_name}:flash_mode")
+            if raw:
+                decoded = (raw.decode() if isinstance(raw, bytes) else raw).strip().lower()
+                if decoded in _FLASH_MODE_ON:
+                    value = True
+                elif decoded in _FLASH_MODE_OFF:
+                    value = False
+                else:
+                    self.logger.warning(
+                        "flash_mode_unrecognised", room_name=room_name, value=decoded
+                    )
+        except Exception:
+            # A room that cannot be read falls back to the deployment default. Never let a
+            # settings lookup stop audio from being processed.
+            self.logger.warning("flash_mode_unavailable", room_name=room_name)
+
+        cache[room_name] = (now, value)
+        return value
+
+    async def _publish_speech_frame(
+        self,
+        room_name: str,
+        speaker_id: str,
+        turn_id: str,
+        seq: int,
+        pcm: bytes,
+        sample_rate: int,
+    ) -> None:
+        """Hand STT one VAD window WHILE the speaker is still producing the turn.
+
+        Best effort in the strongest sense: a frame that cannot be published is simply not
+        appended, and the closed utterance on `audio:chunks` still carries the whole turn's
+        audio. So the worst case of this whole feature failing is the latency the pipeline had
+        before it existed — never a lost sentence. That is why nothing here raises.
+
+        NO ENERGY OR NEAR-FIELD GATE, unlike _publish_speech_chunk. Those gates judge a WHOLE
+        utterance and reject it as noise; a single 96ms window has no such verdict to give, and
+        applying a per-utterance threshold to a frame would punch holes in the middle of real
+        speech. The utterance-level judgement still happens — on `audio:chunks`, where it always
+        did — and STT only commits what that message tells it to.
+        """
+        if room_name in self._paused_rooms:
+            return
+        try:
+            frame = AudioFrameMessage(
+                meeting_id=room_name,
+                speaker_id=speaker_id,
+                turn_id=turn_id,
+                seq=seq,
+                audio_data=pcm,
+                sample_rate=sample_rate,
+                language=await self._speaker_language(room_name, speaker_id),
+            )
+            await self.redis.publish_ephemeral(
+                STT_FRAME_STREAM, frame.to_redis(), STT_FRAME_STREAM_MAXLEN
+            )
+        except Exception:
+            # Deliberately quiet at debug: this fires per 96ms window per speaker, so a warning
+            # here would bury the log the moment Redis hiccuped — and the fallback is silent and
+            # complete.
+            self.logger.debug("speech_frame_publish_failed", room=room_name, exc_info=True)
 
     async def _publish_speech_chunk(
         self,
@@ -1119,6 +1591,8 @@ class LiveKitIngressWorker(BaseWorker):
         chunk_index: int,
         sample_rate: int,
         near_field_gate: NearFieldGate | None = None,
+        turn_id: str = "",
+        speech_samples: int | None = None,
     ) -> None:
         # Transcription is NOT translation, and this gate used to conflate them.
         #
@@ -1147,12 +1621,35 @@ class LiveKitIngressWorker(BaseWorker):
         raw_peak = np.max(np.abs(pcm.astype(np.float32) / 32768.0))
         duration_ms = len(pcm) * 1000 // sample_rate
 
-        # Energy gate: skip chunks that are too quiet (noise, not speech)
-        if raw_rms < 0.02:
+        # Energy gate: skip chunks that are too quiet (noise, not speech).
+        #
+        # WEIGHED AGAINST THE SPEECH, NOT AGAINST THE PADDING AROUND IT. raw_rms averages the whole
+        # chunk, and VAD deliberately wraps every utterance in pre-speech and hangover padding, so
+        # a comparison against a fixed floor asked a shorter utterance to be LOUDER than a long one
+        # to survive — see _ENERGY_FLOOR_RMS for the measurement. Scaling the floor by the square
+        # root of the speech share undoes exactly that dilution, which makes the gate judge what it
+        # already says it judges. A long utterance barely moves (80% share -> 0.0178); a
+        # minimum-length one stops being 4.6 dB stricter for no reason (27% share -> 0.0104).
+        #
+        # Not a loosening dressed up as a fix: the threshold on SPEECH loudness is now the same
+        # 0.02 for every utterance length, which is what one absolute floor was always meant to be.
+        # Marginal audio that gets through still faces min_avg_logprob downstream, which this model
+        # does populate (see STTSettings for the production values that calibrated it).
+        total_samples = len(pcm)
+        floor = _ENERGY_FLOOR_RMS
+        if speech_samples is not None and 0 < speech_samples < total_samples:
+            floor *= float(np.sqrt(speech_samples / total_samples))
+        if raw_rms < floor:
             self.logger.debug(
                 "skipped_low_energy_chunk",
                 chunk_index=chunk_index,
                 raw_rms=round(float(raw_rms), 6),
+                floor=round(float(floor), 6),
+                speech_share=(
+                    round(speech_samples / total_samples, 3)
+                    if speech_samples is not None and total_samples
+                    else None
+                ),
             )
             return
 
@@ -1170,25 +1667,7 @@ class LiveKitIngressWorker(BaseWorker):
         # Send raw audio (no normalization — Whisper handles natural levels better)
         # Peak normalization was amplifying noise to speech levels, causing hallucinations
 
-        # This speaker's own chosen speak-language — TranslationRoomHub.JoinTranslationRoom
-        # persists it (see NormalizeLanguageCode there) keyed by userId, which is the same
-        # value LiveKit uses as participant.identity/speaker_id here. Falls back to "auto"
-        # (STT's own guess) only if the speaker somehow isn't registered yet.
-        language = "auto"
-        try:
-            raw_language = await self.redis.hget(
-                f"translationRoom:{room_name}:speak_languages", speaker_id
-            )
-        except RedisError:
-            raw_language = None
-            self.logger.warning(
-                "speak_language_lookup_failed",
-                room=room_name,
-                speaker_id=speaker_id,
-                exc_info=True,
-            )
-        if raw_language:
-            language = raw_language.decode() if isinstance(raw_language, bytes) else raw_language
+        language = await self._speaker_language(room_name, speaker_id)
 
         msg = AudioChunkMessage(
             meeting_id=room_name,
@@ -1197,6 +1676,11 @@ class LiveKitIngressWorker(BaseWorker):
             audio_data=bytes(pcm),
             sample_rate=sample_rate,
             language=language,
+            # The turn whose streamed frames this message commits. Empty when streaming is off,
+            # which is also exactly what an older ingress sends through a rolling deploy — so
+            # the STT side reads "empty" as "the audio is in this message" and behaves as it
+            # always did.
+            turn_id=turn_id,
             timestamp_ms=int(time.time() * 1000),
         )
 

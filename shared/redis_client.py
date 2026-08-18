@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import time
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, ParamSpec, TypeVar, cast
 from urllib.parse import urlsplit
@@ -24,6 +26,50 @@ from shared.config import RedisSettings
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Where the stage-latency histograms live, and how they are bucketed.
+#
+# Chosen against what this pipeline actually does rather than a default ladder: a live dub is
+# already uncomfortable at 2s and unusable past 8s, so the interesting resolution is between
+# them. The wide tail exists because production p95 was measured at 11.4s — a ladder that
+# topped out at 5s would have reported "everything is over 5s" and said nothing more.
+LATENCY_BUCKETS_MS = (250, 500, 1000, 2000, 3000, 5000, 8000, 12000, 20000)
+LATENCY_KEY_PREFIX = "warptalk:latency:"
+# Refreshed on every observation. Long enough to survive a quiet weekend, bounded so this can
+# never become the next thing that fills Redis.
+LATENCY_KEY_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+def is_per_room_stream(stream: str) -> bool:
+    """Whether this stream belongs to ONE room and may therefore be expired.
+
+    WT-402. Stream expiry was added to stop abandoned per-room streams filling Redis, and it was
+    applied to every stream — including `audio:chunks`, `stt:results`, `translate:results`,
+    `tts:results` and `ai_assistant:results`, which are permanent and shared. An hour with no
+    meeting expired them, Redis deleted the keys, and every consumer group on them went too.
+
+    The Python workers survive that: `ensure_consumer_group` runs ahead of each read and rebuilds
+    what it needs. The GATEWAY does not — it is a .NET service that creates its groups once at
+    startup — so `gateway-consumers` simply ceased to exist and every XREADGROUP after it threw
+    NOGROUP. No translation, no dub and no assistant reply reached a browser again, and the
+    gateway's health check reported healthy throughout.
+
+    THE DEFAULT IS "NEVER EXPIRE", AND THAT DIRECTION IS THE POINT. Deciding by name means a
+    stream nobody thought about is treated as permanent: the cost of being wrong that way is disk,
+    which monitoring already watches, while the cost of being wrong the other way is a silently
+    dead pipeline. A per-room stream is `{base}:{roomId}`, so the question is whether the last
+    segment is a room id — nothing else in this system suffixes a stream with a UUID.
+    """
+    _, _, last = stream.rpartition(":")
+    if not last:
+        return False
+    try:
+        uuid.UUID(last)
+    except ValueError:
+        return False
+    return True
+
+
 P = ParamSpec("P")
 R = TypeVar("R")
 
@@ -167,9 +213,92 @@ class RedisStreamClient:
             key: value if isinstance(value, (bytes, str, int, float)) else json.dumps(value)
             for key, value in data.items()
         }
-        message_id = await self._retry(self.redis.xadd, stream, cast(Any, redis_data))
+        message_id = await self._append_and_refresh_ttl(stream, redis_data)
         await self._trim_stream_without_losing_unconsumed_entries(stream)
         return message_id
+
+    async def publish_ephemeral(
+        self,
+        stream: str,
+        data: dict[str, Any],
+        maxlen: int,
+    ) -> bytes | str:
+        """Append to a stream whose old entries are worthless, and TRIM THEM UNCONDITIONALLY.
+
+        THE DIFFERENCE FROM `publish`, AND WHY IT IS DELIBERATE
+            `publish` goes through _trim_stream_without_losing_unconsumed_entries, which refuses
+            to drop anything a consumer group has not read. That is right for every stream whose
+            entries are work items: losing one loses a transcript line, a translation or a dub.
+
+            It is wrong for a live audio frame. A frame is appendable to an open Realtime buffer
+            for about as long as its turn lasts; once that turn is committed the frame cannot be
+            used for anything by anybody. Protecting it from trimming means a consumer that falls
+            behind grows the stream without bound — and the failure mode at the other end of that
+            is not a slow pipeline, it is Redis reaching its `allkeys-lru` ceiling and silently
+            deleting whichever keys look least recently used, which during a meeting includes
+            that meeting's own state. Production has already been there once (see
+            RedisSettings.stream_maxlen).
+
+            So this trims on the way in and accepts the loss. A lagging consumer degrades one
+            speaker's turn; the alternative degrades every meeting on the box, invisibly.
+
+        No TTL refresh either: a stream nobody writes to stops being written to, and the entries
+        left in it are already past the point of being useful.
+        """
+        redis_data: dict[str, bytes | str | int | float] = {
+            key: value if isinstance(value, (bytes, str, int, float)) else json.dumps(value)
+            for key, value in data.items()
+        }
+        return cast(
+            "bytes | str",
+            await self._retry(
+                self.redis.xadd,
+                stream,
+                cast(Any, redis_data),
+                maxlen=maxlen,
+                approximate=True,
+            ),
+        )
+
+    async def _append_and_refresh_ttl(
+        self,
+        stream: str,
+        redis_data: dict[str, bytes | str | int | float],
+    ) -> bytes | str:
+        """XADD, and push the stream's expiry back out to now + stream_ttl_seconds.
+
+        Nothing else in this system ever deletes a stream. Rooms end, their four streams stay,
+        and production reached 70 abandoned room streams holding 284 MB — the oldest untouched
+        for ten days — inside a 768 MB Redis. Since the policy there is `allkeys-lru`, filling it
+        does not fail a write: Redis silently deletes whichever keys look least recently used,
+        which during a meeting includes that meeting's own streams and consumer groups. The
+        transcript simply stops, with nothing in any log.
+
+        The EXPIRE rides in the same pipeline as the XADD deliberately. This is the hot path —
+        one publish per speech chunk — and a second round trip here would add latency to the very
+        pipeline the leak was already slowing down.
+
+        ONLY PER-ROOM STREAMS. See is_per_room_stream: this shipped expiring EVERY stream, and
+        the global ones are permanent infrastructure whose consumer groups belong to services
+        that never rebuild them. An hour without a meeting was enough to delete `translate:results`
+        and take `gateway-consumers` with it, after which the gateway threw NOGROUP on every read
+        and no translation, dub or assistant reply reached a browser again — while its health
+        check stayed green. Found in production the same day it shipped (WT-402).
+        """
+        ttl = self._settings.stream_ttl_seconds if is_per_room_stream(stream) else 0
+        if ttl <= 0:
+            return cast(
+                "bytes | str", await self._retry(self.redis.xadd, stream, cast(Any, redis_data))
+            )
+
+        async def _append() -> bytes | str:
+            pipeline = self.redis.pipeline(transaction=False)
+            pipeline.xadd(stream, cast(Any, redis_data))
+            pipeline.expire(stream, ttl)
+            results = await pipeline.execute()
+            return cast("bytes | str", results[0])
+
+        return await self._retry(_append)
 
     async def _trim_stream_without_losing_unconsumed_entries(self, stream: str) -> None:
         """Bound a stream only when trimming cannot remove pending/unread messages.
@@ -202,6 +331,24 @@ class RedisStreamClient:
             if self._stream_id_tuple(last_delivered) == (0, 0):
                 return
 
+            # A group that has stopped advancing is not a slow consumer, and treating it as one
+            # is what turned this safety check into the leak it was meant to prevent: on
+            # 2026-08-14 `billing-stt-workers` still held the floor of `stt:results` at its
+            # 2026-08-10 position, so four days of entries could not be trimmed by anyone.
+            if self._group_is_stale(last_delivered):
+                logger.warning(
+                    "stream_group_stale_ignored_for_trim",
+                    stream=stream,
+                    group=group_name.decode() if isinstance(group_name, bytes) else group_name,
+                    last_delivered_id=(
+                        last_delivered.decode()
+                        if isinstance(last_delivered, bytes)
+                        else last_delivered
+                    ),
+                    stale_after_seconds=self._settings.stream_group_stale_after_seconds,
+                )
+                continue
+
             pending = cast(
                 dict[Any, Any],
                 await self._retry(self.redis.xpending, stream, group_name),
@@ -216,6 +363,12 @@ class RedisStreamClient:
                 )
             required_ids.append(required)
 
+        # Every group on this stream is stale. Bounded growth is no longer the safer option —
+        # nobody is reading — so fall back to the plain count bound rather than growing forever.
+        if not required_ids:
+            await self._retry(self.redis.xtrim, stream, maxlen=maxlen, approximate=True)
+            return
+
         earliest_required = min(required_ids, key=self._stream_id_tuple)
         await self._retry(
             self.redis.xtrim,
@@ -224,6 +377,18 @@ class RedisStreamClient:
             approximate=False,
         )
 
+    def _group_is_stale(self, last_delivered: bytes | str) -> bool:
+        """Whether a group has gone quiet long enough to stop holding the trim floor.
+
+        Read off the stream ID itself, whose millisecond component is the wall-clock time Redis
+        stamped on the entry. That needs no extra call and no bookkeeping of our own.
+        """
+        stale_after = self._settings.stream_group_stale_after_seconds
+        if stale_after <= 0:
+            return False
+        delivered_ms, _ = self._stream_id_tuple(last_delivered)
+        return (time.time() * 1000) - delivered_ms > stale_after * 1000
+
     @staticmethod
     def _stream_id_tuple(message_id: bytes | str) -> tuple[int, int]:
         raw = message_id.decode() if isinstance(message_id, bytes) else message_id
@@ -231,7 +396,14 @@ class RedisStreamClient:
         return int(milliseconds), int(sequence)
 
     async def publish_telemetry(self, room_id: str, worker_type: str, latency_ms: int) -> None:
-        """Publish raw telemetry data to the translationRoom:telemetry Pub/Sub channel."""
+        """Publish raw telemetry data to the translationRoom:telemetry Pub/Sub channel.
+
+        The pub/sub half is live-only and has no subscriber that records anything, so until
+        `record_latency` was added below, every one of these numbers was computed and thrown
+        away. When a tester reported the dub arriving 5-10s late there was no metric anywhere in
+        Prometheus to say which stage it was — the answer had to be reconstructed by hand from
+        Redis stream entry ids.
+        """
         import time
 
         payload = {
@@ -242,6 +414,40 @@ class RedisStreamClient:
             "timestamp": int(time.time() * 1000),
         }
         await self._retry(self.redis.publish, "translationRoom:telemetry", json.dumps(payload))
+        await self.record_latency(worker_type, latency_ms)
+
+    async def record_latency(self, stage: str, latency_ms: int) -> None:
+        """Add one observation to a durable histogram the metrics exporter can scrape.
+
+        WHY A REDIS HASH AND NOT A PROMETHEUS CLIENT IN THE WORKER
+            The workers are consumers with no HTTP server, so there is nothing for Prometheus to
+            scrape them on. The exporter is already the one process that answers /metrics and it
+            is deliberately stateless — it derives everything from Redis on each scrape. Keeping
+            that shape means this needs no new port, no new scrape target, and no new deployment.
+
+        Buckets are stored raw (not cumulative); the exporter accumulates them, because that is
+        the only place that has to care what Prometheus's text format wants.
+
+        The key carries a TTL, refreshed on write. A counter that resets is something
+        `rate()` handles; an unbounded Redis key is what filled production to 93% this morning.
+        Best effort throughout — a metric must never be able to fail the pipeline it measures.
+        """
+        if latency_ms < 0:
+            return
+        bucket = next(
+            (str(edge) for edge in LATENCY_BUCKETS_MS if latency_ms <= edge),
+            "+Inf",
+        )
+        key = f"{LATENCY_KEY_PREFIX}{stage}"
+        try:
+            pipeline = self.redis.pipeline(transaction=False)
+            pipeline.hincrby(key, f"le:{bucket}", 1)
+            pipeline.hincrby(key, "sum", latency_ms)
+            pipeline.hincrby(key, "count", 1)
+            pipeline.expire(key, LATENCY_KEY_TTL_SECONDS)
+            await pipeline.execute()
+        except Exception:
+            logger.debug("latency_record_failed", stage=stage, exc_info=True)
 
     async def publish_system_event(
         self, room_id: str, event_type: str, payload: dict[str, Any]
@@ -460,6 +666,32 @@ class RedisStreamClient:
     async def get(self, key: str) -> bytes | str | None:
         """Get a key value."""
         return await self.redis.get(key)
+
+    async def delete(self, key: str) -> None:
+        """Drop a key now rather than waiting for its TTL.
+
+        Added for the uploaded voice samples (WT-396): those are biometric audio, the expiry on
+        them is a backstop against a worker that never runs, and anything that finishes with
+        them should say so immediately instead of leaving them in memory for the rest of the
+        hour.
+        """
+        await self.redis.delete(key)
+
+    async def scan_keys(self, match: str, count: int = 200) -> list[str]:
+        """Every key matching `match`, as decoded strings.
+
+        SCAN, never KEYS: KEYS blocks the whole server for the length of the keyspace, and
+        this runs against the same Redis the live audio pipeline is using.
+
+        Deliberately materialised into a list rather than returned as an iterator — the
+        caller is doing crash recovery at startup and needs the whole set before it can
+        decide anything, and the patterns used here match one key per active meeting rather
+        than one per message.
+        """
+        found: list[str] = []
+        async for key in self.redis.scan_iter(match=match, count=count):
+            found.append(key.decode("utf-8") if isinstance(key, bytes) else str(key))
+        return found
 
     async def set_if_absent(self, key: str, value: bytes | str, ttl_seconds: int) -> bool:
         """SET NX EX — returns True only for the caller that created the key.
