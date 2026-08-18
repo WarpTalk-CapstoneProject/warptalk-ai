@@ -233,6 +233,25 @@ _FLASH_MODE_OFF = {"off", "false", "0", "disabled", "no"}
 # once per speaker per sentence.
 _FLASH_MODE_CACHE_SECONDS = 3.0
 
+# The ingress energy floor: below this, a chunk is noise rather than speech.
+#
+# It is the ONLY always-on audio gate here — near_field_gate_enabled defaults to False — so it is
+# the one thing that can discard a real utterance before STT ever sees it.
+#
+# MEASURED, not guessed (tools/probe_energy_floor.py, 2026-08-18). Against speech whose own RMS is
+# 0.2005 the floor leaves:
+#
+#     3000ms utterance  ->  -19.1 dB of headroom
+#      288ms utterance  ->  -14.6 dB of headroom
+#
+# Same speaker, same distance, 4.6 dB apart — most of one distance doubling — purely because the
+# RMS was taken over the whole chunk, and a chunk carries vad_pre_speech_ms plus
+# vad_silence_hangover_ms (192 + 576 = 768ms) of padding around the speech. The shorter the
+# utterance, the more of that padding is averaged in, and the stricter the gate silently becomes.
+# It was therefore hardest on exactly the short acknowledgements vad_min_speech_ms was lowered
+# to keep.
+_ENERGY_FLOOR_RMS = 0.02
+
 
 class LiveKitIngressWorker(BaseWorker):
     """Worker that joins LiveKit rooms and pushes audio to Redis Streams."""
@@ -1301,6 +1320,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 sample_rate,
                                 near_field_gate=near_field_gate,
                                 turn_id=turn_id,
+                                speech_samples=speech_samples,
                             )
                             chunk_index += 1
                             # The SPEAKER has not stopped, but the commit boundary has moved:
@@ -1343,6 +1363,7 @@ class LiveKitIngressWorker(BaseWorker):
                                         sample_rate,
                                         near_field_gate=near_field_gate,
                                         turn_id=turn_id,
+                                        speech_samples=speech_samples,
                                     )
                                     chunk_index += 1
                                 else:
@@ -1407,6 +1428,7 @@ class LiveKitIngressWorker(BaseWorker):
                     chunk_index,
                     sample_rate,
                     near_field_gate=near_field_gate,
+                    speech_samples=speech_samples,
                 )
             if cancelled:
                 self.logger.info("stopped_audio_stream_processing", track_sid=track.sid)
@@ -1570,6 +1592,7 @@ class LiveKitIngressWorker(BaseWorker):
         sample_rate: int,
         near_field_gate: NearFieldGate | None = None,
         turn_id: str = "",
+        speech_samples: int | None = None,
     ) -> None:
         # Transcription is NOT translation, and this gate used to conflate them.
         #
@@ -1598,12 +1621,35 @@ class LiveKitIngressWorker(BaseWorker):
         raw_peak = np.max(np.abs(pcm.astype(np.float32) / 32768.0))
         duration_ms = len(pcm) * 1000 // sample_rate
 
-        # Energy gate: skip chunks that are too quiet (noise, not speech)
-        if raw_rms < 0.02:
+        # Energy gate: skip chunks that are too quiet (noise, not speech).
+        #
+        # WEIGHED AGAINST THE SPEECH, NOT AGAINST THE PADDING AROUND IT. raw_rms averages the whole
+        # chunk, and VAD deliberately wraps every utterance in pre-speech and hangover padding, so
+        # a comparison against a fixed floor asked a shorter utterance to be LOUDER than a long one
+        # to survive — see _ENERGY_FLOOR_RMS for the measurement. Scaling the floor by the square
+        # root of the speech share undoes exactly that dilution, which makes the gate judge what it
+        # already says it judges. A long utterance barely moves (80% share -> 0.0178); a
+        # minimum-length one stops being 4.6 dB stricter for no reason (27% share -> 0.0104).
+        #
+        # Not a loosening dressed up as a fix: the threshold on SPEECH loudness is now the same
+        # 0.02 for every utterance length, which is what one absolute floor was always meant to be.
+        # Marginal audio that gets through still faces min_avg_logprob downstream, which this model
+        # does populate (see STTSettings for the production values that calibrated it).
+        total_samples = len(pcm)
+        floor = _ENERGY_FLOOR_RMS
+        if speech_samples is not None and 0 < speech_samples < total_samples:
+            floor *= float(np.sqrt(speech_samples / total_samples))
+        if raw_rms < floor:
             self.logger.debug(
                 "skipped_low_energy_chunk",
                 chunk_index=chunk_index,
                 raw_rms=round(float(raw_rms), 6),
+                floor=round(float(floor), 6),
+                speech_share=(
+                    round(speech_samples / total_samples, 3)
+                    if speech_samples is not None and total_samples
+                    else None
+                ),
             )
             return
 
