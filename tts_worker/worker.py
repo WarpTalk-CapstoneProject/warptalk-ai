@@ -764,7 +764,9 @@ class TTSWorker(BaseWorker):
         elif cloned_voice_id:
             default_voice_id, default_voice_type = cloned_voice_id, "cloned"
         else:
-            default_voice_id = await self._hashed_default_voice_id(target_lang, speaker_id)
+            default_voice_id = await self._hashed_default_voice_id(
+                target_lang, speaker_id, meeting_id
+            )
             default_voice_type = "default"
 
         variants: list[tuple[str, str, str]] = [(default_voice_id, default_voice_type, "")]
@@ -807,13 +809,132 @@ class TTSWorker(BaseWorker):
             )
         return voices
 
-    async def _hashed_default_voice_id(self, language: str, speaker_id: str) -> str:
-        """Deterministic per-speaker pick from this language's voice catalog."""
+    @staticmethod
+    def _persona_hash(speaker_id: str, salt: str = "") -> int:
+        return int(hashlib.sha256(f"{salt}{speaker_id}".encode()).hexdigest(), 16)
+
+    @classmethod
+    def _persona_pool(cls, catalog: list[dict[str, Any]], speaker_id: str) -> list[dict[str, Any]]:
+        """The voices this speaker may be heard in — the SAME kind of voice in every language.
+
+        This is the half that fixes "Nhi hears him as female, I hear him as male". The choice of
+        gender is made from the speaker id alone, so it is settled before any catalog is
+        consulted and cannot vary with the listener's language.
+
+        It does NOT claim to know the speaker's real gender — nothing upstream measures or asks
+        for it, and guessing one from pitch is not something to do quietly. What it guarantees is
+        that whatever they are assigned, everybody hears the same one. Matching a real gender
+        needs a real signal (a declared preference, or their voice profile) and is a separate
+        piece of work.
+
+        Falls back to the whole catalog when a language offers only one gender, because there is
+        then nothing to choose between and forcing the choice would just empty the pool.
+        """
+        by_gender: dict[str, list[dict[str, Any]]] = {}
+        for voice in catalog:
+            gender = str(voice.get("gender") or "").strip().lower()
+            by_gender.setdefault(gender, []).append(voice)
+
+        masculine = by_gender.get("masculine", [])
+        feminine = by_gender.get("feminine", [])
+        if not masculine or not feminine:
+            return list(catalog)
+
+        return masculine if cls._persona_hash(speaker_id, "gender:") % 2 == 0 else feminine
+
+    @classmethod
+    def _claim_voice(
+        cls,
+        catalog: list[dict[str, Any]],
+        speaker_id: str,
+        taken: set[str],
+    ) -> dict[str, Any]:
+        """This speaker's preferred voice, or the nearest free one after it."""
+        pool = cls._persona_pool(catalog, speaker_id)
+        start = cls._persona_hash(speaker_id) % len(pool)
+
+        for offset in range(len(pool)):
+            candidate = pool[(start + offset) % len(pool)]
+            if str(candidate["id"]) not in taken:
+                return candidate
+
+        # Their own pool is exhausted. Spilling into the rest of the catalog keeps two people
+        # distinguishable, which matters more than the gender being consistent for one of them.
+        for offset in range(len(catalog)):
+            candidate = catalog[(start + offset) % len(catalog)]
+            if str(candidate["id"]) not in taken:
+                return candidate
+
+        # More speakers than the language has voices. Somebody has to share; the preference is
+        # still deterministic, so at least it is the same sharing every time.
+        return pool[start]
+
+    @classmethod
+    def _assign_voice(
+        cls,
+        catalog: list[dict[str, Any]],
+        roster: list[str],
+        speaker_id: str,
+    ) -> dict[str, Any]:
+        """Which voice `speaker_id` gets, given everybody else in the room. Pure and total.
+
+        THE COLLISION THIS EXISTS TO PREVENT
+            The previous rule was `catalog[hash(speaker) % len(catalog)]` with no reference to
+            anyone else, so two speakers in a room of four routinely landed on one voice. In
+            production on 18 Aug, Kỳ and Tú were assigned the SAME id in English (62ae83ad) AND
+            the same id in Japanese (498e7f37) — every listener in either language heard two
+            different people in one voice and could not tell who was speaking. In a conversation
+            product that is worse than the wrong gender.
+
+            Resolution walks the roster in sorted order and lets each speaker claim their
+            preferred voice, probing forward when it is already taken. Deterministic, so every
+            worker process and every language reaches the same answer without coordinating.
+
+            A join can shift an assignment, but only for someone who both sorts after the joiner
+            AND actually wanted the same voice. Stable assignment would need shared state; a rare
+            change is the better trade against two people permanently sounding identical.
+        """
+        # Sorted so the answer does not depend on the order Cartesia's API happened to return,
+        # nor on which worker warmed the cache.
+        ordered_catalog = sorted(catalog, key=lambda voice: str(voice["id"]))
+
+        taken: set[str] = set()
+        for uid in roster:
+            chosen = cls._claim_voice(ordered_catalog, uid, taken)
+            if uid == speaker_id:
+                return chosen
+            taken.add(str(chosen["id"]))
+
+        # Not on the roster — a speaker the languages hash has not caught up with. They still get
+        # their own preference rather than nothing.
+        return cls._claim_voice(ordered_catalog, speaker_id, set())
+
+    async def _room_speaker_ids(self, meeting_id: str) -> set[str]:
+        """Everyone the room currently knows about, from the same hash the language lookup uses."""
+        try:
+            raw = await self.redis.hgetall(f"translationRoom:{meeting_id}:languages")
+        except Exception:
+            self.logger.warning("room_roster_unavailable", meeting_id=meeting_id, exc_info=True)
+            return set()
+        return {uid.decode() if isinstance(uid, bytes) else uid for uid in (raw or {})}
+
+    async def _hashed_default_voice_id(
+        self, language: str, speaker_id: str, meeting_id: str = ""
+    ) -> str:
+        """The stand-in voice this speaker is dubbed in, when they have no clone and no profile.
+
+        Was `catalog[hash(speaker) % len(catalog)]`, which keyed the choice on the LISTENER's
+        language — so one speaker had a different voice, and a different gender, for every
+        listener — and ignored everyone else in the room, so two speakers collided routinely.
+        See _persona_pool and _assign_voice for the two halves of the answer.
+        """
         catalog = await self._get_voice_catalog(language)
         if not catalog:
             return CartesiaSynthesizer._default_voice_id(language)
-        index = int(hashlib.sha256(speaker_id.encode()).hexdigest(), 16) % len(catalog)
-        return str(catalog[index]["id"])
+
+        roster = await self._room_speaker_ids(meeting_id) if meeting_id else set()
+        roster.add(speaker_id)
+        return str(self._assign_voice(catalog, sorted(roster), speaker_id)["id"])
 
     async def _get_explicit_voice_choices(self, meeting_id: str, target_lang: str) -> set[str]:
         """Distinct voice_ids explicitly chosen (via TranslationRoomHub.

@@ -41,7 +41,9 @@ def _worker(*, chosen: str | None, cloned: str | None, listener_choices: set[str
     async def _choices(_meeting: str, _lang: str) -> set[str]:
         return listener_choices
 
-    async def _hashed(_lang: str, _speaker: str) -> str:
+    # Takes the meeting too: the stand-in voice is now chosen against everybody in the room, so
+    # that two speakers cannot be assigned the same one (WT-528).
+    async def _hashed(_lang: str, _speaker: str, _meeting: str = "") -> str:
         return "hashed-catalog-voice"
 
     worker._get_voice_id = _get_voice_id  # type: ignore[method-assign]
