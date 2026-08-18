@@ -6,7 +6,11 @@ TTFA: 40ms (Sonic Turbo). Voice cloning: 10-15s audio sample → voice_id via AP
 
 from __future__ import annotations
 
+import asyncio
 import io
+import time
+from collections import deque
+from contextlib import suppress
 from typing import Any, cast
 
 from cartesia import AsyncCartesia
@@ -16,6 +20,13 @@ from shared.logger import get_logger
 from tts_worker.prosody_context import SENTENCE_TIMEOUT_SECONDS, ProsodyContext
 
 logger = get_logger(__name__)
+
+# How long a pooled connection may sit unused before it is assumed dead.
+#
+# Not tuned against a documented Cartesia idle timeout, because there is not one to tune
+# against — it is a deliberately short guess in the safe direction. Discarding a live
+# connection costs one background dial; handing over a dead one costs a spoken sentence.
+WARM_CONNECTION_MAX_IDLE_SECONDS = 90.0
 
 
 class CartesiaSynthesizer:
@@ -50,10 +61,121 @@ class CartesiaSynthesizer:
         # this is the whole of the available range, not a tuned number.
         self.speed = speed
         self._client: AsyncCartesia | None = None
+        #: Open, unused websocket connections, newest last. See warm_up.
+        self._warm_connections: deque[tuple[Any, float]] = deque()
+        self._warm_target = 0
+        self._warm_refill_task: asyncio.Task[None] | None = None
 
     async def load(self) -> None:
         self._client = AsyncCartesia(api_key=self.api_key)
         logger.info("cartesia_ready", model=self.model, sample_rate=self.sample_rate)
+
+    async def _open_warm_connection(self) -> tuple[Any, float]:
+        client = self._require_client()
+        connection = await client.tts.websocket_connect().enter()
+        return connection, time.monotonic()
+
+    async def warm_up(self, pool_size: int = 2) -> None:
+        """Dial Cartesia before anybody speaks, so the first sentence does not pay for it.
+
+        WHAT THIS IS WORTH, MEASURED (2026-08-18, tools/probe_tts_first_audio.py)
+            Time to the listener's first audio sample, on the websocket path production runs:
+
+                cold context (dial + generate)   p50 0.669s
+                warm context (generate only)     p50 0.180s
+
+            The gap is the dial, and it was measured on its own at p50 **427.6ms**, against
+            `connection.context(...)` at **0.1ms** — the context is pure local bookkeeping. So
+            roughly three quarters of what a listener waits for on the first sentence of every
+            turn is a TCP+TLS+websocket handshake that could have happened at any earlier
+            moment.
+
+            That is also why swapping TTS model does nothing here: sonic-3.5 is already the
+            fastest of the four that exist (0.669s cold, 0.180s warm) AND the only fast one that
+            speaks Vietnamese at all — sonic-2 and sonic-turbo answer "Invalid language for
+            model" for every Vietnamese sentence.
+
+        SAME SHAPE AS OpenAISTT.warm_up, deliberately. That pool exists for the identical
+        reason on the identical kind of socket, and it already learned the lesson this would
+        otherwise have to learn again: a pool filled once at startup is a pool that helps the
+        first few speakers a process ever sees and nobody afterwards. Hence _schedule_warm_refill.
+
+        A CONNECTION, NOT A CONTEXT. A context needs a voice, a language and a model, none of
+        which are known before a translation arrives. A connection needs none of them, so this
+        can run at startup and serve whatever the meeting turns out to need.
+        """
+        self._warm_target = max(0, pool_size)
+        if self._warm_target == 0:
+            return
+
+        opened = await asyncio.gather(
+            *(self._open_warm_connection() for _ in range(self._warm_target)),
+            return_exceptions=True,
+        )
+        for result in opened:
+            if isinstance(result, BaseException):
+                logger.warning("cartesia_warm_connection_failed", error=str(result))
+            else:
+                self._warm_connections.append(result)
+        logger.info("cartesia_pool_warmed", connections=len(self._warm_connections))
+
+    def _schedule_warm_refill(self) -> None:
+        """Top the pool back up off the caller's critical path."""
+        if self._warm_target <= 0 or self._client is None:
+            return
+        existing = self._warm_refill_task
+        if existing is not None and not existing.done():
+            return
+        self._warm_refill_task = asyncio.create_task(self._refill_warm_connections())
+
+    async def _refill_warm_connections(self) -> None:
+        while len(self._warm_connections) < self._warm_target:
+            try:
+                self._warm_connections.append(await self._open_warm_connection())
+            except Exception as exc:  # noqa: BLE001 - a provider hiccup must not kill the worker
+                # Stop rather than spin: the next claim schedules another attempt, so an outage
+                # costs cold dials, never a reconnect loop.
+                logger.warning("cartesia_warm_refill_failed", error=str(exc))
+                return
+
+    def _take_warm_connection(self) -> Any | None:
+        """A pooled connection young enough to still be open, or None.
+
+        AGE IS CHECKED HERE RATHER THAN ON A TIMER, and that is the whole staleness policy.
+        A websocket left idle is eventually closed by the far end, and handing a dead one to a
+        turn would cost that sentence a fallback — which is WORSE than today, where the dial is
+        at least fresh. Discarding on the way out means a quiet meeting simply pays what it pays
+        now, while a busy one keeps drawing from a pool that traffic itself keeps fresh.
+        """
+        while self._warm_connections:
+            connection, opened_at = self._warm_connections.popleft()
+            if time.monotonic() - opened_at <= WARM_CONNECTION_MAX_IDLE_SECONDS:
+                return connection
+            # Closing is fire-and-forget: the caller is on the hot path of a spoken sentence.
+            asyncio.create_task(self._close_quietly(connection))
+        return None
+
+    @staticmethod
+    async def _close_quietly(connection: Any) -> None:
+        with suppress(Exception):
+            await connection.close()
+
+    async def close(self) -> None:
+        """Drain the pool. Stops refilling first, or the task races shutdown and reopens
+        sockets nobody will ever close."""
+        self._warm_target = 0
+        refill = self._warm_refill_task
+        if refill is not None and not refill.done():
+            refill.cancel()
+            with suppress(asyncio.CancelledError):
+                await refill
+
+        connections = [connection for connection, _opened_at in self._warm_connections]
+        self._warm_connections.clear()
+        await asyncio.gather(
+            *(self._close_quietly(connection) for connection in connections),
+            return_exceptions=True,
+        )
 
     async def open_prosody_context(
         self,
@@ -71,9 +193,19 @@ class CartesiaSynthesizer:
         Raw PCM rather than a WAV container: this is a stream, so there is no total length to
         put in a header up front. ProsodyContext re-wraps each sentence in the 44-byte header
         the publish path expects, so nothing downstream can tell the difference.
+
+        THE DIAL IS THE EXPENSIVE PART AND IT IS TAKEN FROM THE POOL WHEN THERE IS ONE.
+        `websocket_connect().enter()` measured p50 427.6ms; `connection.context(...)` measured
+        0.1ms. So a pooled connection turns a ~0.67s wait for the first audio into ~0.18s, and
+        an empty pool simply behaves exactly as this method did before — see warm_up.
         """
         client = self._require_client()
-        connection = await client.tts.websocket_connect().enter()
+        connection = self._take_warm_connection()
+        if connection is None:
+            connection = await client.tts.websocket_connect().enter()
+        # Scheduled whether or not one was taken: an empty pool is the case that most needs
+        # refilling, and a claim is the only signal that this worker is actually busy.
+        self._schedule_warm_refill()
         context = connection.context(
             context_id=context_id,
             # Belt and braces with ProsodyContext's own asyncio.timeout: this one is the SDK's

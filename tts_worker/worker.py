@@ -213,6 +213,9 @@ class TTSWorker(BaseWorker):
             speed=self.tts_settings.speed,
         )
         await self.cartesia.load()
+        # Before any consumer starts: the first sentence of the first turn is the one that
+        # would otherwise pay the ~427ms dial, and it is also the one somebody is listening for.
+        await self.cartesia.warm_up(pool_size=self.tts_settings.tts_warm_pool_size)
         self.livekit_publisher = LiveKitTTSPublisher(self.settings.livekit)
         asyncio.create_task(self._consume_audio_for_cloning())
         asyncio.create_task(self._consume_upload_clone_requests())
@@ -274,6 +277,17 @@ class TTSWorker(BaseWorker):
             except Exception:
                 self.logger.exception("consume_loop_error")
                 await asyncio.sleep(1.0)
+
+    async def _cleanup(self) -> None:
+        """Drain the Cartesia connection pool on shutdown.
+
+        Without this a redeploy leaves however many sockets the pool held open on the vendor's
+        side until they time out — small, but it is the kind of leak this worker has already
+        been caught doing once with cloned voices.
+        """
+        cartesia = getattr(self, "cartesia", None)
+        if cartesia is not None:
+            await cartesia.close()
 
     def _cleanup_room(self, room_id: str) -> None:
         super()._cleanup_room(room_id)

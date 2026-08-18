@@ -345,6 +345,18 @@ class TTSSettings(BaseSettings):
     # Cartesia's public library doesn't churn often — cache the per-language catalog
     # in Redis this long before re-fetching, to avoid a /voices call on every miss.
     voice_catalog_cache_ttl_seconds: int = 21600  # 6h
+
+    # How many Cartesia websocket connections to hold open, ready for the next spoken sentence.
+    #
+    # MEASURED, not guessed (tools/probe_tts_first_audio.py, 2026-08-18): dialling Cartesia costs
+    # p50 427.6ms and building the context on an already-open connection costs 0.1ms, so this is
+    # roughly three quarters of what a listener waits for on the FIRST sentence of every turn —
+    # 0.669s cold against 0.180s warm, confirmed end to end at 0.721s -> 0.251s.
+    #
+    # Two rather than STT's four: a connection is claimed per spoken TURN, not per utterance, and
+    # a turn lasts seconds. Two covers two speakers starting at once, which is already the
+    # uncommon case, and the pool refills in the background the moment one is taken.
+    tts_warm_pool_size: int = 2
     # Deliver the dub the way the speaker delivered it, using the prosody measured upstream
     # (STT_PROSODY_ENABLED) and carried on the translation message. Independent of the STT flag
     # so the measurement and its use can be turned off separately — which is what makes an A/B
