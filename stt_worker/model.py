@@ -1250,6 +1250,7 @@ class OpenAISTT:
         noise_reduction: str | None = None,
         on_early_segment: Callable[[TranscribedSegment], Awaitable[None]] | None = None,
         on_speculative_segment: Callable[[TranscribedSegment], Awaitable[None]] | None = None,
+        streamed_epoch: int | None = None,
     ) -> list[TranscribedSegment]:
         """Transcribe raw audio bytes via the OpenAI Realtime API.
 
@@ -1371,6 +1372,7 @@ class OpenAISTT:
                 keywords,
                 exclude_emitted_from_final=exclude_emitted_from_final,
                 noise_reduction=noise_reduction,
+                streamed_epoch=streamed_epoch,
             )
         except Exception as first_error:
             # A capability the API rejected ASYNCHRONOUSLY has to be learned here, because the
@@ -1392,6 +1394,9 @@ class OpenAISTT:
                 )
             logger.warning("realtime_session_retry", meeting_id=meeting_id, speaker_id=speaker_id)
             self._sessions.pop(key, None)
+            # No streamed_epoch on this path, deliberately: the line above threw the session
+            # away, and with it the buffer the frames were appended to. This retry must send the
+            # audio itself, which is what omitting the epoch makes it do.
             try:
                 text, avg_logprob = await self._transcribe_via_session(
                     key,
@@ -1581,6 +1586,7 @@ class OpenAISTT:
         *,
         noise_reduction: str | None = None,
         exclude_emitted_from_final: bool = True,
+        streamed_epoch: int | None = None,
     ) -> tuple[str, float]:
         session = await self._get_or_create_session(
             key,
@@ -1592,14 +1598,32 @@ class OpenAISTT:
         )
         conn = session["conn"]
 
-        # Ingress has already assembled a VAD-bounded speech utterance.
-        # Sending that as ten-to-fifteen separately awaited 100ms websocket messages
-        # added pure transport overhead before the model could start. Keep a conservative
-        # 2s raw-PCM cap for unusually long replay/test chunks; production uses one append.
-        append_bytes = REALTIME_SAMPLE_RATE * 2 * 2
-        for i in range(0, len(pcm_24k), append_bytes):
-            frame = pcm_24k[i : i + append_bytes]
-            await conn.input_audio_buffer.append(audio=base64.b64encode(frame).decode())
+        # ALREADY IN THE BUFFER? Then commit it rather than sending it twice.
+        #
+        # When STT_STREAMING_ENABLED is on, the frames of this turn were appended by
+        # `append_streamed_audio` while the speaker was still talking — so by the time this runs
+        # the model has already heard the utterance and the commit below is all that is left.
+        # That is the entire latency win: what used to be "send five seconds, then wait for the
+        # model to hear it" becomes "say go".
+        #
+        # The epoch check is what makes it safe. `append_streamed_audio` returns the epoch its
+        # audio landed in, and a session recreated since then — a language change, an idle
+        # sweep, a restart — took that buffer with it. A mismatch therefore falls through to the
+        # ordinary append below, which is exactly the behaviour this method had before streaming
+        # existed. Wrong here means slow; it never means silent.
+        already_buffered = streamed_epoch is not None and int(session.get("epoch", 0)) == int(
+            streamed_epoch
+        )
+
+        if not already_buffered:
+            # Ingress has already assembled a VAD-bounded speech utterance.
+            # Sending that as ten-to-fifteen separately awaited 100ms websocket messages
+            # added pure transport overhead before the model could start. Keep a conservative
+            # 2s raw-PCM cap for unusually long replay/test chunks; production uses one append.
+            append_bytes = REALTIME_SAMPLE_RATE * 2 * 2
+            for i in range(0, len(pcm_24k), append_bytes):
+                frame = pcm_24k[i : i + append_bytes]
+                await conn.input_audio_buffer.append(audio=base64.b64encode(frame).decode())
 
         await conn.input_audio_buffer.commit()
         session["last_used"] = time.monotonic()
@@ -1970,9 +1994,15 @@ class OpenAISTT:
                 noise_reduction,
             )
 
+        # Bumped per CREATED session, never on a config update — an update keeps the same
+        # socket and therefore the same input_audio_buffer, while a new session throws that
+        # buffer away. Audio streamed into one epoch must never be committed under another;
+        # see append_streamed_audio.
+        self._session_epoch = getattr(self, "_session_epoch", 0) + 1
         session = {
             "manager": manager,
             "conn": conn,
+            "epoch": self._session_epoch,
             "last_used": time.monotonic(),
             "language": language,
             "prompt": prompt,
@@ -1990,6 +2020,62 @@ class OpenAISTT:
             keyword_count=len(normalized_keywords),
         )
         return session
+
+    async def append_streamed_audio(
+        self,
+        key: tuple[str, str],
+        pcm_bytes: bytes,
+        sample_rate: int,
+    ) -> int | None:
+        """Push one frame of live speech into this speaker's OPEN session buffer.
+
+        Returns the session epoch the audio landed in, or None when there was nothing to append
+        to. The epoch is the whole safety mechanism: `transcribe` will only commit without
+        re-sending the audio if the session it resolves is still that same one. A session
+        recreated in between (a language change, an idle sweep, a restart) took the buffer with
+        it, so the caller falls back to sending the audio the way it always did — which is why
+        the worst case of every failure in this path is the latency this feature exists to
+        remove, never a lost sentence.
+
+        DELIBERATELY DOES NOT CREATE A SESSION. Creating one here would mean guessing this
+        speaker's language, prompt and keywords from a frame — and a session pinned to the wrong
+        language transcribes the rest of the meeting badly and silently. `process` owns session
+        lifecycle; this only ever borrows one that already exists, which in practice the
+        track-published prewarm has already opened.
+        """
+        session = getattr(self, "_sessions", {}).get(key)
+        if session is None:
+            return None
+
+        try:
+            pcm_24k = _resample_pcm16(pcm_bytes, sample_rate, REALTIME_SAMPLE_RATE)
+            await session["conn"].input_audio_buffer.append(
+                audio=base64.b64encode(pcm_24k).decode()
+            )
+        except Exception:
+            # A frame that does not land is not an error anybody needs to act on: the closed
+            # utterance still carries the whole turn. Debug, because this fires per 96ms window.
+            logger.debug("stt_stream_append_failed", meeting_id=key[0], exc_info=True)
+            return None
+
+        session["last_used"] = time.monotonic()
+        return int(session.get("epoch", 0))
+
+    async def discard_streamed_audio(self, key: tuple[str, str]) -> None:
+        """Throw away whatever has been appended but never committed for this speaker.
+
+        Called when a turn ends without a chunk to commit it — an utterance too short to
+        publish, a lost frame, an ingress that died mid-turn. Without it those samples stay in
+        the buffer and are transcribed as the opening of the NEXT turn, which is a defect that
+        compounds: every abandoned fragment makes the following utterance wronger.
+        """
+        session = getattr(self, "_sessions", {}).get(key)
+        if session is None:
+            return
+        try:
+            await session["conn"].input_audio_buffer.clear()
+        except Exception:
+            logger.debug("stt_stream_clear_failed", meeting_id=key[0], exc_info=True)
 
     def _sweep_idle_sessions(self) -> None:
         now = time.monotonic()

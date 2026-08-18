@@ -9,6 +9,7 @@ import copy
 import json
 import random
 import time
+import uuid
 from collections import deque
 from contextlib import suppress
 from typing import Any
@@ -21,7 +22,12 @@ from redis.exceptions import RedisError
 
 from livekit_ingress_worker.near_field_gate import NearFieldGate
 from shared.base_worker import BaseWorker
-from shared.schemas import AudioChunkMessage
+from shared.schemas import (
+    STT_FRAME_STREAM,
+    STT_FRAME_STREAM_MAXLEN,
+    AudioChunkMessage,
+    AudioFrameMessage,
+)
 
 SILERO_VAD_REPOSITORY = "snakers4/silero-vad:v6.2.1"
 
@@ -1130,6 +1136,14 @@ class LiveKitIngressWorker(BaseWorker):
         # missed/fragmented speech. Each track owns an independent cloned state machine.
         track_vad_model = copy.deepcopy(self._require_vad_model())
 
+        # Streaming state. A TURN is the audio that the NEXT audio:chunks message will commit
+        # — so it is rotated by a max-chunk flush as well as by silence, because both publish a
+        # chunk and both therefore end a commit boundary on the STT side.
+        streaming = self.settings.stt_streaming_enabled
+        turn_id = ""
+        frame_seq = 0
+        streamed_bytes = 0
+
         # State
         raw_buffer = bytearray()  # Incoming raw resampled audio
         speech_buffer = bytearray()  # Audio collected during speech
@@ -1228,6 +1242,10 @@ class LiveKitIngressWorker(BaseWorker):
                             is_speaking = True
                             speech_buffer = bytearray()
                             speech_samples = 0
+                            if streaming:
+                                turn_id = uuid.uuid4().hex
+                                frame_seq = 0
+                                streamed_bytes = 0
                             for pre_window in pre_speech_ring:
                                 speech_buffer.extend(pre_window)
                             self.logger.info(
@@ -1241,6 +1259,21 @@ class LiveKitIngressWorker(BaseWorker):
                         speech_samples += len(window_data) // 2
                         silence_counter = 0
 
+                        # The pre-speech ring goes out with the first frame rather than being
+                        # skipped: it is the word onset the ring exists to preserve, and a
+                        # session that never hears it transcribes a clipped first syllable.
+                        if streaming and len(speech_buffer) > streamed_bytes:
+                            await self._publish_speech_frame(
+                                room_name,
+                                speaker_id,
+                                turn_id,
+                                frame_seq,
+                                bytes(speech_buffer[streamed_bytes:]),
+                                sample_rate,
+                            )
+                            frame_seq += 1
+                            streamed_bytes = len(speech_buffer)
+
                         # Max chunk length is about the SIZE of what gets sent, so it weighs the
                         # whole buffer — padding included. Only the minimum-speech gate below asks
                         # the different question of whether anyone actually spoke.
@@ -1252,8 +1285,16 @@ class LiveKitIngressWorker(BaseWorker):
                                 chunk_index,
                                 sample_rate,
                                 near_field_gate=near_field_gate,
+                                turn_id=turn_id,
                             )
                             chunk_index += 1
+                            # The SPEAKER has not stopped, but the commit boundary has moved:
+                            # STT will commit everything appended so far when it sees the chunk
+                            # above, so what comes next belongs to a new turn.
+                            if streaming:
+                                turn_id = uuid.uuid4().hex
+                                frame_seq = 0
+                                streamed_bytes = 0
                             speech_buffer = bytearray()
                             # Still mid-utterance — the speaker has simply run past the maximum
                             # chunk length. The accumulated speech went out with the chunk, so the
@@ -1286,6 +1327,7 @@ class LiveKitIngressWorker(BaseWorker):
                                         chunk_index,
                                         sample_rate,
                                         near_field_gate=near_field_gate,
+                                        turn_id=turn_id,
                                     )
                                     chunk_index += 1
                                 else:
@@ -1294,7 +1336,19 @@ class LiveKitIngressWorker(BaseWorker):
                                         samples=speech_samples,
                                         min_required=min_speech_samples,
                                     )
+                                    # No chunk is coming for this turn, so nothing will commit
+                                    # the frames already appended for it. Nothing is published to
+                                    # say so either: the STT side notices that the next turn_id
+                                    # arrived without the previous one ever being committed and
+                                    # clears the buffer itself. That one rule also covers a lost
+                                    # frame and an ingress that died mid-turn, which a marker
+                                    # message would not.
 
+                                # Closed either way — a published chunk commits this turn, and an
+                                # unpublished one is discarded by the rule above. Both end it.
+                                turn_id = ""
+                                frame_seq = 0
+                                streamed_bytes = 0
                                 is_speaking = False
                                 speech_buffer = bytearray()
                                 speech_samples = 0
@@ -1365,6 +1419,77 @@ class LiveKitIngressWorker(BaseWorker):
             raise RuntimeError("Silero VAD model is not loaded")
         return self._vad_model
 
+    async def _speaker_language(self, room_name: str, speaker_id: str) -> str:
+        """This speaker's own chosen speak-language, or "auto".
+
+        TranslationRoomHub.JoinTranslationRoom persists it (see NormalizeLanguageCode there)
+        keyed by userId, which is the same value LiveKit uses as participant.identity and
+        therefore as speaker_id here. Falls back to "auto" — STT's own guess — only if the
+        speaker somehow is not registered yet.
+
+        Extracted so the streamed frames and the closed utterance cannot disagree about it: a
+        frame appended under one language and committed under another is a session pinned to the
+        wrong language for that turn.
+        """
+        try:
+            raw_language = await self.redis.hget(
+                f"translationRoom:{room_name}:speak_languages", speaker_id
+            )
+        except RedisError:
+            self.logger.warning(
+                "speak_language_lookup_failed",
+                room=room_name,
+                speaker_id=speaker_id,
+                exc_info=True,
+            )
+            return "auto"
+        if not raw_language:
+            return "auto"
+        return raw_language.decode() if isinstance(raw_language, bytes) else raw_language
+
+    async def _publish_speech_frame(
+        self,
+        room_name: str,
+        speaker_id: str,
+        turn_id: str,
+        seq: int,
+        pcm: bytes,
+        sample_rate: int,
+    ) -> None:
+        """Hand STT one VAD window WHILE the speaker is still producing the turn.
+
+        Best effort in the strongest sense: a frame that cannot be published is simply not
+        appended, and the closed utterance on `audio:chunks` still carries the whole turn's
+        audio. So the worst case of this whole feature failing is the latency the pipeline had
+        before it existed — never a lost sentence. That is why nothing here raises.
+
+        NO ENERGY OR NEAR-FIELD GATE, unlike _publish_speech_chunk. Those gates judge a WHOLE
+        utterance and reject it as noise; a single 96ms window has no such verdict to give, and
+        applying a per-utterance threshold to a frame would punch holes in the middle of real
+        speech. The utterance-level judgement still happens — on `audio:chunks`, where it always
+        did — and STT only commits what that message tells it to.
+        """
+        if room_name in self._paused_rooms:
+            return
+        try:
+            frame = AudioFrameMessage(
+                meeting_id=room_name,
+                speaker_id=speaker_id,
+                turn_id=turn_id,
+                seq=seq,
+                audio_data=pcm,
+                sample_rate=sample_rate,
+                language=await self._speaker_language(room_name, speaker_id),
+            )
+            await self.redis.publish_ephemeral(
+                STT_FRAME_STREAM, frame.to_redis(), STT_FRAME_STREAM_MAXLEN
+            )
+        except Exception:
+            # Deliberately quiet at debug: this fires per 96ms window per speaker, so a warning
+            # here would bury the log the moment Redis hiccuped — and the fallback is silent and
+            # complete.
+            self.logger.debug("speech_frame_publish_failed", room=room_name, exc_info=True)
+
     async def _publish_speech_chunk(
         self,
         room_name: str,
@@ -1373,6 +1498,7 @@ class LiveKitIngressWorker(BaseWorker):
         chunk_index: int,
         sample_rate: int,
         near_field_gate: NearFieldGate | None = None,
+        turn_id: str = "",
     ) -> None:
         # Transcription is NOT translation, and this gate used to conflate them.
         #
@@ -1424,25 +1550,7 @@ class LiveKitIngressWorker(BaseWorker):
         # Send raw audio (no normalization — Whisper handles natural levels better)
         # Peak normalization was amplifying noise to speech levels, causing hallucinations
 
-        # This speaker's own chosen speak-language — TranslationRoomHub.JoinTranslationRoom
-        # persists it (see NormalizeLanguageCode there) keyed by userId, which is the same
-        # value LiveKit uses as participant.identity/speaker_id here. Falls back to "auto"
-        # (STT's own guess) only if the speaker somehow isn't registered yet.
-        language = "auto"
-        try:
-            raw_language = await self.redis.hget(
-                f"translationRoom:{room_name}:speak_languages", speaker_id
-            )
-        except RedisError:
-            raw_language = None
-            self.logger.warning(
-                "speak_language_lookup_failed",
-                room=room_name,
-                speaker_id=speaker_id,
-                exc_info=True,
-            )
-        if raw_language:
-            language = raw_language.decode() if isinstance(raw_language, bytes) else raw_language
+        language = await self._speaker_language(room_name, speaker_id)
 
         msg = AudioChunkMessage(
             meeting_id=room_name,
@@ -1451,6 +1559,11 @@ class LiveKitIngressWorker(BaseWorker):
             audio_data=bytes(pcm),
             sample_rate=sample_rate,
             language=language,
+            # The turn whose streamed frames this message commits. Empty when streaming is off,
+            # which is also exactly what an older ingress sends through a rolling deploy — so
+            # the STT side reads "empty" as "the audio is in this message" and behaves as it
+            # always did.
+            turn_id=turn_id,
             timestamp_ms=int(time.time() * 1000),
         )
 
