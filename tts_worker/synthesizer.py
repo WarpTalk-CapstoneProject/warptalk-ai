@@ -316,6 +316,29 @@ class CartesiaSynthesizer:
         logger.info("cartesia_voice_deleted", voice_id=voice_id)
         return True
 
+    async def rename_voice(self, voice_id: str, name: str) -> bool:
+        """Rename one voice in this account. True when the new name is stored.
+
+        NOT best-effort, unlike `delete_voice` and the list calls beside it, and the difference
+        decides whether a voice leaks. The orphan sweep judges a voice by its NAME
+        (`_IN_MEETING_VOICE_PREFIX`), so this rename is the only thing that takes a carried-over
+        clone out of the sweep's sights. Its caller must not hand the voice to AuthService unless
+        this returned True: a stored profile pointing at a voice still named `speaker-` is a row
+        that goes dead in 24 hours, and the person it belongs to would hear a stranger.
+
+        So the answer is reported honestly and the caller decides, rather than being swallowed
+        into a shrug the way a cleanup failure can be.
+        """
+        try:
+            await self._require_client().voices.update(voice_id, name=name)
+        except Exception:
+            logger.warning(
+                "cartesia_rename_voice_failed", voice_id=voice_id, name=name, exc_info=True
+            )
+            return False
+        logger.info("cartesia_voice_renamed", voice_id=voice_id, name=name)
+        return True
+
     def _require_client(self) -> AsyncCartesia:
         if self._client is None:
             raise RuntimeError("Cartesia synthesizer is not loaded")
