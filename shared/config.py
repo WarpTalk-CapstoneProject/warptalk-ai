@@ -362,6 +362,41 @@ class TTSSettings(BaseSettings):
     # Cartesia's public library doesn't churn often — cache the per-language catalog
     # in Redis this long before re-fetching, to avoid a /voices call on every miss.
     voice_catalog_cache_ttl_seconds: int = 21600  # 6h
+
+    # How many Cartesia websocket connections to hold open, ready for the next spoken sentence.
+    #
+    # MEASURED, not guessed (tools/probe_tts_first_audio.py, 2026-08-18): dialling Cartesia costs
+    # p50 427.6ms and building the context on an already-open connection costs 0.1ms, so this is
+    # roughly three quarters of what a listener waits for on the FIRST sentence of every turn —
+    # 0.669s cold against 0.180s warm, confirmed end to end at 0.721s -> 0.251s.
+    #
+    # Two rather than STT's four: a connection is claimed per spoken TURN, not per utterance, and
+    # a turn lasts seconds. Two covers two speakers starting at once, which is already the
+    # uncommon case, and the pool refills in the background the moment one is taken.
+    tts_warm_pool_size: int = 2
+
+    # Delete in-meeting clones from the Cartesia account once nothing can reach them.
+    #
+    # Every in-meeting clone creates a real voice in the account, and until this existed
+    # nothing ever removed one: `_clone_and_cache` caches the id at
+    # `voice:{meeting}:{speaker}` for `voice_clone_key_ttl_seconds` and then forgets it,
+    # while the voice itself stays. An upgrade (`voice_clone_max_upgrades`) orphans the
+    # previous one the same way, mid-meeting.
+    #
+    # A periodic sweep rather than a delete at end-of-meeting, because the sweep is the only
+    # form that also collects what has ALREADY leaked, and because deleting a voice while a
+    # meeting might still be speaking through it is a far worse failure than keeping one a
+    # few hours too long. See TTSWorker._sweep_orphan_voices for the rest of the reasoning.
+    orphan_voice_sweep_enabled: bool = True
+    orphan_voice_sweep_interval_seconds: int = 21600  # 6h
+    # How old an in-meeting clone must be before it is considered unreachable.
+    #
+    # NOT a tuning knob: the only pointer to one of these voices is the Redis key
+    # `voice:{meeting}:{speaker}`, whose TTL is `voice_clone_key_ttl_seconds` (12h) and is set
+    # once at clone time rather than refreshed. Twelve hours after it was made, no meeting can
+    # reach it by any path. This is that bound doubled, so the sweep is wrong only if the TTL
+    # above changes without this changing with it.
+    orphan_voice_min_age_seconds: int = 86400  # 24h
     # Deliver the dub the way the speaker delivered it, using the prosody measured upstream
     # (STT_PROSODY_ENABLED) and carried on the translation message. Independent of the STT flag
     # so the measurement and its use can be turned off separately — which is what makes an A/B
