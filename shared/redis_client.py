@@ -217,6 +217,49 @@ class RedisStreamClient:
         await self._trim_stream_without_losing_unconsumed_entries(stream)
         return message_id
 
+    async def publish_ephemeral(
+        self,
+        stream: str,
+        data: dict[str, Any],
+        maxlen: int,
+    ) -> bytes | str:
+        """Append to a stream whose old entries are worthless, and TRIM THEM UNCONDITIONALLY.
+
+        THE DIFFERENCE FROM `publish`, AND WHY IT IS DELIBERATE
+            `publish` goes through _trim_stream_without_losing_unconsumed_entries, which refuses
+            to drop anything a consumer group has not read. That is right for every stream whose
+            entries are work items: losing one loses a transcript line, a translation or a dub.
+
+            It is wrong for a live audio frame. A frame is appendable to an open Realtime buffer
+            for about as long as its turn lasts; once that turn is committed the frame cannot be
+            used for anything by anybody. Protecting it from trimming means a consumer that falls
+            behind grows the stream without bound — and the failure mode at the other end of that
+            is not a slow pipeline, it is Redis reaching its `allkeys-lru` ceiling and silently
+            deleting whichever keys look least recently used, which during a meeting includes
+            that meeting's own state. Production has already been there once (see
+            RedisSettings.stream_maxlen).
+
+            So this trims on the way in and accepts the loss. A lagging consumer degrades one
+            speaker's turn; the alternative degrades every meeting on the box, invisibly.
+
+        No TTL refresh either: a stream nobody writes to stops being written to, and the entries
+        left in it are already past the point of being useful.
+        """
+        redis_data: dict[str, bytes | str | int | float] = {
+            key: value if isinstance(value, (bytes, str, int, float)) else json.dumps(value)
+            for key, value in data.items()
+        }
+        return cast(
+            "bytes | str",
+            await self._retry(
+                self.redis.xadd,
+                stream,
+                cast(Any, redis_data),
+                maxlen=maxlen,
+                approximate=True,
+            ),
+        )
+
     async def _append_and_refresh_ttl(
         self,
         stream: str,

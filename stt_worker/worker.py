@@ -25,7 +25,13 @@ from shared.prosody import (
     to_delivery,
     update_baseline,
 )
-from shared.schemas import AudioChunkMessage, ProsodyEnvelope, STTResultMessage
+from shared.schemas import (
+    STT_FRAME_STREAM,
+    AudioChunkMessage,
+    AudioFrameMessage,
+    ProsodyEnvelope,
+    STTResultMessage,
+)
 from shared.text_utils import split_into_sentences
 from stt_worker.model import OpenAISTT, _normalize_language
 
@@ -139,6 +145,10 @@ class STTWorker(BaseWorker):
         # (meeting_id, speaker_id) -> lock serializing THAT speaker's own chunks — see
         # _consume_loop for why.
         self._speaker_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # (meeting_id, speaker_id) -> (turn_id, session epoch, next expected seq) for a turn
+        # whose frames have been appended but which no chunk has committed yet. Absent means
+        # the buffer cannot be trusted — see _append_speech_frame.
+        self._streamed_turns: dict[tuple[str, str], tuple[str, int, int]] = {}
         # (meeting_id, speaker_id) -> how that speaker normally sounds in THIS room. Held in
         # memory and mirrored to Redis so a restart or a second replica does not start every
         # speaker from scratch — see _speaker_baseline.
@@ -160,6 +170,140 @@ class STTWorker(BaseWorker):
         await self.model.load()
         await self.model.warm_up(pool_size=self.stt_settings.realtime_pool_size)
         self._prewarm_listener_task = asyncio.create_task(self._listen_for_track_prewarm())
+        # Started unconditionally, and that is the point of flash mode being per ROOM.
+        #
+        # It used to be gated on `settings.stt_streaming_enabled`, which made the deployment
+        # default a hard ceiling: with it false — the shipping default — no room could ever turn
+        # streaming on, because the loop that consumes the frames did not exist. The producer
+        # (livekit_ingress_worker._flash_mode_enabled) is where the decision now lives, so a room
+        # with flash mode off simply publishes nothing and this loop blocks on an empty stream,
+        # which costs one idle XREAD.
+        self._frame_consumer_task = asyncio.create_task(self._consume_speech_frames())
+
+    async def _consume_speech_frames(self) -> None:
+        """Append live speech to each speaker's open session WHILE they are still talking.
+
+        WHAT THIS BUYS
+            Without it the pipeline is deaf until VAD closes a turn: a five-second sentence
+            produces zero work for five seconds and then ~2.6s of it. The Realtime API separates
+            `input_audio_buffer.append` from `.commit`, so the audio can arrive as it is spoken
+            and the commit in `process` finds a model that has already heard it.
+
+        THIS LOOP NEVER TRANSCRIBES. It appends, and nothing else. Every decision that produces
+        output — prosody, the transcript anchor, language override, the confidence and
+        hallucination gates, what reaches `stt:results` — stays exactly where it was, on the
+        `audio:chunks` message. That is deliberate: a frame carries no confidence signal and no
+        no-speech probability, and a pipeline that published from frames is the one that put
+        hallucinated partials in front of users (see on_early_segment, kept at None).
+
+        FAILURE IS ALWAYS BACKWARDS, NEVER SIDEWAYS. A frame that does not arrive, a session
+        that does not exist yet, a Redis hiccup — each costs the latency this feature was going
+        to save and nothing else, because the closed utterance still carries the whole turn's
+        audio and `transcribe` falls back to sending it.
+        """
+        group = "stt-frame-workers"
+        while not self._shutdown_event.is_set():
+            try:
+                async for _msg_id, data in self.redis.consume(
+                    stream=STT_FRAME_STREAM,
+                    group=group,
+                    consumer=self._consumer_name,
+                    block_ms=2000,
+                    count=16,
+                ):
+                    await self._append_speech_frame(data)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.exception("stt_frame_consumer_error")
+                await asyncio.sleep(1.0)
+
+    async def _append_speech_frame(self, data: dict[bytes, bytes]) -> None:
+        try:
+            frame = AudioFrameMessage.from_redis(data)
+        except Exception:
+            self.logger.debug("stt_frame_unreadable", exc_info=True)
+            return
+
+        key = (frame.meeting_id, frame.speaker_id)
+        streaming: dict[tuple[str, str], tuple[str, int, int]] | None = getattr(
+            self, "_streamed_turns", None
+        )
+        if streaming is None:
+            streaming = {}
+            self._streamed_turns = streaming
+
+        # A NEW TURN ARRIVING WHILE THE PREVIOUS ONE IS STILL OPEN means that previous turn will
+        # never be committed — the utterance was too short for ingress to publish, or its chunk
+        # was lost, or ingress died mid-turn. Its samples are still sitting in the buffer, and
+        # left there they are transcribed as the opening of THIS turn. That defect compounds:
+        # every abandoned fragment makes the next utterance wronger.
+        #
+        # One rule, no extra protocol. A marker message from ingress would have covered only the
+        # case ingress knows about.
+        async def abandon(reason: str, **fields: Any) -> None:
+            """Stop trusting this speaker's buffer, and empty it.
+
+            THE RULE THIS ENFORCES, AND WHY IT IS ABSOLUTE
+                A commit is only safe if the buffer holds the WHOLE turn and nothing else. A
+                turn missing one frame does not fail loudly — it transcribes with a hole and
+                publishes the result as authoritative, which is the confident-fluent-wrong
+                failure this pipeline has repeatedly proven nobody spots from the outside.
+
+                So every way a frame can fail to land ends here: no session, a refused append, a
+                gap in the sequence, a commit already in flight. Forgetting the turn makes
+                `process` send the audio itself — the pre-streaming path — and clearing the
+                buffer stops the partial from being read as the opening of the next turn.
+            """
+            streaming.pop(key, None)
+            await self._require_model().discard_streamed_audio(key)
+            self.logger.info(
+                "stt_stream_turn_abandoned",
+                reason=reason,
+                meeting_id=frame.meeting_id,
+                speaker_id=frame.speaker_id,
+                **fields,
+            )
+
+        previous = streaming.get(key)
+        if previous is not None and previous[0] != frame.turn_id:
+            # The previous turn will never be committed: too short for ingress to publish, or
+            # its chunk was lost, or ingress died mid-turn.
+            await abandon("previous_turn_never_committed", abandoned_turn=previous[0])
+            previous = None
+
+        # A GAP MEANS THE BUFFER IS NO LONGER THE TURN. `seq` exists for exactly this: the
+        # stream guarantees order, not delivery, and publish_ephemeral trims unread frames on
+        # purpose rather than growing Redis. A dropped frame must therefore be visible here, not
+        # discovered as a hole in a published sentence.
+        expected_seq = previous[2] if previous is not None else 0
+        if frame.seq != expected_seq:
+            await abandon("frame_gap", expected_seq=expected_seq, got_seq=frame.seq)
+            return
+
+        # A COMMIT FOR THIS SPEAKER IS IN FLIGHT. `_consume_loop`'s own docstring says why this
+        # lock exists: two things using one reused WebSocket session at once interleave the
+        # transcription stream. Appending mid-commit would put this frame — which belongs to the
+        # NEXT turn — inside the one being committed.
+        #
+        # Skipped rather than awaited: this loop serves every speaker in every room, and blocking
+        # it behind one speaker's commit (bounded by TRANSCRIBE_EVENT_TIMEOUT_S = 15s) would stall
+        # the frames of all the others.
+        lock = self._speaker_locks.setdefault(key, asyncio.Lock())
+        if lock.locked():
+            await abandon("commit_in_flight")
+            return
+
+        async with lock:
+            epoch = await self._require_model().append_streamed_audio(
+                key, frame.audio_data, frame.sample_rate
+            )
+        if epoch is None:
+            # No session yet (the prewarm has not opened one), or the append was refused.
+            # Either way this turn is no longer whole.
+            await abandon("append_failed")
+            return
+        streaming[key] = (frame.turn_id, epoch, frame.seq + 1)
 
     async def _listen_for_track_prewarm(self) -> None:
         """Prepare the speaker's Realtime socket during room join, before first speech."""
@@ -313,6 +457,10 @@ class STTWorker(BaseWorker):
         getattr(self, "_transcript_anchors", {}).pop(room_id, None)
         getattr(self, "_recent_transcripts", {}).pop(room_id, None)
         self._room_languages.pop(room_id, None)
+        # Same reasoning as the four above: one entry per (meeting, speaker) whose turn was
+        # open when the room ended, held forever otherwise.
+        for streamed_key in [k for k in getattr(self, "_streamed_turns", {}) if k[0] == room_id]:
+            self._streamed_turns.pop(streamed_key, None)
         stale_speakers = [key for key in self._speaker_locks if key[0] == room_id]
         for key in stale_speakers:
             self._speaker_locks.pop(key, None)
@@ -412,6 +560,37 @@ class STTWorker(BaseWorker):
                     inference_offset_ms=int((time.monotonic() - t0) * 1000),
                 )
 
+            # THE COMMIT SIDE OF STREAMING. `_append_speech_frame` put this turn's audio into
+            # the session while the speaker was still producing it; this hands `transcribe` the
+            # epoch it landed in so the commit can happen without sending the audio a second
+            # time. Popped rather than read: this turn ends here either way, and a stale entry
+            # would let the NEXT turn commit against an epoch that no longer describes it.
+            #
+            # None whenever anything at all was different — streaming off, no frames arrived, an
+            # older ingress that sends no turn_id — and None means "send the audio", which is
+            # exactly what this method did before any of this existed.
+            # getattr, matching every other per-room cache reached from process(): the test
+            # suites build workers with __new__ rather than through __init__, and a field that
+            # only exists on a fully-constructed worker would make each of those a crash.
+            streamed_turns: dict[tuple[str, str], tuple[str, int, int]] = getattr(
+                self, "_streamed_turns", {}
+            )
+            streamed = streamed_turns.pop((chunk.meeting_id, chunk.speaker_id), None)
+            streamed_epoch = (
+                streamed[1] if streamed is not None and streamed[0] == chunk.turn_id else None
+            )
+            if streamed is not None and streamed_epoch is None:
+                # Frames were appended under a DIFFERENT turn than the one this chunk closes, so
+                # they belong to a turn nothing will commit. Left in the buffer they would be
+                # transcribed as the opening of this one.
+                await model.discard_streamed_audio((chunk.meeting_id, chunk.speaker_id))
+                self.logger.info(
+                    "stt_stream_turn_mismatch",
+                    meeting_id=chunk.meeting_id,
+                    buffered_turn=streamed[0],
+                    chunk_turn=chunk.turn_id,
+                )
+
             segments = await model.transcribe(
                 chunk.audio_data,
                 sample_rate=chunk.sample_rate,
@@ -432,6 +611,7 @@ class STTWorker(BaseWorker):
                 # may only warm the private speculative translation cache below.
                 on_early_segment=None,
                 on_speculative_segment=publish_speculative,
+                streamed_epoch=streamed_epoch,
             )
         except Exception as exc:
             await self.redis.publish_system_event(

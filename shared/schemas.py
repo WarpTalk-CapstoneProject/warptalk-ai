@@ -44,6 +44,10 @@ class AudioChunkMessage(BaseModel):
     input_lufs: float = 0.0
     noise_suppression_enabled: bool = False
     is_final_chunk: bool = False
+    #: Which streamed turn this closed utterance commits, when STT_STREAMING_ENABLED is on.
+    #: Empty means the audio in this message is the only copy — the pre-streaming contract,
+    #: and it is also what an older ingress keeps sending through a rolling deploy.
+    turn_id: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     model_config = {"arbitrary_types_allowed": True}
@@ -64,6 +68,7 @@ class AudioChunkMessage(BaseModel):
             "input_lufs": str(self.input_lufs),
             "noise_suppression_enabled": _bool_to_redis(self.noise_suppression_enabled),
             "is_final_chunk": "1" if self.is_final_chunk else "0",
+            "turn_id": self.turn_id,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -85,6 +90,87 @@ class AudioChunkMessage(BaseModel):
             input_lufs=float(d.get("input_lufs", "0.0")),
             noise_suppression_enabled=_redis_to_bool(d.get("noise_suppression_enabled", "false")),
             is_final_chunk=d.get("is_final_chunk") == "1",
+            turn_id=d.get("turn_id", ""),
+            timestamp_ms=int(d.get("timestamp_ms", "0")),
+        )
+
+
+# Where AudioFrameMessage travels. Defined beside the message rather than in either worker:
+# the ingress worker publishes it and the STT worker consumes it, and a constant owned by one
+# of them would make the other import a package it has no business importing (the ingress
+# module pulls in torch and the LiveKit SDK).
+STT_FRAME_STREAM = "audio:frames"
+
+# ~48 seconds of a four-speaker room at one frame per VAD window. Generous for a consumer that
+# is keeping up, and a hard ceiling for one that is not — see
+# RedisStreamClient.publish_ephemeral for why these are trimmed unconditionally rather than
+# protected from trimming like every other stream here.
+STT_FRAME_STREAM_MAXLEN = 2000
+
+
+class AudioFrameMessage(BaseModel):
+    """Ingress → STT, WHILE the speaker is still talking. One VAD window of speech.
+
+    WHY A SECOND AUDIO MESSAGE AND NOT A CHANGE TO AudioChunkMessage
+        `audio:chunks` means "one closed utterance" and THREE things read it that way: the STT
+        worker, the TTS worker's voice-clone buffer, and prosody measurement. Turning that
+        stream into a frame feed would multiply its entry rate by roughly forty and hand the
+        clone path — which re-runs an FFT over its whole buffer on every message it sees — that
+        same multiplier. Neither is a change to STT; both are collateral.
+
+        So the frames travel beside the chunks rather than instead of them. `audio:chunks` keeps
+        its exact contract, the clone and prosody paths are untouched, and only the STT worker
+        ever sees a frame.
+
+    WHY THESE FRAMES ARE DELIBERATELY DISPOSABLE
+        A frame is worth appending to a live session for about as long as the turn it belongs
+        to. One that arrives late is worthless — the buffer it belonged to has already been
+        committed. So this stream is published with a hard MAXLEN and NO consumer-floor
+        protection, unlike every other stream here: a lagging consumer must lose frames rather
+        than grow Redis, because a degraded turn costs one sentence and a full Redis silently
+        evicts every live meeting's state (see RedisSettings.stream_maxlen).
+    """
+
+    __slots__ = ()
+
+    meeting_id: str
+    speaker_id: str
+    #: Which turn these frames belong to, so a frame that arrives after its turn was committed
+    #: can be dropped instead of leaking into the next one.
+    turn_id: str
+    #: Position within the turn. Ordering is already guaranteed by the stream; this exists so a
+    #: gap is visible in a log rather than silently transcribed as continuous speech.
+    seq: int
+    audio_data: bytes
+    sample_rate: int = 16000
+    language: str = "auto"
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    def to_redis(self) -> dict[str, str]:
+        return {
+            "meeting_id": self.meeting_id,
+            "speaker_id": self.speaker_id,
+            "turn_id": self.turn_id,
+            "seq": str(self.seq),
+            "audio_data": base64.b64encode(self.audio_data).decode("ascii"),
+            "sample_rate": str(self.sample_rate),
+            "language": self.language,
+            "timestamp_ms": str(self.timestamp_ms),
+        }
+
+    @classmethod
+    def from_redis(cls, data: Mapping[Any, Any]) -> AudioFrameMessage:
+        d = _decode_dict(data)
+        return cls(
+            meeting_id=d["meeting_id"],
+            speaker_id=d["speaker_id"],
+            turn_id=d["turn_id"],
+            seq=int(d.get("seq", "0")),
+            audio_data=base64.b64decode(d["audio_data"]),
+            sample_rate=int(d.get("sample_rate", "16000")),
+            language=d.get("language", "auto"),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 

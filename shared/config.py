@@ -95,6 +95,23 @@ class WorkerSettings(BaseSettings):
     model_config = {"env_prefix": ""}
 
     log_level: str = "INFO"
+    # Send audio to STT WHILE the speaker is talking, instead of only once they stop.
+    #
+    # WHAT IT BUYS
+    #   Today nothing happens until VAD closes a turn: for a five-second sentence the pipeline
+    #   does zero work for five seconds and then does ~2.6s of work. The Realtime API already
+    #   separates `input_audio_buffer.append` from `.commit`, so the audio can arrive as it is
+    #   spoken and the commit at turn end finds the model has already heard it.
+    #
+    # DARK BY DEFAULT, like prosody_continuity before it and for the same reason: this changes
+    # when audio reaches a vendor, and the only honest way to learn what that does to
+    # transcription quality is to measure a real room with it on and off. Turning it on is a
+    # separate, deliberate decision.
+    #
+    # Read by BOTH the ingress worker (which publishes the frames) and the STT worker (which
+    # consumes them), so it lives on the shared settings rather than on either one.
+    stt_streaming_enabled: bool = False
+
     # Max only for uninterrupted speech; ordinary short turns still flush on VAD silence.
     # Six seconds gives the model enough lexical context for natural Vietnamese sentences
     # containing English technical terms without adding delay after an ordinary pause.
