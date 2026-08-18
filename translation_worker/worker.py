@@ -670,6 +670,18 @@ class TranslationWorker(BaseWorker):
 
             is_final = (idx == len(sentences) - 1) and stt_result.is_final_chunk
 
+            # How long this sentence took to become available, from the start of the stage.
+            #
+            # Measured once and used twice — on the message and on the log line below — so the
+            # number a dashboard sees and the number a log search finds cannot drift apart.
+            #
+            # Measured from `translation_started` rather than per-call on purpose: the sentences
+            # are translated concurrently (sentence 0 alone, 1..N-1 in one batch), so a per-call
+            # timer would report the batch's own duration and hide the wait in front of it. What a
+            # listener experiences is the whole interval before their sentence arrived, which is
+            # what this is.
+            sentence_latency_ms = int((time.monotonic() - translation_started) * 1000)
+
             result = TranslationResultMessage(
                 segment_id=chunk_segment_id,
                 meeting_id=stt_result.meeting_id,
@@ -696,6 +708,11 @@ class TranslationWorker(BaseWorker):
                 # and energy — so it is folded in here, from the model that actually read the
                 # sentence. See translation_worker/valence.py.
                 prosody=_with_valence(stt_result.prosody, valence),
+                # Carried so TranscriptService can finally fill translation_contents.latency_ms.
+                # The column and its C# property have existed all along and were NULL on every
+                # row ever written, which is why "translation is sometimes slow" has never been
+                # answerable after the fact.
+                latency_ms=sentence_latency_ms,
             )
 
             # Publish IMMEDIATELY so TTS can synthesize while next chunk is translated
@@ -711,7 +728,7 @@ class TranslationWorker(BaseWorker):
                 original=sentence[:60],
                 translated=translated_text[:60],
                 speculative_hit=speculative_hit if idx == 0 else False,
-                stage_latency_ms=int((time.monotonic() - translation_started) * 1000),
+                stage_latency_ms=sentence_latency_ms,
                 pipeline_latency_ms=max(0, int(time.time() * 1000) - stt_result.timestamp_ms),
             )
         return published_any

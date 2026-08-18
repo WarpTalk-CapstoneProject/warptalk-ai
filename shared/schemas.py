@@ -355,6 +355,21 @@ class TranslationResultMessage(BaseModel):
     # the same envelope, because the measurement's granularity is the audio chunk, not the
     # sentence, and pretending otherwise would invent per-sentence delivery that was never heard.
     prosody: ProsodyEnvelope | None = None
+    # How long THIS sentence spent being translated, in milliseconds.
+    #
+    # The worker has always measured it — `stage_latency_ms` in the chunk_translated log line —
+    # and always thrown it away at the edge of the process. TranscriptService has had a
+    # translation_contents.latency_ms column and a TranslationContent.LatencyMs property for just
+    # as long, and nothing ever filled them: NULL on all 3803 rows ever written.
+    #
+    # So "translation is sometimes fast and sometimes slow", a thing every tester reports, has
+    # never once been measurable after the fact. Carrying the number the worker already has is
+    # the whole of the fix.
+    #
+    # Optional, and omitted from to_redis() when None, for the same reason source_stt_confidence
+    # is: an absent field means "not measured" and a consumer stores NULL. A speculative cache hit
+    # that did no translation work has no honest number to report and sends none.
+    latency_ms: int | None = None
 
     def to_redis(self) -> dict[str, str]:
         payload = {
@@ -380,6 +395,8 @@ class TranslationResultMessage(BaseModel):
             payload["source_stt_confidence"] = str(self.source_stt_confidence)
         if self.prosody is not None:
             payload["prosody"] = self.prosody.to_wire()
+        if self.latency_ms is not None:
+            payload["latency_ms"] = str(self.latency_ms)
         return payload
 
     @classmethod
@@ -405,6 +422,9 @@ class TranslationResultMessage(BaseModel):
             source_segment_id=d.get("source_segment_id", ""),
             chunk_index=int(d.get("chunk_index", "0")),
             prosody=ProsodyEnvelope.from_wire(d.get("prosody")),
+            # Absent means "not measured", which is a different fact from zero — a producer
+            # that did no translation work reports nothing rather than claiming it was instant.
+            latency_ms=int(d["latency_ms"]) if d.get("latency_ms") else None,
         )
 
 

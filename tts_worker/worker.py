@@ -28,7 +28,7 @@ from shared import isochrony
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
 from shared.lang import base_language, is_same_language
-from shared.prosody import Arousal, Delivery, Valence, to_generation_config
+from shared.prosody import SPEED_MAX, Arousal, Delivery, Valence, to_generation_config
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
 from tts_worker.clone_sample_quality import MAX_SAMPLE_SCORE, assess_clone_sample
 from tts_worker.livekit_publisher import LiveKitTTSPublisher, TrackStream
@@ -265,6 +265,32 @@ def _extract_tts_key(
     )
 
 
+# How far behind a dub may fall before it is read faster to catch up. WT-528.
+#
+# TWO WAYS TO BE BEHIND, AND THEY ARE THE SAME PROBLEM
+#     * Out of order — this sentence belongs EARLIER in the speaker's timeline than one already
+#       spoken. The per-key lock preserves the order messages arrive in, but that order is set by
+#       when each translation finished upstream, and translation runs concurrently: a long
+#       sentence loses the race to a short one spoken after it. Testers described exactly this —
+#       "voice clone đoạn dưới trước rồi ngược lên đoạn trên".
+#     * Simply slow — translation took a long time, so the dub starts well after the speaker
+#       finished, and every sentence behind it inherits the delay because the key is serialized.
+#
+# Both mean the dub is running behind the conversation, and reading the backlog at normal pace
+# keeps it behind. Speaking a late line FASTER is what lets the gap close instead of persist.
+#
+# ON_TIME_MS is a budget, not a target: a sentence translated within it was never behind, so no
+# adjustment is made and the call is byte-for-byte what it was before this existed.
+_CATCH_UP_ON_TIME_MS = 1500
+# Lag at which the full boost applies. Between the two the ramp is linear, so a dub that is
+# slightly behind is only slightly quicker — a step change would be audible as the pace jumping.
+_CATCH_UP_FULL_LAG_MS = 4000
+# Deliberately well under shared.prosody.SPEED_MAX (1.5). This multiplies the speaker's own
+# measured rate, so it has to leave room for someone who already talks fast, and a dub that
+# outruns comprehension has not caught up with anything.
+_CATCH_UP_MAX_SPEED = 1.25
+
+
 class TTSWorker(BaseWorker):
     """Text-to-Speech worker using Cartesia Sonic Turbo."""
 
@@ -295,6 +321,10 @@ class TTSWorker(BaseWorker):
         # (meeting_id, speaker_id, target_lang) -> lock serializing that key's own
         # messages — see _consume_loop for why.
         self._key_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        # The furthest-along sentence this key has already SPOKEN, by its position in the
+        # speaker's own timeline. Read and written only while that key's lock is held, so a
+        # plain dict is safe for the same reason `_turns` below is.
+        self._spoken_start_ms: dict[tuple[str, str, str], int] = {}
         # One in-flight spoken turn per (meeting, speaker, language, voice). The per-key lock
         # above is what makes a plain dict safe here: a key's sentences are processed one at a
         # time, so a turn can never be pushed into concurrently.
@@ -398,6 +428,14 @@ class TTSWorker(BaseWorker):
         stale_keys = [key for key in self._key_locks if key[0] == room_id]
         for key in stale_keys:
             self._key_locks.pop(key, None)
+        # Same lifetime as the locks. A room that ends and is somehow seen again must not judge
+        # its first sentence as late against a timeline from the previous meeting.
+        #
+        # getattr for the same reason `_turns` below uses it: the tests build workers with
+        # __new__ and never run __init__.
+        spoken: dict[tuple[str, str, str], int] = getattr(self, "_spoken_start_ms", {})
+        for key in [key for key in spoken if key[0] == room_id]:
+            spoken.pop(key, None)
         # getattr, because the tests build workers with __new__ and never run __init__ — the
         # same guard the rest of this codebase uses for that pattern. A worker with no turns
         # dict has no turns to abandon.
@@ -639,8 +677,26 @@ class TTSWorker(BaseWorker):
             translation.meeting_id, translation.speaker_id, translation.target_lang
         )
 
+        # Once per message, not once per voice variant: the variants are the same sentence
+        # rendered in different voices, so the second one must not be judged as arriving after
+        # the first and read faster for it.
+        lag_ms = self._catch_up_lag_ms(translation)
+        if lag_ms > 0:
+            self.logger.info(
+                "dub_running_behind",
+                meeting_id=translation.meeting_id,
+                speaker_id=translation.speaker_id,
+                target_lang=translation.target_lang,
+                segment_id=translation.segment_id,
+                lag_ms=lag_ms,
+                start_ms=translation.start_ms,
+                translation_latency_ms=translation.latency_ms,
+            )
+
         for voice_id, voice_type, voice_key in variants:
-            await self._synthesize_and_publish(translation, text, voice_id, voice_type, voice_key)
+            await self._synthesize_and_publish(
+                translation, text, voice_id, voice_type, voice_key, lag_ms=lag_ms
+            )
 
         # Exactly once per message regardless of how many voice variants rendered —
         # billing_worker/TranscriptRedisConsumerService key off this event, not off
@@ -708,7 +764,9 @@ class TTSWorker(BaseWorker):
         elif cloned_voice_id:
             default_voice_id, default_voice_type = cloned_voice_id, "cloned"
         else:
-            default_voice_id = await self._hashed_default_voice_id(target_lang, speaker_id)
+            default_voice_id = await self._hashed_default_voice_id(
+                target_lang, speaker_id, meeting_id
+            )
             default_voice_type = "default"
 
         variants: list[tuple[str, str, str]] = [(default_voice_id, default_voice_type, "")]
@@ -751,13 +809,147 @@ class TTSWorker(BaseWorker):
             )
         return voices
 
-    async def _hashed_default_voice_id(self, language: str, speaker_id: str) -> str:
-        """Deterministic per-speaker pick from this language's voice catalog."""
+    def _wav_duration_ms(self, audio_bytes: bytes) -> int:
+        """How long this WAV actually plays for.
+
+        Same arithmetic CartesiaSynthesizer.synthesize does on the bytes it just produced — 44
+        bytes of header, the rest 16-bit mono PCM — so a cached rendering reports the identical
+        duration to the render that filled the cache.
+
+        Reads the sample rate off the synthesizer rather than assuming one: it is configurable,
+        and a wrong rate here would misreport every cached line by the ratio between them.
+        """
+        cartesia = getattr(self, "cartesia", None)
+        sample_rate = getattr(cartesia, "sample_rate", 0) or 44100
+        pcm_bytes = max(0, len(audio_bytes) - 44)
+        return int(pcm_bytes / 2 / sample_rate * 1000)
+
+    @staticmethod
+    def _persona_hash(speaker_id: str, salt: str = "") -> int:
+        return int(hashlib.sha256(f"{salt}{speaker_id}".encode()).hexdigest(), 16)
+
+    @classmethod
+    def _persona_pool(cls, catalog: list[dict[str, Any]], speaker_id: str) -> list[dict[str, Any]]:
+        """The voices this speaker may be heard in — the SAME kind of voice in every language.
+
+        This is the half that fixes "Nhi hears him as female, I hear him as male". The choice of
+        gender is made from the speaker id alone, so it is settled before any catalog is
+        consulted and cannot vary with the listener's language.
+
+        It does NOT claim to know the speaker's real gender — nothing upstream measures or asks
+        for it, and guessing one from pitch is not something to do quietly. What it guarantees is
+        that whatever they are assigned, everybody hears the same one. Matching a real gender
+        needs a real signal (a declared preference, or their voice profile) and is a separate
+        piece of work.
+
+        Falls back to the whole catalog when a language offers only one gender, because there is
+        then nothing to choose between and forcing the choice would just empty the pool.
+        """
+        by_gender: dict[str, list[dict[str, Any]]] = {}
+        for voice in catalog:
+            gender = str(voice.get("gender") or "").strip().lower()
+            by_gender.setdefault(gender, []).append(voice)
+
+        masculine = by_gender.get("masculine", [])
+        feminine = by_gender.get("feminine", [])
+        if not masculine or not feminine:
+            return list(catalog)
+
+        return masculine if cls._persona_hash(speaker_id, "gender:") % 2 == 0 else feminine
+
+    @classmethod
+    def _claim_voice(
+        cls,
+        catalog: list[dict[str, Any]],
+        speaker_id: str,
+        taken: set[str],
+    ) -> dict[str, Any]:
+        """This speaker's preferred voice, or the nearest free one after it."""
+        pool = cls._persona_pool(catalog, speaker_id)
+        start = cls._persona_hash(speaker_id) % len(pool)
+
+        for offset in range(len(pool)):
+            candidate = pool[(start + offset) % len(pool)]
+            if str(candidate["id"]) not in taken:
+                return candidate
+
+        # Their own pool is exhausted. Spilling into the rest of the catalog keeps two people
+        # distinguishable, which matters more than the gender being consistent for one of them.
+        for offset in range(len(catalog)):
+            candidate = catalog[(start + offset) % len(catalog)]
+            if str(candidate["id"]) not in taken:
+                return candidate
+
+        # More speakers than the language has voices. Somebody has to share; the preference is
+        # still deterministic, so at least it is the same sharing every time.
+        return pool[start]
+
+    @classmethod
+    def _assign_voice(
+        cls,
+        catalog: list[dict[str, Any]],
+        roster: list[str],
+        speaker_id: str,
+    ) -> dict[str, Any]:
+        """Which voice `speaker_id` gets, given everybody else in the room. Pure and total.
+
+        THE COLLISION THIS EXISTS TO PREVENT
+            The previous rule was `catalog[hash(speaker) % len(catalog)]` with no reference to
+            anyone else, so two speakers in a room of four routinely landed on one voice. In
+            production on 18 Aug, Kỳ and Tú were assigned the SAME id in English (62ae83ad) AND
+            the same id in Japanese (498e7f37) — every listener in either language heard two
+            different people in one voice and could not tell who was speaking. In a conversation
+            product that is worse than the wrong gender.
+
+            Resolution walks the roster in sorted order and lets each speaker claim their
+            preferred voice, probing forward when it is already taken. Deterministic, so every
+            worker process and every language reaches the same answer without coordinating.
+
+            A join can shift an assignment, but only for someone who both sorts after the joiner
+            AND actually wanted the same voice. Stable assignment would need shared state; a rare
+            change is the better trade against two people permanently sounding identical.
+        """
+        # Sorted so the answer does not depend on the order Cartesia's API happened to return,
+        # nor on which worker warmed the cache.
+        ordered_catalog = sorted(catalog, key=lambda voice: str(voice["id"]))
+
+        taken: set[str] = set()
+        for uid in roster:
+            chosen = cls._claim_voice(ordered_catalog, uid, taken)
+            if uid == speaker_id:
+                return chosen
+            taken.add(str(chosen["id"]))
+
+        # Not on the roster — a speaker the languages hash has not caught up with. They still get
+        # their own preference rather than nothing.
+        return cls._claim_voice(ordered_catalog, speaker_id, set())
+
+    async def _room_speaker_ids(self, meeting_id: str) -> set[str]:
+        """Everyone the room currently knows about, from the same hash the language lookup uses."""
+        try:
+            raw = await self.redis.hgetall(f"translationRoom:{meeting_id}:languages")
+        except Exception:
+            self.logger.warning("room_roster_unavailable", meeting_id=meeting_id, exc_info=True)
+            return set()
+        return {uid.decode() if isinstance(uid, bytes) else uid for uid in (raw or {})}
+
+    async def _hashed_default_voice_id(
+        self, language: str, speaker_id: str, meeting_id: str = ""
+    ) -> str:
+        """The stand-in voice this speaker is dubbed in, when they have no clone and no profile.
+
+        Was `catalog[hash(speaker) % len(catalog)]`, which keyed the choice on the LISTENER's
+        language — so one speaker had a different voice, and a different gender, for every
+        listener — and ignored everyone else in the room, so two speakers collided routinely.
+        See _persona_pool and _assign_voice for the two halves of the answer.
+        """
         catalog = await self._get_voice_catalog(language)
         if not catalog:
             return CartesiaSynthesizer._default_voice_id(language)
-        index = int(hashlib.sha256(speaker_id.encode()).hexdigest(), 16) % len(catalog)
-        return str(catalog[index]["id"])
+
+        roster = await self._room_speaker_ids(meeting_id) if meeting_id else set()
+        roster.add(speaker_id)
+        return str(self._assign_voice(catalog, sorted(roster), speaker_id)["id"])
 
     async def _get_explicit_voice_choices(self, meeting_id: str, target_lang: str) -> set[str]:
         """Distinct voice_ids explicitly chosen (via TranslationRoomHub.
@@ -797,8 +989,17 @@ class TTSWorker(BaseWorker):
         voice_id: str,
         voice_type: str,
         voice_key: str,
+        lag_ms: int = 0,
     ) -> None:
-        generation_config = self._generation_config(translation)
+        # Catch-up is folded in HERE rather than inside _generation_config, because that method
+        # answers "what did we measure about this speaker's delivery" and the answer is often
+        # nothing. How far behind the dub is running is known either way, so it must be able to
+        # produce a config where prosody produced None. See _with_catch_up.
+        #
+        # It also has to land before _cache_key below: the key already includes
+        # generation_config, so a sped-up render and a normal one cannot collide, and a line
+        # cached while the room was keeping up is not replayed at the wrong pace later.
+        generation_config = self._with_catch_up(self._generation_config(translation), lag_ms)
 
         cache_key = self._cache_key(
             speaker_id=translation.speaker_id,
@@ -836,12 +1037,28 @@ class TTSWorker(BaseWorker):
                     await self._publish_result(
                         translation=translation,
                         audio_bytes=cached_bytes,
-                        duration_ms=0,
+                        # Derived from the audio, not hardcoded to 0. WT-528.
+                        #
+                        # A cache hit plays exactly as long as the render that filled the cache,
+                        # so 0 was never true — it was "we did not bother to work it out", and it
+                        # reached transcript.audio_dubbings.duration_ms as a fact. A third of the
+                        # rows one production evening read 0 with status 'done', which is
+                        # indistinguishable from audio that failed to synthesize, and it is what
+                        # sent an investigation into the TTS pipeline looking for silence that
+                        # was never there.
+                        #
+                        # It is also not cosmetic: _observe_dub_fit sums these to learn how much
+                        # longer a dub runs than the speech it replaces, and isochrony centres
+                        # every later sentence's speed on that fit. Feeding it zeros taught it
+                        # that dubs take no time at all.
+                        duration_ms=self._wav_duration_ms(cached_bytes),
                         voice_type=voice_type,
                         voice_key=voice_key,
                         provider_voice_id=voice_id,
                         cache_key=cache_key,
                         cache_hit=True,
+                        # Genuinely zero — nothing was synthesized. Unlike the duration, this one
+                        # is a real measurement of this call and 0 is the honest answer.
                         synthesis_latency_ms=0,
                     )
                 return
@@ -1904,6 +2121,67 @@ class TTSWorker(BaseWorker):
             # genuinely slowed down still sounds like they slowed down, inside a slot that fits.
             speed_center=isochrony.speed_center(self._dub_fit(translation)),
         )
+
+    def _catch_up_lag_ms(self, translation: TranslationResultMessage) -> int:
+        """How far behind the conversation this sentence is, in milliseconds. WT-528.
+
+        Records this sentence's position as the furthest spoken for its key, so the NEXT one is
+        judged against it. Called once per message, from process(), under that key's lock — which
+        is what makes the read-then-write safe without a second lock of its own.
+
+        Zero is the normal answer and it means "make no adjustment".
+        """
+        # getattr + assign back, matching `_turns`: the tests build workers with __new__ and
+        # never run __init__, and this one is written to as well as read.
+        timeline: dict[tuple[str, str, str], int] = getattr(self, "_spoken_start_ms", None) or {}
+        self._spoken_start_ms = timeline
+
+        key = self._fit_key(translation)
+        spoken = timeline.get(key)
+
+        # Out of order: a sentence that belongs before one already spoken. Its whole gap is lag,
+        # because everything between the two has already been said and it is arriving into a
+        # conversation that has moved on.
+        out_of_order_ms = 0 if spoken is None else max(0, spoken - translation.start_ms)
+
+        # Simply slow. Only the part of the translation that overran the budget counts: a sentence
+        # inside it was never behind, and charging the whole duration as lag would speed up every
+        # dub in a healthy meeting.
+        overrun_ms = max(0, (translation.latency_ms or 0) - _CATCH_UP_ON_TIME_MS)
+
+        # The larger, not the sum. They are two measurements of the same delay from different
+        # ends — a slow translation is usually also what pushed the sentence out of order — and
+        # adding them would double-count it.
+        timeline[key] = max(spoken or 0, translation.start_ms)
+        return max(out_of_order_ms, overrun_ms)
+
+    @staticmethod
+    def _with_catch_up(
+        generation_config: dict[str, float | str] | None, lag_ms: int
+    ) -> dict[str, float | str] | None:
+        """Raise the delivery speed in proportion to how far behind the dub is. WT-528.
+
+        Returns the config UNCHANGED when there is no lag, including None — a meeting that is
+        keeping up makes exactly the Cartesia call it made before this existed, and prosody's own
+        rule that silence is the honest thing to say about unmeasured delivery is preserved.
+
+        When there IS lag the config may be created from nothing, because being behind is a fact
+        about this dub that is known regardless of whether the speaker's prosody was measurable.
+        """
+        if lag_ms <= 0:
+            return generation_config
+
+        ramp = min(1.0, lag_ms / _CATCH_UP_FULL_LAG_MS)
+        multiplier = 1.0 + ramp * (_CATCH_UP_MAX_SPEED - 1.0)
+
+        base = dict(generation_config) if generation_config else {}
+        # Multiplies whatever speed was already decided — the speaker's own measured rate through
+        # isochrony's centre — rather than replacing it, so a slow talker who is behind still
+        # sounds like a slow talker, just less far behind.
+        current_speed = base.get("speed", 1.0)
+        speed = min(SPEED_MAX, float(cast(float, current_speed)) * multiplier)
+        base["speed"] = round(speed, 3)
+        return base
 
     def _fit_key(self, translation: TranslationResultMessage) -> tuple[str, str, str]:
         """Fit is per (meeting, speaker, target language). Not global: how much longer a dub
