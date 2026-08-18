@@ -15,11 +15,13 @@ Voice cloning:
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from shared import isochrony
@@ -54,6 +56,63 @@ _CLONE_RESULT_PREFIX = "voice:clone_result:"
 # The answer outlives the audio: somebody may upload and not open the page for days, and losing
 # the id would mean paying Cartesia again for a voice we already made.
 _CLONE_RESULT_TTL_SECONDS = 7 * 24 * 60 * 60
+
+# The two kinds of voice this worker creates in the Cartesia account, told apart by the name it
+# gives them. This is not cosmetic: `_sweep_orphan_voices` deletes on exactly this distinction,
+# because the AI side has no database and no other way to know which voices something still
+# points at.
+#
+#   {_IN_MEETING_VOICE_PREFIX}  cloned live from a meeting microphone. Reachable only through
+#                               `voice:{meeting}:{speaker}`, which expires — so these become
+#                               garbage on their own and are what the sweep collects.
+#   {_UPLOAD_VOICE_PREFIX}      made from a recording somebody uploaded. AuthService stores the
+#                               id in voice_profiles.provider_voice_id and a person chose it in
+#                               the picker. NEVER swept: this side cannot see that table, so a
+#                               deletion here is unrecoverable from here.
+#
+# Anything that later PROMOTES an in-meeting clone to a permanent profile must rename it to the
+# upload prefix (cartesia voices.update takes `name`) as part of promoting it. That is the whole
+# handshake — no extra bookkeeping, and the voice stops being sweepable the moment it stops
+# being disposable.
+_IN_MEETING_VOICE_PREFIX = "speaker-"
+_UPLOAD_VOICE_PREFIX = "profile-"
+
+# WT-D — "what will I actually sound like in a meeting?"
+#
+# Same shape as the clone hand-off above and for the same reason: the Cartesia key lives only on
+# this side, so AuthService cannot render a sample itself and asks for one instead.
+#
+# THE RESULT KEY IS THE CACHE, AND THAT IS WHY IT IS NOT KEYED BY REQUEST
+#     A preview of one voice in one language is the same audio every time anybody asks for it.
+#     Keying by (voice, language) rather than by request id means the second person to press play
+#     — and the same person pressing it again — is served from Redis with no Cartesia call at all.
+#     The cost of a preview is therefore paid once per voice, not once per click.
+_PREVIEW_REQUEST_STREAM = "voice:preview_requests"
+_PREVIEW_RESULT_PREFIX = "voice:preview:"
+# A rendered sample does not go stale: the voice it came from is immutable, and a voice that is
+# deleted takes its preview with it at the next expiry. A day keeps repeat plays free without
+# holding audio for a voice nobody has touched in a week.
+_PREVIEW_RESULT_TTL_SECONDS = 24 * 60 * 60
+
+# What the preview says, per language.
+#
+# It is spoken in the language being previewed rather than translated into it, because the point
+# of the sample is to answer "is this me?" — and a listener judges that far better on a sentence
+# in a language they read. The wording is deliberately ordinary: a dramatic line would be
+# performed by the model and flatter the voice, which is the opposite of what this is for.
+_PREVIEW_TEXT: dict[str, str] = {
+    "en": "Hello, this is how I will sound to people listening in another language.",
+    "vi": "Xin chào, đây là giọng của tôi khi mọi người nghe bằng ngôn ngữ khác.",
+    "ja": "こんにちは。別の言語で聞いている人には、この声で聞こえます。",
+    "ko": "안녕하세요. 다른 언어로 듣는 사람에게는 이 목소리로 들립니다.",
+    "fr": "Bonjour, voici comment je sonnerai pour ceux qui écoutent dans une autre langue.",
+    "es": "Hola, así es como sonaré para quienes escuchen en otro idioma.",
+    "zh": "你好，这就是别人用其他语言收听时我的声音。",
+}
+
+# One replica sweeps per cycle. Held for the length of the interval, so a fleet-wide restart
+# does not turn every replica's startup sweep into a duplicate walk of the whole account.
+_ORPHAN_SWEEP_LOCK_KEY = "voice:orphan_sweep:lock"
 
 # Cartesia's voices.clone() requires a concrete `language`, but AudioChunkMessage.language
 # defaults to "auto" (STT does language auto-detection, not the audio-chunk producer) — so
@@ -181,6 +240,9 @@ class TTSWorker(BaseWorker):
     # WT-396. Its own group, not the audio one: these are two unrelated backlogs, and sharing a
     # group would make a slow clone hold up live meeting audio behind it.
     _clone_request_group = "tts-upload-clone-workers"
+    # Its own group again, by the same rule: a preview is somebody waiting on a button, and it
+    # must not queue behind a clone or behind live meeting audio.
+    _preview_request_group = "tts-preview-workers"
     _running = True
 
     def __init__(
@@ -216,6 +278,9 @@ class TTSWorker(BaseWorker):
         self.livekit_publisher = LiveKitTTSPublisher(self.settings.livekit)
         asyncio.create_task(self._consume_audio_for_cloning())
         asyncio.create_task(self._consume_upload_clone_requests())
+        asyncio.create_task(self._consume_preview_requests())
+        if self.tts_settings.orphan_voice_sweep_enabled:
+            asyncio.create_task(self._sweep_orphan_voices())
         self.logger.info("tts_worker_ready", model=self.tts_settings.model)
 
     async def _consume_loop(self) -> None:
@@ -549,11 +614,29 @@ class TTSWorker(BaseWorker):
         variant billed (see _synthesize_and_publish) and the only one with a backward-
         compatible LiveKit identity (ai-interpreter-{lang}-{speakerId}, unchanged).
 
-        Plus one extra entry per DISTINCT voice a listener explicitly chose via
-        SetVoicePreference for this language (deduped — two listeners picking the same
-        voice share one synthesis+track, same principle as _get_target_languages
-        deduping identical listen-languages). Skipped entirely if it happens to equal
-        the default voice already being rendered.
+        Plus — ONLY for a speaker who has no voice of their own — one extra entry per
+        DISTINCT voice a listener explicitly chose via SetVoicePreference for this
+        language (deduped: two listeners picking the same voice share one
+        synthesis+track, same principle as _get_target_languages deduping identical
+        listen-languages).
+
+        VOICE IS ONE-DIRECTIONAL; ONLY THE LANGUAGE IS THE LISTENER'S
+            Whose voice a dub is spoken in is the SPEAKER's decision, and a listener may
+            not overrule it. What the listener chooses is which language they hear — and
+            the same voice is rendered once per distinct target language, so A speaking
+            Vietnamese with a cloned voice is heard by B in English IN A'S VOICE.
+
+            It did not work that way. `_get_explicit_voice_choices` was applied to every
+            speaker unconditionally, and the client accepts ONLY the preference track once
+            a listener has one (see filtered-room-audio.tsx `dubbedSpeakerId`), so any
+            listener who had ever picked a voice silently stopped hearing every cloned
+            speaker in their own voice — while the speaker saw "My voice", watched the
+            capture succeed, and had no way to learn it was being discarded.
+
+            So the override now applies only where there is nothing of the speaker's to
+            override: a speaker on the hashed catalogue default has expressed no
+            preference about how they sound, and letting a listener pick a stand-in for
+            them costs nobody anything.
         """
         # WT-396. The speaker's OWN choice wins over everything, including a voice cloned live in
         # this meeting: they went and picked one, and a live clone quietly overriding it is the
@@ -576,6 +659,12 @@ class TTSWorker(BaseWorker):
             default_voice_type = "default"
 
         variants: list[tuple[str, str, str]] = [(default_voice_id, default_voice_type, "")]
+
+        # The speaker owns how they sound. A clone or a deliberate pick is not a default
+        # waiting to be overridden, and rendering a listener's alternative for one would be
+        # paying Cartesia to throw the speaker's own voice away.
+        if chosen_voice_id or cloned_voice_id:
+            return variants
 
         explicit_choices = await self._get_explicit_voice_choices(meeting_id, target_lang)
         for voice_id in explicit_choices:
@@ -942,7 +1031,9 @@ class TTSWorker(BaseWorker):
             audio = sample.encode("utf-8") if isinstance(sample, str) else sample
             synthesizer = self._require_cartesia()
             voice_id = await synthesizer.clone_voice(
-                audio, speaker_label=f"profile-{profile_id[:8]}", language=_clone_language(language)
+                audio,
+                speaker_label=f"{_UPLOAD_VOICE_PREFIX}{profile_id[:8]}",
+                language=_clone_language(language),
             )
             await answer(voice_id, None)
             self.logger.info(
@@ -958,6 +1049,186 @@ class TTSWorker(BaseWorker):
                 await self.redis.delete(sample_key)
             except Exception:
                 self.logger.debug("clone_sample_delete_failed", profile_id=profile_id)
+
+    async def _consume_preview_requests(self) -> None:
+        """Render "what will I sound like?" samples for the voice-profiles page.
+
+        WHY THIS SIDE RENDERS IT
+            The same boundary the clone hand-off crosses: the Cartesia key is confined here, so
+            AuthService can offer a play button but cannot produce the audio behind it.
+
+        WHY IT MUST GO THROUGH synthesize() AND NOT A SIMPLER CALL
+            The preview is only worth anything if it is the SAME rendering the meeting would
+            produce. `CartesiaSynthesizer.synthesize` carries `speed="fast"`, which is not a
+            default — it is a deliberate choice made because a dub has to fit the gap the speaker
+            left, and it audibly changes the result. A preview rendered at Cartesia's normal speed
+            would be a fair sample of a voice this product never plays.
+
+            `generation_config` is passed as None, and that is correct rather than a shortcut: it
+            is built from the speaker's measured prosody, there is no speaker here, and
+            `_generation_config` already returns None for any utterance prosody could not be
+            measured on. A preview is exactly that case, so it matches a real dub of one.
+        """
+        while self._running:
+            try:
+                async for _msg_id, data in self.redis.consume(
+                    stream=_PREVIEW_REQUEST_STREAM,
+                    group=self._preview_request_group,
+                    consumer=self._consumer_name,
+                    block_ms=5000,
+                    count=1,
+                ):
+                    await self._handle_preview_request(data)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.exception("preview_consumer_error")
+                await asyncio.sleep(1.0)
+
+    async def _handle_preview_request(self, data: dict[bytes, bytes]) -> None:
+        voice_id = _decode_field(data, "voice_id")
+        language = base_language(_decode_field(data, "language") or "en")
+        if not voice_id:
+            return
+
+        result_key = f"{_PREVIEW_RESULT_PREFIX}{voice_id}:{language}"
+
+        async def answer(audio: bytes | None, error: str | None) -> None:
+            # An answer is always written, including for failure — the same rule the clone
+            # hand-off follows. A missing key and a key that has not been written yet look
+            # identical to the waiting request, so silence would render as "still loading"
+            # until it timed out, for every retry, forever.
+            await self.redis.set_with_ttl(
+                result_key,
+                json.dumps(
+                    {
+                        "audio": base64.b64encode(audio).decode("ascii") if audio else None,
+                        "error": error,
+                    }
+                ),
+                _PREVIEW_RESULT_TTL_SECONDS,
+            )
+
+        try:
+            text = _PREVIEW_TEXT.get(language) or _PREVIEW_TEXT["en"]
+            audio_bytes, duration_ms, _resolved = await self._require_cartesia().synthesize(
+                text, language, voice_id
+            )
+            if not audio_bytes:
+                await answer(None, "the provider returned no audio for this voice")
+                return
+            await answer(audio_bytes, None)
+            self.logger.info(
+                "voice_preview_rendered",
+                voice_id=voice_id,
+                language=language,
+                duration_ms=duration_ms,
+                bytes=len(audio_bytes),
+            )
+        except Exception as exc:
+            self.logger.exception("voice_preview_failed", voice_id=voice_id, language=language)
+            # Truncated because it goes on the wire to a person pressing a play button, and a
+            # Cartesia stack trace is not a message for one.
+            await answer(None, str(exc)[:200])
+
+    async def _sweep_orphan_voices(self) -> None:
+        """Delete in-meeting clones from the Cartesia account once nothing can reach them.
+
+        WHAT LEAKS, AND WHY IT NEVER STOPPED
+            `_clone_and_cache` creates a real voice in the account and records it at
+            `voice:{meeting}:{speaker}` with a 12h TTL. When that key expires the voice is
+            unreachable — and it is also still there, because nothing in this repository has
+            ever called `voices.delete`. Every meeting leaked one voice per cloned speaker, and
+            every upgrade (`voice_clone_max_upgrades`) leaked the one it replaced, mid-meeting,
+            without even that pointer surviving to name it.
+
+        WHY A SWEEP AND NOT A DELETE WHEN THE MEETING ENDS
+            Three reasons, in order of how much they matter.
+
+            A sweep collects what has ALREADY leaked. An end-of-meeting hook only ever stops
+            the bleeding from now on, and the account is the state it is in.
+
+            A sweep cannot delete a voice somebody is still speaking through. The end-of-meeting
+            path runs off the route-status broadcast, which arrives on every replica and can
+            arrive for a room that a slower replica is mid-sentence on; getting that wrong takes
+            a live dub down, whereas getting the sweep wrong keeps a voice a few hours too long.
+
+            A sweep has no bookkeeping to lose. Deleting on the way out means tracking every id
+            created for a room, and a replica that dies takes its list with it — the leak this
+            method exists to close, reintroduced one level up.
+
+        HOW A VOICE IS JUDGED GARBAGE
+            Its name and its age, and nothing else, because this service has no database. See
+            `_IN_MEETING_VOICE_PREFIX`. An upload-made voice is named for its profile and is
+            never touched here; anything else in the account was not made by this worker at all
+            and is likewise left alone, which is the safe reading of a name we do not recognise.
+        """
+        interval = self.tts_settings.orphan_voice_sweep_interval_seconds
+        while not self._shutdown_event.is_set():
+            try:
+                await self._sweep_orphan_voices_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Never let account housekeeping stop the worker. The next cycle retries, and
+                # the failure mode of skipping one is the state this method started from.
+                self.logger.exception("orphan_voice_sweep_failed")
+
+            # Waiting on the shutdown event rather than sleeping it out, so a deploy is not held
+            # up by however much of a six-hour interval happens to be left.
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)
+            except TimeoutError:
+                pass
+
+    async def _sweep_orphan_voices_once(self) -> None:
+        """One pass. Returns quietly when another replica already has this cycle."""
+        interval = self.tts_settings.orphan_voice_sweep_interval_seconds
+        if not await self.redis.set_if_absent(
+            _ORPHAN_SWEEP_LOCK_KEY, self._consumer_name, interval
+        ):
+            return
+
+        cutoff = datetime.now(UTC) - timedelta(
+            seconds=self.tts_settings.orphan_voice_min_age_seconds
+        )
+        synthesizer = self._require_cartesia()
+        voices = await synthesizer.list_owned_voices()
+
+        deleted = 0
+        failed = 0
+        too_young = 0
+        for voice in voices:
+            if not str(voice.get("name") or "").startswith(_IN_MEETING_VOICE_PREFIX):
+                continue
+
+            created_at = voice.get("created_at")
+            if not isinstance(created_at, datetime):
+                # No age means no way to know it is unreachable. Keeping a voice costs storage;
+                # deleting one that a meeting is still speaking through costs the meeting.
+                too_young += 1
+                continue
+            # A naive timestamp from the vendor is UTC — comparing it against an aware `cutoff`
+            # raises rather than mis-sorting, so it is normalized rather than left to chance.
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            if created_at > cutoff:
+                too_young += 1
+                continue
+
+            if await synthesizer.delete_voice(str(voice["id"])):
+                deleted += 1
+            else:
+                failed += 1
+
+        self.logger.info(
+            "orphan_voice_sweep_completed",
+            owned=len(voices),
+            deleted=deleted,
+            failed=failed,
+            too_young=too_young,
+            min_age_seconds=self.tts_settings.orphan_voice_min_age_seconds,
+        )
 
     async def _consume_audio_for_cloning(self) -> None:
         """Buffer raw audio per speaker; clone voice once enough is collected."""
@@ -1330,7 +1601,7 @@ class TTSWorker(BaseWorker):
         The upload path (`_handle_upload_clone_request`) never hit this because the bytes it
         sends come straight from a user-uploaded recording, which already has a container.
         """
-        label = f"speaker-{speaker_id[:8]}-{meeting_id[:8]}"
+        label = f"{_IN_MEETING_VOICE_PREFIX}{speaker_id[:8]}-{meeting_id[:8]}"
         key = (meeting_id, speaker_id)
         try:
             voice_id = await self._require_cartesia().clone_voice(
