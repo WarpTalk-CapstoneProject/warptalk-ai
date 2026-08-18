@@ -150,3 +150,37 @@ class TestSpeed:
         config = TTSWorker._with_catch_up(None, _CATCH_UP_FULL_LAG_MS * 100)
         assert config is not None
         assert config["speed"] == pytest.approx(_CATCH_UP_MAX_SPEED)
+
+
+class TestCachedDuration:
+    """A cache hit plays for as long as the render that filled the cache. WT-528.
+
+    `duration_ms=0` was hardcoded on that path, so the number reached
+    transcript.audio_dubbings.duration_ms as a fact: a third of one production evening's rows
+    read 0 with status 'done'. That is indistinguishable from audio that failed to synthesize,
+    and it is what sent an investigation hunting for silence that was never there.
+
+    It also feeds _observe_dub_fit, which sums these to learn how much longer a dub runs than the
+    speech it replaces — isochrony then centres every later sentence's speed on that fit. Zeros
+    taught it that dubs take no time at all.
+    """
+
+    @staticmethod
+    def _wav(pcm_samples: int, sample_rate: int) -> bytes:
+        return b"\x00" * 44 + b"\x00\x00" * pcm_samples
+
+    def test_a_cached_second_reports_a_second(self) -> None:
+        worker = _worker()
+        worker.cartesia = type("_C", (), {"sample_rate": 44100})()
+        assert worker._wav_duration_ms(self._wav(44100, 44100)) == 1000
+
+    def test_it_follows_the_configured_sample_rate(self) -> None:
+        """A wrong rate would misreport every cached line by the ratio between the two."""
+        worker = _worker()
+        worker.cartesia = type("_C", (), {"sample_rate": 22050})()
+        assert worker._wav_duration_ms(self._wav(22050, 22050)) == 1000
+
+    def test_header_only_audio_is_zero_not_negative(self) -> None:
+        worker = _worker()
+        worker.cartesia = type("_C", (), {"sample_rate": 44100})()
+        assert worker._wav_duration_ms(b"\x00" * 20) == 0

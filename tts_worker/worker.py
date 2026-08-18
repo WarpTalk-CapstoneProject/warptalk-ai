@@ -809,6 +809,21 @@ class TTSWorker(BaseWorker):
             )
         return voices
 
+    def _wav_duration_ms(self, audio_bytes: bytes) -> int:
+        """How long this WAV actually plays for.
+
+        Same arithmetic CartesiaSynthesizer.synthesize does on the bytes it just produced — 44
+        bytes of header, the rest 16-bit mono PCM — so a cached rendering reports the identical
+        duration to the render that filled the cache.
+
+        Reads the sample rate off the synthesizer rather than assuming one: it is configurable,
+        and a wrong rate here would misreport every cached line by the ratio between them.
+        """
+        cartesia = getattr(self, "cartesia", None)
+        sample_rate = getattr(cartesia, "sample_rate", 0) or 44100
+        pcm_bytes = max(0, len(audio_bytes) - 44)
+        return int(pcm_bytes / 2 / sample_rate * 1000)
+
     @staticmethod
     def _persona_hash(speaker_id: str, salt: str = "") -> int:
         return int(hashlib.sha256(f"{salt}{speaker_id}".encode()).hexdigest(), 16)
@@ -1022,12 +1037,28 @@ class TTSWorker(BaseWorker):
                     await self._publish_result(
                         translation=translation,
                         audio_bytes=cached_bytes,
-                        duration_ms=0,
+                        # Derived from the audio, not hardcoded to 0. WT-528.
+                        #
+                        # A cache hit plays exactly as long as the render that filled the cache,
+                        # so 0 was never true — it was "we did not bother to work it out", and it
+                        # reached transcript.audio_dubbings.duration_ms as a fact. A third of the
+                        # rows one production evening read 0 with status 'done', which is
+                        # indistinguishable from audio that failed to synthesize, and it is what
+                        # sent an investigation into the TTS pipeline looking for silence that
+                        # was never there.
+                        #
+                        # It is also not cosmetic: _observe_dub_fit sums these to learn how much
+                        # longer a dub runs than the speech it replaces, and isochrony centres
+                        # every later sentence's speed on that fit. Feeding it zeros taught it
+                        # that dubs take no time at all.
+                        duration_ms=self._wav_duration_ms(cached_bytes),
                         voice_type=voice_type,
                         voice_key=voice_key,
                         provider_voice_id=voice_id,
                         cache_key=cache_key,
                         cache_hit=True,
+                        # Genuinely zero — nothing was synthesized. Unlike the duration, this one
+                        # is a real measurement of this call and 0 is the honest answer.
                         synthesis_latency_ms=0,
                     )
                 return
