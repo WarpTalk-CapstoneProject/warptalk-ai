@@ -170,8 +170,15 @@ class STTWorker(BaseWorker):
         await self.model.load()
         await self.model.warm_up(pool_size=self.stt_settings.realtime_pool_size)
         self._prewarm_listener_task = asyncio.create_task(self._listen_for_track_prewarm())
-        if self.settings.stt_streaming_enabled:
-            self._frame_consumer_task = asyncio.create_task(self._consume_speech_frames())
+        # Started unconditionally, and that is the point of flash mode being per ROOM.
+        #
+        # It used to be gated on `settings.stt_streaming_enabled`, which made the deployment
+        # default a hard ceiling: with it false — the shipping default — no room could ever turn
+        # streaming on, because the loop that consumes the frames did not exist. The producer
+        # (livekit_ingress_worker._flash_mode_enabled) is where the decision now lives, so a room
+        # with flash mode off simply publishes nothing and this loop blocks on an empty stream,
+        # which costs one idle XREAD.
+        self._frame_consumer_task = asyncio.create_task(self._consume_speech_frames())
 
     async def _consume_speech_frames(self) -> None:
         """Append live speech to each speaker's open session WHILE they are still talking.

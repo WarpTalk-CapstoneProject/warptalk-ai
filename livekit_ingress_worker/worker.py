@@ -222,6 +222,18 @@ def _parse_track_published_event(
     return room_name, participant_identity, track_id
 
 
+# WT-B/flash mode — the per-room switch for streaming audio during speech.
+#
+# Accepted spellings are generous on purpose: this key is written by the backend today and by a
+# person with redis-cli during an incident tomorrow, and a switch that silently ignores "true"
+# is worse than one that accepts it.
+_FLASH_MODE_ON = {"on", "true", "1", "enabled", "yes"}
+_FLASH_MODE_OFF = {"off", "false", "0", "disabled", "no"}
+# Short enough that a toggle feels immediate, long enough that a busy room does not read Redis
+# once per speaker per sentence.
+_FLASH_MODE_CACHE_SECONDS = 3.0
+
+
 class LiveKitIngressWorker(BaseWorker):
     """Worker that joins LiveKit rooms and pushes audio to Redis Streams."""
 
@@ -1139,7 +1151,9 @@ class LiveKitIngressWorker(BaseWorker):
         # Streaming state. A TURN is the audio that the NEXT audio:chunks message will commit
         # — so it is rotated by a max-chunk flush as well as by silence, because both publish a
         # chunk and both therefore end a commit boundary on the STT side.
-        streaming = self.settings.stt_streaming_enabled
+        # Decided at each speech onset (see _flash_mode_enabled), not once here: this is a
+        # switch somebody flips mid-meeting and then listens for.
+        streaming = False
         turn_id = ""
         frame_seq = 0
         streamed_bytes = 0
@@ -1242,6 +1256,7 @@ class LiveKitIngressWorker(BaseWorker):
                             is_speaking = True
                             speech_buffer = bytearray()
                             speech_samples = 0
+                            streaming = await self._flash_mode_enabled(room_name)
                             if streaming:
                                 turn_id = uuid.uuid4().hex
                                 frame_seq = 0
@@ -1446,6 +1461,62 @@ class LiveKitIngressWorker(BaseWorker):
         if not raw_language:
             return "auto"
         return raw_language.decode() if isinstance(raw_language, bytes) else raw_language
+
+    async def _flash_mode_enabled(self, room_name: str) -> bool:
+        """Whether THIS room streams audio while the speaker is still talking (flash mode).
+
+        WHY PER ROOM, AND WHY IT IS READ HERE RATHER THAN ONCE PER TRACK
+            One environment variable makes this an all-or-nothing choice for the whole platform,
+            which is the same trap WT-427 documented for denoising: whichever way it is set, half
+            the estate is configured for the other half. It is also the only way to A/B the thing
+            in a real meeting — one room on, one room off, same build.
+
+            Read at SPEECH ONSET, not once when the track opens. A person toggling it mid-meeting
+            expects the next thing they say to be affected; captured at track open it would do
+            nothing until they rejoined, which reads as a dead switch.
+
+        WHY THE VALUE IS HELD FOR THE WHOLE UTTERANCE
+            A turn that starts streaming must finish streaming. Flipping mid-utterance would send
+            the STT side a turn whose frames stop partway, which its own gap check would then have
+            to throw away — so a toggle takes effect on the next thing the speaker says, at most a
+            sentence later.
+
+        Falls back to the deployment default on anything unexpected, which is what every room did
+        before this key existed.
+        """
+        cache: dict[str, tuple[float, bool]] | None = getattr(self, "_flash_mode_cache", None)
+        if cache is None:
+            cache = {}
+            self._flash_mode_cache = cache
+
+        now = time.monotonic()
+        cached = cache.get(room_name)
+        # Short, unlike WT-427's permanent per-room cache, because this one is behind a switch a
+        # person flips DURING a meeting and then listens for. Three seconds keeps a toggle feeling
+        # immediate while still collapsing the per-turn reads of a room full of people.
+        if cached is not None and now - cached[0] < _FLASH_MODE_CACHE_SECONDS:
+            return cached[1]
+
+        value = self.settings.stt_streaming_enabled
+        try:
+            raw = await self.redis.get(f"translationRoom:{room_name}:flash_mode")
+            if raw:
+                decoded = (raw.decode() if isinstance(raw, bytes) else raw).strip().lower()
+                if decoded in _FLASH_MODE_ON:
+                    value = True
+                elif decoded in _FLASH_MODE_OFF:
+                    value = False
+                else:
+                    self.logger.warning(
+                        "flash_mode_unrecognised", room_name=room_name, value=decoded
+                    )
+        except Exception:
+            # A room that cannot be read falls back to the deployment default. Never let a
+            # settings lookup stop audio from being processed.
+            self.logger.warning("flash_mode_unavailable", room_name=room_name)
+
+        cache[room_name] = (now, value)
+        return value
 
     async def _publish_speech_frame(
         self,
