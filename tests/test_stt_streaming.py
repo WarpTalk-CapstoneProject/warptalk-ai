@@ -54,6 +54,7 @@ def _worker(model: _Model) -> STTWorker:
     worker._consumer_name = "stt-test"
     worker.model = model  # type: ignore[assignment]
     worker._streamed_turns = {}
+    worker._speaker_locks = {}
     return worker
 
 
@@ -71,7 +72,7 @@ async def test_a_frame_is_appended_to_the_open_session() -> None:
     await worker._append_speech_frame(_frame("T1", audio=b"abcd"))
 
     assert model.appended == [b"abcd"]
-    assert worker._streamed_turns[(MEETING, SPEAKER)] == ("T1", 7)
+    assert worker._streamed_turns[(MEETING, SPEAKER)] == ("T1", 7, 1)
 
 
 @pytest.mark.asyncio
@@ -98,7 +99,7 @@ async def test_a_new_turn_while_the_old_one_is_open_clears_the_abandoned_audio()
     await worker._append_speech_frame(_frame("T2"))
 
     assert model.discards == 1
-    assert worker._streamed_turns[(MEETING, SPEAKER)] == ("T2", 7)
+    assert worker._streamed_turns[(MEETING, SPEAKER)] == ("T2", 7, 1)
 
 
 @pytest.mark.asyncio
@@ -235,3 +236,59 @@ async def test_streaming_off_behaves_exactly_as_before() -> None:
 
     assert conn.input_audio_buffer.appends
     assert conn.input_audio_buffer.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_append_mid_turn_stops_the_turn_being_trusted() -> None:
+    """THE BUG THIS PINS. A turn missing one frame does not fail loudly — it commits a buffer
+    with a hole in it and publishes the result as an authoritative sentence. Frame 1 landing and
+    frame 2 not must therefore forget the turn, so `process` sends the whole audio itself."""
+    model = _Model()
+    worker = _worker(model)
+    await worker._append_speech_frame(_frame("T1", 0, b"aa"))
+    assert worker._streamed_turns  # the turn is trusted so far
+
+    model.epoch = None  # the next append is refused
+    await worker._append_speech_frame(_frame("T1", 1, b"bb"))
+
+    assert worker._streamed_turns == {}, "a turn with a hole must not be committed"
+    assert model.discards == 1, "and the partial must not open the next turn"
+
+
+@pytest.mark.asyncio
+async def test_a_gap_in_the_sequence_stops_the_turn_being_trusted() -> None:
+    """publish_ephemeral trims unread frames on purpose rather than growing Redis, so a dropped
+    frame is an expected outcome. `seq` is what makes it visible here instead of discovered as a
+    hole in a published sentence."""
+    model = _Model()
+    worker = _worker(model)
+    await worker._append_speech_frame(_frame("T1", 0))
+
+    await worker._append_speech_frame(_frame("T1", 2))  # frame 1 never arrived
+
+    assert worker._streamed_turns == {}
+    assert model.discards == 1
+
+
+@pytest.mark.asyncio
+async def test_a_frame_arriving_during_a_commit_is_not_appended() -> None:
+    """_consume_loop's own docstring: two things using one reused WebSocket session at once
+    interleave the transcription stream. A frame appended mid-commit belongs to the NEXT turn
+    and would land inside the one being committed."""
+    import asyncio as _asyncio
+
+    model = _Model()
+    worker = _worker(model)
+    await worker._append_speech_frame(_frame("T1", 0))
+    appended_before = len(model.appended)
+
+    lock = worker._speaker_locks[(MEETING, SPEAKER)]
+    await lock.acquire()
+    try:
+        await worker._append_speech_frame(_frame("T1", 1))
+    finally:
+        lock.release()
+
+    assert len(model.appended) == appended_before, "nothing was appended mid-commit"
+    assert worker._streamed_turns == {}, "and the turn is no longer trusted"
+    assert isinstance(lock, _asyncio.Lock)

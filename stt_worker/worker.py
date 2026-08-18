@@ -145,9 +145,10 @@ class STTWorker(BaseWorker):
         # (meeting_id, speaker_id) -> lock serializing THAT speaker's own chunks — see
         # _consume_loop for why.
         self._speaker_locks: dict[tuple[str, str], asyncio.Lock] = {}
-        # (meeting_id, speaker_id) -> (turn_id, session epoch) for a turn whose frames have
-        # been appended but which no chunk has committed yet. See _append_speech_frame.
-        self._streamed_turns: dict[tuple[str, str], tuple[str, int]] = {}
+        # (meeting_id, speaker_id) -> (turn_id, session epoch, next expected seq) for a turn
+        # whose frames have been appended but which no chunk has committed yet. Absent means
+        # the buffer cannot be trusted — see _append_speech_frame.
+        self._streamed_turns: dict[tuple[str, str], tuple[str, int, int]] = {}
         # (meeting_id, speaker_id) -> how that speaker normally sounds in THIS room. Held in
         # memory and mirrored to Redis so a restart or a second replica does not start every
         # speaker from scratch — see _speaker_baseline.
@@ -218,7 +219,7 @@ class STTWorker(BaseWorker):
             return
 
         key = (frame.meeting_id, frame.speaker_id)
-        streaming: dict[tuple[str, str], tuple[str, int]] | None = getattr(
+        streaming: dict[tuple[str, str], tuple[str, int, int]] | None = getattr(
             self, "_streamed_turns", None
         )
         if streaming is None:
@@ -233,25 +234,69 @@ class STTWorker(BaseWorker):
         #
         # One rule, no extra protocol. A marker message from ingress would have covered only the
         # case ingress knows about.
-        previous = streaming.get(key)
-        if previous is not None and previous[0] != frame.turn_id:
+        async def abandon(reason: str, **fields: Any) -> None:
+            """Stop trusting this speaker's buffer, and empty it.
+
+            THE RULE THIS ENFORCES, AND WHY IT IS ABSOLUTE
+                A commit is only safe if the buffer holds the WHOLE turn and nothing else. A
+                turn missing one frame does not fail loudly — it transcribes with a hole and
+                publishes the result as authoritative, which is the confident-fluent-wrong
+                failure this pipeline has repeatedly proven nobody spots from the outside.
+
+                So every way a frame can fail to land ends here: no session, a refused append, a
+                gap in the sequence, a commit already in flight. Forgetting the turn makes
+                `process` send the audio itself — the pre-streaming path — and clearing the
+                buffer stops the partial from being read as the opening of the next turn.
+            """
+            streaming.pop(key, None)
             await self._require_model().discard_streamed_audio(key)
             self.logger.info(
                 "stt_stream_turn_abandoned",
+                reason=reason,
                 meeting_id=frame.meeting_id,
                 speaker_id=frame.speaker_id,
-                abandoned_turn=previous[0],
+                **fields,
             )
-            streaming.pop(key, None)
 
-        epoch = await self._require_model().append_streamed_audio(
-            key, frame.audio_data, frame.sample_rate
-        )
-        if epoch is None:
-            # No session to append to — the prewarm has not opened one yet. The turn simply
-            # goes the old way; `process` will send the audio itself.
+        previous = streaming.get(key)
+        if previous is not None and previous[0] != frame.turn_id:
+            # The previous turn will never be committed: too short for ingress to publish, or
+            # its chunk was lost, or ingress died mid-turn.
+            await abandon("previous_turn_never_committed", abandoned_turn=previous[0])
+            previous = None
+
+        # A GAP MEANS THE BUFFER IS NO LONGER THE TURN. `seq` exists for exactly this: the
+        # stream guarantees order, not delivery, and publish_ephemeral trims unread frames on
+        # purpose rather than growing Redis. A dropped frame must therefore be visible here, not
+        # discovered as a hole in a published sentence.
+        expected_seq = previous[2] if previous is not None else 0
+        if frame.seq != expected_seq:
+            await abandon("frame_gap", expected_seq=expected_seq, got_seq=frame.seq)
             return
-        streaming[key] = (frame.turn_id, epoch)
+
+        # A COMMIT FOR THIS SPEAKER IS IN FLIGHT. `_consume_loop`'s own docstring says why this
+        # lock exists: two things using one reused WebSocket session at once interleave the
+        # transcription stream. Appending mid-commit would put this frame — which belongs to the
+        # NEXT turn — inside the one being committed.
+        #
+        # Skipped rather than awaited: this loop serves every speaker in every room, and blocking
+        # it behind one speaker's commit (bounded by TRANSCRIBE_EVENT_TIMEOUT_S = 15s) would stall
+        # the frames of all the others.
+        lock = self._speaker_locks.setdefault(key, asyncio.Lock())
+        if lock.locked():
+            await abandon("commit_in_flight")
+            return
+
+        async with lock:
+            epoch = await self._require_model().append_streamed_audio(
+                key, frame.audio_data, frame.sample_rate
+            )
+        if epoch is None:
+            # No session yet (the prewarm has not opened one), or the append was refused.
+            # Either way this turn is no longer whole.
+            await abandon("append_failed")
+            return
+        streaming[key] = (frame.turn_id, epoch, frame.seq + 1)
 
     async def _listen_for_track_prewarm(self) -> None:
         """Prepare the speaker's Realtime socket during room join, before first speech."""
@@ -520,7 +565,7 @@ class STTWorker(BaseWorker):
             # getattr, matching every other per-room cache reached from process(): the test
             # suites build workers with __new__ rather than through __init__, and a field that
             # only exists on a fully-constructed worker would make each of those a crash.
-            streamed_turns: dict[tuple[str, str], tuple[str, int]] = getattr(
+            streamed_turns: dict[tuple[str, str], tuple[str, int, int]] = getattr(
                 self, "_streamed_turns", {}
             )
             streamed = streamed_turns.pop((chunk.meeting_id, chunk.speaker_id), None)
