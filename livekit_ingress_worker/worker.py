@@ -22,6 +22,7 @@ from redis.exceptions import RedisError
 
 from livekit_ingress_worker.near_field_gate import NearFieldGate
 from shared.base_worker import BaseWorker
+from shared.control_markers import is_external_bridge_speaker
 from shared.schemas import (
     STT_FRAME_STREAM,
     STT_FRAME_STREAM_MAXLEN,
@@ -1161,7 +1162,25 @@ class LiveKitIngressWorker(BaseWorker):
         # One near-field gate per track — see near_field_gate.py. It builds a running
         # peak-amplitude reference from this track's own earlier chunks, so it must live
         # for the whole track lifetime, not be recreated per chunk.
-        near_field_gate = NearFieldGate(self.settings)
+        #
+        # WT-525: except for the external-bridge stand-in, where the concept does not apply.
+        # That track is not somebody at a microphone — it is a line-level feed from Google Meet
+        # mixing several people in another room. The gate is one-directional and raises its
+        # baseline on every louder chunk, so one person on the far side speaking loudly would
+        # lift the bar and silence the next person who speaks quietly. The symptom is
+        # "translation works sometimes" with no error anywhere, which is close to undiagnosable
+        # from the outside.
+        #
+        # The hallucination risk the gate exists to prevent is genuinely lower here: a conference
+        # feed carries clean digital audio, not a far-field voice bleeding into a mic.
+        bridge_speaker = is_external_bridge_speaker(speaker_id)
+        near_field_gate = None if bridge_speaker else NearFieldGate(self.settings)
+        if bridge_speaker:
+            self.logger.info(
+                "near_field_gate_disabled_for_bridge",
+                room=room_name,
+                speaker_id=speaker_id,
+            )
         # Silero VAD carries recurrent state. Sharing one model across concurrently
         # iterated participant tracks interleaves unrelated audio histories and causes
         # missed/fragmented speech. Each track owns an independent cloned state machine.
