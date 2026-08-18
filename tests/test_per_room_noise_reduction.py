@@ -11,6 +11,18 @@ transcript tệ hẳn".
 
 One variable made that an all-or-nothing choice, so whichever way it was set half the meetings were
 configured for the other half's room.
+
+AND THE ROOM WAS STILL TOO COARSE
+    Denoising describes a microphone. The mixed room — a headset and a laptop two metres from a
+    fan, in the same call — is wrong for one participant whichever way a single room-wide value is
+    set, and the transcription session was already keyed per (meeting, speaker). So a speaker's own
+    setting outranks the room's, and the room remains the default for everyone who has not chosen.
+
+WHY NONE OF IT EVER RAN
+    The room key had a reader and no writer, in any repo. And this lookup cached per room for as
+    long as the worker remembered it, which cancelled the mid-meeting change
+    OpenAISTT._get_or_create_session goes out of its way to support. Both are fixed here; the
+    write half lives in warptalk-backend and warptalk-web.
 """
 
 from __future__ import annotations
@@ -20,6 +32,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import stt_worker.worker as worker_module
 from shared.config import STTSettings, WorkerSettings
 from stt_worker.model import OpenAISTT
 from stt_worker.worker import STTWorker
@@ -38,14 +51,35 @@ class _ModeRedis:
         return self._value
 
 
+class _KeyRedis:
+    """Answers depend on the key, so the speaker -> room -> default chain is observable."""
+
+    def __init__(self, values: dict[str, str | None]) -> None:
+        self.values = values
+        self.reads: list[str] = []
+
+    async def get(self, key: str) -> str | None:
+        self.reads.append(key)
+        return self.values.get(key)
+
+
 def _worker(redis: Any) -> STTWorker:
     worker = STTWorker.__new__(STTWorker)
     worker.settings = WorkerSettings()
     worker.stt_settings = STTSettings()
     worker.logger = MagicMock()
     worker._room_noise_reduction = {}
+    worker._speaker_noise_reduction = {}
     worker.redis = redis
     return worker
+
+
+def _room_key(meeting_id: str) -> str:
+    return f"translationRoom:{meeting_id}:noise_reduction"
+
+
+def _speaker_key(meeting_id: str, speaker_id: str) -> str:
+    return f"translationRoom:{meeting_id}:participant:{speaker_id}:noise_reduction"
 
 
 def _model(default: str) -> OpenAISTT:
@@ -110,8 +144,9 @@ async def test_an_unrecognised_mode_is_refused_not_forwarded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_mode_is_read_once_per_room() -> None:
-    # It is on the hot path — every chunk of every speaker.
+async def test_the_mode_is_read_at_most_once_per_window() -> None:
+    # It is on the hot path — every chunk of every speaker. The TTL exists to let a change
+    # through, not to move this lookup onto Redis per sentence.
     redis = _ModeRedis("far_field")
     worker = _worker(redis)
 
@@ -119,6 +154,128 @@ async def test_the_mode_is_read_once_per_room() -> None:
         await worker._get_room_noise_reduction("m1")
 
     assert redis.reads == 1
+
+
+@pytest.mark.asyncio
+async def test_a_change_made_during_the_meeting_reaches_the_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regression that made this whole feature unreachable.
+
+    OpenAISTT._get_or_create_session compares `noise_reduction` and issues a session.update on the
+    LIVE socket when it differs — deliberately, with a comment saying a value the update never
+    notices changed "is a setting that silently does nothing". But this lookup cached per room for
+    as long as the worker remembered it, so the new value could never arrive. Somebody moving the
+    control mid-meeting saw nothing happen, for the rest of the meeting.
+    """
+    monkeypatch.setattr(worker_module, "_NOISE_REDUCTION_TTL_S", 0.0)
+    redis = _KeyRedis({_room_key("m1"): None})
+    worker = _worker(redis)
+
+    assert await worker._get_room_noise_reduction("m1") is None
+
+    redis.values[_room_key("m1")] = "far_field"
+
+    assert await worker._get_room_noise_reduction("m1") == "far_field"
+
+
+# ── the speaker override ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_speakers_own_microphone_setting_wins_over_the_room() -> None:
+    """Denoising describes a microphone, not a meeting.
+
+    The mixed room is the one that needs this: a headset and a laptop two metres from a fan in the
+    same call. One room-wide value is wrong for one of them whichever way it is set, and the
+    transcription session is already keyed per (meeting, speaker).
+    """
+    redis = _KeyRedis({_room_key("m1"): "off", _speaker_key("m1", "s1"): "far_field"})
+
+    assert await _worker(redis)._get_noise_reduction("m1", "s1") == "far_field"
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_off_on_a_speaker_beats_a_room_set_to_far_field() -> None:
+    """ "Off" is an answer, not the absence of one.
+
+    The close-mic distortion the deployment default was measured against is exactly what a headset
+    user needs to opt out of, even in a room the host configured for far-field.
+    """
+    redis = _KeyRedis({_room_key("m1"): "far_field", _speaker_key("m1", "s1"): "off"})
+
+    assert await _worker(redis)._get_noise_reduction("m1", "s1") == "off"
+
+
+@pytest.mark.asyncio
+async def test_a_speaker_who_has_chosen_nothing_inherits_the_room() -> None:
+    redis = _KeyRedis({_room_key("m1"): "far_field"})
+
+    assert await _worker(redis)._get_noise_reduction("m1", "s1") == "far_field"
+
+
+@pytest.mark.asyncio
+async def test_two_speakers_in_one_room_get_their_own_answers() -> None:
+    redis = _KeyRedis(
+        {
+            _room_key("m1"): "off",
+            _speaker_key("m1", "headset"): "off",
+            _speaker_key("m1", "laptop"): "far_field",
+        }
+    )
+    worker = _worker(redis)
+
+    assert await worker._get_noise_reduction("m1", "headset") == "off"
+    assert await worker._get_noise_reduction("m1", "laptop") == "far_field"
+
+
+@pytest.mark.asyncio
+async def test_the_speaker_id_is_case_normalised_before_it_becomes_a_redis_key() -> None:
+    """Redis keys are case-sensitive; this id's casing is not dependable.
+
+    speaker_id is the auth user id as LiveKit reported it, and base_worker compares SourceUserId
+    with .lower() on both sides because the two do not reliably agree. An un-normalised id here
+    would be a write half that never meets its reader — the exact failure this change ends.
+    """
+    speaker = "3F2504E0-4F89-11D3-9A0C-0305E82C3301"
+    redis = _KeyRedis({_speaker_key("m1", speaker.lower()): "far_field"})
+
+    assert await _worker(redis)._get_noise_reduction("m1", speaker) == "far_field"
+
+
+@pytest.mark.asyncio
+async def test_nobody_configured_anything_and_the_deployment_default_stands() -> None:
+    redis = _KeyRedis({})
+
+    assert await _worker(redis)._get_noise_reduction("m1", "s1") is None
+
+
+@pytest.mark.asyncio
+async def test_ending_a_room_forgets_both_of_its_denoising_caches() -> None:
+    """Otherwise one entry per meeting, and one per (meeting, speaker), held for the process life.
+
+    WT-427's cache was missing from _cleanup_room entirely; the per-speaker one would have
+    repeated that.
+    """
+    worker = _worker(_KeyRedis({}))
+    # What _cleanup_room touches beyond this feature. Built with __new__, so nothing exists yet.
+    worker._route_states = {}
+    worker._translation_active = {}
+    worker._paused_rooms = set()
+    worker._room_routes = {}
+    worker._stt_prompts = {}
+    worker._room_languages = {}
+    worker._speaker_locks = {}
+    worker._room_noise_reduction["m1"] = ("far_field", 0.0)
+    worker._speaker_noise_reduction[("m1", "s1")] = ("off", 0.0)
+    worker._speaker_noise_reduction[("m2", "s1")] = ("off", 0.0)
+
+    STTWorker._cleanup_room(worker, "m1")
+
+    assert "m1" not in worker._room_noise_reduction
+    assert ("m1", "s1") not in worker._speaker_noise_reduction
+    # A different meeting is untouched.
+    assert ("m2", "s1") in worker._speaker_noise_reduction
 
 
 @pytest.mark.asyncio
