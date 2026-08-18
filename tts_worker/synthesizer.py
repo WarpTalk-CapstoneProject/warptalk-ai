@@ -399,6 +399,78 @@ class CartesiaSynthesizer:
             return []
         return voices
 
+    async def list_owned_voices(self, max_scanned: int = 5000) -> list[dict[str, Any]]:
+        """Voices this ACCOUNT owns — the ones we created, not the public library.
+
+        `is_owner=True` is the whole difference from `list_voices`, which asks for the
+        opposite. That one is looking for something to speak with, so it filters by language
+        and stops at a handful; this one is looking for something to DELETE, so it filters by
+        nothing and returns `created_at` and `name` — the caller decides what is garbage and
+        cannot do that without seeing every candidate.
+
+        Best-effort, same as `list_voices`: any failure returns [] rather than raising, which
+        makes the sweep a no-op for this cycle instead of taking the worker down.
+        """
+        voices: list[dict[str, Any]] = []
+        try:
+            client = self._require_client()
+            async for voice in client.voices.list(is_owner=True, limit=100):
+                voices.append(
+                    {
+                        "id": voice.id,
+                        "name": voice.name or "",
+                        "created_at": voice.created_at,
+                    }
+                )
+                if len(voices) >= max_scanned:
+                    logger.warning("cartesia_list_owned_voices_scan_capped", scanned=len(voices))
+                    break
+        except Exception:
+            logger.exception("cartesia_list_owned_voices_failed")
+            return []
+        return voices
+
+    async def delete_voice(self, voice_id: str) -> bool:
+        """Remove one voice from this account. True when it is gone.
+
+        Best-effort by the same rule as the two list calls: a failure here leaves a voice in
+        the account until the next sweep, which is exactly the state the sweep started from.
+        Nothing a cleanup path does is worth raising into its caller.
+
+        A voice that is already gone answers 404 and counts as failure here, which is
+        harmless — the sweep will not see it again to retry.
+        """
+        try:
+            await self._require_client().voices.delete(voice_id)
+        except Exception:
+            logger.warning("cartesia_delete_voice_failed", voice_id=voice_id, exc_info=True)
+            return False
+        logger.info("cartesia_voice_deleted", voice_id=voice_id)
+        return True
+
+    async def rename_voice(self, voice_id: str, name: str) -> bool:
+        """Rename one voice in this account. True when the new name is stored.
+
+        NOT best-effort, unlike `delete_voice` and the list calls beside it, and the difference
+        decides whether a voice leaks. The orphan sweep judges a voice by its NAME
+        (`_IN_MEETING_VOICE_PREFIX`), so this rename is the only thing that takes a carried-over
+        clone out of the sweep's sights. Its caller must not hand the voice to AuthService unless
+        this returned True: a stored profile pointing at a voice still named `speaker-` is a row
+        that goes dead in 24 hours, and the person it belongs to would hear a stranger.
+
+        So the answer is reported honestly and the caller decides, rather than being swallowed
+        into a shrug the way a cleanup failure can be.
+        """
+        try:
+            await self._require_client().voices.update(voice_id, name=name)
+        except Exception:
+            logger.warning(
+                "cartesia_rename_voice_failed", voice_id=voice_id, name=name, exc_info=True
+            )
+            return False
+        logger.info("cartesia_voice_renamed", voice_id=voice_id, name=name)
+        return True
+
     def _require_client(self) -> AsyncCartesia:
         if self._client is None:
             raise RuntimeError("Cartesia synthesizer is not loaded")

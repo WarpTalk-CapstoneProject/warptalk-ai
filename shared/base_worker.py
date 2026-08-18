@@ -449,6 +449,47 @@ class BaseWorker(ABC):
                 return str(voice_id)
         return None
 
+    def carried_clone(self, room_id: str, speaker_user_id: str) -> tuple[str | None, float | None]:
+        """The voice this speaker was cloned into in an EARLIER meeting, and how good it was.
+
+        WHY THIS IS NOT `chosen_dub_voice` (WT-B)
+            They arrive on the same route and look alike, and merging them would break the
+            feature permanently. A dub voice is a DELIBERATE PICK: the speaker went to the
+            picker and named a voice, so the worker must stop capturing and never overwrite it.
+            A carried-over clone is the opposite — it is a starting point the worker is supposed
+            to keep improving on, and reading it as a pick would freeze every speaker at the
+            first clone they ever earned, which is the state this whole feature exists to end.
+
+        THE SCORE IS THE BAR, AND ABSENT IS NOT ZERO
+            It is the quality of the clip the carried voice was built from, and the next clip
+            has to beat it by the upgrade margin to replace it. Missing means nobody measured
+            it — an old row, or an uploaded recording — and it comes back as None so the caller
+            treats the bar as unset rather than as zero, which would invite replacement by
+            literally any clip that passed the floors.
+
+        Missing fields are None throughout, for the same reason `chosen_dub_voice` tolerates
+        them: during a rolling deploy half the fleet is talking to a backend that does not send
+        this yet, and the honest reading of "not told" is "no carried clone".
+        """
+        for route in self._room_routes.get(room_id, []):
+            if str(route.get("SourceUserId") or "").lower() != speaker_user_id.lower():
+                continue
+            voice_id = route.get("SourceAutoCloneVoiceId")
+            if not voice_id:
+                continue
+            raw_score = route.get("SourceAutoCloneScore")
+            score: float | None = None
+            if raw_score is not None and raw_score != "":
+                try:
+                    score = float(raw_score)
+                except (TypeError, ValueError):
+                    # An unreadable score is not a zero one. Keeping the voice and dropping the
+                    # bar means the next good clip can still replace it, which is the safe way
+                    # to be wrong here.
+                    score = None
+            return str(voice_id), score
+        return None, None
+
     async def voice_clone_consent_state(
         self, room_id: str, speaker_user_id: str
     ) -> tuple[bool, str]:
