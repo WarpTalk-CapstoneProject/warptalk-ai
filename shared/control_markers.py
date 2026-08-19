@@ -63,3 +63,32 @@ def is_system_speaker(speaker_id: str | None) -> bool:
     above — a synthetic event nobody has thought of yet is still not a person to charge.
     """
     return (speaker_id or "").strip().casefold() == SYSTEM_SPEAKER_ID
+
+
+# ---------------------------------------------------------------------------------------------
+# WT-525 — the external-bridge stand-in
+# ---------------------------------------------------------------------------------------------
+
+#: LiveKit participant identity of the seat that represents everyone on the far side of an
+#: external call (Google Meet, Zoom, Teams) in an EXTERNAL_BRIDGE room.
+#:
+#: Not a control marker in the sentinel sense — this IS a real speaker and must be transcribed,
+#: translated and dubbed like any other. It lives here because it is the same KIND of fact as the
+#: sentinel above: a string three repositories must agree on exactly, that nothing would fail to
+#: compile over if one of them changed it.
+#:
+#: Written by warptalk-backend (translation-room seeds the seat, meeting mints its token — see
+#: WarpTalk.Shared.ExternalBridgeConstants). Read here.
+EXTERNAL_BRIDGE_SPEAKER_ID = "00000000-0000-0000-0000-00000000b21d"
+
+
+def is_external_bridge_speaker(speaker_id: str | None) -> bool:
+    """True for the stand-in seat carrying the far side of an external call.
+
+    Callers use this to turn OFF processing that assumes a person at a microphone. The track is
+    a line-level conference feed mixing several people in a different room — every near-mic
+    assumption the pipeline makes about it is wrong.
+    """
+    if not speaker_id:
+        return False
+    return speaker_id.strip().lower() == EXTERNAL_BRIDGE_SPEAKER_ID

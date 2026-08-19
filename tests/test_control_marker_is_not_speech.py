@@ -48,6 +48,7 @@ import pytest
 from shared.control_markers import (
     MEETING_END_MARKER,
     is_control_marker,
+    is_external_bridge_speaker,
     is_system_speaker,
 )
 
@@ -145,3 +146,28 @@ async def test_translation_declines_the_marker_before_spending_anything() -> Non
 
     # Returns quietly rather than raising through _never.
     await worker.process(b"1-0", message.to_redis())  # type: ignore[arg-type]
+
+
+# --- WT-525: the external-bridge stand-in ------------------------------------------------------
+#
+# The opposite question to the sentinel above. This identity IS speech and must go all the way
+# through the pipeline; what it must NOT get is processing that assumes a person at a microphone.
+
+
+def test_bridge_speaker_is_recognised_regardless_of_case():
+    # Backend hands identities out as .NET Guid.ToString(), which is lowercase, but a token or a
+    # config could carry the uppercase form. Failing to recognise it would not error — it would
+    # silently re-enable near-field gating on a conference feed, whose symptom is "translation
+    # works sometimes" with nothing in the logs.
+    assert is_external_bridge_speaker("00000000-0000-0000-0000-00000000b21d")
+    assert is_external_bridge_speaker("00000000-0000-0000-0000-00000000B21D")
+    assert is_external_bridge_speaker("  00000000-0000-0000-0000-00000000b21d  ")
+
+
+def test_a_real_participant_is_not_the_bridge_speaker():
+    # The guard exists to turn OFF a quality filter. Matching too broadly would disable it for
+    # real microphones, which is the hallucination risk the gate was built to prevent.
+    assert not is_external_bridge_speaker("550e8400-e29b-41d4-a716-446655440000")
+    assert not is_external_bridge_speaker("system")
+    assert not is_external_bridge_speaker("")
+    assert not is_external_bridge_speaker(None)
