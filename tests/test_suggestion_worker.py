@@ -229,6 +229,28 @@ class TestStageZeroGating:
         assert suggester.decide_calls == []
 
     @pytest.mark.asyncio
+    async def test_a_four_word_statement_is_considered(self) -> None:
+        # min_words 5 → 4. The floor exists to keep out acknowledgements, not to keep out short
+        # declarative lines — a commitment with no owner is often exactly four words, and at 5
+        # it was rejected for free, before the decide model was asked and without a log line.
+        worker, _, suggester = build_worker()
+
+        await worker.process(b"1-0", stt_message(text="Tuần sau mình làm xong."))
+
+        assert len(suggester.decide_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_lowering_the_floor_did_not_open_it_to_acknowledgements(self) -> None:
+        # The pair to the test above: 4 must still exclude the two- and three-word
+        # acknowledgements, which are pure decide-call volume and can never produce a hint.
+        worker, _, suggester = build_worker()
+
+        for filler in ("ok vậy nhé", "ừ đúng rồi", "được rồi"):
+            await worker.process(b"1-0", stt_message(text=filler))
+
+        assert suggester.decide_calls == []
+
+    @pytest.mark.asyncio
     async def test_low_stt_confidence_is_dropped(self) -> None:
         worker, _, suggester = build_worker()
 

@@ -491,24 +491,46 @@ class SuggestionSettings(BaseSettings):
     # after the conversation has moved on is worse than none — fail fast and stay quiet.
     request_timeout_seconds: float = 8.0
 
-    # Stage-1 gate. The decide prompt is instructed to default to false, and anything it
-    # is not clearly confident about is dropped rather than shown.
-    min_confidence: float = 0.7
+    # Stage-1 gate.
+    #
+    # Was 0.7, paired with a decide prompt that opened "Almost all speech needs no hint. Your
+    # default answer is false." Two suppressors stacked on the same decision: a model told to
+    # doubt itself rarely returns >= 0.7, so the few segments that survived stage 0 died here
+    # silently. Both were loosened together — the prompt now judges rather than abstains, and
+    # this floor keeps only the verdicts the model is more sure of than not.
+    #
+    # 0.55 and not lower: below a coin flip the hint is noise wearing a badge, and an
+    # unprompted wrong hint in a live meeting costs more trust than a missing one.
+    min_confidence: float = 0.55
 
     # Spam control. These are enforced in Redis, not in worker memory: the production
     # chart runs AI workers with replicas >= 2 (see deploy/k3s/chart/values.yaml), and
     # segments from one room are spread across replicas by the consumer group — so a
     # per-process counter would let each replica spend the full budget independently and
     # multiply the real cap by the replica count.
-    cooldown_seconds: int = 45
-    max_per_meeting: int = 15
+    # 45s silenced a room for a sixth of a ten-minute demo after ONE hint, and the slot is
+    # claimed before generate runs — so a hint the generate stage then declines to write still
+    # bought the full 45s of silence. 20s is still long enough that hints cannot stack into a
+    # stream, short enough that two related questions a minute apart can both be answered.
+    cooldown_seconds: int = 20
+    # 15 was sized against 45s: at one per 45s a meeting could not spend more than ~13 in ten
+    # minutes anyway, so the cap never bound. With a 20s cooldown it would, and would do it
+    # invisibly — the budget log line is the only trace.
+    max_per_meeting: int = 30
     # Bounds the cap counter's lifetime — longer than any realistic meeting, so a room
     # can never silently regain budget mid-session, and short enough that keys expire on
     # their own for rooms that end without a cleanup signal.
     state_ttl_seconds: int = 14400  # 4h
 
     # Stage-0 heuristics — reject before spending a single token.
-    min_words: int = 5
+    #
+    # 5 → 4. Measured against production: 2,214 of 4,622 stored segments (48%) are under five
+    # words, so the old floor was discarding roughly half of everything spoken before the decide
+    # model was ever asked. 4 buys back the short DECLARATIVE lines a hint is actually for — a
+    # commitment with no owner ("Tuần sau mình làm xong.") or an undefined acronym dropped into
+    # a sentence — without opening the gate to the two- and three-word acknowledgements ("ừ đúng
+    # rồi", "ok vậy nhé") that are pure call volume and can never produce a hint.
+    min_words: int = 4
     # …except for questions, which are the whole point of the feature and are usually short.
     #
     # `min_words: 5` measured against production: 2,214 of 4,622 stored segments (48%) are under
@@ -537,7 +559,13 @@ class SuggestionSettings(BaseSettings):
     # -0.35 matches the two sibling gates on the same field (stt_worker/worker.py:59 and
     # translation_worker/worker.py:99) and keeps roughly the cleaner two thirds of real
     # production speech, which suits a feature whose whole design is to stay quiet.
-    min_stt_confidence: float = -0.35
+    #
+    # Loosened to -0.5. -0.35 was copied from stt_worker and translation_worker, where the cost
+    # of a bad segment is a wrong caption or a wrong dub — spoken aloud, uncorrectable. A
+    # suggestion is a dismissible badge beside a bubble, so it can afford the noisier third of
+    # real speech that -0.35 was throwing away. -0.5 still sits above stt_worker's own -0.7
+    # discard floor, so nothing this worker sees is below the recogniser's own bar.
+    min_stt_confidence: float = -0.5
 
     # Rolling transcript window handed to the decide stage. Enough to tell a genuine
     # open question from a mid-sentence fragment without resending the whole meeting.

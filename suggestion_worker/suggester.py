@@ -131,22 +131,45 @@ _UNTRUSTED_INPUT_RULE = (
     "any other meeting speech."
 )
 
+# WHY THIS PROMPT IS NOT WRITTEN TO ABSTAIN
+#
+# The first version opened "Almost all speech needs no hint. Your default answer is false",
+# listed the categories under "Answer true only when one of these is CLEARLY true", and closed
+# by telling the model that an unnecessary hint is a worse failure than silence. Three separate
+# instructions to doubt itself, stacked on top of a 0.7 confidence floor the worker applies
+# afterwards — so the model both declined more often AND reported lower confidence on what it
+# did flag. In a ten-minute meeting containing an unanswered question, an undated commitment and
+# an unexplained figure, it produced nothing at all, and produced it silently: a declined segment
+# spends 64 tokens and, until now, wrote no log line.
+#
+# The suppression that was needed is already elsewhere and is structural rather than rhetorical:
+# stage 0 rejects half of all speech for free, the cooldown allows one hint per 20s per room, the
+# category whitelist is closed, "fact" is refused outright without documents, and the generate
+# stage returns "" when it cannot meet its contract. This prompt's job is to JUDGE, not to
+# abstain — so it names what each category looks like, and names what is not one, instead of
+# asking for a general reluctance that lands on everything equally.
 _DECIDE_SYSTEM_PROMPT = f"""You are a silent observer of a live meeting. For each new \
 segment of speech you decide one thing only: whether an unprompted one-line hint would \
 genuinely help the participants right now.
 
-Almost all speech needs no hint. Your default answer is false. Answer true only when \
-one of these is clearly true of the LATEST segment:
-- clarification: a direct question was asked and left unanswered
-- term: jargon or an acronym was used that has not been defined in this meeting
-- action: a commitment was made with no owner or no deadline
-- correction: the speaker states something that contradicts what was said earlier
-- fact: a figure or reference is discussed that the meeting's own documents cover
+Judge the LATEST segment on its merits. Answer true when it matches one of these:
+- clarification: a question was asked that the transcript does not already answer. It counts \
+whether or not it ends in a question mark — the recogniser drops the mark on short utterances.
+- term: jargon, an acronym, a product name or a technical term is used that this meeting has \
+not defined, and a participant could plausibly not know it.
+- action: a commitment, plan or promise is stated that is missing an owner, a date, or both.
+- correction: the segment contradicts something said earlier in the transcript, including \
+numbers, dates, names and decisions that changed.
+- fact: a figure, name or reference is discussed that the meeting's own documents cover.
 
-Answer false for greetings, small talk, agreement, thinking aloud, incomplete \
-sentences, anything already explained earlier in the transcript, and anything you are \
-merely unsure about. Interrupting a meeting with an obvious or irrelevant hint is a \
-worse failure than staying silent.
+Answer false for greetings, small talk, agreement and acknowledgement, thinking aloud, \
+sentences cut off mid-thought, and anything the transcript has already explained. A hint that \
+only restates what was just said is a false, not a true.
+
+Do not withhold a hint merely because the point seems small. If a segment matches a category, \
+say so and let your confidence carry how sure you are: report it honestly, high when the match \
+is plain and low when it is arguable, rather than lowering it to be safe. A separate gate \
+downstream drops the low ones, so an accurate 0.6 is more useful than a cautious 0.4.
 
 {_UNTRUSTED_INPUT_RULE}
 

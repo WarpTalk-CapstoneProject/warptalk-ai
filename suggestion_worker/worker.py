@@ -171,16 +171,29 @@ class SuggestionWorker(BaseWorker):
             window.append(turn)
 
         if not self._passes_local_heuristics(turn, stt_result.confidence):
+            # Stage 0 spends no tokens, so until now it wrote nothing at all — and it is the
+            # gate that rejects roughly half of everything spoken. That is precisely why the
+            # feature could look dead rather than starved: every other stage leaves a trace,
+            # this one left none. DEBUG rather than INFO because it fires ~75x per meeting.
+            self.logger.debug(
+                "suggestion_stage0_rejected",
+                meeting_id=room_id,
+                words=len(turn.text.split()),
+                question=_looks_like_question(turn.text),
+                stt_confidence=stt_result.confidence,
+            )
             return
 
         # Consent gate, before any transcript text leaves this process.
         if not await self._external_llm_allowed(room_id):
+            self.logger.debug("suggestion_external_llm_denied", meeting_id=room_id)
             return
 
         # Read-only cooldown probe. The authoritative claim happens after the decide
         # stage — claiming here would burn a 45s slot on a segment the model then
         # declines, silencing the room for no reason.
         if await self._cooldown_active(room_id):
+            self.logger.debug("suggestion_cooldown_active", meeting_id=room_id)
             return
 
         # The current segment is the subject, not part of its own context.
@@ -188,6 +201,15 @@ class SuggestionWorker(BaseWorker):
         decision = await self.suggester.decide(context, turn)
 
         if not decision.should_suggest:
+            # The decide stage's own words for why. Paired with suggestion_below_confidence_gate
+            # below, these two lines are what separate "the model is seeing this room and saying
+            # no" from "nothing is reaching the model at all" — a distinction that previously
+            # cost a production reproduction to make.
+            self.logger.debug(
+                "suggestion_declined",
+                meeting_id=room_id,
+                reason=decision.reason,
+            )
             return
         if decision.confidence < self.suggestion_settings.min_confidence:
             self.logger.debug(
