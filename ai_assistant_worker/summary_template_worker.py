@@ -99,6 +99,21 @@ class SummaryTemplateWorker(BaseWorker):
             template_key=template.key,
         )
 
+        # WT-530: a generation that failed is not a rewrite that succeeded.
+        #
+        # This published every result as status="completed", so when the model call threw, the
+        # assistant's placeholder ("could not generate a structured summary") was written over
+        # the meeting's existing summary — a rewrite that both failed AND destroyed what it was
+        # replacing. The consumer already treats a failure correctly: it logs the reason and
+        # leaves the current summary alone.
+        if content.get("generationFailed"):
+            await self._publish_failure(
+                request,
+                template.key,
+                "The summary could not be generated. The previous one is unchanged.",
+            )
+            return
+
         await self.publish(
             "assistant:summary_results",
             request.room_id,

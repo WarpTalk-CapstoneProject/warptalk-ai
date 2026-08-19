@@ -174,3 +174,55 @@ async def test_an_uninitialised_chat_worker_still_answers_before_it_raises() -> 
 
     worker._publish_result.assert_awaited_once()
     assert worker._publish_result.await_args.kwargs["type_"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_generation_is_published_as_a_failure_not_a_completed_rewrite() -> None:
+    """WT-530.
+
+    The assistant returns a placeholder dict when the model call throws. It used to be
+    indistinguishable from a real summary, so this worker published it as `completed` and the
+    backend wrote it OVER the meeting's existing summary: a rewrite that failed AND destroyed
+    what it was replacing, while the page waited ninety seconds for a template that never
+    arrived and the console stayed clean.
+    """
+    worker = _worker()
+    worker._load_transcript = AsyncMock(return_value="Alice: hello")  # type: ignore[method-assign]
+    worker.assistant.generate_structured_summary = AsyncMock(
+        return_value={
+            "summary": "The AI assistant could not generate a structured summary for this meeting.",
+            "decisions": [],
+            "actionItems": [],
+            "insufficientData": True,
+            "generationFailed": True,
+            "templateKey": "standup",
+        }
+    )
+
+    await worker.process(b"1", _request(template_key="standup"))
+
+    result = _published(worker)
+    assert result.status == "failed", "a failed generation must not be reported as completed"
+    # The consumer leaves the existing summary alone on a failure, so this sentence is what
+    # stops a good summary being replaced by an apology.
+    assert "previous one is unchanged" in result.error
+
+
+@pytest.mark.asyncio
+async def test_a_real_summary_is_still_published_as_completed() -> None:
+    """The guard must key on the failure flag alone — insufficientData is a legitimate answer."""
+    worker = _worker()
+    worker._load_transcript = AsyncMock(return_value="Alice: hello")  # type: ignore[method-assign]
+    worker.assistant.generate_structured_summary = AsyncMock(
+        return_value={
+            "summary": "Nobody said much.",
+            "decisions": [],
+            "actionItems": [],
+            "insufficientData": True,
+            "templateKey": "standup",
+        }
+    )
+
+    await worker.process(b"1", _request(template_key="standup"))
+
+    assert _published(worker).status == "completed"
