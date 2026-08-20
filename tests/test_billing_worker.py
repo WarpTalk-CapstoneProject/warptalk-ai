@@ -13,6 +13,7 @@ import pytest
 from billing_worker import db as billing_db
 from billing_worker.worker import BillingSettlementWorker, _extract_underlying_segment_id
 from shared.health_probe import check_worker
+from shared.schemas import TranslationResultMessage
 
 
 class TestExtractUnderlyingSegmentId:
@@ -270,6 +271,66 @@ class TestBillableSurface:
     def test_the_billable_handlers_are_still_wired(self) -> None:
         assert hasattr(BillingSettlementWorker, "_handle_translation")
         assert hasattr(BillingSettlementWorker, "_handle_tts")
+
+
+class TestEarlySegmentsAreNotCharged:
+    """One turn must cost the same whether or not STT published it a sentence at a time.
+
+    stt_worker publishes each sentence the model finishes MID-CHUNK, and the completed
+    segment for that same chunk still carries the chunk's WHOLE duration
+    (stt_worker/model.py: `"end": duration_s`). So charging both bills the same audio twice.
+
+    Charging the early ones on their own terms would be wrong in the other direction: they
+    carry start_ms == end_ms, which sends `_handle_translation` down its zero-duration
+    fallback of a flat 1.0s — pricing a fifteen-second turn as four seconds.
+
+    Both mistakes are silent and both are money, which is why this is pinned.
+    """
+
+    @staticmethod
+    def _worker() -> BillingSettlementWorker:
+        worker = BillingSettlementWorker.__new__(BillingSettlementWorker)
+        worker.logger = MagicMock()
+        worker.db = MagicMock()
+        worker.db.record_usage_and_charge = AsyncMock()
+        worker._resolve_subscription = AsyncMock(return_value=(uuid.uuid4(), uuid.uuid4()))
+        worker._is_unbillable = MagicMock(return_value=False)
+        return worker
+
+    @staticmethod
+    def _message(*, is_early: bool) -> dict[str, str]:
+        return TranslationResultMessage(
+            segment_id=f"{uuid.uuid4()}-vi-c0",
+            meeting_id=str(uuid.uuid4()),
+            speaker_id=str(uuid.uuid4()),
+            original_text="Hello there.",
+            translated_text="Xin chào.",
+            source_lang="en",
+            target_lang="vi",
+            start_ms=1000,
+            end_ms=1000 if is_early else 16000,
+            is_early=is_early,
+        ).to_redis()
+
+    def test_an_early_sentence_is_not_charged(self) -> None:
+        worker = self._worker()
+        asyncio.run(worker._handle_translation(self._message(is_early=True)))
+        worker.db.record_usage_and_charge.assert_not_awaited()
+
+    def test_the_completed_segment_still_is(self) -> None:
+        worker = self._worker()
+        asyncio.run(worker._handle_translation(self._message(is_early=False)))
+        worker.db.record_usage_and_charge.assert_awaited_once()
+        # 15s of audio, billed as seconds — not the 1.0s zero-duration fallback.
+        assert worker.db.record_usage_and_charge.await_args.kwargs["quantity"] == 15.0
+
+    def test_a_message_from_before_the_flag_existed_is_still_charged(self) -> None:
+        """Rolling deploy: an older translation worker publishes no `is_early` field at all."""
+        worker = self._worker()
+        payload = self._message(is_early=False)
+        payload.pop("is_early")
+        asyncio.run(worker._handle_translation(payload))
+        worker.db.record_usage_and_charge.assert_awaited_once()
 
 
 class _FakeConnection:
