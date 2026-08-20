@@ -41,8 +41,9 @@ HOW THE TIMELINE IS REBUILT
 
 from __future__ import annotations
 
+import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,14 @@ _MAX_PAD_SECONDS = 60
 
 
 @dataclass(frozen=True)
+class SpeechSpan:
+    """One utterance's place on the meeting clock, in milliseconds."""
+
+    start_ms: int
+    end_ms: int
+
+
+@dataclass(frozen=True)
 class ArchivedTrack:
     """One speaker's archived speech from one meeting."""
 
@@ -70,6 +79,24 @@ class ArchivedTrack:
     sample_rate: int
     #: Samples actually written, silence included — the track's length on the meeting clock.
     frames: int
+    #: Where the speech actually is. Written beside the audio as `{speaker}.json`.
+    #:
+    #: WHY THE SILENCE HAS TO BE DESCRIBED
+    #:     The padding that makes an offset in this file mean an offset in the meeting also makes
+    #:     the file mostly silence — an hour of one person's meeting is mostly other people
+    #:     talking. Whisper-family models do not merely skip silence: they fill it, confidently,
+    #:     with whatever the surrounding context suggests. `stt_worker/model.py` carries a whole
+    #:     filter chain built from production hallucinations for exactly that reason.
+    #:
+    #:     A second pass therefore needs to know where nobody was speaking, so it can DROP a
+    #:     segment the model placed there rather than trust it. Reconstructing that from the audio
+    #:     means re-running VAD over a file whose VAD decisions are already known — this is those
+    #:     decisions, recorded once, by the code that made them.
+    spans: list[SpeechSpan] = field(default_factory=list)
+
+    @property
+    def spans_path(self) -> Path:
+        return self.path.with_suffix(".json")
 
     @property
     def duration_ms(self) -> int:
@@ -83,6 +110,7 @@ class _SpeakerTrack:
         self.path = path
         self.sample_rate = sample_rate
         self.frames = 0
+        self.spans: list[SpeechSpan] = []
         self._file = sf.SoundFile(
             str(path),
             mode="w",
@@ -105,8 +133,13 @@ class _SpeakerTrack:
             missing -= step
 
     def write(self, samples: npt.NDArray[np.int16]) -> None:
+        # Recorded from the write head rather than from the requested start: an overlapping
+        # utterance is clamped forward (see append), and the span has to describe where the audio
+        # ACTUALLY is, not where it asked to be.
+        start_ms = int(self.frames * 1000 / self.sample_rate)
         self._file.write(samples)
         self.frames += len(samples)
+        self.spans.append(SpeechSpan(start_ms, int(self.frames * 1000 / self.sample_rate)))
 
     def close(self) -> None:
         self._file.close()
@@ -208,15 +241,16 @@ class MeetingAudioArchive:
             track = self._tracks.pop(key)
             try:
                 track.close()
-                finished.append(
-                    ArchivedTrack(
-                        meeting_id=meeting_id,
-                        speaker_id=key[1],
-                        path=track.path,
-                        sample_rate=track.sample_rate,
-                        frames=track.frames,
-                    )
+                archived = ArchivedTrack(
+                    meeting_id=meeting_id,
+                    speaker_id=key[1],
+                    path=track.path,
+                    sample_rate=track.sample_rate,
+                    frames=track.frames,
+                    spans=list(track.spans),
                 )
+                _write_spans(archived)
+                finished.append(archived)
             except Exception:
                 logger.warning(
                     "audio_archive_close_failed",
@@ -245,6 +279,39 @@ class MeetingAudioArchive:
     def open_track_count(self) -> int:
         """How many tracks are currently open, for the worker's own health reporting."""
         return len(self._tracks)
+
+
+def _write_spans(track: ArchivedTrack) -> None:
+    """The span index, beside the audio it describes.
+
+    A separate file rather than a chunk of FLAC metadata: the audio is uploaded and read by
+    whatever can open a FLAC, and a sidecar keeps that true. Failures are logged and swallowed —
+    losing the index costs a second pass its silence filter, and losing the AUDIO costs it
+    everything, so the audio must never fail because of this.
+    """
+    try:
+        track.spans_path.write_text(
+            json.dumps(
+                {
+                    "meetingId": track.meeting_id,
+                    "speakerId": track.speaker_id,
+                    "sampleRate": track.sample_rate,
+                    "frames": track.frames,
+                    "spans": [
+                        {"startMs": span.start_ms, "endMs": span.end_ms} for span in track.spans
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        logger.warning(
+            "audio_archive_spans_write_failed",
+            meeting_id=track.meeting_id,
+            speaker_id=track.speaker_id,
+            exc_info=True,
+        )
 
 
 def _safe(value: str) -> str:

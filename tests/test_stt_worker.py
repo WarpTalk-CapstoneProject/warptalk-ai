@@ -27,11 +27,15 @@ from stt_worker.worker import STTWorker, _language_hint_for_stt
 
 
 def test_default_stt_model_uses_accuracy_first_transcribe_variant() -> None:
-    assert STTSettings().model == "gpt-transcribe"
+    # The DECLARED default, not STTSettings().model. shared/config.py calls load_dotenv() at
+    # import and this class reads STT_*, so instantiating it here consults the developer's own
+    # .env — which sets STT_MODEL on any machine that has run the stack. The test was green in CI
+    # only because CI has no .env, and red for everybody else.
+    assert STTSettings.model_fields["model"].default == "gpt-transcribe"
 
 
 def test_default_chunk_window_preserves_long_code_switched_utterances() -> None:
-    assert WorkerSettings().chunk_duration_ms == 6000
+    assert WorkerSettings.model_fields["chunk_duration_ms"].default == 6000
 
 
 class FakeRealtimeConn:

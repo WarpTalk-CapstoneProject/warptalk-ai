@@ -7,6 +7,7 @@ timestamps look authoritative and point at the wrong moment.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -166,3 +167,59 @@ def test_describe_reports_what_was_written(tmp_path: Path):
     assert summary["tracks"] == 2
     assert sorted(summary["speakers"]) == ["alice", "bob"]
     assert summary["total_ms"] > 0
+
+
+def test_the_span_index_says_where_the_speech_actually_is(tmp_path: Path):
+    """The padding that buys a shared meeting clock also makes the file mostly silence, and a
+    Whisper-family model fills silence rather than skipping it. A second pass needs to know which
+    parts of an hour of audio anybody was actually speaking in."""
+    archive = MeetingAudioArchive(tmp_path)
+
+    archive.append("room", "alice", _tone(1.0), SR, now=100.0)  # 99.0 -> 100.0
+    archive.append("room", "alice", _tone(1.0), SR, now=105.0)  # 104.0 -> 105.0
+    track = archive.close_meeting("room")[0]
+
+    index = json.loads(track.spans_path.read_text(encoding="utf-8"))
+    spans = index["spans"]
+
+    assert len(spans) == 2
+    assert spans[0]["startMs"] == 0
+    assert spans[0]["endMs"] == pytest.approx(1000, abs=2)
+    # The five-second gap is silence, and the index says so by not covering it.
+    assert spans[1]["startMs"] == pytest.approx(5000, abs=2)
+    assert spans[1]["endMs"] == pytest.approx(6000, abs=2)
+
+
+def test_a_clamped_overlap_is_indexed_where_the_audio_actually_landed(tmp_path: Path):
+    """An utterance whose clock says it overlaps the previous one is appended after it, so the
+    span has to describe where the samples are — not where they asked to be."""
+    archive = MeetingAudioArchive(tmp_path)
+
+    archive.append("room", "alice", _tone(5.0), SR, now=100.0)  # 95.0 -> 100.0
+    archive.append("room", "alice", _tone(1.0), SR, now=99.0)  # claims 98.0 -> 99.0
+    track = archive.close_meeting("room")[0]
+
+    spans = json.loads(track.spans_path.read_text(encoding="utf-8"))["spans"]
+
+    assert spans[1]["startMs"] == pytest.approx(5000, abs=2)
+    assert spans[1]["endMs"] == pytest.approx(6000, abs=2)
+
+
+def test_the_index_carries_what_a_reader_needs_to_use_it(tmp_path: Path):
+    archive = MeetingAudioArchive(tmp_path)
+    archive.append("room", "alice", _tone(0.5), SR, now=100.0)
+    track = archive.close_meeting("room")[0]
+
+    index = json.loads(track.spans_path.read_text(encoding="utf-8"))
+
+    assert index["meetingId"] == "room"
+    assert index["speakerId"] == "alice"
+    assert index["sampleRate"] == SR
+    assert index["frames"] == track.frames
+
+
+def test_a_meeting_with_no_speech_writes_no_index(tmp_path: Path):
+    archive = MeetingAudioArchive(tmp_path)
+
+    assert archive.close_meeting("silent-room") == []
+    assert list(tmp_path.rglob("*.json")) == []
