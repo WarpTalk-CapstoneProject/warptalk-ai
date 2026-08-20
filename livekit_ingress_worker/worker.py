@@ -234,6 +234,25 @@ _FLASH_MODE_OFF = {"off", "false", "0", "disabled", "no"}
 # once per speaker per sentence.
 _FLASH_MODE_CACHE_SECONDS = 3.0
 
+# WHERE THE DEPLOYMENT DEFAULT IS PUBLISHED SO THE BACKEND CAN READ IT.
+#
+# The backend owns only the per-room OVERRIDE key, and reported "off" whenever a room had never
+# set one. That was true of the override and false of the room, and it was harmless only while
+# the deployment default was also off. The day the default flipped to on, every host saw a
+# switch that said "off" while their room was in fact streaming — and flipping it on and back
+# off would then write a real override, silently costing them the latency they had just gained.
+#
+# Published from here rather than mirrored into the backend's own configuration because THIS is
+# where the value governs behaviour. Two settings named the same thing in two services drift,
+# and the one that drifts is always the one nobody is watching.
+_FLASH_MODE_DEFAULT_KEY = "warptalk:stt:flash_mode_default"
+
+# Refreshed on every heartbeat (10s), so this only has to outlive a deploy window rather than a
+# week. Redis here runs allkeys-lru and has evicted live meeting state before, so the key is not
+# allowed to be immortal — and an expired key degrades to the backend saying "unknown", which is
+# honest, rather than to it asserting something false.
+_FLASH_MODE_DEFAULT_TTL_SECONDS = 60 * 60
+
 # The ingress energy floor: below this, a chunk is noise rather than speech.
 #
 # It is the ONLY always-on audio gate here — near_field_gate_enabled defaults to False — so it is
@@ -318,6 +337,37 @@ class LiveKitIngressWorker(BaseWorker):
             trust_repo=True,
         )
         self.logger.info("silero_vad_loaded")
+
+    async def _publish_heartbeat(self) -> None:
+        """Prove this worker is alive, and restate how it is configured while doing so.
+
+        The flash-mode default rides the heartbeat rather than a one-shot at startup for two
+        reasons. It is republished every beat, so an eviction on a Redis running allkeys-lru
+        costs at most one interval instead of lasting until the next deploy. And it keeps
+        load_model doing one thing: that method is exercised by a test that builds this worker
+        with __new__ purely to assert the Silero release is pinned, and a Redis write bolted
+        into it made an unrelated contract test depend on settings and a connection.
+        """
+        await super()._publish_heartbeat()
+        await self._publish_flash_mode_default()
+
+    async def _publish_flash_mode_default(self) -> None:
+        """Tell the backend what a room with no override actually does. See _FLASH_MODE_DEFAULT_KEY.
+
+        Best effort on purpose: this exists so a HOST'S SWITCH can describe reality, and failing
+        to describe reality must never stop audio being processed. A worker that cannot write it
+        simply leaves the backend reporting "unknown", which is what it reports before any worker
+        has started anyway — and swallowing here is also what keeps a Redis blip from taking
+        down the heartbeat that calls it.
+        """
+        value = "on" if self.settings.stt_streaming_enabled else "off"
+        try:
+            await self.redis.set_with_ttl(
+                _FLASH_MODE_DEFAULT_KEY, value, _FLASH_MODE_DEFAULT_TTL_SECONDS
+            )
+            self.logger.info("flash_mode_default_published", default=value)
+        except Exception:
+            self.logger.warning("flash_mode_default_publish_failed", default=value, exc_info=True)
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Not used, we override _consume_loop for Pub/Sub."""
