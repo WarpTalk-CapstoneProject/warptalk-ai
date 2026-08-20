@@ -422,6 +422,26 @@ class BillingSettlementWorker:
         msg = TranslationResultMessage.from_redis(data)
         if not msg.translated_text.strip():
             return
+        # An early sentence — one the STT model finished mid-chunk and published before the
+        # turn closed — is NOT free work, but it is already paid for by the completed segment
+        # of the same chunk, which carries that chunk's WHOLE duration however much text went
+        # out early (stt_worker/model.py: `"end": duration_s`). Charging both would bill the
+        # same seconds twice.
+        #
+        # Charging it on its own terms would be worse than double-billing, in the other
+        # direction: an early segment has start_ms == end_ms, so it falls into the
+        # zero-duration fallback below and bills a flat 1.0s. A fifteen-second turn split into
+        # four early sentences would be priced as four seconds.
+        #
+        # So the money still follows the audio, exactly as it did before early publishing
+        # existed. This is the only place that reads the flag.
+        if msg.is_early:
+            self.logger.debug(
+                "skipped_early_segment",
+                translation_room_id=msg.meeting_id,
+                segment_id=msg.segment_id,
+            )
+            return
         if self._is_unbillable(msg.speaker_id, msg.meeting_id):
             return
 

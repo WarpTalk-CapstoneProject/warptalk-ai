@@ -20,7 +20,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from livekit_ingress_worker.worker import LiveKitIngressWorker
+from livekit_ingress_worker.worker import (
+    _FLASH_MODE_DEFAULT_KEY,
+    LiveKitIngressWorker,
+)
 from shared.config import WorkerSettings
 
 ROOM = "room-1"
@@ -30,10 +33,17 @@ class _Redis:
     def __init__(self, value: str | None = None) -> None:
         self.value = value
         self.gets = 0
+        self.written: dict[str, tuple[str, int]] = {}
 
     async def get(self, key: str) -> str | None:
         self.gets += 1
         return self.value
+
+    async def set_with_ttl(self, key: str, value: bytes | str, ttl_seconds: int) -> None:
+        self.written[key] = (
+            value.decode() if isinstance(value, bytes) else value,
+            ttl_seconds,
+        )
 
 
 def _worker(redis: _Redis, *, default: bool = False) -> LiveKitIngressWorker:
@@ -172,3 +182,67 @@ def test_the_frame_consumer_is_not_gated_on_the_deployment_default() -> None:
                 "the frame consumer is started inside a conditional; a per-room switch cannot "
                 "turn streaming on when the loop that consumes the frames does not exist"
             )
+
+
+# ---------------------------------------------------------------------------
+# Publishing the deployment default, so the host's switch can describe reality
+# ---------------------------------------------------------------------------
+#
+# The backend owns only the per-room OVERRIDE key. Asked about a room that never set one it
+# answered "off", which was true of the override and false of the room — harmless while the
+# deployment default was also off, and actively misleading the day that default became on. It
+# reads this key to tell the difference, and this worker is the only thing that knows the answer.
+
+
+@pytest.mark.asyncio
+async def test_the_deployment_default_is_published_for_the_backend_to_read() -> None:
+    redis = _Redis()
+    await _worker(redis, default=True)._publish_flash_mode_default()
+
+    value, ttl = redis.written[_FLASH_MODE_DEFAULT_KEY]
+    assert value == "on"
+    # Long enough to outlive a deploy window, and not immortal: this Redis runs allkeys-lru.
+    # It does not need to be longer because the heartbeat republishes it every interval — which
+    # is the property the next test pins.
+    assert 10 * 60 <= ttl <= 24 * 60 * 60
+
+
+@pytest.mark.asyncio
+async def test_an_off_deployment_publishes_off_rather_than_nothing() -> None:
+    """Absent and "off" are different answers, and the backend renders them differently."""
+    redis = _Redis()
+    await _worker(redis, default=False)._publish_flash_mode_default()
+
+    assert redis.written[_FLASH_MODE_DEFAULT_KEY][0] == "off"
+
+
+@pytest.mark.asyncio
+async def test_a_redis_that_refuses_the_write_does_not_stop_the_worker_starting() -> None:
+    """This key exists so a switch can describe reality. Failing to describe reality must never
+    stop audio being processed — the backend simply keeps reporting "unknown"."""
+
+    class _Refuses(_Redis):
+        async def set_with_ttl(self, key: str, value: bytes | str, ttl_seconds: int) -> None:
+            raise ConnectionError("redis is down")
+
+    await _worker(_Refuses(), default=True)._publish_flash_mode_default()
+
+
+@pytest.mark.asyncio
+async def test_the_default_rides_the_heartbeat_so_an_eviction_heals_itself() -> None:
+    """Not a one-shot at startup.
+
+    On a Redis running allkeys-lru a startup-only write is gone until the next deploy, and the
+    backend would spend that whole window telling every host "unknown". Riding the heartbeat
+    caps that at one interval. It also keeps load_model doing one thing — a Redis write bolted
+    in there broke a contract test that builds this worker with __new__ purely to assert the
+    Silero release is pinned.
+    """
+    redis = _Redis()
+    worker = _worker(redis, default=True)
+    worker._consumer_name = "livekit-ingress-worker-test"
+    worker.worker_name = "livekit-ingress-worker"
+
+    await worker._publish_heartbeat()
+
+    assert _FLASH_MODE_DEFAULT_KEY in redis.written

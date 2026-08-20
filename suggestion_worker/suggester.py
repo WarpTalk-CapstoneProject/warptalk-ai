@@ -14,6 +14,7 @@ rather than to noise.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -70,6 +71,9 @@ class GeneratedSuggestion:
     detail: str = ""
     category: str = ""
     token_count: int = 0
+    #: Documents from the meeting's own snapshot that this hint drew on. Only ever names the
+    #: snapshot actually contained — see _known_documents.
+    sources: tuple[str, ...] = ()
 
 
 class Suggester(Protocol):
@@ -226,13 +230,37 @@ string. That is a normal, correct answer.
 {_UNTRUSTED_INPUT_RULE}
 
 Respond ONLY with a JSON object of exactly this shape:
-{{"content": string, "detail": string}}
+{{"content": string, "detail": string, "source": string}}
 content is the badge text and must be at most {max_chars} characters — the one sentence that \
 satisfies the contract above. detail is what the reader sees when they expand the badge: one \
 or two sentences carrying the evidence for `content` — the surrounding quote, the earlier \
 statement being contradicted, the document the figure came from. Write it whenever that \
 evidence exists, which is nearly always; use "" only when `content` is already complete on \
-its own and repeating it would add nothing."""
+its own and repeating it would add nothing.
+source is the reference document this hint came out of, copied EXACTLY as it appears in its \
+`--- Document: ... ---` header. Use "" when the hint came from the transcript rather than from \
+a document, which is the normal case. A name that is not one of the headers you were given is \
+discarded, so inventing one only loses you the credit."""
+
+
+#: How MeetingStartedEventConsumer labels each document inside the snapshot blob. The names in
+#: those headers are the ONLY things a hint is allowed to name as a source.
+_DOCUMENT_HEADER = re.compile(r"^--- Document:\s*(.+?)\s*---\s*$", re.MULTILINE)
+
+
+def _known_documents(context_snapshot: str) -> dict[str, str]:
+    """{casefolded name: name as written} for every document in the snapshot.
+
+    WHY A HINT MAY ONLY NAME ONE OF THESE
+        The same rule the chat assistant's markers enforce, arrived at from the other side. A
+        model asked where a figure came from will answer, and a plausible filename is the easiest
+        thing in the world to produce — "Q3-budget.xlsx" under a hint that invented the figure is
+        worse than the bare hint, because it converts a guess into a citation.
+
+        The snapshot is a blob of text the model was handed. A name it can only have read out of
+        that blob is a name that exists; anything else is dropped in silence.
+    """
+    return {name.casefold(): name for name in _DOCUMENT_HEADER.findall(context_snapshot or "")}
 
 
 def _render_transcript(window: Sequence[TranscriptTurn], segment: TranscriptTurn) -> str:
@@ -384,11 +412,18 @@ class OpenAISuggester:
         # Not truncated here. SuggestionWorker._publish already enforces max_suggestion_chars
         # at the boundary where it matters, and a second cap would mean the rule lives in two
         # places that can drift apart.
+        named = str(parsed.get("source", "")).strip()
+        known = _known_documents(context_snapshot)
+        # Silent on a miss. A hint whose source did not check out is still a correct hint about
+        # the transcript, and dropping the answer over its footnote would be the worse trade.
+        sources = (known[named.casefold()],) if named.casefold() in known else ()
+
         return GeneratedSuggestion(
             content=content,
             detail=str(parsed.get("detail", "")).strip(),
             category=decision.category,
             token_count=_total_tokens(completion),
+            sources=sources,
         )
 
     def _require_client(self) -> AsyncOpenAI:

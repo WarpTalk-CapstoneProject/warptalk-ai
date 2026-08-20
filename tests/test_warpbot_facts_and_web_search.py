@@ -191,3 +191,71 @@ def test_web_search_is_not_a_local_tool() -> None:
     # would put a name in TOOLS_BY_NAME with no handler behind it, and the dispatch loop would
     # answer every call with "Unknown tool".
     assert "web_search" not in TOOLS_BY_NAME
+
+
+# ---------------------------------------------------------------------------------------------
+# What a hosted search leaves behind: annotations on the answer, and the step the reader sees.
+# ---------------------------------------------------------------------------------------------
+
+
+class _Annotation:
+    def __init__(self, type_: str, url: str = "", title: str = "", start_index: int = 0) -> None:
+        self.type = type_
+        self.url = url
+        self.title = title
+        self.start_index = start_index
+
+
+class _Part:
+    def __init__(self, annotations: list[_Annotation]) -> None:
+        self.annotations = annotations
+
+
+class _Item:
+    def __init__(self, type_: str, content: list[_Part] | None = None) -> None:
+        self.type = type_
+        self.content = content or []
+
+
+def test_a_url_citation_becomes_a_web_source() -> None:
+    from ai_assistant_worker.chat_worker import _web_citations
+
+    items = [
+        _Item(
+            "message",
+            [_Part([_Annotation("url_citation", "https://vnexpress.net/x", "VnExpress", 42)])],
+        )
+    ]
+
+    assert _web_citations(items) == [("VnExpress", "https://vnexpress.net/x", 42)]
+
+
+def test_an_untitled_result_is_named_by_its_host() -> None:
+    # "vnexpress.net" is a source a reader recognises. An untitled chip is not.
+    from ai_assistant_worker.chat_worker import _web_citations
+
+    items = [_Item("message", [_Part([_Annotation("url_citation", "https://vnexpress.net/x")])])]
+
+    assert _web_citations(items) == [("vnexpress.net", "https://vnexpress.net/x", 0)]
+
+
+def test_annotations_that_are_not_url_citations_are_ignored() -> None:
+    from ai_assistant_worker.chat_worker import _web_citations
+
+    items = [
+        _Item("message", [_Part([_Annotation("file_citation", "https://example.com/a", "A")])]),
+        # A reasoning or web_search_call item carries no answer text to anchor anything to.
+        _Item("web_search_call"),
+    ]
+
+    assert _web_citations(items) == []
+
+
+def test_a_response_shape_without_annotations_does_not_raise() -> None:
+    # Provider response shapes change. Losing a chip is acceptable; losing the answer is not.
+    from ai_assistant_worker.chat_worker import _web_citations
+
+    class _Bare:
+        type = "message"
+
+    assert _web_citations([_Bare()]) == []
