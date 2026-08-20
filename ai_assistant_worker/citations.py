@@ -62,12 +62,19 @@ class Source:
         return payload
 
 
+#: Where a directly-cited source with no known position in the answer is sorted. Past any real
+#: index, so it lands after everything the answer positions, in the order it was noted.
+_UNPOSITIONED = 1 << 30
+
+
 @dataclass
 class SourceRegistry:
     """Every source shown to the model during one turn, and the markers they were shown under."""
 
     _sources: list[Source] = field(default_factory=list)
     _by_identity: dict[tuple[str, str, str | None], Source] = field(default_factory=dict)
+    #: Sources the ANSWER ITSELF anchors to, with no marker in between — see note_cited.
+    _direct: list[tuple[int, Source]] = field(default_factory=list)
 
     def register(self, kind: str, title: str | None, ref: str | None = None) -> str | None:
         """Issue a marker for one source, or None when there is nothing to point at.
@@ -98,31 +105,72 @@ class SourceRegistry:
         self._by_identity[identity] = source
         return source.marker
 
-    def cited(self, answer: str) -> list[Source]:
-        """The sources this answer actually points at, in the order it first points at them.
+    def note_cited(
+        self,
+        kind: str,
+        title: str | None,
+        ref: str | None = None,
+        at: int | None = None,
+    ) -> str | None:
+        """Record a source the ANSWER ITSELF anchors to, with no marker in between.
 
-        First-appearance order rather than registry order: the chips then read in the same
-        sequence as the argument they support.
+        WHY THIS EXISTS AT ALL, GIVEN THE WHOLE POINT IS MARKERS
+            A marker is how a source that passed through OUR hands gets an unforgeable handle. A
+            hosted tool never passes through them: OpenAI runs web_search server-side, so the
+            model is never shown a marker for what it found and could not cite one if it tried.
+
+            What comes back instead is a url_citation annotation, anchored to a span of the
+            answer text. That is not weaker evidence than a marker — it is stronger. A marker
+            says the model wrote a handle it was given; an annotation says the provider tied this
+            sentence to this url. Refusing it would mean the one source kind a reader can
+            actually go and check is the one kind that never gets a chip.
+
+        `at` is the annotation's index into the answer, so a web source sorts into the reading
+        order alongside the markers rather than being appended in a clump at the end.
+        """
+        marker = self.register(kind, title, ref)
+        if marker is None:
+            return None
+        source = self._by_identity[
+            (
+                kind if kind in SOURCE_KINDS else "knowledge",
+                (title or "").strip().casefold(),
+                (ref or "").strip() or None,
+            )
+        ]
+        self._direct.append((_UNPOSITIONED if at is None else at, source))
+        return marker
+
+    def cited(self, answer: str) -> list[Source]:
+        """The sources this answer actually rests on, in the order the answer reaches them.
+
+        Reading order rather than registry order: the chips then run in the same sequence as the
+        argument they support. Markers are positioned by where they appear in the text and
+        directly-cited sources by their annotation index, so the two kinds interleave correctly
+        in an answer that used both.
         """
         seen: set[str] = set()
         issued = {source.marker: source for source in self._sources}
-        found: list[Source] = []
+        found: list[tuple[int, Source]] = []
 
-        for marker in _MARKER.findall(answer or ""):
-            if marker in seen:
-                continue
-            source = issued.get(marker)
+        for match in _MARKER.finditer(answer or ""):
+            source = issued.get(match.group(1))
             # A marker this registry never issued is a model completing the SHAPE of a citation.
             # Dropped in silence: it is not an error the reader can do anything about, and the
             # answer without it is exactly as good.
-            if source is None:
+            if source is None or source.marker in seen:
                 continue
-            seen.add(marker)
-            found.append(source)
-            if len(found) >= MAX_SOURCES_PER_ANSWER:
-                break
+            seen.add(source.marker)
+            found.append((match.start(), source))
 
-        return found
+        for position, source in self._direct:
+            if source.marker in seen:
+                continue
+            seen.add(source.marker)
+            found.append((position, source))
+
+        found.sort(key=lambda pair: pair[0])
+        return [source for _, source in found[:MAX_SOURCES_PER_ANSWER]]
 
     def registered(self) -> list[Source]:
         """Everything shown to the model this turn — for logging what it declined to cite."""

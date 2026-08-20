@@ -147,3 +147,58 @@ def test_a_source_with_nowhere_to_go_omits_its_ref():
     registry.register("glossary", "SLA")
 
     assert "ref" not in registry.registered()[0].as_dict()
+
+
+# ---------------------------------------------------------------------------------------------
+# Sources the answer anchors to directly — OpenAI's hosted web search, which never passes through
+# a handler here and so can never be handed a marker.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_hosted_search_result_is_cited_without_any_marker():
+    registry = SourceRegistry()
+    registry.note_cited("web", "VnExpress", "https://vnexpress.net/article", at=0)
+
+    cited = registry.cited("Bộ luật mới có hiệu lực từ tháng 7.")
+
+    assert [(source.kind, source.ref) for source in cited] == [
+        ("web", "https://vnexpress.net/article")
+    ]
+
+
+def test_web_and_marker_sources_interleave_in_reading_order():
+    # An answer that searched the knowledge base AND the web reads in one order; the chips under
+    # it must too, or the reader matches the wrong chip to the wrong claim.
+    registry = SourceRegistry()
+    marker = registry.register("document", "Q3-plan.pdf", "doc-1")
+    answer = f"The web says X. The plan says Y [{marker}]."
+    registry.note_cited("web", "VnExpress", "https://vnexpress.net/x", at=answer.index("web"))
+
+    assert [source.kind for source in registry.cited(answer)] == ["web", "document"]
+
+
+def test_a_web_source_with_no_position_lands_after_the_positioned_ones():
+    registry = SourceRegistry()
+    marker = registry.register("glossary", "SLA")
+    registry.note_cited("web", "example.com", "https://example.com/a")
+
+    assert [source.kind for source in registry.cited(f"Định nghĩa [{marker}].")] == [
+        "glossary",
+        "web",
+    ]
+
+
+def test_the_same_source_cited_twice_is_still_one_chip():
+    # Once through a marker and once through an annotation: the same url, one chip.
+    registry = SourceRegistry()
+    marker = registry.register("web", "example.com", "https://example.com/a")
+    registry.note_cited("web", "example.com", "https://example.com/a", at=0)
+
+    assert len(registry.cited(f"Answer [{marker}].")) == 1
+
+
+def test_a_nameless_hosted_result_registers_nothing():
+    registry = SourceRegistry()
+
+    assert registry.note_cited("web", "", "https://example.com/a") is None
+    assert registry.cited("Answer.") == []

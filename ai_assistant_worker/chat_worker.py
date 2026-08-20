@@ -19,6 +19,7 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
+from urllib.parse import urlparse
 
 import httpx
 from openai import AsyncOpenAI
@@ -38,6 +39,11 @@ from shared.openai_options import responses_options
 from shared.schemas import ChatRequestMessage, ChatResultMessage
 
 SIBLING_SERVICE_TIMEOUT_SECONDS = 15.0
+
+#: What the client shows while OpenAI runs a hosted web search. Not in ASSISTANT_TOOL_LABELS on
+#: the web side because it is not a local tool — but from the reader's chair it is the same thing
+#: happening, and a search that took four seconds with no step shown looks like a stall.
+WEB_SEARCH_STEP_NAME = "web_search"
 
 # The prompt is generated per turn from chat_templates, which is where the routing rules
 # ("read the transcript when asked what was said") now live. This name survives as the
@@ -351,6 +357,35 @@ def _now_message(now: datetime | None = None) -> str:
     )
 
 
+def _web_citations(output_items: list[Any]) -> list[tuple[str, str, int]]:
+    """(title, url, position) for every url_citation OpenAI's hosted search anchored in the answer.
+
+    The hosted tool runs server-side and never reaches a handler here, so the ordinary marker
+    mechanism cannot see it — see SourceRegistry.note_cited for why an annotation is accepted in
+    its place. Read defensively: this is a provider response shape, and the failure of being
+    strict about it is an answer that loses its only checkable sources.
+    """
+    citations: list[tuple[str, str, int]] = []
+    for item in output_items:
+        if getattr(item, "type", "") != "message":
+            continue
+        for part in getattr(item, "content", []) or []:
+            for annotation in getattr(part, "annotations", []) or []:
+                if getattr(annotation, "type", "") != "url_citation":
+                    continue
+                url = (getattr(annotation, "url", "") or "").strip()
+                if not url:
+                    continue
+                # A title is what the chip reads. Falling back to the host keeps the chip
+                # nameable — "vnexpress.net" is a source; an untitled chip is not.
+                title = (getattr(annotation, "title", "") or "").strip()
+                if not title:
+                    title = urlparse(url).netloc or url
+                position = getattr(annotation, "start_index", None)
+                citations.append((title, url, position if isinstance(position, int) else 0))
+    return citations
+
+
 class ChatAssistantWorker(BaseWorker):
     """Global assistant worker — free-form Q&A with tool-calling, independent of any meeting."""
 
@@ -588,6 +623,25 @@ class ChatAssistantWorker(BaseWorker):
                 # response.completed carries every output item whole, so reading them
                 # from there removes a class of partial-JSON bugs the chat-completions
                 # version had to guard against by hand.
+                # The hosted search is the one tool whose work is invisible from here: it has no
+                # handler, so the tool_call_started below never fires for it and a four-second
+                # search read as a stalled worker. These events are the only evidence it is
+                # running, and an event name that changes costs a step, not a turn.
+                elif etype.startswith("response.web_search_call."):
+                    if etype.endswith(".completed") or etype.endswith(".failed"):
+                        await self._publish_result(
+                            request,
+                            type_="tool_call_completed",
+                            tool_name=WEB_SEARCH_STEP_NAME,
+                            tool_status="completed" if etype.endswith(".completed") else "failed",
+                        )
+                    else:
+                        await self._publish_result(
+                            request,
+                            type_="tool_call_started",
+                            tool_name=WEB_SEARCH_STEP_NAME,
+                        )
+
                 elif etype == "response.completed":
                     response = getattr(event, "response", None)
                     output_items = list(getattr(response, "output", []) or [])
@@ -601,6 +655,12 @@ class ChatAssistantWorker(BaseWorker):
             if not function_calls:
                 # A turn that produced a message rather than a call is the final answer.
                 final_text = full_text
+                # Noted here rather than in a handler because there is no handler to note it in.
+                # Positions come from the annotations, so a web source sorts into reading order
+                # beside the markers instead of being appended in a clump.
+                if tool_context.citations is not None:
+                    for title, url, position in _web_citations(output_items):
+                        tool_context.citations.note_cited("web", title, url, at=position)
                 break
 
             for call in function_calls:
