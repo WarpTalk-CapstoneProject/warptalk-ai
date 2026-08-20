@@ -637,6 +637,13 @@ class STTWorker(BaseWorker):
                 self.logger.info(
                     "stt_early_sentence",
                     meeting_id=chunk.meeting_id,
+                    speaker_id=chunk.speaker_id,
+                    # Same join key as segment_transcribed. In flash mode MOST spoken sentences
+                    # arrive down this path, so without it the majority of a meeting's dubs
+                    # would be the untraceable ones.
+                    segment_id=result.segment_id,
+                    language=result.language,
+                    declared_language=chunk.language,
                     chunk_index=chunk.chunk_index,
                     chars=len(text),
                     inference_offset_ms=int((time.monotonic() - t0) * 1000),
@@ -782,9 +789,21 @@ class STTWorker(BaseWorker):
             self.logger.info(
                 "segment_transcribed",
                 meeting_id=chunk.meeting_id,
+                speaker_id=chunk.speaker_id,
+                # THE JOIN KEY. Every stage below logs this same id, which is the only way to
+                # follow one sentence STT -> MT -> TTS after the fact. Without it "this line was
+                # never spoken" could only be chased by matching truncated text across three
+                # workers, which is how an investigation ends in a shrug.
+                segment_id=result.segment_id,
                 text=segment.text[:80],
                 language=segment.language,
+                # What the room DECLARED this speaker speaks, printed beside what the model
+                # actually heard. Neither number means anything alone: a mismatch is the
+                # cheapest signal that the hint was wrong or absent, which is the failure mode
+                # that leaks a Spanish "que" into the middle of a Vietnamese turn.
+                declared_language=chunk.language,
                 confidence=segment.confidence,
+                is_final_chunk=chunk.is_final_chunk,
                 inference_ms=inference_ms,
             )
 
