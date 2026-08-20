@@ -236,6 +236,25 @@ _FLASH_MODE_OFF = {"off", "false", "0", "disabled", "no"}
 # once per speaker per sentence.
 _FLASH_MODE_CACHE_SECONDS = 3.0
 
+# WHERE THE DEPLOYMENT DEFAULT IS PUBLISHED SO THE BACKEND CAN READ IT.
+#
+# The backend owns only the per-room OVERRIDE key, and reported "off" whenever a room had never
+# set one. That was true of the override and false of the room, and it was harmless only while
+# the deployment default was also off. The day the default flipped to on, every host saw a
+# switch that said "off" while their room was in fact streaming — and flipping it on and back
+# off would then write a real override, silently costing them the latency they had just gained.
+#
+# Published from here rather than mirrored into the backend's own configuration because THIS is
+# where the value governs behaviour. Two settings named the same thing in two services drift,
+# and the one that drifts is always the one nobody is watching.
+_FLASH_MODE_DEFAULT_KEY = "warptalk:stt:flash_mode_default"
+
+# Refreshed on every heartbeat (10s), so this only has to outlive a deploy window rather than a
+# week. Redis here runs allkeys-lru and has evicted live meeting state before, so the key is not
+# allowed to be immortal — and an expired key degrades to the backend saying "unknown", which is
+# honest, rather than to it asserting something false.
+_FLASH_MODE_DEFAULT_TTL_SECONDS = 60 * 60
+
 # The ingress energy floor: below this, a chunk is noise rather than speech.
 #
 # It is the ONLY always-on audio gate here — near_field_gate_enabled defaults to False — so it is
@@ -344,6 +363,37 @@ class LiveKitIngressWorker(BaseWorker):
             trust_repo=True,
         )
         self.logger.info("silero_vad_loaded")
+
+    async def _publish_heartbeat(self) -> None:
+        """Prove this worker is alive, and restate how it is configured while doing so.
+
+        The flash-mode default rides the heartbeat rather than a one-shot at startup for two
+        reasons. It is republished every beat, so an eviction on a Redis running allkeys-lru
+        costs at most one interval instead of lasting until the next deploy. And it keeps
+        load_model doing one thing: that method is exercised by a test that builds this worker
+        with __new__ purely to assert the Silero release is pinned, and a Redis write bolted
+        into it made an unrelated contract test depend on settings and a connection.
+        """
+        await super()._publish_heartbeat()
+        await self._publish_flash_mode_default()
+
+    async def _publish_flash_mode_default(self) -> None:
+        """Tell the backend what a room with no override actually does. See _FLASH_MODE_DEFAULT_KEY.
+
+        Best effort on purpose: this exists so a HOST'S SWITCH can describe reality, and failing
+        to describe reality must never stop audio being processed. A worker that cannot write it
+        simply leaves the backend reporting "unknown", which is what it reports before any worker
+        has started anyway — and swallowing here is also what keeps a Redis blip from taking
+        down the heartbeat that calls it.
+        """
+        value = "on" if self.settings.stt_streaming_enabled else "off"
+        try:
+            await self.redis.set_with_ttl(
+                _FLASH_MODE_DEFAULT_KEY, value, _FLASH_MODE_DEFAULT_TTL_SECONDS
+            )
+            self.logger.info("flash_mode_default_published", default=value)
+        except Exception:
+            self.logger.warning("flash_mode_default_publish_failed", default=value, exc_info=True)
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Not used, we override _consume_loop for Pub/Sub."""
@@ -1250,6 +1300,27 @@ class LiveKitIngressWorker(BaseWorker):
         min_speech_samples = int(sample_rate * (min_speech_ms / 1000.0))
         max_chunk_samples = int(sample_rate * (max_chunk_ms / 1000.0))
 
+        # BOUNDARY SEEKING. Past `seek_after_samples` of actual speech, a shorter pause is
+        # accepted as a cut point, so a long turn is split where the speaker drew breath
+        # instead of wherever `max_chunk_samples` happened to land. See the settings for the
+        # measurements behind it.
+        #
+        # Deliberately reuses the hangover branch below rather than adding a third one: a
+        # 250ms pause IS the end of a clause, so the turn closes exactly as it would on a
+        # long pause, and the next clause collects its own pre-speech ring. Everything that
+        # branch already gets right — the min-speech gate, turn bookkeeping, not resetting
+        # Silero's recurrent state — is got right here too, for free.
+        #
+        # Measured on SPEECH, not on the buffer: the buffer also holds padding and every
+        # internal pause, so a hesitant speaker would otherwise trip the seek threshold
+        # having said very little.
+        seek_after_samples = int(sample_rate * (self.settings.vad_seek_boundary_after_ms / 1000.0))
+        seek_hangover_samples = int(sample_rate * (self.settings.vad_seek_hangover_ms / 1000.0))
+        seek_hangover_windows = max(
+            1,
+            (seek_hangover_samples + vad_window_samples - 1) // vad_window_samples,
+        )
+
         # One near-field gate per track — see near_field_gate.py. It builds a running
         # peak-amplitude reference from this track's own earlier chunks, so it must live
         # for the whole track lifetime, not be recreated per chunk.
@@ -1293,6 +1364,11 @@ class LiveKitIngressWorker(BaseWorker):
         pre_speech_ring: deque[bytes] = deque(
             maxlen=max(1, pre_speech_samples * 2 // (vad_window_samples * 2))
         )  # Rolling pre-speech windows (in bytes, 2 bytes/sample)
+        # Whether this turn has ALREADY sent a chunk, i.e. whether what is in the buffer now
+        # is a continuation rather than a fresh utterance. The min-speech gate exists to stop a
+        # cough being transcribed; a 190ms tail left over after a cap or seek cut is not a
+        # cough, it is the rest of a sentence, and dropping it lost real words silently.
+        published_this_turn = False
         is_speaking = False
         # Samples in speech_buffer that VAD actually called speech — excludes the pre-speech
         # padding and the hangover tail. This, not the buffer length, is what the minimum-speech
@@ -1329,6 +1405,7 @@ class LiveKitIngressWorker(BaseWorker):
                     speech_buffer = bytearray()
                     pre_speech_ring.clear()
                     is_speaking = False
+                    published_this_turn = False
                     speech_samples = 0
                     silence_counter = 0
                     track_vad_model.reset_states()
@@ -1433,6 +1510,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 speech_samples=speech_samples,
                             )
                             chunk_index += 1
+                            published_this_turn = True
                             # The SPEAKER has not stopped, but the commit boundary has moved:
                             # STT will commit everything appended so far when it sees the chunk
                             # above, so what comes next belongs to a new turn.
@@ -1452,7 +1530,16 @@ class LiveKitIngressWorker(BaseWorker):
                             silence_counter += 1
                             speech_buffer.extend(window_data)  # Keep recording during pauses
 
-                            if silence_counter >= silence_hangover_windows:
+                            # A long turn takes the next real pause; a short one still waits
+                            # for the full end-of-sentence hangover. This is the whole of
+                            # boundary seeking — see seek_hangover_windows above.
+                            hangover_windows = (
+                                seek_hangover_windows
+                                if speech_samples >= seek_after_samples
+                                else silence_hangover_windows
+                            )
+
+                            if silence_counter >= hangover_windows:
                                 # End of speech — publish if there was enough SPEECH in it.
                                 #
                                 # WT-371 #7: this measured the whole buffer, which by this point
@@ -1464,7 +1551,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 #
                                 # The padding still ships; it is just no longer counted as evidence
                                 # that somebody spoke.
-                                if speech_samples >= min_speech_samples:
+                                if speech_samples >= min_speech_samples or published_this_turn:
                                     await self._publish_speech_chunk(
                                         room_name,
                                         speaker_id,
@@ -1496,6 +1583,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 frame_seq = 0
                                 streamed_bytes = 0
                                 is_speaking = False
+                                published_this_turn = False
                                 speech_buffer = bytearray()
                                 speech_samples = 0
                                 silence_counter = 0

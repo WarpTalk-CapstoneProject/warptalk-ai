@@ -474,6 +474,9 @@ class TranslationWorker(BaseWorker):
                         translator_model=self._require_translator().model,
                         source_segment_id=stt_result.segment_id,
                         chunk_index=stt_result.chunk_index,
+                        # Courier, not judge — billing_worker is what reads this. See
+                        # STTResultMessage.is_early.
+                        is_early=stt_result.is_early,
                         prosody=stt_result.prosody,
                     )
                     await self.publish(
@@ -702,6 +705,9 @@ class TranslationWorker(BaseWorker):
                 translator_model=translator.model,
                 source_segment_id=stt_result.segment_id,
                 chunk_index=stt_result.chunk_index,
+                # Courier, not judge — billing_worker is what reads this. See
+                # STTResultMessage.is_early.
+                is_early=stt_result.is_early,
                 # Delivery is carried, not derived: how the speaker sounded is settled upstream
                 # at the audio, and translating the words does not change it. VALENCE is the one
                 # part that cannot come from the audio — anger and delight look alike on pitch
@@ -722,11 +728,21 @@ class TranslationWorker(BaseWorker):
             self.logger.info(
                 "chunk_translated",
                 meeting_id=stt_result.meeting_id,
+                speaker_id=stt_result.speaker_id,
+                # Both ids: this message's own, which is what tts_worker will log, and the STT
+                # segment it came from, which is what stt_worker logged. One sentence can fan
+                # out to several target languages, so the source id is what collapses them back
+                # into the one thing the speaker actually said.
+                segment_id=result.segment_id,
+                source_segment_id=stt_result.segment_id,
                 chunk_index=idx,
                 source_lang=stt_result.language,
                 target_lang=target_lang,
                 original=sentence[:60],
                 translated=translated_text[:60],
+                # Flash mode: an early sentence is spoken but never billed. When a dub goes
+                # missing this says which half of the pipeline it belonged to.
+                is_early=stt_result.is_early,
                 speculative_hit=speculative_hit if idx == 0 else False,
                 stage_latency_ms=sentence_latency_ms,
                 pipeline_latency_ms=max(0, int(time.time() * 1000) - stt_result.timestamp_ms),

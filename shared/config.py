@@ -103,14 +103,30 @@ class WorkerSettings(BaseSettings):
     #   separates `input_audio_buffer.append` from `.commit`, so the audio can arrive as it is
     #   spoken and the commit at turn end finds the model has already heard it.
     #
-    # DARK BY DEFAULT, like prosody_continuity before it and for the same reason: this changes
-    # when audio reaches a vendor, and the only honest way to learn what that does to
-    # transcription quality is to measure a real room with it on and off. Turning it on is a
-    # separate, deliberate decision.
+    # ON since 2026-08-20. It was dark by default pending exactly one experiment — "measure a
+    # real room with it on and off" — because what it changes is WHEN audio reaches the vendor,
+    # and nobody knew what that did to transcription quality. That experiment has now been run
+    # on a human Vietnamese recording, n=3 per cell, commit -> completed:
+    #
+    #     model                 audio arrives          p50      foreign script
+    #     gpt-transcribe        dumped at turn end   1651ms             0/3
+    #     gpt-transcribe        paced at 1x          1003ms             0/3
+    #     gpt-live-transcribe   dumped at turn end   4733ms             0/3
+    #     gpt-live-transcribe   paced at 1x           774ms             0/3
+    #
+    # Pacing cost nothing in quality in any cell — no script leak, no visible degradation —
+    # and bought 648ms on the model that was already deployed. Paired with the streaming model
+    # (see STTSettings.model) the stage goes 1651ms -> 774ms, 2.13x.
+    #
+    # STILL A REAL-ROOM DECISION, and the per-room override exists for that: the measurement
+    # above is a recording, not a meeting, and it says nothing about behaviour under packet
+    # loss or a speaker who trails off. `translationRoom:{id}:flash_mode` overrides this per
+    # room in both directions (livekit_ingress_worker._flash_mode_enabled), so a room can be
+    # put back on the old path without a deploy.
     #
     # Read by BOTH the ingress worker (which publishes the frames) and the STT worker (which
     # consumes them), so it lives on the shared settings rather than on either one.
-    stt_streaming_enabled: bool = False
+    stt_streaming_enabled: bool = True
 
     # Max only for uninterrupted speech; ordinary short turns still flush on VAD silence.
     # Six seconds gives the model enough lexical context for natural Vietnamese sentences
@@ -147,6 +163,44 @@ class WorkerSettings(BaseSettings):
     # two-window production replay cut "Kubernetes" to "Kuber".
     vad_silence_hangover_ms: int = 576
     vad_min_speech_ms: int = 288  # Keeps short English keywords and acknowledgements
+
+    # BOUNDARY SEEKING — once a turn has run this long, take the next real pause.
+    #
+    # THE PROBLEM IT SOLVES, which a reviewer named before this code did
+    #   `chunk_duration_ms` is a HARD cap: a speaker who runs past it is cut wherever they
+    #   happen to be, mid-clause and often mid-word, and the two halves are then transcribed
+    #   and translated independently. That is "cắt ngữ nghĩa của người nói khi họ nói câu dài",
+    #   and the literature is blunt about the cost — SHAS (Interspeech 2022) measured
+    #   pause-based segmentation retaining 81.3% of manual-segmentation BLEU, BELOW naive
+    #   fixed-length chunking, and a 2025 replication measured a 7.3 BLEU spread at CONSTANT
+    #   latency purely from where the cuts land (arXiv 2510.12195).
+    #
+    # WHY A SHORTER HANGOVER RATHER THAN A CLEVERER CUT
+    #   The only place this loop can cut without severing a word is a window VAD already
+    #   called silence — everywhere else it is mid-phoneme. So "seek a boundary" here means
+    #   "accept a shorter pause as a boundary once the turn is long enough", which is SHAS's
+    #   split-at-lowest-probability idea expressed in the one signal this loop actually has.
+    #   Below the threshold nothing changes: a short turn still waits the full hangover, so
+    #   ordinary conversational speech is untouched.
+    #
+    # 4000ms because a turn under four seconds is usually one clause and has nothing worth
+    # seeking inside it.
+    #
+    # THE SEEKING WINDOW IS NARROWER THAN IT LOOKS, and whoever tunes this next should know
+    # why. The cap weighs the whole BUFFER, which carries 192ms of pre-speech padding, so it
+    # fires at ~5808ms of speech rather than 6000. Seeking therefore has 4000ms -> 5808ms —
+    # about 1.8 seconds — to find a pause. A speaker who goes that long without a 288ms gap
+    # is still cut blindly.
+    #
+    # Widening it means RAISING `chunk_duration_ms`, and that is a separate decision with a
+    # real cost: every speaker who genuinely does not pause then waits the larger cap before
+    # anything is transcribed at all. Seeking as it stands can only ever cut EARLIER than the
+    # cap would, and at a better place, so it is a strict improvement; raising the cap is a
+    # trade. Measure the pause distribution in real meetings before making it.
+    vad_seek_boundary_after_ms: int = 4000
+    # ~250ms is an ordinary inter-clause pause; 576ms is closer to an end-of-sentence one.
+    # Rounded up to whole VAD windows at use, like the hangover it shadows.
+    vad_seek_hangover_ms: int = 250
 
     # Near-field energy gate (ingress worker only, see livekit_ingress_worker/near_field_gate.py).
     # Opt-in only: a relative peak threshold cannot tell a distant speaker from a quiet
@@ -185,9 +239,50 @@ class STTSettings(BaseSettings):
 
     provider: str = "openai"
     api_key: str = ""
-    # Accuracy-first model for completed utterances. It supports expected `languages`,
-    # structured `keywords`, and prompt context in Realtime transcription sessions.
-    model: str = "gpt-transcribe"
+    # STREAMING transcription model. Emits partials while the speaker is still talking, and
+    # is what `WorkerSettings.stt_streaming_enabled` exists to feed.
+    #
+    # THIS ONLY WORKS AS A PAIR — the two settings are one decision (measured 2026-08-20,
+    # human Vietnamese recording, commit -> completed, n=3):
+    #
+    #     model                 audio arrives          p50
+    #     gpt-transcribe        dumped at turn end   1651ms   <- where this started
+    #     gpt-transcribe        paced at 1x          1003ms
+    #     gpt-live-transcribe   dumped at turn end   4733ms   <- 2.9x WORSE than the start
+    #     gpt-live-transcribe   paced at 1x           774ms   <- 2.13x better than the start
+    #
+    #   Read the third row before touching either setting. gpt-live-transcribe is built to
+    #   consume audio AS IT IS SPOKEN; handed a closed VAD chunk in one go it is dramatically
+    #   slower. Turning flash mode off while leaving this model on is a regression, not a
+    #   rollback — put both back, or neither.
+    #
+    # WHAT IS STILL ON THE TABLE
+    #   The big number — listener-perceived lag 7189ms -> 1080ms, 6.7x, per
+    #   tools/probe_streaming_lag.py — needs a third piece that is NOT done: wiring
+    #   `on_early_segment` in stt_worker/worker.py, currently None, so `_collect()` discards
+    #   every delta. That is where partial captions would come from. It is deliberately off
+    #   (hallucinated partials reached the UI once); re-enabling it is a separate change with
+    #   its own quality gate.
+    #
+    # A NOTE ON THE FIXTURE, because it cost a wrong revert. An earlier attempt was rolled
+    # back on 5/5 lost utterances — this model hallucinating Han characters into Vietnamese,
+    # which _filter_segments then correctly dropped whole. It did not survive real audio:
+    #
+    #     fixture                     gpt-live-transcribe   gpt-transcribe
+    #     Cartesia sonic-3.5 (vi)     5/5 utterances lost   0/5
+    #     human recording (vi)        0/5                   0/5
+    #     human recording (en)        0/5                   0/5
+    #
+    #   TTS output is not a safe proxy for a microphone when the thing being measured is how
+    #   a model behaves on marginal audio. This repo has no speech fixture, which is why STT
+    #   work keeps reaching for one.
+    #
+    # COST: $0.017/min against gpt-transcribe's $0.0045 — ~3.8x, on ~12% of provider spend.
+    # No word timestamps or confidence scores, which is already safe: this model is listed in
+    # _LOGPROBS_UNSUPPORTED_SEED, the collect path falls back to STT_UNKNOWN_CONFIDENCE
+    # (-1.0), and every logprob gate reads `avg_logprob != STT_UNKNOWN_CONFIDENCE and ...`.
+    # `languages` + `keywords` are still accepted, so the room glossary survives.
+    model: str = "gpt-live-transcribe"
     language: str = "auto"  # Auto-detect for code-switching (Vi + En)
     # Browser capture already applies WebRTC echo cancellation/noise suppression and
     # may additionally use the optional Krisp processor. A second Realtime denoising
