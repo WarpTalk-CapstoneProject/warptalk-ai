@@ -122,7 +122,11 @@ _SEARCH_DOCUMENTS = ContextSource(
         "the user names a document, refers to 'the spec'/'the contract'/'the deck', or asks "
         "what documents exist. Use it to turn a name into an id, then call get_document"
     ),
-    caveat="matches on the document's name, not on its contents",
+    caveat=(
+        "matches on the document's name — punctuation, case and diacritics are ignored — and "
+        "falls back to content matches when no name matches, so an empty answer from it means "
+        "the workspace genuinely has nothing, not that the title was worded differently"
+    ),
 )
 
 _TERMINOLOGY = ContextSource(

@@ -849,21 +849,42 @@ async def _search_documents(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             return json.dumps({"error": "Could not look up workspace documents right now."})
 
         items = response.json().get("items") or []
+        named = [
+            {
+                "id": doc.get("id"),
+                "name": doc.get("name"),
+                "status": doc.get("status"),
+                "ingestionStatus": doc.get("ingestionStatus"),
+                # Whether the assistant is allowed to read this document's contents at
+                # all. A false here means get_document will come back metadata-only, so
+                # the model can say why rather than reporting an empty document.
+                "isAiAllowed": doc.get("isAiAllowed"),
+                "confidentialityLevel": doc.get("confidentialityLevel"),
+            }
+            for doc in items
+        ]
+        if named or not query:
+            return json.dumps(named)
+
+        # No NAME matched — which is not the same fact as "there is no such document", and
+        # answering as though it were is what sent somebody away from a file sitting in their
+        # own list. They asked for "bug tracking"; the file is BUG-TRACKING-WT478-494.
+        #
+        # Names now fold their punctuation server-side, so that exact miss is fixed at the
+        # source. This is for the larger half the name search can never reach: people describe
+        # what a document is ABOUT far more often than they quote its title. So the miss falls
+        # through to the index that does read contents, rather than being reported as absence.
+        fallback = await _semantic_search(ctx, {"query": query})
         return json.dumps(
-            [
-                {
-                    "id": doc.get("id"),
-                    "name": doc.get("name"),
-                    "status": doc.get("status"),
-                    "ingestionStatus": doc.get("ingestionStatus"),
-                    # Whether the assistant is allowed to read this document's contents at
-                    # all. A false here means get_document will come back metadata-only, so
-                    # the model can say why rather than reporting an empty document.
-                    "isAiAllowed": doc.get("isAiAllowed"),
-                    "confidentialityLevel": doc.get("confidentialityLevel"),
-                }
-                for doc in items
-            ]
+            {
+                "documentsMatchingName": [],
+                "note": (
+                    "No document NAME matched this query. Below are content matches from the "
+                    "workspace index, already cited. Answer from them and cite their markers. "
+                    "Do NOT tell the user no such document exists — say what you found."
+                ),
+                "contentMatches": json.loads(fallback),
+            }
         )
     except Exception:
         logger.exception("search_documents_error")
@@ -1648,8 +1669,11 @@ TOOLS: list[ChatTool] = [
         description=(
             "Find workspace documents by name, or list them when the user asks what "
             "documents exist. Use this whenever the user refers to a document by name "
-            "rather than by id — it returns ids to pass to get_document. Matches on the "
-            "document's name, not on its contents; use semantic_search to find a passage."
+            "rather than by id — it returns ids to pass to get_document. Name matching "
+            'ignores case, Vietnamese diacritics and punctuation, so "bug tracking" finds '
+            "BUG-TRACKING-WT478-494. When no name matches, it automatically returns content "
+            "matches from the workspace index instead — read them and answer from them; "
+            "never report that no such document exists on the strength of a name miss."
         ),
         parameters={
             "type": "object",
