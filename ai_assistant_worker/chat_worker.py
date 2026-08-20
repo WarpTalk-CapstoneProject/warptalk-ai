@@ -25,6 +25,13 @@ from openai import AsyncOpenAI
 
 from ai_assistant_worker.chat_templates import PERSONA, build_system_prompt, resolve_template
 from ai_assistant_worker.chat_tools import TOOLS, TOOLS_BY_NAME, ToolContext
+from ai_assistant_worker.citations import (
+    SourceRegistry,
+    strip_markers,
+)
+from ai_assistant_worker.citations import (
+    instruction as citation_instruction,
+)
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
 from shared.openai_options import responses_options
@@ -433,6 +440,11 @@ class ChatAssistantWorker(BaseWorker):
         except json.JSONDecodeError:
             history = []
 
+        # One per TURN. A registry that outlived the turn would let an answer cite a document
+        # retrieved for somebody else's earlier question, which is exactly the unverifiable claim
+        # this mechanism exists to prevent.
+        citations = SourceRegistry()
+
         tool_context = ToolContext(
             workspace_id=request.workspace_id,
             user_id=request.user_id,
@@ -445,15 +457,34 @@ class ChatAssistantWorker(BaseWorker):
             openai_client=self._openai,
             model=self.chat_settings.model,
             redis=self.redis,
+            citations=citations,
         )
 
         try:
             final_text, tool_call_log = await self._run_agent_loop(request, history, tool_context)
+
+            # The intersection: sources genuinely retrieved this turn AND pointed at by the
+            # answer. A marker the model invented resolves to nothing and is dropped in silence.
+            cited = citations.cited(final_text)
+            if cited:
+                self.logger.info(
+                    "chat_answer_cited_sources",
+                    request_id=request.request_id,
+                    cited=len(cited),
+                    # What it was SHOWN, beside what it used — the gap is the interesting number
+                    # when somebody asks why an answer has no chips.
+                    registered=len(citations.registered()),
+                )
+
             await self._publish_result(
                 request,
                 type_="completed",
-                content=final_text,
+                # Markers are machinery; the reader gets chips instead.
+                content=strip_markers(final_text),
                 tool_calls_json=json.dumps(tool_call_log) if tool_call_log else "",
+                sources_json=json.dumps([source.as_dict() for source in cited], ensure_ascii=False)
+                if cited
+                else "",
             )
         except Exception as exc:
             self.logger.exception("chat_turn_failed", request_id=request.request_id)
@@ -498,6 +529,7 @@ class ChatAssistantWorker(BaseWorker):
         mentions_message = _format_mentions(request.mentions_json)
         if mentions_message:
             instructions_parts.append(mentions_message)
+        instructions_parts.append(citation_instruction())
         instructions = "\n\n".join(instructions_parts)
 
         conversation: list[dict[str, Any]] = [
@@ -656,6 +688,7 @@ class ChatAssistantWorker(BaseWorker):
         tool_name: str = "",
         tool_status: str = "",
         tool_calls_json: str = "",
+        sources_json: str = "",
     ) -> None:
         result = ChatResultMessage(
             request_id=request.request_id,
@@ -666,5 +699,6 @@ class ChatAssistantWorker(BaseWorker):
             tool_name=tool_name,
             tool_status=tool_status,
             tool_calls_json=tool_calls_json,
+            sources_json=sources_json,
         )
         await self.publish("assistant:chat_results", request.conversation_id, result.to_redis())

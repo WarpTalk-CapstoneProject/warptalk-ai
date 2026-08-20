@@ -678,6 +678,11 @@ class ChatResultMessage(BaseModel):
     tool_name: str = ""
     tool_status: str = ""
     tool_calls_json: str = ""
+    #: On a "completed" event: the sources the answer actually points at, as a JSON array of
+    #: {marker, kind, title, ref?}. Empty when the answer cited nothing, which is the normal case
+    #: for a reply drawn from the conversation rather than from a tool result — see
+    #: ai_assistant_worker/citations.py for why this is not simply "the tools that ran".
+    sources_json: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -690,6 +695,7 @@ class ChatResultMessage(BaseModel):
             "tool_name": self.tool_name,
             "tool_status": self.tool_status,
             "tool_calls_json": self.tool_calls_json,
+            "sources_json": self.sources_json,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -705,6 +711,10 @@ class ChatResultMessage(BaseModel):
             tool_name=d.get("tool_name", ""),
             tool_status=d.get("tool_status", ""),
             tool_calls_json=d.get("tool_calls_json", ""),
+            # Defaulted, so a message already on the stream from a worker that predates this
+            # field is read rather than rejected — the same rolling-deploy rule the rest of this
+            # schema follows.
+            sources_json=d.get("sources_json", ""),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 
