@@ -557,3 +557,30 @@ class TestWorkspaceConsent:
         worker._cleanup_room("room-1")
 
         assert "room-1" not in worker._policies
+
+
+# -------------------------------------------------------------------------------------------
+# The published chip array.
+# -------------------------------------------------------------------------------------------
+
+
+def test_sources_json_is_the_shape_every_ai_surface_renders() -> None:
+    from suggestion_worker.worker import _sources_json
+
+    assert json.loads(_sources_json(("Q3-budget.xlsx",))) == [
+        {"marker": "S1", "kind": "document", "title": "Q3-budget.xlsx"}
+    ]
+
+
+def test_a_hint_with_no_document_publishes_an_empty_field() -> None:
+    # Not "[]": an empty string is what every other optional field on this stream uses for
+    # absent, and the .NET side reads a missing field the same way.
+    from suggestion_worker.worker import _sources_json
+
+    assert _sources_json(()) == ""
+
+
+def test_a_vietnamese_document_name_is_not_escaped_into_ascii() -> None:
+    from suggestion_worker.worker import _sources_json
+
+    assert "Kế hoạch" in _sources_json(("Kế hoạch 2026.docx",))

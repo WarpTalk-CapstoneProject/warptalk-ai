@@ -315,3 +315,90 @@ class TestEntrypointWiring:
         assert isinstance(suggester, OpenAISuggester)
         assert suggester.decide_model == "d"
         assert suggester.generate_model == "g"
+
+
+# -------------------------------------------------------------------------------------------
+# Where a hint says it came from.
+#
+# The same rule the chat assistant's markers enforce, arrived at from the other side: a model
+# asked for its source will always produce one, and a plausible filename under an invented
+# figure is worse than the bare hint — it turns a guess into a citation.
+# -------------------------------------------------------------------------------------------
+
+SNAPSHOT = (
+    "RAG CONTEXT (STATIC SNAPSHOT FOR MEETING):\n"
+    "--- Document: Q3-budget.xlsx ---\n"
+    "Marketing spend: 1.2 tỷ\n"
+    "-----------------------------------\n"
+    "--- Document: Kế hoạch 2026.docx ---\n"
+    "Mục tiêu doanh thu\n"
+    "-----------------------------------\n"
+)
+
+
+class TestGeneratedSources:
+    APPROVED = SuggestionDecision(
+        should_suggest=True, category="fact", confidence=0.8, reason="figure discussed"
+    )
+
+    @pytest.mark.asyncio
+    async def test_a_document_the_snapshot_contained_is_kept(self) -> None:
+        suggester, _ = build_suggester(
+            {"content": "Ngân sách marketing là 1.2 tỷ.", "source": "Q3-budget.xlsx"}
+        )
+
+        suggestion = await suggester.generate(
+            WINDOW, SEGMENT, self.APPROVED, context_snapshot=SNAPSHOT
+        )
+
+        assert suggestion is not None
+        assert suggestion.sources == ("Q3-budget.xlsx",)
+
+    @pytest.mark.asyncio
+    async def test_an_invented_document_is_dropped_and_the_hint_survives(self) -> None:
+        # The hint is still a correct hint about the transcript. Losing it over its footnote
+        # would be the worse trade.
+        suggester, _ = build_suggester(
+            {"content": "Ngân sách marketing là 1.2 tỷ.", "source": "Q4-forecast.pdf"}
+        )
+
+        suggestion = await suggester.generate(
+            WINDOW, SEGMENT, self.APPROVED, context_snapshot=SNAPSHOT
+        )
+
+        assert suggestion is not None
+        assert suggestion.content == "Ngân sách marketing là 1.2 tỷ."
+        assert suggestion.sources == ()
+
+    @pytest.mark.asyncio
+    async def test_a_name_is_returned_as_the_snapshot_spelled_it(self) -> None:
+        # Matching is case-insensitive; what reaches the chip is the document's own casing, not
+        # whatever the model typed.
+        suggester, _ = build_suggester(
+            {"content": "Mục tiêu doanh thu.", "source": "kế hoạch 2026.DOCX"}
+        )
+
+        suggestion = await suggester.generate(
+            WINDOW, SEGMENT, self.APPROVED, context_snapshot=SNAPSHOT
+        )
+
+        assert suggestion is not None
+        assert suggestion.sources == ("Kế hoạch 2026.docx",)
+
+    @pytest.mark.asyncio
+    async def test_a_hint_from_the_transcript_names_nothing(self) -> None:
+        suggester, _ = build_suggester({"content": "Ai nhận phần này?", "source": ""})
+
+        suggestion = await suggester.generate(WINDOW, SEGMENT, self.APPROVED)
+
+        assert suggestion is not None
+        assert suggestion.sources == ()
+
+    @pytest.mark.asyncio
+    async def test_a_source_named_with_no_snapshot_at_all_is_dropped(self) -> None:
+        suggester, _ = build_suggester({"content": "Ngân sách 1.2 tỷ.", "source": "Q3-budget.xlsx"})
+
+        suggestion = await suggester.generate(WINDOW, SEGMENT, self.APPROVED)
+
+        assert suggestion is not None
+        assert suggestion.sources == ()

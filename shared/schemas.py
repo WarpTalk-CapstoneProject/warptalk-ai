@@ -751,6 +751,10 @@ class SuggestionResultMessage(BaseModel):
     # 017-15-07-2026-translation-cluster-finalize.sql, which already lists AI_ASSISTANT
     # among the valid charge types, so no new charge type is introduced here.
     token_count: int = 0
+    #: Documents this hint drew on: the same [{marker, kind, title}] array the chat assistant
+    #: publishes, so one client component renders provenance on every AI surface. Empty for a
+    #: hint that came out of the transcript, which is the normal case.
+    sources_json: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -764,6 +768,7 @@ class SuggestionResultMessage(BaseModel):
             "confidence": str(self.confidence),
             "language": self.language,
             "token_count": str(self.token_count),
+            "sources_json": self.sources_json,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -780,6 +785,7 @@ class SuggestionResultMessage(BaseModel):
             confidence=float(d.get("confidence", "0.0")),
             language=d.get("language", ""),
             token_count=int(d.get("token_count", "0")),
+            sources_json=d.get("sources_json", ""),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import time
 from collections import deque
+from collections.abc import Sequence
 from typing import Any
 
 from shared.base_worker import BaseWorker
@@ -107,6 +108,24 @@ def _looks_like_question(text: str) -> bool:
         return False
     # First or last word: English fronts its interrogatives, Vietnamese ends with a particle.
     return words[0] in _QUESTION_WORDS or words[-1] in _QUESTION_WORDS
+
+
+def _sources_json(names: Sequence[str]) -> str:
+    """Document names as the chip array every AI surface already speaks.
+
+    Markers are issued here rather than omitted: the shape is shared with the chat assistant,
+    where a marker is load-bearing, and a second shape differing in one optional field is how two
+    renderers end up existing.
+    """
+    if not names:
+        return ""
+    return json.dumps(
+        [
+            {"marker": f"S{index}", "kind": "document", "title": name}
+            for index, name in enumerate(names, start=1)
+        ],
+        ensure_ascii=False,
+    )
 
 
 class SuggestionWorker(BaseWorker):
@@ -380,6 +399,11 @@ class SuggestionWorker(BaseWorker):
             confidence=decision.confidence,
             language=stt_result.language,
             token_count=decision.token_count + suggestion.token_count,
+            # The same array shape ai_assistant_worker publishes, so the client renders one
+            # component on every AI surface rather than one per surface. A hint's source is
+            # always a document: the transcript is what the reader is already looking at, and a
+            # "Transcript" chip on a badge pinned to a transcript line says nothing.
+            sources_json=_sources_json(getattr(suggestion, "sources", ())),
         )
 
         await self.publish("ai_assistant:results", stt_result.meeting_id, message.to_redis())
