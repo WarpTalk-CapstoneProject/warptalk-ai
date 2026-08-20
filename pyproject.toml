@@ -29,6 +29,7 @@ dependencies = [
     # STT uses the Realtime API (gpt-realtime-whisper over WebSocket) — needs the
     # openai[realtime] extra's websockets dependency.
     "openai>=2.45",
+    "boto3>=1.34",
     "websockets>=13",
     # LiveKit
     "livekit>=0.11",
