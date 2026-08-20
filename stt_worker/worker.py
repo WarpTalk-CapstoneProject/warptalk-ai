@@ -27,6 +27,7 @@ from shared.prosody import (
 )
 from shared.schemas import (
     STT_FRAME_STREAM,
+    STT_UNKNOWN_CONFIDENCE,
     AudioChunkMessage,
     AudioFrameMessage,
     ProsodyEnvelope,
@@ -577,6 +578,70 @@ class STTWorker(BaseWorker):
                     inference_offset_ms=int((time.monotonic() - t0) * 1000),
                 )
 
+            async def publish_early(segment: Any) -> None:
+                """Publish a sentence the model completed before the turn closed.
+
+                Same stream and same shape as the ordinary path below, with three fields
+                deliberately different:
+
+                CONFIDENCE IS UNKNOWN, NOT ZERO. `_emit_early` builds its candidate with
+                `avg_logprob: 0.0` so the filter has a number to work with, but 0.0 on a
+                logprob scale reads as MAXIMALLY confident — a claim nothing here can
+                support, and exactly the defect WT-277 removed when it made this field
+                nullable. STT_UNKNOWN_CONFIDENCE is the honest value and every consumer
+                already renders it as "unknown" rather than as a score.
+
+                TIMING IS ABSENT. A delta event carries no word timings, so start and end
+                are the chunk's own offset. Apportioning the chunk's span across its
+                sentences would be inventing precision that was never measured — the same
+                reason prosody is attached per chunk rather than per segment.
+
+                NOT `is_final_chunk`. More text is still coming from this very chunk, so
+                marking it final would tell every downstream consumer the turn had ended.
+
+                Prosody is omitted because it has not been measured yet: it is computed from
+                the whole chunk and awaited after `transcribe` returns.
+                """
+                text = " ".join(segment.text.split())
+                if not text:
+                    return
+                result = STTResultMessage(
+                    segment_id=_build_segment_id(
+                        chunk.meeting_id,
+                        chunk.speaker_id,
+                        message_id,
+                        chunk_offset_ms,
+                        chunk_offset_ms,
+                        text,
+                    ),
+                    meeting_id=chunk.meeting_id,
+                    speaker_id=chunk.speaker_id,
+                    text=text,
+                    language=segment.language or chunk.language,
+                    confidence=STT_UNKNOWN_CONFIDENCE,
+                    start_ms=chunk_offset_ms,
+                    end_ms=chunk_offset_ms,
+                    chunk_index=chunk.chunk_index,
+                    is_final_chunk=False,
+                    # Billing must not charge this. The completed segment for this same chunk
+                    # carries the chunk's WHOLE duration regardless of what went out early
+                    # (stt_worker/model.py: `"end": duration_s`), so charging both would bill
+                    # the same audio twice, and charging this one on its own terms is worse —
+                    # start_ms == end_ms sends billing_worker down its zero-duration fallback,
+                    # which prices a fifteen-second turn as four one-second ones.
+                    is_early=True,
+                    timestamp_ms=chunk.timestamp_ms,
+                    prosody=None,
+                )
+                await self.publish("stt:results", chunk.meeting_id, result.to_redis())
+                self.logger.info(
+                    "stt_early_sentence",
+                    meeting_id=chunk.meeting_id,
+                    chunk_index=chunk.chunk_index,
+                    chars=len(text),
+                    inference_offset_ms=int((time.monotonic() - t0) * 1000),
+                )
+
             # THE COMMIT SIDE OF STREAMING. `_append_speech_frame` put this turn's audio into
             # the session while the speaker was still producing it; this hands `transcribe` the
             # epoch it landed in so the commit can happen without sending the audio a second
@@ -622,11 +687,32 @@ class STTWorker(BaseWorker):
                 allowed_languages=allowed_languages,
                 keywords=keywords,
                 noise_reduction=noise_reduction,
-                # Realtime delta events carry neither confidence nor no-speech
-                # probability. Publishing them allowed hallucinated partials to reach
-                # translation/UI before the completed event could be validated. They
-                # may only warm the private speculative translation cache below.
-                on_early_segment=None,
+                # Publish each sentence the model finishes MID-CHUNK, rather than waiting
+                # for the turn to close. Measured on human recordings (n=3 each):
+                #
+                #     clip                first sentence   whole chunk    earlier by
+                #     Vietnamese 15.0s          1649ms        5653ms    4004ms (3.43x)
+                #     English    18.5s          1176ms        5697ms    4521ms (4.84x)
+                #
+                # WHY THIS IS SAFE NOW, WHEN IT WAS NOT BEFORE
+                #   These are not revisable partials. `transcribe` sets
+                #   exclude_emitted_from_final=True when this callback is present, so the
+                #   completed event carries only the REMAINDER — each emitted sentence is
+                #   final and append-only when it goes out, and nothing has to be retracted.
+                #   `_emit_early` also runs the full `_filter_segments` pass, so the script
+                #   allow-list and hallucination blocklist still apply.
+                #
+                # WHAT IS GENUINELY GIVEN UP
+                #   A delta carries no logprob, so the confidence GATE cannot fire on these.
+                #   Measured 0/6 foreign-script leaks across vi and en, which is evidence and
+                #   not a guarantee. They are published with STT_UNKNOWN_CONFIDENCE rather
+                #   than a fabricated score — see publish_early.
+                #
+                # This REPLACES the speculative cache rather than losing it: on_early_segment
+                # and on_speculative_segment are mutually exclusive in `transcribe`, and the
+                # sentences that used to warm a cache under a 1-slot semaphore and a key that
+                # often missed are now simply translated for real, as soon as they exist.
+                on_early_segment=publish_early,
                 on_speculative_segment=publish_speculative,
                 streamed_epoch=streamed_epoch,
             )

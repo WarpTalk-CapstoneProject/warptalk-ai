@@ -474,6 +474,9 @@ class TranslationWorker(BaseWorker):
                         translator_model=self._require_translator().model,
                         source_segment_id=stt_result.segment_id,
                         chunk_index=stt_result.chunk_index,
+                        # Courier, not judge — billing_worker is what reads this. See
+                        # STTResultMessage.is_early.
+                        is_early=stt_result.is_early,
                         prosody=stt_result.prosody,
                     )
                     await self.publish(
@@ -702,6 +705,9 @@ class TranslationWorker(BaseWorker):
                 translator_model=translator.model,
                 source_segment_id=stt_result.segment_id,
                 chunk_index=stt_result.chunk_index,
+                # Courier, not judge — billing_worker is what reads this. See
+                # STTResultMessage.is_early.
+                is_early=stt_result.is_early,
                 # Delivery is carried, not derived: how the speaker sounded is settled upstream
                 # at the audio, and translating the words does not change it. VALENCE is the one
                 # part that cannot come from the audio — anger and delight look alike on pitch

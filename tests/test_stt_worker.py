@@ -26,8 +26,23 @@ from stt_worker.model import (
 from stt_worker.worker import STTWorker, _language_hint_for_stt
 
 
-def test_default_stt_model_uses_accuracy_first_transcribe_variant() -> None:
-    assert STTSettings().model == "gpt-transcribe"
+def test_streaming_stt_model_and_flash_mode_are_enabled_together() -> None:
+    """These two settings are ONE decision, and this test is what keeps them in step.
+
+    `gpt-live-transcribe` consumes audio as it is spoken. Handed a closed VAD chunk in one
+    go it is far SLOWER than the model it replaced. Measured on a 15s human Vietnamese
+    recording, commit -> completed, n=3 (2026-08-20):
+
+        gpt-transcribe       dumped at turn end   1651ms
+        gpt-transcribe       paced at 1x          1003ms
+        gpt-live-transcribe  dumped at turn end   4733ms   <- 2.9x worse
+        gpt-live-transcribe  paced at 1x           774ms   <- 2.13x better
+
+    So the streaming model without flash mode is a regression, not a rollback. Anyone
+    turning one off must turn the other off too, and this assertion is what will tell them.
+    """
+    assert STTSettings().model == "gpt-live-transcribe"
+    assert WorkerSettings().stt_streaming_enabled is True
 
 
 def test_default_chunk_window_preserves_long_code_switched_utterances() -> None:
@@ -1425,17 +1440,25 @@ class TestSTTWorker:
         streams_published = [str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list]
         assert any("stt:results" in s for s in streams_published)
 
-    async def test_process_publishes_only_completed_segments(
+    async def test_process_publishes_early_sentences_without_claiming_confidence(
         self,
         mock_redis_client,
         worker_settings: WorkerSettings,
         sample_audio_bytes: bytes,
     ) -> None:
-        """Production must not publish unverified Realtime deltas.
+        """A sentence finished mid-chunk is published, and says it does not know how sure it is.
 
-        Delta events have no real confidence/no-speech signal and were the source of
-        hallucinated transcript lines. Only the authoritative completed result may be
-        forwarded to translation and the UI.
+        This replaces an older invariant ("only completed segments may be published"), which
+        was correct when a delta was treated as a revisable partial. `transcribe` now sets
+        exclude_emitted_from_final when on_early_segment is present, so an emitted sentence is
+        FINAL and append-only and the completed event carries only the remainder — there is
+        nothing to retract, and waiting for the turn to close costs 3.4-4.8x (measured, see
+        the call site).
+
+        What must not come back is the fabricated score. `_emit_early` feeds the filter
+        `avg_logprob: 0.0`, and on a logprob scale 0.0 reads as MAXIMALLY confident — the
+        exact "unknown rendered as certain" defect WT-277 removed. Early sentences must carry
+        STT_UNKNOWN_CONFIDENCE, and must not claim the turn has ended.
         """
         worker = STTWorker.__new__(STTWorker)
         worker.settings = worker_settings
@@ -1447,12 +1470,11 @@ class TestSTTWorker:
         worker._room_languages = {}
 
         async def fake_transcribe(*args, **kwargs):
-            assert kwargs.get("on_early_segment") is None
-            speculative = kwargs.get("on_speculative_segment")
-            assert speculative is not None
-            await speculative(
+            early = kwargs.get("on_early_segment")
+            assert early is not None
+            await early(
                 TranscribedSegment(
-                    text="How are you?",
+                    text="Hello there.",
                     language="en",
                     confidence=0.0,
                     start_ms=0,
@@ -1483,17 +1505,20 @@ class TestSTTWorker:
             for stream, data in (c.args for c in mock_redis_client._redis.xadd.call_args_list)
             if "stt:results" in str(stream)
         ]
-        assert {data["text"] for data in published} == {"How are you?"}
-        assert {data["is_final_chunk"] for data in published} == {"1"}
-        speculative_publish = [
-            call
-            for call in mock_redis_client._redis.publish.call_args_list
-            if call.args[0] == "stt:speculative"
-        ]
-        assert len(speculative_publish) == 1
-        speculative_payload = json.loads(speculative_publish[0].args[1])
-        assert speculative_payload["text"] == "How are you?"
-        assert speculative_payload["meeting_id"] == "meeting-1"
+        by_text = {data["text"]: data for data in published}
+        assert set(by_text) == {"Hello there.", "How are you?"}
+
+        early = by_text["Hello there."]
+        # -1.0 is STT_UNKNOWN_CONFIDENCE. Anything >= 0 here would be the model claiming
+        # certainty about text no confidence signal ever covered.
+        assert float(early["confidence"]) == STT_UNKNOWN_CONFIDENCE
+        # More is still coming from this same chunk, so the turn has not ended.
+        assert early["is_final_chunk"] == "0"
+
+        # The completed segment is unchanged: real confidence, real timing, real finality.
+        completed = by_text["How are you?"]
+        assert completed["is_final_chunk"] == "1"
+        assert int(completed["end_ms"]) == 1000
 
     async def test_process_skips_paused_room(
         self,

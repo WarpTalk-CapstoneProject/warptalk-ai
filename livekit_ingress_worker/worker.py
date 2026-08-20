@@ -1159,6 +1159,27 @@ class LiveKitIngressWorker(BaseWorker):
         min_speech_samples = int(sample_rate * (min_speech_ms / 1000.0))
         max_chunk_samples = int(sample_rate * (max_chunk_ms / 1000.0))
 
+        # BOUNDARY SEEKING. Past `seek_after_samples` of actual speech, a shorter pause is
+        # accepted as a cut point, so a long turn is split where the speaker drew breath
+        # instead of wherever `max_chunk_samples` happened to land. See the settings for the
+        # measurements behind it.
+        #
+        # Deliberately reuses the hangover branch below rather than adding a third one: a
+        # 250ms pause IS the end of a clause, so the turn closes exactly as it would on a
+        # long pause, and the next clause collects its own pre-speech ring. Everything that
+        # branch already gets right — the min-speech gate, turn bookkeeping, not resetting
+        # Silero's recurrent state — is got right here too, for free.
+        #
+        # Measured on SPEECH, not on the buffer: the buffer also holds padding and every
+        # internal pause, so a hesitant speaker would otherwise trip the seek threshold
+        # having said very little.
+        seek_after_samples = int(sample_rate * (self.settings.vad_seek_boundary_after_ms / 1000.0))
+        seek_hangover_samples = int(sample_rate * (self.settings.vad_seek_hangover_ms / 1000.0))
+        seek_hangover_windows = max(
+            1,
+            (seek_hangover_samples + vad_window_samples - 1) // vad_window_samples,
+        )
+
         # One near-field gate per track — see near_field_gate.py. It builds a running
         # peak-amplitude reference from this track's own earlier chunks, so it must live
         # for the whole track lifetime, not be recreated per chunk.
@@ -1202,6 +1223,11 @@ class LiveKitIngressWorker(BaseWorker):
         pre_speech_ring: deque[bytes] = deque(
             maxlen=max(1, pre_speech_samples * 2 // (vad_window_samples * 2))
         )  # Rolling pre-speech windows (in bytes, 2 bytes/sample)
+        # Whether this turn has ALREADY sent a chunk, i.e. whether what is in the buffer now
+        # is a continuation rather than a fresh utterance. The min-speech gate exists to stop a
+        # cough being transcribed; a 190ms tail left over after a cap or seek cut is not a
+        # cough, it is the rest of a sentence, and dropping it lost real words silently.
+        published_this_turn = False
         is_speaking = False
         # Samples in speech_buffer that VAD actually called speech — excludes the pre-speech
         # padding and the hangover tail. This, not the buffer length, is what the minimum-speech
@@ -1238,6 +1264,7 @@ class LiveKitIngressWorker(BaseWorker):
                     speech_buffer = bytearray()
                     pre_speech_ring.clear()
                     is_speaking = False
+                    published_this_turn = False
                     speech_samples = 0
                     silence_counter = 0
                     track_vad_model.reset_states()
@@ -1342,6 +1369,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 speech_samples=speech_samples,
                             )
                             chunk_index += 1
+                            published_this_turn = True
                             # The SPEAKER has not stopped, but the commit boundary has moved:
                             # STT will commit everything appended so far when it sees the chunk
                             # above, so what comes next belongs to a new turn.
@@ -1361,7 +1389,16 @@ class LiveKitIngressWorker(BaseWorker):
                             silence_counter += 1
                             speech_buffer.extend(window_data)  # Keep recording during pauses
 
-                            if silence_counter >= silence_hangover_windows:
+                            # A long turn takes the next real pause; a short one still waits
+                            # for the full end-of-sentence hangover. This is the whole of
+                            # boundary seeking — see seek_hangover_windows above.
+                            hangover_windows = (
+                                seek_hangover_windows
+                                if speech_samples >= seek_after_samples
+                                else silence_hangover_windows
+                            )
+
+                            if silence_counter >= hangover_windows:
                                 # End of speech — publish if there was enough SPEECH in it.
                                 #
                                 # WT-371 #7: this measured the whole buffer, which by this point
@@ -1373,7 +1410,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 #
                                 # The padding still ships; it is just no longer counted as evidence
                                 # that somebody spoke.
-                                if speech_samples >= min_speech_samples:
+                                if speech_samples >= min_speech_samples or published_this_turn:
                                     await self._publish_speech_chunk(
                                         room_name,
                                         speaker_id,
@@ -1405,6 +1442,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 frame_seq = 0
                                 streamed_bytes = 0
                                 is_speaking = False
+                                published_this_turn = False
                                 speech_buffer = bytearray()
                                 speech_samples = 0
                                 silence_counter = 0
