@@ -1073,7 +1073,19 @@ class TTSWorker(BaseWorker):
                 generation_config=generation_config,
             )
         except Exception as e:
-            self.logger.error("cartesia_synthesis_failed", error=str(e), voice_type=voice_type)
+            # Carried the error and the voice and nothing else, so a failure could not be tied
+            # to the sentence that failed: the one question worth asking of this line — WHICH
+            # line went silent — was the one it could not answer.
+            self.logger.error(
+                "cartesia_synthesis_failed",
+                error=str(e),
+                meeting_id=translation.meeting_id,
+                speaker_id=translation.speaker_id,
+                segment_id=translation.segment_id,
+                target_lang=translation.target_lang,
+                text=text[:60],
+                voice_type=voice_type,
+            )
             await self.redis.publish_system_event(
                 room_id=translation.meeting_id,
                 event_type="tts_unavailable",
@@ -1135,8 +1147,24 @@ class TTSWorker(BaseWorker):
             "audio_synthesized",
             meeting_id=translation.meeting_id,
             speaker_id=translation.speaker_id,
+            # Closes the STT -> MT -> TTS chain: this is the id chunk_translated logged.
+            segment_id=translation.segment_id,
+            target_lang=translation.target_lang,
             voice_type=voice_type,
             voice_key=voice_key,
+            # WHICH Cartesia voice actually spoke, not just whether we believe it was cloned.
+            # voice_type is what this worker intended; this is what it used.
+            provider_voice_id=resolved_voice_id,
+            # THIS LINE IS LOGGED WHETHER OR NOT ANYTHING WAS SPOKEN. The publish above sits
+            # behind `if audio_bytes:`, so a sentence Cartesia returned nothing for still
+            # arrived here looking exactly like a success with duration_ms=0 — which is how a
+            # dropped sentence stayed invisible while every other field said the pipeline was
+            # healthy. `synthesized=False` is that case, stated rather than inferred.
+            synthesized=bool(audio_bytes),
+            # Streamed into the track during synthesis rather than pushed after it. Not a
+            # failure — but it changes which publish branch ran, and therefore what to expect
+            # on tts:results.
+            already_spoken=already_spoken,
             duration_ms=duration_ms,
             synthesis_latency_ms=synthesis_latency_ms,
             text=text[:60],
