@@ -849,20 +849,29 @@ async def _search_documents(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             return json.dumps({"error": "Could not look up workspace documents right now."})
 
         items = response.json().get("items") or []
+        # Cited like every other tool's results. Without this, a question answered purely from
+        # names — "what documents do we have about X" — produced an answer resting on real
+        # documents with no chips under it, because the chips are built from registered sources
+        # and this tool registered none. The document IS the source; naming it is not less of a
+        # citation than quoting from it.
         named = [
-            {
-                "id": doc.get("id"),
-                "name": doc.get("name"),
-                "status": doc.get("status"),
-                "ingestionStatus": doc.get("ingestionStatus"),
-                # Whether the assistant is allowed to read this document's contents at
-                # all. A false here means get_document will come back metadata-only, so
-                # the model can say why rather than reporting an empty document.
-                "isAiAllowed": doc.get("isAiAllowed"),
-                "confidentialityLevel": doc.get("confidentialityLevel"),
-            }
+            _with_marker(
+                {
+                    "id": doc.get("id"),
+                    "name": doc.get("name"),
+                    "status": doc.get("status"),
+                    "ingestionStatus": doc.get("ingestionStatus"),
+                    # Whether the assistant is allowed to read this document's contents at
+                    # all. A false here means get_document will come back metadata-only, so
+                    # the model can say why rather than reporting an empty document.
+                    "isAiAllowed": doc.get("isAiAllowed"),
+                    "confidentialityLevel": doc.get("confidentialityLevel"),
+                },
+                _cite(ctx, "document", doc.get("name"), doc.get("id")),
+            )
             for doc in items
         ]
+
         if named or not query:
             return json.dumps(named)
 
