@@ -20,9 +20,11 @@ import torch
 from livekit import api, rtc
 from redis.exceptions import RedisError
 
+from livekit_ingress_worker.audio_archive import MeetingAudioArchive, describe
 from livekit_ingress_worker.near_field_gate import NearFieldGate
 from shared.base_worker import BaseWorker
 from shared.control_markers import is_external_bridge_speaker
+from shared.object_storage import ObjectStorage, ObjectStorageSettings
 from shared.schemas import (
     STT_FRAME_STREAM,
     STT_FRAME_STREAM_MAXLEN,
@@ -284,6 +286,12 @@ class LiveKitIngressWorker(BaseWorker):
     VAD_FRAME_SIZE = 512
     SAMPLE_RATE = 16000
 
+    # Declared on the class, not only in __init__, because the tests around this worker
+    # build it with `__new__` and set just the attributes they exercise. An instance-only
+    # default would turn "archiving is off" into an AttributeError raised from the middle of
+    # the audio path — the one place that must not raise.
+    _archive: MeetingAudioArchive | None = None
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.rooms: dict[str, rtc.Room] = {}
@@ -312,6 +320,24 @@ class LiveKitIngressWorker(BaseWorker):
         # which is a third connect nobody asked for.
         self._room_locks: dict[str, asyncio.Lock] = {}
         self._event_tasks: set[asyncio.Task[None]] = set()
+        # Keeps the speech this worker forwards to STT, so the meeting can be transcribed
+        # again after it ends. Built even when disabled — `_archive` stays None then, and the
+        # audio path pays one attribute check rather than a settings lookup per chunk.
+        self._archive: MeetingAudioArchive | None = (
+            MeetingAudioArchive(self.settings.audio_archive_root)
+            if getattr(self.settings, "audio_archive_enabled", False)
+            else None
+        )
+        self._archive_storage = ObjectStorage(
+            ObjectStorageSettings(
+                bucket=getattr(self.settings, "audio_archive_bucket", ""),
+                prefix=getattr(self.settings, "audio_archive_prefix", ""),
+                endpoint=getattr(self.settings, "audio_archive_endpoint", ""),
+                region=getattr(self.settings, "audio_archive_region", "auto"),
+                access_key=getattr(self.settings, "audio_archive_access_key", ""),
+                secret_key=getattr(self.settings, "audio_archive_secret_key", ""),
+            )
+        )
         self._connect_failures: dict[str, int] = {}
         self._connect_not_before: dict[str, float] = {}
         self._connect_history: dict[str, deque[float]] = {}
@@ -781,6 +807,65 @@ class LiveKitIngressWorker(BaseWorker):
             self.audio_tasks.pop(key, None)
             self.audio_task_tracks.pop(key, None)
 
+    async def _finish_archive(self, room_id: str) -> None:
+        """Seal one meeting's audio tracks, put them somewhere durable, free the disk.
+
+        The upload runs in a thread. It is a network call on a path that also disconnects
+        the bot and releases the room lock, and blocking the event loop on a slow bucket
+        would stall every OTHER meeting this worker is carrying.
+
+        A track that fails to upload is KEPT on local disk and named in the log. Deleting it
+        would destroy the only copy of a meeting's audio to tidy up after a transient S3
+        error, and this archive exists precisely because the audio is otherwise gone.
+        """
+        archive = self._archive
+        if archive is None:
+            return
+
+        try:
+            tracks = await asyncio.to_thread(archive.close_meeting, room_id)
+            if not tracks:
+                return
+
+            if not self._archive_storage.settings.configured:
+                # Not a failure — a development box with no bucket. Said once, with the
+                # location, so nobody has to guess where the audio went.
+                self.logger.info(
+                    "meeting_audio_archived_locally",
+                    room=room_id,
+                    path=str(tracks[0].path.parent),
+                    **describe(tracks),
+                )
+                return
+
+            uploaded = 0
+            for track in tracks:
+                key = f"{track.meeting_id}/{track.speaker_id}.flac"
+                uri = await asyncio.to_thread(self._archive_storage.upload, track.path, key)
+                if uri is None:
+                    self.logger.warning(
+                        "meeting_audio_upload_failed_keeping_local",
+                        room=room_id,
+                        speaker_id=track.speaker_id,
+                        path=str(track.path),
+                    )
+                    continue
+                uploaded += 1
+                with suppress(OSError):
+                    track.path.unlink()
+
+            self.logger.info(
+                "meeting_audio_archived",
+                room=room_id,
+                uploaded=uploaded,
+                **describe(tracks),
+            )
+        except Exception:
+            # The meeting is already over and the bot is already going home. Losing the
+            # archive is a degraded outcome; letting this escape would abandon the rest of
+            # the teardown that runs alongside it.
+            self.logger.warning("meeting_audio_archive_failed", room=room_id, exc_info=True)
+
     def _cleanup_room(self, room_id: str) -> None:
         """Release the bot when the translation room reaches a terminal state.
 
@@ -796,6 +881,12 @@ class LiveKitIngressWorker(BaseWorker):
         self._room_last_occupied.pop(room_id, None)
         # The room is over for everyone, so no replica should keep chasing it.
         self._deferred_rooms.discard(room_id)
+        # Sealed only after _cancel_room_audio_tasks above has stopped this room's readers,
+        # so no chunk can arrive once the files are closed and be dropped without a trace.
+        if self._archive is not None:
+            finish = asyncio.create_task(self._finish_archive(room_id))
+            self._event_tasks.add(finish)
+            finish.add_done_callback(self._event_tasks.discard)
         room = self.rooms.pop(room_id, None)
         # Compare-and-delete, so this is a harmless no-op on a replica that never owned it.
         release = asyncio.create_task(self._release_room_ownership(room_id))
@@ -1790,6 +1881,12 @@ class LiveKitIngressWorker(BaseWorker):
             turn_id=turn_id,
             timestamp_ms=int(time.time() * 1000),
         )
+
+        # Tapped here, from the bytes this message carries, so a second pass is handed
+        # exactly what the first pass was handed. Archiving from anywhere else would make a
+        # pass-1-vs-pass-2 accuracy comparison a comparison of two audio paths instead.
+        if self._archive is not None:
+            self._archive.append(room_name, speaker_id, msg.audio_data, sample_rate)
 
         payload = msg.to_redis()
         for attempt in range(1, 4):

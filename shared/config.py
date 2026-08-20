@@ -214,6 +214,23 @@ class WorkerSettings(BaseSettings):
     near_field_gate_min_baseline_chunks: int = 2
     near_field_gate_baseline_ema_alpha: float = 0.3
 
+    # Keep the speech forwarded to STT, so a meeting can be transcribed a second time after
+    # it ends — see livekit_ingress_worker/audio_archive.py for why the existing recording
+    # cannot serve that purpose. Off by default because it writes files and uploads them;
+    # turning it on is a deliberate act with a bucket configured.
+    audio_archive_enabled: bool = False
+    #: Where tracks are assembled before upload. A meeting's files live here only until it
+    #: ends, so this wants scratch space rather than a durable volume.
+    audio_archive_root: str = "/tmp/warptalk-audio-archive"
+    #: Object storage for finished tracks. With no bucket the tracks stay on local disk and
+    #: the worker says so — useful in development, and never silently on in production.
+    audio_archive_bucket: str = ""
+    audio_archive_prefix: str = "meeting-audio"
+    audio_archive_endpoint: str = ""
+    audio_archive_region: str = "auto"
+    audio_archive_access_key: str = ""
+    audio_archive_secret_key: str = ""
+
 
 class STTSettings(BaseSettings):
     """Speech-to-Text worker settings."""

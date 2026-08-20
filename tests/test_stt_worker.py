@@ -40,13 +40,18 @@ def test_streaming_stt_model_and_flash_mode_are_enabled_together() -> None:
 
     So the streaming model without flash mode is a regression, not a rollback. Anyone
     turning one off must turn the other off too, and this assertion is what will tell them.
+
+    Both are read off the DECLARED default rather than off an instance. shared/config.py calls
+    load_dotenv() at import and these classes read STT_* / WORKER_*, so instantiating them here
+    consults the developer's own .env — which sets STT_MODEL on any machine that has run the
+    stack. Asserting the instance is green in CI, which has no .env, and red for everybody else.
     """
-    assert STTSettings().model == "gpt-live-transcribe"
-    assert WorkerSettings().stt_streaming_enabled is True
+    assert STTSettings.model_fields["model"].default == "gpt-live-transcribe"
+    assert WorkerSettings.model_fields["stt_streaming_enabled"].default is True
 
 
 def test_default_chunk_window_preserves_long_code_switched_utterances() -> None:
-    assert WorkerSettings().chunk_duration_ms == 6000
+    assert WorkerSettings.model_fields["chunk_duration_ms"].default == 6000
 
 
 class FakeRealtimeConn:
