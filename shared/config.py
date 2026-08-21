@@ -546,7 +546,19 @@ class ChatAssistantSettings(BaseSettings):
     # incident tools/responses_api_probe.py exists to document. A default that does not match the
     # deployed value is a test suite that cannot see the bug it is meant to catch.
     model: str = "gpt-5.6-luna"
-    max_tokens: int = 1024
+    # 1024 cut answers off mid-sentence — reported with a screenshot of a reply that stopped at
+    # a bullet reading "Đ".
+    #
+    # It is `max_output_tokens` on /v1/responses, and for a reasoning model the REASONING tokens
+    # are drawn from the same budget before a single character of the answer is. So the visible
+    # ceiling was never 1024; it was 1024 minus however long Luna thought, which is why the cut
+    # landed in a different place every time and looked like a streaming fault rather than a
+    # limit. Vietnamese costs more tokens per word than English on top of that.
+    #
+    # 4096 is sized for the longest thing this widget is actually asked for — a list with a
+    # sentence per item — and still bounds a runaway. Not pinned in production's compose, so
+    # this default is the value that ships.
+    max_tokens: int = 4096
     # Sent only to models that accept it — responses_options() drops it for gpt-5*, which answers
     # `temperature` with a 400 on this endpoint. Kept configured so pointing the worker back at a
     # gpt-4 model still behaves as before.
