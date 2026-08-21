@@ -393,6 +393,17 @@ class TranslationResultMessage(BaseModel):
     # is: an absent field means "not measured" and a consumer stores NULL. A speculative cache hit
     # that did no translation work has no honest number to report and sends none.
     latency_ms: int | None = None
+    # This translation REPLACES an earlier one of the same line, rather than being its first.
+    #
+    # transcript.translation_contents has carried is_retranslated and
+    # previous_translation_content_id since the table was designed, and the persistence consumer
+    # hardcoded the first to false and never set the second — a correction chain the schema
+    # models and nothing ever wrote. Only a producer knows the difference: the live pipeline is
+    # always translating a line for the first time, and only the post-correction path redoes one.
+    is_retranslated: bool = False
+    # The translation_contents row this one supersedes. Set together with is_retranslated; the
+    # producer gets it from the current SegmentTranslationLink it is replacing.
+    previous_translation_content_id: str | None = None
 
     def to_redis(self) -> dict[str, str]:
         payload = {
@@ -421,6 +432,13 @@ class TranslationResultMessage(BaseModel):
             payload["prosody"] = self.prosody.to_wire()
         if self.latency_ms is not None:
             payload["latency_ms"] = str(self.latency_ms)
+        # Sent only when true. An ordinary live translation says nothing about being a redo, and
+        # a consumer reading an absent field as false is the behaviour every existing producer
+        # already relies on.
+        if self.is_retranslated:
+            payload["is_retranslated"] = "1"
+        if self.previous_translation_content_id:
+            payload["previous_translation_content_id"] = self.previous_translation_content_id
         return payload
 
     @classmethod
@@ -450,6 +468,8 @@ class TranslationResultMessage(BaseModel):
             # Absent means "not measured", which is a different fact from zero — a producer
             # that did no translation work reports nothing rather than claiming it was instant.
             latency_ms=int(d["latency_ms"]) if d.get("latency_ms") else None,
+            is_retranslated=d.get("is_retranslated") == "1",
+            previous_translation_content_id=d.get("previous_translation_content_id") or None,
         )
 
 

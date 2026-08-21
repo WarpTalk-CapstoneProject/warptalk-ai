@@ -7,10 +7,15 @@ why a finished transcript can only be read back in the language that happened to
 the time, and a meeting that switched from English to Japanese half way through has neither
 language covering the whole of it.
 
-This worker is the after-the-fact half. TranscriptService works out which segments have no
-version in the requested language and publishes them here; this translates them and publishes
-ordinary translation results, which TranscriptService persists through the same code path a live
-translation takes.
+This worker is the after-the-fact half. TranscriptService works out which lines need translating
+and publishes them here; this translates them and publishes ordinary translation results, which
+TranscriptService persists through the same code path a live translation takes.
+
+Two things send work here, and they differ by one field per line:
+
+* a language the meeting never covered — the line has no translation in it at all;
+* a line whose transcript was corrected — it HAS one, of a sentence nobody said, and the request
+  names the translation_contents row being replaced so the consumer can record the chain.
 
 Results go to `translate:backfill_results`, NOT `translate:results`: tts_worker consumes the
 latter, and a backfill landing there would synthesise — and bill — speech for every line of a
@@ -115,7 +120,18 @@ class TranslationBackfillWorker(BaseWorker):
                 # Already in the requested language; TranscriptService does not count these as
                 # missing, so reaching here means the two sides disagree about a language tag.
                 continue
-            by_source.setdefault(source_lang, []).append({"segment_id": segment_id, "text": text})
+            by_source.setdefault(source_lang, []).append(
+                {
+                    "segment_id": segment_id,
+                    "text": text,
+                    # Present when this line already HAS a translation in the target language and
+                    # is being redone — a human corrected what was said, so the stored translation
+                    # is of a sentence nobody spoke. Absent for an ordinary gap fill.
+                    "previous_translation_content_id": str(
+                        segment.get("previous_translation_content_id") or ""
+                    ),
+                }
+            )
 
         started = time.monotonic()
         translated_count = 0
@@ -150,6 +166,14 @@ class TranslationBackfillWorker(BaseWorker):
                         translator_model=self.translator.model,
                         source_segment_id=item["segment_id"],
                         is_final_chunk=True,
+                        # Carried through rather than decided here: only the producer knows
+                        # whether this line already had a translation, and the consumer needs
+                        # both facts to write the correction chain that
+                        # transcript.translation_contents models and has never recorded.
+                        is_retranslated=bool(item["previous_translation_content_id"]),
+                        previous_translation_content_id=(
+                            item["previous_translation_content_id"] or None
+                        ),
                         # No latency_ms on purpose. One API call produced N sentences, so no
                         # sentence has a duration of its own; the schema treats an absent field
                         # as "not measured" and the column stores NULL.

@@ -228,6 +228,10 @@ GLOBAL_STREAMS = [
     "audio:chunks",
     "stt:results",
     "translate:results",
+    # Legacy. TranscriptService used to publish a correction here and no worker ever read it, so
+    # corrections never propagated; that path now goes to translate:backfill_requests. The key can
+    # still hold entries written before then, and expiring it would take its consumer groups —
+    # there are none, but the rule is about what a name IS, not about who happens to be reading.
     "translate:requests",
     "translate:backfill_requests",
     "translate:backfill_results",

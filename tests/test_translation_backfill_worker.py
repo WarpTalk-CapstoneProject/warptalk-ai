@@ -247,3 +247,46 @@ async def test_a_missing_glossary_is_not_an_error() -> None:
 )
 def test_bare_reduces_a_tag_to_the_code_segments_are_stored_with(raw: str, expected: str) -> None:
     assert _bare(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_a_redo_carries_the_row_it_replaces_so_the_chain_is_recorded() -> None:
+    # transcript.translation_contents has modelled a correction chain since the table was designed
+    # and nothing ever wrote it: is_retranslated hardcoded false, previous_translation_content_id
+    # never set. Only the producer knows which of the two this line is.
+    worker = _worker()
+    previous = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+
+    await worker.process(
+        b"1-0",
+        _request(
+            [
+                {
+                    "segment_id": SEGMENT_A,
+                    "text": "xin chào",
+                    "source_lang": "vi",
+                    "previous_translation_content_id": previous,
+                }
+            ]
+        ),
+    )
+
+    _, _, payload = worker.published[0]
+    assert payload["is_retranslated"] == "1"
+    assert payload["previous_translation_content_id"] == previous
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_gap_fill_claims_no_predecessor() -> None:
+    # Absent, not "0"/"": every existing producer relies on a consumer reading a missing field as
+    # false, and a blank previous id would be a foreign key to nothing.
+    worker = _worker()
+
+    await worker.process(
+        b"1-0",
+        _request([{"segment_id": SEGMENT_A, "text": "xin chào", "source_lang": "vi"}]),
+    )
+
+    _, _, payload = worker.published[0]
+    assert "is_retranslated" not in payload
+    assert "previous_translation_content_id" not in payload
