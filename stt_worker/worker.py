@@ -34,7 +34,7 @@ from shared.schemas import (
     STTResultMessage,
 )
 from shared.text_utils import split_into_sentences
-from stt_worker.model import OpenAISTT, _normalize_language
+from stt_worker.model import OpenAISTT, _normalize_language, _normalize_overheard_text
 
 
 def _decode_field(data: Mapping[Any, Any], key: str) -> str:
@@ -77,6 +77,20 @@ _NOISE_REDUCTION_MODES = {"off", "near_field", "far_field"}
 # compares `noise_reduction` and issues a session.update on the LIVE socket when it differs, and
 # nothing could ever hand it a different value. Two halves of one feature, disagreeing.
 _NOISE_REDUCTION_TTL_S = 5.0
+
+# How long a line of the room's own TTS remains grounds for discarding identical incoming
+# "speech" (the dub-echo guard — see _matches_recent_dub in model.py). Playback starts a few
+# seconds after the translation is published and a dubbed sentence runs a few more through the
+# speakers; 25s covers the whole replay with margin, without holding a line long enough to
+# collide with somebody genuinely repeating it later in the meeting.
+_DUB_ECHO_WINDOW_MS = 25_000
+# translate:results entries to look back through per fetch. At conversational pace a room
+# produces well under two lines a second, so 48 newest-first entries always spans the window.
+_DUB_ECHO_SCAN_COUNT = 48
+# An echo physically cannot arrive before its dub has been synthesized and played, which is
+# seconds — a 2s-stale read can never miss the line it needs, and chunks arrive about once a
+# second per speaker, so this turns a per-chunk stream read into one every couple of seconds.
+_DUB_ECHO_CACHE_TTL_S = 2.0
 
 _RECENT_CONTEXT_SEGMENTS = 4
 _MAX_STT_PROMPT_CHARS = 600
@@ -471,6 +485,7 @@ class STTWorker(BaseWorker):
         getattr(self, "_recent_transcripts", {}).pop(room_id, None)
         self._room_languages.pop(room_id, None)
         getattr(self, "_room_noise_reduction", {}).pop(room_id, None)
+        getattr(self, "_dub_echo_cache", {}).pop(room_id, None)
         # Same reasoning as the four above: one entry per (meeting, speaker) whose turn was
         # open when the room ended, held forever otherwise.
         for noise_key in [
@@ -532,6 +547,7 @@ class STTWorker(BaseWorker):
         allowed_languages = await self._get_room_languages(chunk.meeting_id)
         keywords = await self._get_stt_keywords(chunk.meeting_id)
         noise_reduction = await self._get_noise_reduction(chunk.meeting_id, chunk.speaker_id)
+        recent_dub_texts = await self._get_recent_dub_texts(chunk.meeting_id)
 
         # Measured CONCURRENTLY with recognition, not before it. Transcription is a
         # network round trip of hundreds of milliseconds; the measurement is single-digit
@@ -722,6 +738,9 @@ class STTWorker(BaseWorker):
                 on_early_segment=publish_early,
                 on_speculative_segment=publish_speculative,
                 streamed_epoch=streamed_epoch,
+                # The dub-echo guard's reference lines (see _matches_recent_dub). Fetched
+                # here because only the worker can reach Redis; the filter is pure.
+                recent_dub_texts=recent_dub_texts,
             )
         except Exception as exc:
             await self.redis.publish_system_event(
@@ -1181,6 +1200,63 @@ class STTWorker(BaseWorker):
         if mine is not None:
             return mine
         return await self._get_room_noise_reduction(meeting_id)
+
+    async def _get_recent_dub_texts(self, meeting_id: str) -> list[str]:
+        """Lines the room's own TTS was just told to speak, for the dub-echo guard.
+
+        Read from translate:results:{meeting}, not tts:results: the translated text IS what
+        the dub voices, and it is on this stream the moment it exists — a guard fed from a
+        later stage would open a gap exactly as long as synthesis.
+
+        Fails open. A room with no translations guards nothing, and an unreadable stream must
+        degrade to the behaviour this worker had before the guard existed, not to an error a
+        speaker can hear as their sentence going missing.
+        """
+        cache: dict[str, tuple[list[str], float]] | None = getattr(self, "_dub_echo_cache", None)
+        if cache is None:
+            cache = {}
+            self._dub_echo_cache = cache
+
+        now = time.monotonic()
+        cached = cache.get(meeting_id)
+        if cached is not None and now - cached[1] < _DUB_ECHO_CACHE_TTL_S:
+            return cached[0]
+
+        texts: list[str] = []
+        try:
+            entries = (
+                await self.redis.redis.xrevrange(
+                    f"translate:results:{meeting_id}", count=_DUB_ECHO_SCAN_COUNT
+                )
+                or []
+            )
+            now_ms = int(time.time() * 1000)
+            for _entry_id, fields in entries:
+                if not fields:
+                    continue
+                data = {
+                    (key.decode() if isinstance(key, bytes) else key): (
+                        value.decode() if isinstance(value, bytes) else value
+                    )
+                    for key, value in fields.items()
+                }
+                try:
+                    age_ms = now_ms - int(data.get("timestamp_ms", "0"))
+                except ValueError:
+                    continue
+                if age_ms > _DUB_ECHO_WINDOW_MS:
+                    # Entries arrive newest-first, so the first stale one ends the scan.
+                    break
+                normalized = _normalize_overheard_text(data.get("translated_text", ""))
+                if not normalized:
+                    continue
+                texts.append(normalized)
+        except Exception:
+            self.logger.warning("dub_echo_lookup_failed", meeting_id=meeting_id, exc_info=True)
+            texts = []
+
+        cache[meeting_id] = (texts, now)
+        return texts
 
     async def _get_stt_keywords(self, meeting_id: str) -> list[str]:
         """Return structured glossary terms for the provider's keyword-bias field."""
