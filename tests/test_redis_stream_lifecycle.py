@@ -229,6 +229,8 @@ GLOBAL_STREAMS = [
     "stt:results",
     "translate:results",
     "translate:requests",
+    "translate:backfill_requests",
+    "translate:backfill_results",
     "tts:results",
     "ai_assistant:results",
     "assistant:chat_requests",
