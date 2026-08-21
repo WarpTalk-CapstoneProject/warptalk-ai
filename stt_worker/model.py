@@ -13,9 +13,10 @@ import base64
 import re
 import time
 from collections import Counter, deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any, cast
 
 import numpy as np
@@ -732,6 +733,80 @@ def _is_keyword_enumeration_echo(text: str, keywords: list[str] | None) -> bool:
     return matched >= _MIN_KEYWORD_ECHO_TERMS and matched / len(items) >= _MIN_KEYWORD_ECHO_RATIO
 
 
+def _normalize_overheard_text(text: str) -> str:
+    """One spelling for comparing what STT heard against what the room's TTS was told to say.
+
+    The same recipe the prompt-echo guard uses on its side of the comparison, exported so the
+    worker normalizes translate:results lines identically — two normalizers that drift is a
+    guard that silently stops matching.
+    """
+    return " ".join(text.casefold().split()).rstrip(".!?,")
+
+
+# THE ROOM HEARING ITS OWN TRANSLATION BACK.
+#
+# A listener hears the far side's dub through their speakers, their microphone re-captures it,
+# and the pipeline transcribes it as new speech — attributed to the LISTENER, in the dub's
+# language. Browser echo cancellation is modelled on a near-field human talker and synthesized
+# speech through laptop speakers routinely defeats it; the client half of the defence
+# (half-duplex-mic.tsx in warptalk-web) gates on the tab running current code and on LiveKit's
+# isSpeaking signal, and production meeting "Hieu Clone" (21 Aug, 01a0202b…) shows what gets
+# through regardless: 77 English segments in ten minutes credited to a participant who had not
+# spoken — each one, line for line, the English dub of the other speaker's Vietnamese. Those
+# segments were then re-translated, re-synthesized, billed, and taught the language-override
+# loop that the listener speaks English.
+#
+# So the guard of last resort sits where every path converges: a segment whose text matches a
+# line the room's own TTS was just told to speak, in that dub's language, is the room hearing
+# itself, and it is dropped before it can become transcript, translation, or language evidence.
+# The texts to compare against come from translate:results, fetched and windowed by the worker
+# (STTWorker._get_recent_dub_texts).
+#
+# Length floors rise with match looseness: "yeah." said near a dub that also said "Yeah." is
+# ordinary back-channel, not echo, and dropping real speech is the one failure mode this guard
+# must not have.
+_DUB_ECHO_MIN_EXACT_CHARS = 6
+_DUB_ECHO_MIN_PARTIAL_CHARS = 10
+_DUB_ECHO_MIN_FUZZY_CHARS = 12
+_DUB_ECHO_FUZZY_RATIO = 0.85
+
+
+def _matches_recent_dub(
+    normalized_text: str,
+    recent_dub_texts: Sequence[str],
+) -> bool:
+    """Whether this segment re-captures a dub line the room just played.
+
+    `recent_dub_texts` holds translated_text lines, already normalized with
+    _normalize_overheard_text and already windowed for recency by the caller.
+
+    DELIBERATELY NO LANGUAGE CONDITION. The segment's language label is the one thing echo
+    corrupts: an English dub re-captured from a speaker declared `vi` resolves to `vi` —
+    Latin text carries no unambiguous evidence, so the declaration wins — and a guard gated
+    on the label matching the dub's language misses exactly the production case it was built
+    from. Cross-language coincidence needs no gate either: text in one language does not
+    fuzzy-match text in another, so the text comparison already separates them.
+    """
+    if not normalized_text:
+        return False
+    for dub_text in recent_dub_texts:
+        if not dub_text:
+            continue
+        if len(normalized_text) >= _DUB_ECHO_MIN_EXACT_CHARS and normalized_text == dub_text:
+            return True
+        if len(normalized_text) >= _DUB_ECHO_MIN_PARTIAL_CHARS and (
+            normalized_text in dub_text or dub_text in normalized_text
+        ):
+            return True
+        if (
+            len(normalized_text) >= _DUB_ECHO_MIN_FUZZY_CHARS
+            and len(dub_text) >= _DUB_ECHO_MIN_FUZZY_CHARS
+            and SequenceMatcher(None, normalized_text, dub_text).ratio() >= _DUB_ECHO_FUZZY_RATIO
+        ):
+            return True
+    return False
+
+
 def _filter_segments(
     segments_raw: list[dict[str, Any]],
     detected_language: str,
@@ -742,6 +817,7 @@ def _filter_segments(
     keywords: list[str] | None = None,
     min_avg_logprob: float = -0.7,
     min_avg_logprob_by_language: dict[str, float] | None = None,
+    recent_dub_texts: Sequence[str] | None = None,
 ) -> list[TranscribedSegment]:
     language_known = detected_language != "unknown"
     lang_code = _normalize_language(detected_language) if language_known else None
@@ -918,6 +994,16 @@ def _filter_segments(
             or lang_code
             or _guess_language_from_text(text, allowed)
         )
+        # Before the contradiction log below, deliberately: an echoed dub is exactly a segment
+        # whose language contradicts the declaration, and letting it write that log line is the
+        # confusion this guard exists to remove.
+        if recent_dub_texts and _matches_recent_dub(normalized_text, recent_dub_texts):
+            logger.info(
+                "filtered_dub_echo",
+                text=text[:80],
+                language=seg_lang,
+            )
+            continue
         if lang_code and seg_lang != lang_code:
             # Worth a line in the log: the speaker's profile and their actual speech disagree,
             # which is a setup mistake they cannot see and which degrades their transcription
@@ -1251,6 +1337,7 @@ class OpenAISTT:
         on_early_segment: Callable[[TranscribedSegment], Awaitable[None]] | None = None,
         on_speculative_segment: Callable[[TranscribedSegment], Awaitable[None]] | None = None,
         streamed_epoch: int | None = None,
+        recent_dub_texts: Sequence[str] | None = None,
     ) -> list[TranscribedSegment]:
         """Transcribe raw audio bytes via the OpenAI Realtime API.
 
@@ -1320,6 +1407,7 @@ class OpenAISTT:
                 keywords=keywords,
                 min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
                 min_avg_logprob_by_language=getattr(self, "min_avg_logprob_by_language", None),
+                recent_dub_texts=recent_dub_texts,
             )
             for seg in segs:
                 await on_early_segment(seg)
@@ -1344,6 +1432,7 @@ class OpenAISTT:
                 keywords=keywords,
                 min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
                 min_avg_logprob_by_language=getattr(self, "min_avg_logprob_by_language", None),
+                recent_dub_texts=recent_dub_texts,
             )
             for seg in segs:
                 await on_speculative_segment(seg)
@@ -1441,6 +1530,10 @@ class OpenAISTT:
             context_prompt=prompt,
             keywords=keywords,
             min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
+            # Was missing here while the early/speculative paths passed it — the per-language
+            # floor never applied to the completed path, the one place with real logprobs.
+            min_avg_logprob_by_language=getattr(self, "min_avg_logprob_by_language", None),
+            recent_dub_texts=recent_dub_texts,
         )
         # Learned from the COMPLETED path only. Early and speculative segments are provisional
         # by construction, and re-pinning a session on a guess that a later completed event
