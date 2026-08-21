@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["shared*", "stt_worker*", "translation_worker*", "tts_worker*", "ai_assistant_worker*", "suggestion_worker*", "embedding_worker*", "billing_worker*", "security_worker*", "livekit_ingress_worker*", "metrics_exporter*"]
+include = ["shared*", "stt_worker*", "translation_worker*", "tts_worker*", "ai_assistant_worker*", "suggestion_worker*", "embedding_worker*", "billing_worker*", "security_worker*", "livekit_ingress_worker*", "retranscribe_worker*", "metrics_exporter*"]
 
 [project]
 name = "warptalk-ai"
@@ -29,6 +29,7 @@ dependencies = [
     # STT uses the Realtime API (gpt-realtime-whisper over WebSocket) — needs the
     # openai[realtime] extra's websockets dependency.
     "openai>=2.45",
+    "boto3>=1.34",
     "websockets>=13",
     # LiveKit
     "livekit>=0.11",

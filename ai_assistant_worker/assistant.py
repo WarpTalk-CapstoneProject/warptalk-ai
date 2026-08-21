@@ -229,6 +229,18 @@ When extracting action items:
             return parsed
         except Exception:
             logger.exception("structured_summary_generation_failed")
+            # WT-530. Two keys here are load-bearing, and their absence was the bug.
+            #
+            # `templateKey`: without it the web never learns which template this summary is, so a
+            # rewrite request waits for a template that never arrives and gives up after 90s with
+            # "The rewritten summary has not arrived" — and nothing in the console, because from
+            # the browser's side nothing failed.
+            #
+            # `generationFailed`: this dict was previously indistinguishable from a real summary,
+            # so the worker published it as status="completed" and the backend wrote it OVER a
+            # perfectly good existing summary. A failed rewrite must not destroy the summary it
+            # failed to replace. `insufficientData` cannot carry that meaning — it is already the
+            # honest answer for a meeting that genuinely has too little to summarise.
             return {
                 "summary": (
                     "The AI assistant could not generate a structured summary for this meeting."
@@ -236,6 +248,8 @@ When extracting action items:
                 "decisions": [],
                 "actionItems": [],
                 "insufficientData": True,
+                "generationFailed": True,
+                "templateKey": template.key,
             }
 
     def _require_client(self) -> AsyncOpenAI:

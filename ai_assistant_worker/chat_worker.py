@@ -19,18 +19,31 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
+from urllib.parse import urlparse
 
 import httpx
 from openai import AsyncOpenAI
 
 from ai_assistant_worker.chat_templates import PERSONA, build_system_prompt, resolve_template
 from ai_assistant_worker.chat_tools import TOOLS, TOOLS_BY_NAME, ToolContext
+from ai_assistant_worker.citations import (
+    SourceRegistry,
+    strip_markers,
+)
+from ai_assistant_worker.citations import (
+    instruction as citation_instruction,
+)
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
 from shared.openai_options import responses_options
 from shared.schemas import ChatRequestMessage, ChatResultMessage
 
 SIBLING_SERVICE_TIMEOUT_SECONDS = 15.0
+
+#: What the client shows while OpenAI runs a hosted web search. Not in ASSISTANT_TOOL_LABELS on
+#: the web side because it is not a local tool — but from the reader's chair it is the same thing
+#: happening, and a search that took four seconds with no step shown looks like a stall.
+WEB_SEARCH_STEP_NAME = "web_search"
 
 # The prompt is generated per turn from chat_templates, which is where the routing rules
 # ("read the transcript when asked what was said") now live. This name survives as the
@@ -344,6 +357,35 @@ def _now_message(now: datetime | None = None) -> str:
     )
 
 
+def _web_citations(output_items: list[Any]) -> list[tuple[str, str, int]]:
+    """(title, url, position) for every url_citation OpenAI's hosted search anchored in the answer.
+
+    The hosted tool runs server-side and never reaches a handler here, so the ordinary marker
+    mechanism cannot see it — see SourceRegistry.note_cited for why an annotation is accepted in
+    its place. Read defensively: this is a provider response shape, and the failure of being
+    strict about it is an answer that loses its only checkable sources.
+    """
+    citations: list[tuple[str, str, int]] = []
+    for item in output_items:
+        if getattr(item, "type", "") != "message":
+            continue
+        for part in getattr(item, "content", []) or []:
+            for annotation in getattr(part, "annotations", []) or []:
+                if getattr(annotation, "type", "") != "url_citation":
+                    continue
+                url = (getattr(annotation, "url", "") or "").strip()
+                if not url:
+                    continue
+                # A title is what the chip reads. Falling back to the host keeps the chip
+                # nameable — "vnexpress.net" is a source; an untitled chip is not.
+                title = (getattr(annotation, "title", "") or "").strip()
+                if not title:
+                    title = urlparse(url).netloc or url
+                position = getattr(annotation, "start_index", None)
+                citations.append((title, url, position if isinstance(position, int) else 0))
+    return citations
+
+
 class ChatAssistantWorker(BaseWorker):
     """Global assistant worker — free-form Q&A with tool-calling, independent of any meeting."""
 
@@ -433,6 +475,11 @@ class ChatAssistantWorker(BaseWorker):
         except json.JSONDecodeError:
             history = []
 
+        # One per TURN. A registry that outlived the turn would let an answer cite a document
+        # retrieved for somebody else's earlier question, which is exactly the unverifiable claim
+        # this mechanism exists to prevent.
+        citations = SourceRegistry()
+
         tool_context = ToolContext(
             workspace_id=request.workspace_id,
             user_id=request.user_id,
@@ -445,15 +492,34 @@ class ChatAssistantWorker(BaseWorker):
             openai_client=self._openai,
             model=self.chat_settings.model,
             redis=self.redis,
+            citations=citations,
         )
 
         try:
             final_text, tool_call_log = await self._run_agent_loop(request, history, tool_context)
+
+            # The intersection: sources genuinely retrieved this turn AND pointed at by the
+            # answer. A marker the model invented resolves to nothing and is dropped in silence.
+            cited = citations.cited(final_text)
+            if cited:
+                self.logger.info(
+                    "chat_answer_cited_sources",
+                    request_id=request.request_id,
+                    cited=len(cited),
+                    # What it was SHOWN, beside what it used — the gap is the interesting number
+                    # when somebody asks why an answer has no chips.
+                    registered=len(citations.registered()),
+                )
+
             await self._publish_result(
                 request,
                 type_="completed",
-                content=final_text,
+                # Markers are machinery; the reader gets chips instead.
+                content=strip_markers(final_text),
                 tool_calls_json=json.dumps(tool_call_log) if tool_call_log else "",
+                sources_json=json.dumps([source.as_dict() for source in cited], ensure_ascii=False)
+                if cited
+                else "",
             )
         except Exception as exc:
             self.logger.exception("chat_turn_failed", request_id=request.request_id)
@@ -498,6 +564,7 @@ class ChatAssistantWorker(BaseWorker):
         mentions_message = _format_mentions(request.mentions_json)
         if mentions_message:
             instructions_parts.append(mentions_message)
+        instructions_parts.append(citation_instruction())
         instructions = "\n\n".join(instructions_parts)
 
         conversation: list[dict[str, Any]] = [
@@ -556,6 +623,25 @@ class ChatAssistantWorker(BaseWorker):
                 # response.completed carries every output item whole, so reading them
                 # from there removes a class of partial-JSON bugs the chat-completions
                 # version had to guard against by hand.
+                # The hosted search is the one tool whose work is invisible from here: it has no
+                # handler, so the tool_call_started below never fires for it and a four-second
+                # search read as a stalled worker. These events are the only evidence it is
+                # running, and an event name that changes costs a step, not a turn.
+                elif etype.startswith("response.web_search_call."):
+                    if etype.endswith(".completed") or etype.endswith(".failed"):
+                        await self._publish_result(
+                            request,
+                            type_="tool_call_completed",
+                            tool_name=WEB_SEARCH_STEP_NAME,
+                            tool_status="completed" if etype.endswith(".completed") else "failed",
+                        )
+                    else:
+                        await self._publish_result(
+                            request,
+                            type_="tool_call_started",
+                            tool_name=WEB_SEARCH_STEP_NAME,
+                        )
+
                 elif etype == "response.completed":
                     response = getattr(event, "response", None)
                     output_items = list(getattr(response, "output", []) or [])
@@ -569,6 +655,12 @@ class ChatAssistantWorker(BaseWorker):
             if not function_calls:
                 # A turn that produced a message rather than a call is the final answer.
                 final_text = full_text
+                # Noted here rather than in a handler because there is no handler to note it in.
+                # Positions come from the annotations, so a web source sorts into reading order
+                # beside the markers instead of being appended in a clump.
+                if tool_context.citations is not None:
+                    for title, url, position in _web_citations(output_items):
+                        tool_context.citations.note_cited("web", title, url, at=position)
                 break
 
             for call in function_calls:
@@ -656,6 +748,7 @@ class ChatAssistantWorker(BaseWorker):
         tool_name: str = "",
         tool_status: str = "",
         tool_calls_json: str = "",
+        sources_json: str = "",
     ) -> None:
         result = ChatResultMessage(
             request_id=request.request_id,
@@ -666,5 +759,6 @@ class ChatAssistantWorker(BaseWorker):
             tool_name=tool_name,
             tool_status=tool_status,
             tool_calls_json=tool_calls_json,
+            sources_json=sources_json,
         )
         await self.publish("assistant:chat_results", request.conversation_id, result.to_redis())

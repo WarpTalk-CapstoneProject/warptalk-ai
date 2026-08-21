@@ -262,6 +262,20 @@ class STTResultMessage(BaseModel):
     chunk_index: int = 0
     is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    # A sentence the model finished mid-chunk and published before the turn closed, rather
+    # than one recognised from the completed event. See stt_worker.publish_early.
+    #
+    # IT EXISTS FOR BILLING, and the invariant is worth stating exactly: the COMPLETED segment
+    # carries the whole chunk's duration whatever was emitted early (see the `"end": duration_s`
+    # comment in stt_worker/model.py — "duration_s is the WHOLE chunk's audio, while `text`
+    # here is only the trailing fragment"). So charging the completed segment alone bills the
+    # same seconds as before early publishing existed, while charging both would bill the same
+    # audio twice — and charging early segments on their own terms is worse still, since they
+    # have start_ms == end_ms and billing_worker's zero-duration fallback would price a
+    # fifteen-second turn as four one-second ones.
+    #
+    # Consumers that render or translate should IGNORE this flag; only money cares.
+    is_early: bool = False
     # How the speaker sounded saying this, measured from the audio chunk this segment came out
     # of — the only point in the pipeline where the audio still exists. None when nothing could
     # be measured; see ProsodyEnvelope.
@@ -279,6 +293,7 @@ class STTResultMessage(BaseModel):
             "end_ms": str(self.end_ms),
             "chunk_index": str(self.chunk_index),
             "is_final_chunk": "1" if self.is_final_chunk else "0",
+            "is_early": "1" if self.is_early else "0",
             "timestamp_ms": str(self.timestamp_ms),
         }
         # Omitted rather than sent as a neutral placeholder — "not measured" and "measured as
@@ -301,6 +316,9 @@ class STTResultMessage(BaseModel):
             end_ms=int(d.get("end_ms", "0")),
             chunk_index=int(d.get("chunk_index", "0")),
             is_final_chunk=d.get("is_final_chunk") == "1",
+            # Absent on anything published before this field existed, which reads as False —
+            # the safe direction, since a pre-existing message was a completed segment.
+            is_early=d.get("is_early") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
             prosody=ProsodyEnvelope.from_wire(d.get("prosody")),
         )
@@ -350,6 +368,11 @@ class TranslationResultMessage(BaseModel):
     # the first (and usually only) sentence. A consumer uses this to APPEND rather than
     # overwrite when one STT segment yields more than one translated chunk.
     chunk_index: int = 0
+    # Carried unchanged from the STT segment this was translated from, and read by
+    # billing_worker, which must NOT charge it: the completed segment for the same chunk
+    # already carries that chunk's whole duration, so charging both bills the same audio
+    # twice. See STTResultMessage.is_early for the full invariant.
+    is_early: bool = False
     # Carried unchanged from the STT segment this was translated from. The translation worker
     # measures nothing — it is the courier. Every sentence split out of one STT segment inherits
     # the same envelope, because the measurement's granularity is the audio chunk, not the
@@ -383,6 +406,7 @@ class TranslationResultMessage(BaseModel):
             "start_ms": str(self.start_ms),
             "end_ms": str(self.end_ms),
             "is_final_chunk": "1" if self.is_final_chunk else "0",
+            "is_early": "1" if self.is_early else "0",
             "timestamp_ms": str(self.timestamp_ms),
             "translator_model": self.translator_model,
             "source_segment_id": self.source_segment_id,
@@ -417,6 +441,7 @@ class TranslationResultMessage(BaseModel):
             start_ms=int(d.get("start_ms", "0")),
             end_ms=int(d.get("end_ms", "0")),
             is_final_chunk=d.get("is_final_chunk") == "1",
+            is_early=d.get("is_early") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
             translator_model=d.get("translator_model", ""),
             source_segment_id=d.get("source_segment_id", ""),
@@ -678,6 +703,11 @@ class ChatResultMessage(BaseModel):
     tool_name: str = ""
     tool_status: str = ""
     tool_calls_json: str = ""
+    #: On a "completed" event: the sources the answer actually points at, as a JSON array of
+    #: {marker, kind, title, ref?}. Empty when the answer cited nothing, which is the normal case
+    #: for a reply drawn from the conversation rather than from a tool result — see
+    #: ai_assistant_worker/citations.py for why this is not simply "the tools that ran".
+    sources_json: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -690,6 +720,7 @@ class ChatResultMessage(BaseModel):
             "tool_name": self.tool_name,
             "tool_status": self.tool_status,
             "tool_calls_json": self.tool_calls_json,
+            "sources_json": self.sources_json,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -705,6 +736,10 @@ class ChatResultMessage(BaseModel):
             tool_name=d.get("tool_name", ""),
             tool_status=d.get("tool_status", ""),
             tool_calls_json=d.get("tool_calls_json", ""),
+            # Defaulted, so a message already on the stream from a worker that predates this
+            # field is read rather than rejected — the same rolling-deploy rule the rest of this
+            # schema follows.
+            sources_json=d.get("sources_json", ""),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 
@@ -741,6 +776,10 @@ class SuggestionResultMessage(BaseModel):
     # 017-15-07-2026-translation-cluster-finalize.sql, which already lists AI_ASSISTANT
     # among the valid charge types, so no new charge type is introduced here.
     token_count: int = 0
+    #: Documents this hint drew on: the same [{marker, kind, title}] array the chat assistant
+    #: publishes, so one client component renders provenance on every AI surface. Empty for a
+    #: hint that came out of the transcript, which is the normal case.
+    sources_json: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -754,6 +793,7 @@ class SuggestionResultMessage(BaseModel):
             "confidence": str(self.confidence),
             "language": self.language,
             "token_count": str(self.token_count),
+            "sources_json": self.sources_json,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -770,6 +810,7 @@ class SuggestionResultMessage(BaseModel):
             confidence=float(d.get("confidence", "0.0")),
             language=d.get("language", ""),
             token_count=int(d.get("token_count", "0")),
+            sources_json=d.get("sources_json", ""),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 

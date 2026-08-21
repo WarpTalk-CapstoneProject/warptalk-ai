@@ -63,6 +63,52 @@ def test_the_minimum_speech_gate_does_not_count_padding_as_speech() -> None:
     assert "if len(speech_buffer) // 2 >= max_chunk_samples:" in WORKER_SOURCE, (
         "the max-chunk check must weigh the whole buffer — it is about how much audio gets sent"
     )
-    assert "if speech_samples >= min_speech_samples:" in WORKER_SOURCE, (
+    assert "speech_samples >= min_speech_samples" in WORKER_SOURCE, (
         "the minimum-speech gate must weigh the speech-only count"
+    )
+
+
+def test_a_continuation_is_not_held_to_the_minimum_speech_gate() -> None:
+    """The gate exists to stop a cough reaching the model. A leftover tail is not a cough.
+
+    After a cap or boundary-seek cut, `speech_samples` restarts at zero while the SPEAKER has
+    not stopped. If they then pause with less than `vad_min_speech_ms` of new speech buffered,
+    the old code dropped it — silently, at debug level — and those words never existed. With a
+    6000ms cap the vulnerable window is the 288ms immediately after each cut, and "speak just
+    past the cap, then pause" is exactly what expressive delivery sounds like.
+
+    So the gate is skipped when this turn has already published: what is in the buffer is the
+    remainder of an utterance the model has already been given the front of.
+    """
+    assert "published_this_turn" in WORKER_SOURCE, (
+        "nothing tracks whether this turn already sent a chunk, so a leftover tail cannot be "
+        "told apart from a fresh cough"
+    )
+    assert "speech_samples >= min_speech_samples or published_this_turn" in WORKER_SOURCE, (
+        "the minimum-speech gate is being applied to continuations again"
+    )
+
+
+def test_a_long_turn_takes_the_next_real_pause_instead_of_the_hard_cap() -> None:
+    """Boundary seeking — the reviewer's "cắt ngữ nghĩa khi nói câu dài", in code.
+
+    `chunk_duration_ms` is a hard cap that cuts wherever the speaker happens to be, and SHAS
+    (Interspeech 2022) measured pause-based segmentation retaining only 81.3% of
+    manual-segmentation BLEU — below naive fixed-length chunking — with a 2025 replication
+    finding a 7.3 BLEU spread at constant latency purely from where cuts land.
+
+    The only place this loop can cut without severing a word is a window VAD already called
+    silence, so seeking means accepting a SHORTER pause once the turn has run long. Short
+    turns must keep the full hangover, or ordinary conversation fragments.
+    """
+    assert "seek_hangover_windows" in WORKER_SOURCE, "boundary seeking is not wired at all"
+    assert "if speech_samples >= seek_after_samples" in WORKER_SOURCE, (
+        "the seek threshold must be measured on SPEECH — the buffer also holds padding and "
+        "every internal pause, so a hesitant speaker would trip it having said very little"
+    )
+    assert "else silence_hangover_windows" in WORKER_SOURCE, (
+        "a short turn must still wait the full end-of-sentence hangover"
+    )
+    assert "silence_counter >= hangover_windows" in WORKER_SOURCE, (
+        "the hangover check must read the chosen threshold, not the fixed one"
     )

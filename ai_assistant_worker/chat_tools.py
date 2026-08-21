@@ -18,6 +18,7 @@ from typing import Any, cast
 
 import httpx
 
+from ai_assistant_worker.citations import SourceRegistry
 from ai_assistant_worker.meeting_draft import (
     MEETING_TYPES,
     RECURRENCE_CHOICES,
@@ -68,6 +69,10 @@ class ToolContext:
     #: failing to start.
     billing_client: httpx.AsyncClient | None = None
     auth_client: httpx.AsyncClient | None = None
+    #: Where a tool declares what it just showed the model, so the answer can be traced back to
+    #: it. Optional and last: every existing construction site keeps working, and a context
+    #: without one simply produces no citations rather than failing.
+    citations: SourceRegistry | None = None
 
 
 @dataclass
@@ -90,6 +95,44 @@ class ChatTool:
             "description": self.description,
             "parameters": self.parameters,
         }
+
+
+def _source_kind(source_type: Any) -> str:
+    """What an indexed chunk's own sourceType means as a chip.
+
+    The indexer's vocabulary and the chip's are different sets, and mapping here keeps the closed
+    set in citations.py closed. Anything unrecognised is knowledge — true of every chunk in the
+    index, and the honest fallback when a new producer starts publishing a type this has not met.
+    """
+    raw = str(source_type or "").strip().lower()
+    if raw in {"document", "file", "attachment"}:
+        return "document"
+    if raw in {"glossary", "term"}:
+        return "glossary"
+    if raw in {"meeting", "meeting_summary", "summary"}:
+        return "meeting"
+    if raw in {"transcript", "transcript_segment"}:
+        return "transcript"
+    return "knowledge"
+
+
+def _cite(ctx: ToolContext, kind: str, title: str | None, ref: str | None = None) -> str | None:
+    """Register one source and return the marker to hand the model, or None.
+
+    None whenever there is nothing to point at — no registry on this context, or a source with no
+    title. Callers attach the marker only when it exists, so an unciteable item simply arrives
+    without one instead of carrying a marker that resolves to nothing.
+    """
+    if ctx.citations is None:
+        return None
+    return ctx.citations.register(kind, title, ref)
+
+
+def _with_marker(item: dict[str, Any], marker: str | None) -> dict[str, Any]:
+    """The item as the model sees it, carrying its marker when it has one."""
+    if marker:
+        item["marker"] = marker
+    return item
 
 
 def _auth_headers(ctx: ToolContext) -> dict[str, str]:
@@ -177,6 +220,7 @@ async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> st
                 if query_lower in haystack:
                     matches.append(
                         {
+                            "marker": _cite(ctx, "glossary", term.get("sourceTerm")),
                             "source": "workspace",
                             "glossary": glossary.get("name"),
                             "term": term.get("sourceTerm"),
@@ -218,6 +262,7 @@ async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> st
                     if query_lower in haystack:
                         matches.append(
                             {
+                                "marker": _cite(ctx, "glossary", term.get("sourceTerm")),
                                 "source": "global",
                                 "glossary": "System (Global Glossary)",
                                 "term": term_name,
@@ -457,13 +502,25 @@ async def _search_facts(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             continue
         if query and query not in f"{fact} {item.get('sourceTitle') or ''}".lower():
             continue
+        source_title = item.get("sourceTitle") or item.get("documentName")
         matches.append(
-            {
-                "fact": fact,
-                "category": item.get("factCategory"),
-                "source": item.get("sourceTitle") or item.get("documentName"),
-                "source_type": item.get("sourceType"),
-            }
+            _with_marker(
+                {
+                    "fact": fact,
+                    "category": item.get("factCategory"),
+                    "source": source_title,
+                    "source_type": item.get("sourceType"),
+                },
+                # A fact extracted from a document is cited as that document; one with no source
+                # title is knowledge with nowhere to point, and gets no marker rather than a chip
+                # nobody can open.
+                _cite(
+                    ctx,
+                    _source_kind(item.get("sourceType")),
+                    source_title,
+                    item.get("documentId") or item.get("sourceId"),
+                ),
+            )
         )
         if len(matches) >= 25:
             break
@@ -530,7 +587,22 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     if not merged:
         return json.dumps({"matches": [], "note": "No results available."})
 
-    return json.dumps({"matches": merged})
+    # Every chunk carries a marker for whatever it came out of, so an answer resting on one chunk
+    # cites that document rather than "the knowledge base".
+    cited = [
+        _with_marker(
+            dict(match),
+            _cite(
+                ctx,
+                _source_kind(match.get("sourceType")),
+                match.get("sourceTitle") or match.get("documentName"),
+                match.get("documentId") or match.get("sourceId"),
+            ),
+        )
+        for match in merged
+    ]
+
+    return json.dumps({"matches": cited})
 
 
 async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> str | None:
@@ -777,8 +849,13 @@ async def _search_documents(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             return json.dumps({"error": "Could not look up workspace documents right now."})
 
         items = response.json().get("items") or []
-        return json.dumps(
-            [
+        # Cited like every other tool's results. Without this, a question answered purely from
+        # names — "what documents do we have about X" — produced an answer resting on real
+        # documents with no chips under it, because the chips are built from registered sources
+        # and this tool registered none. The document IS the source; naming it is not less of a
+        # citation than quoting from it.
+        named = [
+            _with_marker(
                 {
                     "id": doc.get("id"),
                     "name": doc.get("name"),
@@ -789,9 +866,34 @@ async def _search_documents(ctx: ToolContext, arguments: dict[str, Any]) -> str:
                     # the model can say why rather than reporting an empty document.
                     "isAiAllowed": doc.get("isAiAllowed"),
                     "confidentialityLevel": doc.get("confidentialityLevel"),
-                }
-                for doc in items
-            ]
+                },
+                _cite(ctx, "document", doc.get("name"), doc.get("id")),
+            )
+            for doc in items
+        ]
+
+        if named or not query:
+            return json.dumps(named)
+
+        # No NAME matched — which is not the same fact as "there is no such document", and
+        # answering as though it were is what sent somebody away from a file sitting in their
+        # own list. They asked for "bug tracking"; the file is BUG-TRACKING-WT478-494.
+        #
+        # Names now fold their punctuation server-side, so that exact miss is fixed at the
+        # source. This is for the larger half the name search can never reach: people describe
+        # what a document is ABOUT far more often than they quote its title. So the miss falls
+        # through to the index that does read contents, rather than being reported as absence.
+        fallback = await _semantic_search(ctx, {"query": query})
+        return json.dumps(
+            {
+                "documentsMatchingName": [],
+                "note": (
+                    "No document NAME matched this query. Below are content matches from the "
+                    "workspace index, already cited. Answer from them and cite their markers. "
+                    "Do NOT tell the user no such document exists — say what you found."
+                ),
+                "contentMatches": json.loads(fallback),
+            }
         )
     except Exception:
         logger.exception("search_documents_error")
@@ -1576,8 +1678,11 @@ TOOLS: list[ChatTool] = [
         description=(
             "Find workspace documents by name, or list them when the user asks what "
             "documents exist. Use this whenever the user refers to a document by name "
-            "rather than by id — it returns ids to pass to get_document. Matches on the "
-            "document's name, not on its contents; use semantic_search to find a passage."
+            "rather than by id — it returns ids to pass to get_document. Name matching "
+            'ignores case, Vietnamese diacritics and punctuation, so "bug tracking" finds '
+            "BUG-TRACKING-WT478-494. When no name matches, it automatically returns content "
+            "matches from the workspace index instead — read them and answer from them; "
+            "never report that no such document exists on the strength of a name miss."
         ),
         parameters={
             "type": "object",
