@@ -33,6 +33,7 @@ from ai_assistant_worker.citations import (
 from ai_assistant_worker.citations import (
     instruction as citation_instruction,
 )
+from ai_assistant_worker.tool_targets import describe_tool_target, describe_web_search_target
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
 from shared.openai_options import responses_options
@@ -591,6 +592,9 @@ class ChatAssistantWorker(BaseWorker):
             buffer = ""
             full_text = ""
             output_items: list[Any] = []
+            # Per ITERATION, not per turn: a second round of searching is a second target, and
+            # carrying the first one over would label the new step with the old query.
+            web_search_detail = ""
 
             assert self._openai is not None, "OpenAI client must be initialized"
             stream = await self._openai.responses.create(
@@ -627,6 +631,22 @@ class ChatAssistantWorker(BaseWorker):
                 # handler, so the tool_call_started below never fires for it and a four-second
                 # search read as a stalled worker. These events are the only evidence it is
                 # running, and an event name that changes costs a step, not a turn.
+                # WHAT the hosted search is doing arrives on a different event from the fact
+                # THAT it is running: the lifecycle events below carry an item_id and nothing
+                # else, while the query (or the page being opened) lives on the item itself.
+                # Remembered here so the lifecycle events can name their target.
+                #
+                # Best-effort by design. If the item is not on the wire yet when the search
+                # starts, the started step goes out with no detail and the completed one
+                # carries it — which is why the client fills a missing detail in from the
+                # completed event rather than treating the two as unrelated.
+                elif etype in ("response.output_item.added", "response.output_item.done"):
+                    item = getattr(event, "item", None)
+                    if getattr(item, "type", "") == "web_search_call":
+                        found = describe_web_search_target(getattr(item, "action", None))
+                        if found:
+                            web_search_detail = found
+
                 elif etype.startswith("response.web_search_call."):
                     if etype.endswith(".completed") or etype.endswith(".failed"):
                         await self._publish_result(
@@ -634,12 +654,14 @@ class ChatAssistantWorker(BaseWorker):
                             type_="tool_call_completed",
                             tool_name=WEB_SEARCH_STEP_NAME,
                             tool_status="completed" if etype.endswith(".completed") else "failed",
+                            tool_detail=web_search_detail,
                         )
                     else:
                         await self._publish_result(
                             request,
                             type_="tool_call_started",
                             tool_name=WEB_SEARCH_STEP_NAME,
+                            tool_detail=web_search_detail,
                         )
 
                 elif etype == "response.completed":
@@ -667,17 +689,27 @@ class ChatAssistantWorker(BaseWorker):
                 call_id = getattr(call, "call_id", None) or f"call_{uuid.uuid4().hex}"
                 tool_name = getattr(call, "name", "") or ""
                 raw_arguments = getattr(call, "arguments", "") or ""
-                await self._publish_result(request, type_="tool_call_started", tool_name=tool_name)
+
+                # Parsed BEFORE the step is published, which is the whole point: the arguments
+                # are what the step is about, and they used to be decoded inside the handler
+                # branch — after the only event that tells anyone the call is happening.
+                try:
+                    arguments = json.loads(raw_arguments) if raw_arguments else {}
+                except json.JSONDecodeError:
+                    arguments = {}
+
+                await self._publish_result(
+                    request,
+                    type_="tool_call_started",
+                    tool_name=tool_name,
+                    tool_detail=describe_tool_target(tool_name, arguments),
+                )
 
                 tool = TOOLS_BY_NAME.get(tool_name)
                 if tool is None:
                     result_json = json.dumps({"error": f"Unknown tool '{tool_name}'."})
                     status = "failed"
                 else:
-                    try:
-                        arguments = json.loads(raw_arguments) if raw_arguments else {}
-                    except json.JSONDecodeError:
-                        arguments = {}
                     try:
                         result_json = await tool.handler(tool_context, arguments)
                         status = "completed"
@@ -687,7 +719,11 @@ class ChatAssistantWorker(BaseWorker):
                         status = "failed"
 
                 await self._publish_result(
-                    request, type_="tool_call_completed", tool_name=tool_name, tool_status=status
+                    request,
+                    type_="tool_call_completed",
+                    tool_name=tool_name,
+                    tool_status=status,
+                    tool_detail=describe_tool_target(tool_name, arguments),
                 )
 
                 # ask_user is the one tool whose OUTPUT is a UI, not text for the model. The
@@ -747,6 +783,7 @@ class ChatAssistantWorker(BaseWorker):
         content: str = "",
         tool_name: str = "",
         tool_status: str = "",
+        tool_detail: str = "",
         tool_calls_json: str = "",
         sources_json: str = "",
     ) -> None:
@@ -758,6 +795,7 @@ class ChatAssistantWorker(BaseWorker):
             content=content,
             tool_name=tool_name,
             tool_status=tool_status,
+            tool_detail=tool_detail,
             tool_calls_json=tool_calls_json,
             sources_json=sources_json,
         )

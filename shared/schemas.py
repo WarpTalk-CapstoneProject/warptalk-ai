@@ -722,6 +722,11 @@ class ChatResultMessage(BaseModel):
     content: str = ""
     tool_name: str = ""
     tool_status: str = ""
+    #: What this call is ABOUT — the phrase searched, the file opened, the site fetched. The
+    #: tool name alone says a search happened; this says which one, which is what makes a wrong
+    #: turn visible while it is still running. Empty whenever the call has no subject worth
+    #: naming (see ai_assistant_worker/tool_targets.py) — never a placeholder.
+    tool_detail: str = ""
     tool_calls_json: str = ""
     #: On a "completed" event: the sources the answer actually points at, as a JSON array of
     #: {marker, kind, title, ref?}. Empty when the answer cited nothing, which is the normal case
@@ -739,6 +744,7 @@ class ChatResultMessage(BaseModel):
             "content": self.content,
             "tool_name": self.tool_name,
             "tool_status": self.tool_status,
+            "tool_detail": self.tool_detail,
             "tool_calls_json": self.tool_calls_json,
             "sources_json": self.sources_json,
             "timestamp_ms": str(self.timestamp_ms),
@@ -755,6 +761,7 @@ class ChatResultMessage(BaseModel):
             content=d.get("content", ""),
             tool_name=d.get("tool_name", ""),
             tool_status=d.get("tool_status", ""),
+            tool_detail=d.get("tool_detail", ""),
             tool_calls_json=d.get("tool_calls_json", ""),
             # Defaulted, so a message already on the stream from a worker that predates this
             # field is read rather than rejected — the same rolling-deploy rule the rest of this
