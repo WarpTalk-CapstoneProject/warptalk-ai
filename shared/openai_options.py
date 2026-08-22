@@ -73,3 +73,24 @@ def responses_options(
     if temperature is not None and not model.startswith("gpt-5"):
         options["temperature"] = temperature
     return options
+
+
+def reasoning_summary_options(model: str) -> dict[str, Any]:
+    """Ask a reasoning model to narrate what it is doing, when it can.
+
+    WHY THIS IS WORTH ASKING FOR
+        A trail built only from tool calls can say "Searching the web" and never say WHY — and
+        between two calls, where the model is deciding what to do next, it says nothing at all.
+        The summary is the model's own account of the step it is taking, which is the only
+        source for that sentence: everything else the client could show is a label somebody
+        wrote in advance about a tool, not a description of this turn.
+
+    Off for anything outside the gpt-5 family, and separate from `responses_options` on
+    purpose. Sending `reasoning` to a model that does not take it is a 400 on the FIRST
+    request — the exact trap the header of this module exists to describe — and the assistant
+    is the only caller that wants it, so widening the shared helper would hand it to
+    translation and suggestion as well.
+    """
+    if not model.startswith("gpt-5"):
+        return {}
+    return {"reasoning": {"summary": "auto"}}

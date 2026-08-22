@@ -14,7 +14,9 @@ from ai_assistant_worker.tool_targets import (
     MAX_TARGET_CHARS,
     describe_tool_target,
     describe_web_search_target,
+    split_reasoning_summary,
 )
+from shared.openai_options import reasoning_summary_options
 
 
 class TestDescribeToolTarget:
@@ -106,3 +108,58 @@ class TestDescribeWebSearchTarget:
     def test_an_unrecognised_action_is_no_target_rather_than_a_crash(self) -> None:
         assert describe_web_search_target(None) == ""
         assert describe_web_search_target({"type": "something_new"}) == ""
+
+
+class TestSplitReasoningSummary:
+    """The model's own account of a step, as a title and the sentence under it.
+
+    A trail built from tool calls alone can say "Searching the web" and never say why, and
+    between two calls it says nothing at all. This is the only source for that sentence — and
+    it has to be split, because a title line with an indented body is how every agent UI worth
+    copying draws a step.
+    """
+
+    def test_a_bold_heading_becomes_the_title(self) -> None:
+        title, body = split_reasoning_summary(
+            "**Clarifying specifications and sources**\n\nI will re-check the official Qwen "
+            "announcements before answering."
+        )
+        assert title == "Clarifying specifications and sources"
+        assert body.startswith("I will re-check the official Qwen")
+
+    def test_a_markdown_heading_works_too(self) -> None:
+        title, body = split_reasoning_summary("## Weighing the options\nBoth paths are viable.")
+        assert title == "Weighing the options"
+        assert body == "Both paths are viable."
+
+    def test_a_paragraph_with_no_heading_keeps_all_of_itself(self) -> None:
+        # No invented title: cutting the first sentence out to sit in bold would misrepresent
+        # the model as having structured something it did not.
+        title, body = split_reasoning_summary("Just a plain thought about the question.")
+        assert title == ""
+        assert body == "Just a plain thought about the question."
+
+    def test_an_overlong_heading_is_prose_not_a_title(self) -> None:
+        long_heading = "**" + ("word " * 40).strip() + "**\n\nbody"
+        title, body = split_reasoning_summary(long_heading)
+        assert title == ""
+        assert "word" in body
+
+    def test_whitespace_only_is_nothing_at_all(self) -> None:
+        assert split_reasoning_summary("   \n  ") == ("", "")
+        assert split_reasoning_summary("") == ("", "")
+
+    def test_a_heading_with_no_body_still_titles_the_step(self) -> None:
+        title, body = split_reasoning_summary("**Checking the transcript**")
+        assert title == "Checking the transcript"
+        assert body == ""
+
+
+class TestReasoningSummaryOptions:
+    def test_a_gpt5_model_is_asked_to_narrate(self) -> None:
+        assert reasoning_summary_options("gpt-5.6-luna") == {"reasoning": {"summary": "auto"}}
+
+    def test_anything_else_is_asked_for_nothing(self) -> None:
+        # Sending `reasoning` to a model that does not take it is a 400 on the FIRST request,
+        # which is the trap shared/openai_options.py exists to describe.
+        assert reasoning_summary_options("gpt-4o-mini") == {}
