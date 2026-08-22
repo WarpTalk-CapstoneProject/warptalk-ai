@@ -165,6 +165,35 @@ _MEMBERS = ContextSource(
     use_when="the question is about a person in this workspace — their role, email, or status",
 )
 
+#: THE ONLY SOURCE OUTSIDE THIS WORKSPACE, and the last one every template reaches for.
+#:
+#: It was already handed to the model as a tool — OpenAI runs it server-side — but it was named
+#: in no template, so the "WHERE TO GET CONTEXT" list never mentioned it and the ground rules
+#: read as a flat prohibition on outside knowledge. What the model actually did with a term the
+#: workspace had never heard of was announce that it could not find it and then answer from
+#: memory anyway: production, in a live meeting, asked "@WarpBot c# là gì" and got "Mình không
+#: tìm thấy 'C#' trong transcript cuộc họp hoặc glossary của workspace" followed by a definition
+#: it had not looked up. Both halves of that are wrong — it should have searched.
+#:
+#: Listed LAST in every template on purpose: `build_system_prompt` renders sources in order and
+#: calls that order a preference, so position IS the priority. The workspace's own transcript,
+#: glossary and documents outrank the web, and a term the glossary defines is answered from the
+#: glossary even if the web disagrees.
+_WEB_SEARCH = ContextSource(
+    tool="web_search",
+    use_when=(
+        "every workspace source above has come back empty AND the question is about the wider "
+        "world — a technology, a public company, an acronym that is not this workspace's own, "
+        "anything nobody here would have written down. Search it rather than answering from "
+        "memory"
+    ),
+    caveat=(
+        "it is the last place to look and never the first, and it knows nothing about this "
+        "workspace — it cannot tell you what was said in a meeting or how this team translates "
+        "a term. Say that an answer came from the web, so the user knows it is not theirs"
+    ),
+)
+
 _MEETING_BINDING = EntityBinding(
     noun="translation room / meeting",
     arguments=(
@@ -315,8 +344,13 @@ def resolve_template(origin: str | None = None, page_type: str | None = None) ->
     return GENERAL
 
 
-def build_system_prompt(template: ChatTemplate) -> str:
-    """Generate the system prompt from the template."""
+def build_system_prompt(template: ChatTemplate, web_search_enabled: bool = True) -> str:
+    """Generate the system prompt from the template.
+
+    `web_search_enabled` mirrors the tool schema the worker actually sends. Naming a tool in the
+    prompt that was not handed to the model is worse than omitting it — the model plans a step it
+    cannot take and then has to explain itself — so the two are driven from the same setting.
+    """
     lines = [PERSONA, "", f"SITUATION — {template.label}", template.situation, ""]
 
     if template.binding is not None and template.binding.arguments:
@@ -332,7 +366,11 @@ def build_system_prompt(template: ChatTemplate) -> str:
         )
 
     lines.append("WHERE TO GET CONTEXT — in this order of preference for this situation:")
-    for source in template.sources:
+    # Appended here rather than written into all six template tuples. It applies to every
+    # situation identically, and a source that has to be remembered in six places is a source
+    # that will be missing from the seventh template somebody adds.
+    sources = template.sources + ((_WEB_SEARCH,) if web_search_enabled else ())
+    for source in sources:
         entry = f"- {source.tool}: use when {source.use_when}."
         if source.caveat:
             entry += f" Limit: {source.caveat}."
@@ -354,6 +392,18 @@ def build_system_prompt(template: ChatTemplate) -> str:
             "for. Do not silently fall back to your own knowledge.",
         ]
     )
+
+    # The escalation, spelled out. Without it the rule above reads as a flat prohibition and the
+    # model stops at "I could not find it" — or, worse, says that and then answers from memory
+    # anyway, which is what production did when asked what C# is.
+    if web_search_enabled:
+        lines.append(
+            "- WORKSPACE FIRST, WEB LAST. When the workspace sources have nothing and the "
+            "question is about the wider world rather than about this team, call web_search "
+            'instead of answering from memory and instead of stopping at "I could not find '
+            'it". Never let it override the glossary: if this workspace defines a term, its '
+            "wording wins over anything on the web."
+        )
 
     if template.style:
         lines.extend(["", "STYLE", template.style])

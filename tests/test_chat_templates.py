@@ -182,3 +182,57 @@ class TestFormatMentions:
     def test_junk_is_ignored(self) -> None:
         for payload in ("", "not json", "{}", "[]", json.dumps(["string"]), json.dumps([{}])):
             assert _format_mentions(payload) is None
+
+
+class TestWebSearchIsTheLastResort:
+    """WT — "nếu không có trong glossary thì tự search web".
+
+    `web_search` was already in the tool schema OpenAI was handed, but it was named in no
+    template, so the "WHERE TO GET CONTEXT" list never mentioned it and the ground rules read as
+    a flat ban on outside knowledge. Production, in a live meeting: "@WarpBot c# là gì" →
+    "Mình không tìm thấy 'C#' trong transcript cuộc họp hoặc glossary của workspace", followed by
+    a definition it had not looked up. Both halves wrong — it should have searched.
+    """
+
+    def test_every_situation_can_reach_the_web(self) -> None:
+        # The SOURCE LINE, not the bare word: "web_search" also appears in the ground rule
+        # below, so asserting on the word alone passes even when the tool has no place in the
+        # priority list — which is exactly the state this whole change fixes.
+        for template in TEMPLATES.values():
+            prompt = build_system_prompt(template, web_search_enabled=True)
+            assert "- web_search: use when" in prompt, template.key
+
+    def test_the_web_is_listed_after_every_workspace_source(self) -> None:
+        """Position IS the priority — the list is rendered in order and called a preference."""
+        for template in TEMPLATES.values():
+            prompt = build_system_prompt(template, web_search_enabled=True)
+            web_at = prompt.index("- web_search:")
+            for source in template.sources:
+                assert prompt.index(f"- {source.tool}:") < web_at, (template.key, source.tool)
+
+    def test_the_glossary_still_outranks_the_web(self) -> None:
+        prompt = build_system_prompt(MEETING_CHAT, web_search_enabled=True)
+        assert "WORKSPACE FIRST, WEB LAST" in prompt
+        assert "glossary" in prompt
+
+    def test_a_disabled_web_search_is_not_offered(self) -> None:
+        """A prompt that names a tool the model was not given plans a step it cannot take."""
+        prompt = build_system_prompt(MEETING_CHAT, web_search_enabled=False)
+        assert "web_search" not in prompt
+        assert "WORKSPACE FIRST, WEB LAST" not in prompt
+
+    def test_the_workspace_sources_are_unaffected_by_the_switch(self) -> None:
+        on = build_system_prompt(MEETING_CHAT, web_search_enabled=True)
+        off = build_system_prompt(MEETING_CHAT, web_search_enabled=False)
+        for source in MEETING_CHAT.sources:
+            assert f"- {source.tool}:" in on
+            assert f"- {source.tool}:" in off
+
+    def test_both_surfaces_get_the_same_rule(self) -> None:
+        """The widget and the in-meeting chat run one agent; the escalation cannot differ."""
+        widget = build_system_prompt(resolve_template(page_type="general"), web_search_enabled=True)
+        in_meeting = build_system_prompt(
+            resolve_template(origin="meeting_chat"), web_search_enabled=True
+        )
+        assert "WORKSPACE FIRST, WEB LAST" in widget
+        assert "WORKSPACE FIRST, WEB LAST" in in_meeting
