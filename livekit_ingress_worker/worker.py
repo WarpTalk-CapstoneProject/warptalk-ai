@@ -778,8 +778,26 @@ class LiveKitIngressWorker(BaseWorker):
             del self.audio_tasks[key]
             self.audio_task_tracks.pop(key, None)
 
+    def _cancel_audio_task(self, room_name: str, speaker_id: str) -> bool:
+        """Stop reading one speaker, leaving the rest of the room untouched.
+
+        Returns whether there was a live reader to stop, so the caller can log a real state
+        change rather than every repeat of an event LiveKit may fire more than once.
+        """
+        key = (room_name, speaker_id)
+        task = self.audio_tasks.get(key)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        # Dropped here rather than waiting for the done-callback: the reaper sweep runs on its
+        # own clock and would see a cancelled-but-still-registered reader as live, so a speaker
+        # who unmutes in that window would get no reader at all.
+        self.audio_tasks.pop(key, None)
+        self.audio_task_tracks.pop(key, None)
+        return True
+
     def _start_pending_audio_tasks(self, room_name: str, room: rtc.Room) -> int:
-        """Attach to every already-published human audio track we are not reading yet."""
+        """Attach to every already-published, UNMUTED human audio track we are not reading yet."""
         started = 0
         for participant in room.remote_participants.values():
             if _is_ai_bot_identity(participant.identity):
@@ -787,6 +805,11 @@ class LiveKitIngressWorker(BaseWorker):
             for pub in participant.track_publications.values():
                 track = pub.track
                 if track is None or track.kind != rtc.TrackKind.KIND_AUDIO:
+                    continue
+                # WT-542. Without this the reaper sweep undoes the mute: it re-attaches any
+                # track with no live reader, which after on_track_muted is precisely the
+                # muted one, and the hallucinations resume one sweep later.
+                if pub.muted:
                     continue
                 if self._start_audio_task(room_name, participant.identity, track):
                     self.logger.info(
@@ -1217,10 +1240,75 @@ class LiveKitIngressWorker(BaseWorker):
             if track.kind == rtc.TrackKind.KIND_AUDIO and not _is_ai_bot_identity(
                 participant.identity
             ):
+                if publication.muted:
+                    # WT-542. Somebody who joined muted is not speaking, and reading them
+                    # anyway is what put words in their mouth — see on_track_muted.
+                    self.logger.info(
+                        "audio_track_subscribed_muted",
+                        participant=participant.identity,
+                        track=track.sid,
+                    )
+                    return
                 self.logger.info(
                     "audio_track_subscribed", participant=participant.identity, track=track.sid
                 )
                 self._start_audio_task(room_name, participant.identity, track)
+
+        @room.on("track_muted")
+        def on_track_muted(
+            participant: rtc.RemoteParticipant,
+            publication: rtc.RemoteTrackPublication,
+        ) -> None:
+            """WT-542: stop reading a microphone its owner has switched off.
+
+            A muted publication is not a silent one. LiveKit keeps the subscription alive and
+            the reader keeps receiving frames — near-silence, room tone, whatever the encoder
+            emits — and near-silence is exactly the input Whisper invents text from. Production
+            room 01a01e3f: a participant who was muted for the whole meeting was credited with
+            thirteen segments of English in a Vietnamese call, including the profanity string
+            Whisper is known to hallucinate on empty audio.
+
+            No amount of downstream filtering fixes that honestly, because there is no text a
+            muted microphone could legitimately produce. The audio must not be read at all.
+            """
+            if publication.kind != rtc.TrackKind.KIND_AUDIO or _is_ai_bot_identity(
+                participant.identity
+            ):
+                return
+            if self._cancel_audio_task(room_name, participant.identity):
+                self.logger.info(
+                    "audio_reader_stopped_on_mute",
+                    room=room_name,
+                    participant=participant.identity,
+                    track=publication.sid,
+                )
+
+        @room.on("track_unmuted")
+        def on_track_unmuted(
+            participant: rtc.RemoteParticipant,
+            publication: rtc.RemoteTrackPublication,
+        ) -> None:
+            """The other half of WT-542 — and the half that must not be missed.
+
+            Without it a participant who muted once would stay unread for the rest of the
+            meeting. The reaper sweep would eventually re-attach them, but "eventually" is up
+            to one sweep interval of speech lost every time somebody unmutes, so the event
+            re-attaches immediately and the sweep stays the backstop it was written to be.
+            """
+            if publication.kind != rtc.TrackKind.KIND_AUDIO or _is_ai_bot_identity(
+                participant.identity
+            ):
+                return
+            track = publication.track
+            if track is None:
+                return
+            if self._start_audio_task(room_name, participant.identity, track):
+                self.logger.info(
+                    "audio_reader_resumed_on_unmute",
+                    room=room_name,
+                    participant=participant.identity,
+                    track=track.sid,
+                )
 
         @room.on("disconnected")
         def on_disconnected(reason: Any = None) -> None:

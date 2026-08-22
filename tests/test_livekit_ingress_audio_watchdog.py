@@ -56,6 +56,10 @@ def _room_with_speaker(track: MagicMock | None, identity: str = SPEAKER) -> Magi
     participant.identity = identity
     publication = MagicMock()
     publication.track = track
+    # Explicitly False, not left to MagicMock: an auto-attribute is truthy, and WT-542 made the
+    # sweep skip muted publications — so an unset `muted` would silently mean "muted" here and
+    # this test would assert the watchdog is broken.
+    publication.muted = False
     participant.track_publications = {"pub-1": publication}
 
     room = MagicMock()

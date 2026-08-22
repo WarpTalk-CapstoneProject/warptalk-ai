@@ -24,7 +24,11 @@ from typing import Any
 
 from shared.base_worker import BaseWorker
 from shared.config import SuggestionSettings
-from shared.schemas import STTResultMessage, SuggestionResultMessage
+from shared.schemas import (
+    STT_UNKNOWN_CONFIDENCE,
+    STTResultMessage,
+    SuggestionResultMessage,
+)
 from suggestion_worker.suggester import (
     SUGGESTION_CATEGORIES,
     NullSuggester,
@@ -307,7 +311,30 @@ class SuggestionWorker(BaseWorker):
         )
         if len(turn.text.split()) < floor:
             return False
-        return confidence >= self.suggestion_settings.min_stt_confidence
+
+        # WT-543 — AN ABSENT MEASUREMENT IS NOT A BAD ONE.
+        #
+        # `confidence` is an average token logprob, and STT_UNKNOWN_CONFIDENCE (-1.0) is the
+        # sentinel stt_worker publishes when the provider exposed no logprobs at all. Compared as
+        # if it were a score it is below every floor, so this line rejected the segment — and
+        # stage 0 spends no tokens and writes no log line, so it rejected it in complete silence.
+        #
+        # That stopped being hypothetical on 2026-08-15, when the realtime STT path stopped
+        # reporting logprobs: transcript segments carrying a confidence fell from ~85% to ~1% of
+        # the day's rows, and the last suggestion this worker ever produced was 2026-08-14 11:10.
+        # Six days of meetings, the worker healthy, its consumer group reading all 5,800 entries
+        # with zero lag, and not one suggestion — which is precisely how WT-543 was reported.
+        #
+        # The same guard stt_worker/model.py already applies to this field (see the language
+        # floor there): test the sentinel for equality first, and let unknown through. The decide
+        # model is the real gate; this one exists to skip the obviously worthless, and "we do not
+        # know how confident the recogniser was" is not evidence of worthlessness.
+        if (
+            confidence != STT_UNKNOWN_CONFIDENCE
+            and confidence < self.suggestion_settings.min_stt_confidence
+        ):
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Workspace consent
