@@ -33,10 +33,14 @@ from ai_assistant_worker.citations import (
 from ai_assistant_worker.citations import (
     instruction as citation_instruction,
 )
-from ai_assistant_worker.tool_targets import describe_tool_target, describe_web_search_target
+from ai_assistant_worker.tool_targets import (
+    describe_tool_target,
+    describe_web_search_target,
+    split_reasoning_summary,
+)
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
-from shared.openai_options import responses_options
+from shared.openai_options import reasoning_summary_options, responses_options
 from shared.schemas import ChatRequestMessage, ChatResultMessage
 
 SIBLING_SERVICE_TIMEOUT_SECONDS = 15.0
@@ -595,6 +599,10 @@ class ChatAssistantWorker(BaseWorker):
             # Per ITERATION, not per turn: a second round of searching is a second target, and
             # carrying the first one over would label the new step with the old query.
             web_search_detail = ""
+            # The reasoning summary the model is currently writing. Accumulated across deltas
+            # and published whole, because half a sentence appearing and then being completed
+            # under the reader is worse than the sentence arriving a moment later.
+            summary_buffer = ""
 
             assert self._openai is not None, "OpenAI client must be initialized"
             stream = await self._openai.responses.create(
@@ -604,6 +612,7 @@ class ChatAssistantWorker(BaseWorker):
                     self.chat_settings.max_tokens,
                     self.chat_settings.temperature,
                 ),
+                **reasoning_summary_options(self.chat_settings.model),
                 instructions=instructions,
                 input=cast(Any, conversation),
                 tools=cast(Any, tool_schemas),
@@ -631,6 +640,35 @@ class ChatAssistantWorker(BaseWorker):
                 # handler, so the tool_call_started below never fires for it and a four-second
                 # search read as a stalled worker. These events are the only evidence it is
                 # running, and an event name that changes costs a step, not a turn.
+                # THE MODEL'S OWN ACCOUNT OF WHAT IT IS DOING.
+                #
+                # A trail built from tool calls alone can say "Searching the web" and never say
+                # why — and between two calls, where the model is deciding what to do next, it
+                # says nothing at all. These events are the only source for that sentence.
+                #
+                # Published per PART rather than per delta: a summary arrives as a heading and a
+                # paragraph, and a step that rewrites itself word by word under the reader is
+                # movement without information.
+                elif etype == "response.reasoning_summary_text.delta":
+                    summary_buffer += getattr(event, "delta", "") or ""
+
+                elif etype in (
+                    "response.reasoning_summary_text.done",
+                    "response.reasoning_summary_part.done",
+                ):
+                    # .done carries the whole text on some shapes and nothing on others; the
+                    # buffer is what every shape agrees on.
+                    whole = getattr(event, "text", "") or summary_buffer
+                    summary_buffer = ""
+                    title, body = split_reasoning_summary(whole)
+                    if title or body:
+                        await self._publish_result(
+                            request,
+                            type_="reasoning",
+                            content=body,
+                            tool_detail=title,
+                        )
+
                 # WHAT the hosted search is doing arrives on a different event from the fact
                 # THAT it is running: the lifecycle events below carry an item_id and nothing
                 # else, while the query (or the page being opened) lives on the item itself.
