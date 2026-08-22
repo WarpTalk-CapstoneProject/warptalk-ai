@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from shared.config import SuggestionSettings, WorkerSettings
-from shared.schemas import STTResultMessage
+from shared.schemas import STT_UNKNOWN_CONFIDENCE, STTResultMessage
 from suggestion_worker.suggester import (
     GeneratedSuggestion,
     NullSuggester,
@@ -257,6 +257,37 @@ class TestStageZeroGating:
         # -0.6: poor but still above stt_worker's own -0.7 discard floor, so this is a
         # segment that really does reach this worker and really should be declined.
         await worker.process(b"1-0", stt_message(confidence=-0.6))
+
+        assert suggester.decide_calls == []
+
+    @pytest.mark.asyncio
+    async def test_unreported_stt_confidence_is_not_treated_as_bad_confidence(self) -> None:
+        """WT-543 — the sentinel is an absence, not a score.
+
+        STT_UNKNOWN_CONFIDENCE (-1.0) is what stt_worker publishes when the provider exposed no
+        token logprobs at all. Compared against the floor it is below every threshold, so this
+        worker declined the segment — silently, because stage 0 spends no tokens and logs
+        nothing.
+
+        On 2026-08-15 the realtime STT path stopped reporting logprobs and the share of
+        transcript rows carrying a confidence fell from ~85% to ~1% of the day. The last
+        suggestion production ever made was 2026-08-14 11:10: six days of meetings, a healthy
+        worker reading all 5,800 stream entries with zero lag, and not one suggestion.
+        """
+        worker, _, suggester = build_worker()
+
+        await worker.process(b"1-0", stt_message(confidence=STT_UNKNOWN_CONFIDENCE))
+
+        assert suggester.decide_calls != [], (
+            "a segment with no reported confidence must still reach the decide stage"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_real_measurement_below_the_floor_is_still_dropped(self) -> None:
+        """The guard is equality against the sentinel, not "anything negative passes"."""
+        worker, _, suggester = build_worker()
+
+        await worker.process(b"1-0", stt_message(confidence=-0.95))
 
         assert suggester.decide_calls == []
 
