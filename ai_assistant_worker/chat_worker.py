@@ -562,7 +562,13 @@ class ChatAssistantWorker(BaseWorker):
             template=template.key,
             origin=request.origin,
         )
-        instructions_parts = [build_system_prompt(template), _now_message()]
+        # The same flag that decides whether the tool is in the schema below decides whether
+        # the prompt names it. A prompt that offers a tool the model was not given is a plan
+        # it cannot carry out.
+        instructions_parts = [
+            build_system_prompt(template, web_search_enabled=self.chat_settings.web_search_enabled),
+            _now_message(),
+        ]
         page_context_message = _format_page_context(request.page_context_json)
         if page_context_message:
             instructions_parts.append(page_context_message)
