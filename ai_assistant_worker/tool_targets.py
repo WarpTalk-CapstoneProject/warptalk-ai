@@ -87,6 +87,37 @@ def describe_tool_target(tool_name: str, arguments: Any) -> str:
     return ""
 
 
+#: A reasoning summary opens with its own heading — "**Weighing the options**\n\nI should…" —
+#: and the heading is the step, while the paragraph under it is what the step is about. Split so
+#: the client can draw the two the way every agent UI does: a title line, and an indented
+#: sentence beneath it.
+_SUMMARY_HEADING = re.compile(r"^\s*(?:\*\*|##+\s*)(?P<title>[^*\n]{2,80}?)(?:\*\*)?\s*(?:\n|$)")
+
+#: A title is a label, not a sentence. Anything longer is prose that happened to be first.
+MAX_SUMMARY_TITLE_CHARS = 72
+
+
+def split_reasoning_summary(text: str) -> tuple[str, str]:
+    """One summary part as (title, body).
+
+    Falls back to ("", whole text) rather than inventing a title: a summary with no heading is
+    a paragraph, and cutting its first sentence off to sit in bold would misrepresent the model
+    as having structured something it did not.
+    """
+    if not text or not text.strip():
+        return "", ""
+
+    cleaned = text.strip()
+    match = _SUMMARY_HEADING.match(cleaned)
+    if match:
+        title = " ".join(match.group("title").split())
+        body = cleaned[match.end() :].strip()
+        if title and len(title) <= MAX_SUMMARY_TITLE_CHARS:
+            return title, " ".join(body.split())
+
+    return "", " ".join(cleaned.split())
+
+
 def _attr(source: Any, name: str) -> Any:
     """Read a field from an SDK object or from the dict the same payload arrives as.
 
