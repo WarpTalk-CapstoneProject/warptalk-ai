@@ -659,6 +659,25 @@ class RedisStreamClient:
         """Get all fields/values of a hash."""
         return await self.redis.hgetall(key)
 
+    async def rpush_capped(
+        self, key: str, value: bytes | str, *, max_len: int, ttl_seconds: int
+    ) -> None:
+        """Append to a list, keep only the newest `max_len`, and refresh its TTL.
+
+        One pipeline rather than three round trips, because this runs once per transcript
+        segment on the live path. The trim is what stops a very long meeting — or a room left
+        open overnight — from growing a list nobody bounded.
+        """
+        pipe = self.redis.pipeline()
+        pipe.rpush(key, value)
+        pipe.ltrim(key, -max_len, -1)
+        pipe.expire(key, ttl_seconds)
+        await pipe.execute()
+
+    async def lrange(self, key: str, start: int = 0, stop: int = -1) -> list[bytes | str]:
+        """Every element of a list, oldest first."""
+        return list(await self.redis.lrange(key, start, stop))
+
     async def set_with_ttl(self, key: str, value: bytes | str, ttl_seconds: int) -> None:
         """Set a key with expiration."""
         await self.redis.setex(key, ttl_seconds, value)
