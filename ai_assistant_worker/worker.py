@@ -19,6 +19,14 @@ from typing import Any, cast
 from ai_assistant_worker.assistant import MeetingAssistant
 from ai_assistant_worker.speaker_names import SpeakerNamer, parse_speaker_names
 from ai_assistant_worker.summary_templates import format_transcript_line
+from ai_assistant_worker.transcript_buffer import (
+    BUFFER_TTL_S,
+    MAX_BUFFERED_SEGMENTS,
+    buffer_key,
+    choose_segments,
+    decode_segments,
+    encode_segment,
+)
 from shared.base_worker import BaseWorker
 from shared.config import AssistantSettings, resolve_openai_api_key
 from shared.control_markers import is_control_marker
@@ -93,9 +101,29 @@ class AIAssistantWorker(BaseWorker):
         if stt_result.meeting_id not in self._transcripts:
             self._transcripts[stt_result.meeting_id] = []
 
-        self._transcripts[stt_result.meeting_id].append(
-            (stt_result.speaker_id, stt_result.text, stt_result.timestamp_ms)
-        )
+        segment = (stt_result.speaker_id, stt_result.text, stt_result.timestamp_ms)
+        self._transcripts[stt_result.meeting_id].append(segment)
+
+        # WT-536: the same segment, somewhere a restart cannot erase it. A deploy between the
+        # first word and the last used to take the whole meeting with it, and the summary that
+        # came out said the transcript was empty while the database held every line of it.
+        #
+        # Best-effort and never fatal: this is the live path, and a Redis hiccup must cost at
+        # most this one line's insurance — the in-memory copy is still there, and
+        # choose_segments picks whichever ends up more complete.
+        try:
+            await self.redis.rpush_capped(
+                buffer_key(stt_result.meeting_id),
+                encode_segment(segment),
+                max_len=MAX_BUFFERED_SEGMENTS,
+                ttl_seconds=BUFFER_TTL_S,
+            )
+        except Exception:
+            self.logger.warning(
+                "transcript_buffer_append_failed",
+                meeting_id=stt_result.meeting_id,
+                exc_info=True,
+            )
 
         self.logger.debug(
             "transcript_accumulated",
@@ -115,12 +143,33 @@ class AIAssistantWorker(BaseWorker):
 
     async def _generate_summary(self, meeting_id: str) -> None:
         """Generate and publish meeting summary."""
-        segments = substantive_segments(self._transcripts.get(meeting_id, []))
+        # WT-536: memory alone was the whole record, and the whole record died with the process.
+        try:
+            buffered = decode_segments(await self.redis.lrange(buffer_key(meeting_id)))
+        except Exception:
+            self.logger.warning(
+                "transcript_buffer_read_failed", meeting_id=meeting_id, exc_info=True
+            )
+            buffered = []
+
+        in_memory = self._transcripts.get(meeting_id, [])
+        chosen = choose_segments(in_memory, buffered)
+        if len(buffered) > len(in_memory):
+            # Worth an INFO line: it says a restart happened mid-meeting AND that the summary
+            # survived it, which is the only externally visible sign this fix is doing anything.
+            self.logger.info(
+                "transcript_recovered_from_buffer",
+                meeting_id=meeting_id,
+                in_memory=len(in_memory),
+                buffered=len(buffered),
+            )
+
+        segments = substantive_segments(chosen)
         if not segments:
             # Dropped here as well as on the success path: this method runs once per meeting,
             # on the end-of-meeting marker, so nothing will ever add to this entry again and
             # leaving it behind grows the accumulator for the life of the process.
-            self._transcripts.pop(meeting_id, None)
+            await self._forget_meeting(meeting_id)
             return
 
         # Format transcript WITH the moment each line was spoken. The timestamp was
@@ -259,7 +308,27 @@ class AIAssistantWorker(BaseWorker):
         )
 
         # Cleanup
-        del self._transcripts[meeting_id]
+        #
+        # `.pop`, not `del`: a meeting recovered from the buffer after a restart has no entry in
+        # memory at all, and a KeyError here would throw away a summary that had already been
+        # published and stored.
+        await self._forget_meeting(meeting_id)
+
+    async def _forget_meeting(self, meeting_id: str) -> None:
+        """Release both copies of a finished meeting's transcript.
+
+        This method runs once per meeting, on the end-of-meeting marker, so nothing will ever
+        add to either copy again. The Redis buffer has its own TTL as a backstop for a meeting
+        that never ends properly; dropping it here is what keeps the normal case tidy.
+        """
+        self._transcripts.pop(meeting_id, None)
+        try:
+            await self.redis.delete(buffer_key(meeting_id))
+        except Exception:
+            # It expires on its own. Never worth failing a finished summary over.
+            self.logger.warning(
+                "transcript_buffer_delete_failed", meeting_id=meeting_id, exc_info=True
+            )
 
     def _require_assistant(self) -> MeetingAssistant:
         if self.assistant is None:
