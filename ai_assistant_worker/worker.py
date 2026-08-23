@@ -17,6 +17,7 @@ import time
 from typing import Any, cast
 
 from ai_assistant_worker.assistant import MeetingAssistant
+from ai_assistant_worker.speaker_names import SpeakerNamer, parse_speaker_names
 from ai_assistant_worker.summary_templates import format_transcript_line
 from shared.base_worker import BaseWorker
 from shared.config import AssistantSettings, resolve_openai_api_key
@@ -128,8 +129,32 @@ class AIAssistantWorker(BaseWorker):
         # to the first segment so a cited atMs resolves against the stored transcript,
         # which is rendered the same way: a base time plus a per-segment offset.
         base_ms = min(ts for _, _, ts in segments)
+
+        # WT-529 — `speaker` here is the LiveKit participant identity
+        # ("speaker-019f0d00-0de0-7000-9000-000000000003"), and it went into the prompt
+        # verbatim. The model repeated the only name it was given, so summaries and action
+        # items attributed decisions to a uuid.
+        #
+        # Best-effort by design: a missing or unreadable map is the normal case for a room the
+        # room service never published names for, and SpeakerNamer answers it with readable
+        # per-meeting pseudonyms rather than the id. Never a reason to fail the summary.
+        try:
+            speaker_names = parse_speaker_names(
+                await self.redis.hgetall(f"meeting:{meeting_id}:speaker_names")
+            )
+        except Exception:
+            self.logger.warning("failed_to_read_speaker_names", meeting_id=meeting_id)
+            speaker_names = {}
+
+        namer = SpeakerNamer(speaker_names)
+        self.logger.info(
+            "resolving_speaker_names",
+            meeting_id=meeting_id,
+            published_names=len(speaker_names),
+        )
+
         transcript_lines = [
-            format_transcript_line(ts - base_ms, speaker, text.strip())
+            format_transcript_line(ts - base_ms, namer.name_for(speaker), text.strip())
             for speaker, text, ts in segments
         ]
         transcript_text = "\n".join(transcript_lines)
