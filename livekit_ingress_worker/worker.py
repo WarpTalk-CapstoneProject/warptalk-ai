@@ -312,6 +312,9 @@ class LiveKitIngressWorker(BaseWorker):
         # rather than being refused as a duplicate of it.
         self.audio_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self.audio_task_tracks: dict[tuple[str, str], str] = {}
+        # WT-529: in-flight speaker-name writes, held so the event loop cannot collect a task
+        # nobody awaits. Discarded on completion — see _remember_speaker_name.
+        self._speaker_name_tasks: set[asyncio.Task[None]] = set()
         self._vad_model: Any | None = None
         # One lock per room, held across the whole handler. Events arrive as independent
         # tasks (see _consume_loop), so without this two events for the same room could
@@ -744,6 +747,54 @@ class LiveKitIngressWorker(BaseWorker):
         except Exception:
             self.logger.warning("room_disconnect_failed", room=room_name, exc_info=True)
 
+    # Long enough to outlive any real meeting — the summary is written when it ends — and short
+    # enough that a finished room's names expire on their own. Matches the transcript anchor.
+    _SPEAKER_NAMES_TTL_S = 6 * 60 * 60
+
+    def _remember_speaker_name(self, room_name: str, participant: rtc.RemoteParticipant) -> None:
+        """Record how to say this speaker's name out loud. WT-529.
+
+        The summariser accumulates `(speaker_id, text, ts)` off `stt:results`, where speaker_id is
+        the LiveKit identity — `speaker-019f0d00-…`. That went into the prompt verbatim, the model
+        repeated the only name it was given, and meeting summaries attributed decisions to a uuid.
+
+        The name is already here and was simply never written down: the join token carries a
+        `name` claim (LiveKitTokenService), so LiveKit populates `participant.name` for us.
+
+        A HASH, one field per participant, because this runs once per speaker as they are met —
+        two ingress replicas doing read-modify-write on a JSON blob would lose whichever name
+        landed second.
+
+        Fire-and-forget and entirely best-effort: a room with no names summarises with readable
+        per-meeting pseudonyms (`Speaker 1`), which is what SpeakerNamer is for. Nothing about
+        reading audio may depend on this write.
+        """
+        name = (participant.name or "").strip()
+        if not name or name == participant.identity:
+            # No claim on the token, or a client that sent the identity as the name. Either way
+            # there is nothing here a reader could not already see, and writing it would only
+            # move the uuid from the transcript into the map.
+            return
+
+        async def write() -> None:
+            try:
+                key = f"meeting:{room_name}:speaker_names"
+                await self.redis.hset(key, participant.identity, name)
+                await self.redis.expire(key, self._SPEAKER_NAMES_TTL_S)
+            except Exception:
+                self.logger.warning(
+                    "speaker_name_not_recorded",
+                    room=room_name,
+                    participant=participant.identity,
+                    exc_info=True,
+                )
+
+        task = asyncio.create_task(write())
+        # Held so the loop cannot garbage-collect a task nobody awaits, and discarded on
+        # completion so the set does not grow for the life of the process.
+        self._speaker_name_tasks.add(task)
+        task.add_done_callback(self._speaker_name_tasks.discard)
+
     def _start_audio_task(self, room_name: str, speaker_id: str, track: rtc.Track) -> bool:
         """Start this speaker's VAD pipeline, replacing any reader left on a stale track."""
         key = (room_name, speaker_id)
@@ -811,6 +862,7 @@ class LiveKitIngressWorker(BaseWorker):
                 # muted one, and the hallucinations resume one sweep later.
                 if pub.muted:
                     continue
+                self._remember_speaker_name(room_name, participant)
                 if self._start_audio_task(room_name, participant.identity, track):
                     self.logger.info(
                         "subscribing_existing_audio_track",
@@ -1252,6 +1304,9 @@ class LiveKitIngressWorker(BaseWorker):
                 self.logger.info(
                     "audio_track_subscribed", participant=participant.identity, track=track.sid
                 )
+                # WT-529 — here rather than inside _start_audio_task because that method takes
+                # the identity string and never sees the participant carrying the name.
+                self._remember_speaker_name(room_name, participant)
                 self._start_audio_task(room_name, participant.identity, track)
 
         @room.on("track_muted")
