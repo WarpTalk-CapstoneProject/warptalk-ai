@@ -73,6 +73,7 @@ class ToolContext:
     #: it. Optional and last: every existing construction site keeps working, and a context
     #: without one simply produces no citations rather than failing.
     citations: SourceRegistry | None = None
+    assistant_client: httpx.AsyncClient | None = None
 
 
 @dataclass

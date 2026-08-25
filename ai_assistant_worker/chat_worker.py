@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -25,13 +26,21 @@ import httpx
 from openai import AsyncOpenAI
 
 from ai_assistant_worker.chat_templates import PERSONA, build_system_prompt, resolve_template
-from ai_assistant_worker.chat_tools import TOOLS, TOOLS_BY_NAME, ToolContext
+from ai_assistant_worker.chat_tools import TOOLS, TOOLS_BY_NAME, ChatTool, ToolContext
 from ai_assistant_worker.citations import (
     SourceRegistry,
     strip_markers,
 )
 from ai_assistant_worker.citations import (
     instruction as citation_instruction,
+)
+from ai_assistant_worker.mcp_tools import (
+    build_mcp_confirmation_questions as _build_mcp_confirmation_questions,
+)
+from ai_assistant_worker.mcp_tools import normalize_mcp_tool_payload as _normalize_mcp_tool_payload
+from ai_assistant_worker.mcp_tools import split_mcp_tool_arguments as _split_mcp_tool_arguments
+from ai_assistant_worker.mcp_tools import (
+    with_mcp_confirmation_parameter as _with_mcp_confirmation_parameter,
 )
 from ai_assistant_worker.tool_targets import (
     describe_tool_target,
@@ -407,6 +416,7 @@ class ChatAssistantWorker(BaseWorker):
         self.chat_settings = chat_settings or ChatAssistantSettings()
         self._openai: AsyncOpenAI | None = None
         self._workspace_client: httpx.AsyncClient | None = None
+        self._assistant_client: httpx.AsyncClient | None = None
         self._transcript_client: httpx.AsyncClient | None = None
         self._translation_room_client: httpx.AsyncClient | None = None
         # Only get_platform_analytics uses these two, and only with the caller's own token —
@@ -422,6 +432,10 @@ class ChatAssistantWorker(BaseWorker):
         self._openai = AsyncOpenAI(api_key=api_key)
         self._workspace_client = httpx.AsyncClient(
             base_url=self.chat_settings.workspace_service_url,
+            timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
+        )
+        self._assistant_client = httpx.AsyncClient(
+            base_url=self.chat_settings.assistant_service_url,
             timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
         )
         self._transcript_client = httpx.AsyncClient(
@@ -445,6 +459,7 @@ class ChatAssistantWorker(BaseWorker):
     async def _cleanup(self) -> None:
         for client in (
             self._workspace_client,
+            self._assistant_client,
             self._transcript_client,
             self._translation_room_client,
             self._billing_client,
@@ -458,6 +473,7 @@ class ChatAssistantWorker(BaseWorker):
 
         if (
             self._workspace_client is None
+            or self._assistant_client is None
             or self._transcript_client is None
             or self._translation_room_client is None
             or self._openai is None
@@ -490,6 +506,7 @@ class ChatAssistantWorker(BaseWorker):
             user_id=request.user_id,
             bearer_token=request.bearer_token,
             workspace_client=self._workspace_client,
+            assistant_client=self._assistant_client,
             transcript_client=self._transcript_client,
             translation_room_client=self._translation_room_client,
             billing_client=self._billing_client,
@@ -583,7 +600,12 @@ class ChatAssistantWorker(BaseWorker):
         ]
         _attach_attachments(conversation, request.images_json, self.logger)
 
-        tool_schemas: list[dict[str, Any]] = [t.to_openai_schema() for t in TOOLS]
+        dynamic_mcp_tools = await self._load_dynamic_mcp_tools(request, tool_context)
+        tool_lookup = {**TOOLS_BY_NAME, **{tool.name: tool for tool in dynamic_mcp_tools}}
+        tool_schemas: list[dict[str, Any]] = [
+            *(t.to_openai_schema() for t in TOOLS),
+            *(t.to_openai_schema() for t in dynamic_mcp_tools),
+        ]
 
         # OpenAI's HOSTED web search, not a ChatTool: the model calls it and OpenAI runs it
         # server-side, so it has no handler here and never reaches the dispatch below — that loop
@@ -749,7 +771,7 @@ class ChatAssistantWorker(BaseWorker):
                     tool_detail=describe_tool_target(tool_name, arguments),
                 )
 
-                tool = TOOLS_BY_NAME.get(tool_name)
+                tool = tool_lookup.get(tool_name)
                 if tool is None:
                     result_json = json.dumps({"error": f"Unknown tool '{tool_name}'."})
                     status = "failed"
@@ -819,6 +841,136 @@ class ChatAssistantWorker(BaseWorker):
             )
 
         return final_text, tool_call_log
+
+    async def _load_dynamic_mcp_tools(
+        self,
+        request: ChatRequestMessage,
+        tool_context: ToolContext,
+    ) -> list[ChatTool]:
+        assistant_client = tool_context.assistant_client
+        if not isinstance(assistant_client, httpx.AsyncClient):
+            return []
+
+        try:
+            response = await assistant_client.get(
+                "/api/v1/assistant/mcp/tools",
+                params={"workspaceId": request.workspace_id},
+                headers={"Authorization": request.bearer_token} if request.bearer_token else {},
+            )
+        except Exception:
+            self.logger.exception("mcp_tool_discovery_failed", request_id=request.request_id)
+            return []
+
+        if response.status_code != 200:
+            self.logger.warning(
+                "mcp_tool_discovery_rejected",
+                request_id=request.request_id,
+                status=response.status_code,
+            )
+            return []
+
+        try:
+            tools_payload = response.json()
+        except ValueError:
+            self.logger.warning("mcp_tool_discovery_invalid_json", request_id=request.request_id)
+            return []
+
+        if not isinstance(tools_payload, list):
+            return []
+
+        tools: list[ChatTool] = []
+        static_names = set(TOOLS_BY_NAME)
+        for item in tools_payload:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            plugin_key = str(item.get("pluginKey") or "").strip()
+            if not name or not plugin_key or name in static_names:
+                continue
+
+            parameters = item.get("parameters")
+            if not isinstance(parameters, dict):
+                parameters = {"type": "object", "properties": {}, "additionalProperties": False}
+
+            label = str(item.get("label") or name)
+            description = str(item.get("description") or label)
+            effect = str(item.get("effect") or "")
+            tools.append(
+                ChatTool(
+                    name=name,
+                    description=description,
+                    parameters=_with_mcp_confirmation_parameter(
+                        cast(dict[str, Any], parameters),
+                        effect=effect,
+                    ),
+                    handler=self._build_mcp_tool_handler(plugin_key, name, request),
+                )
+            )
+
+        return tools
+
+    def _build_mcp_tool_handler(
+        self,
+        plugin_key: str,
+        tool_name: str,
+        request: ChatRequestMessage,
+    ) -> Callable[[ToolContext, dict[str, Any]], Awaitable[str]]:
+        async def handler(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+            assistant_client = ctx.assistant_client
+            if assistant_client is None:
+                return json.dumps({"error": "Plugin tools are not available right now."})
+
+            tool_arguments, confirmation_token = _split_mcp_tool_arguments(arguments)
+            response = await assistant_client.post(
+                "/api/v1/assistant/mcp/tools/execute",
+                json={
+                    "workspaceId": request.workspace_id,
+                    "pluginKey": plugin_key,
+                    "toolName": tool_name,
+                    "arguments": tool_arguments,
+                    "conversationId": request.conversation_id,
+                    "assistantMessageId": None,
+                    "confirmationToken": confirmation_token,
+                },
+                headers={"Authorization": request.bearer_token} if request.bearer_token else {},
+            )
+
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {"error": "Plugin tool returned an invalid response."}
+
+            if response.status_code >= 400:
+                return json.dumps(
+                    {
+                        "error": (
+                            payload.get("message")
+                            or payload.get("error")
+                            or "Plugin tool failed."
+                        ),
+                        "status": response.status_code,
+                        "code": payload.get("code"),
+                    }
+                )
+
+            normalized = _normalize_mcp_tool_payload(payload)
+            user_action = normalized.get("userAction")
+            if (
+                isinstance(user_action, dict)
+                and user_action.get("type") == "confirm_write"
+            ):
+                await self._publish_result(
+                    request,
+                    type_="question",
+                    tool_name=tool_name,
+                    tool_calls_json=json.dumps(
+                        _build_mcp_confirmation_questions(normalized, tool_name=tool_name)
+                    ),
+                )
+
+            return json.dumps(normalized)
+
+        return handler
 
     async def _publish_result(
         self,

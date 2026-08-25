@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from ai_assistant_worker import chat_worker as chat_worker_module
@@ -81,6 +82,9 @@ def _build_worker(
 def _request(
     *,
     origin: str = "assistant",
+    conversation_id: str = "conversation-1",
+    workspace_id: str = "workspace-1",
+    bearer_token: str = "Bearer token",
     page_context_json: str = "",
     mentions_json: str = "",
     # WT-474. Present with its real default rather than left off: the worker reads
@@ -90,6 +94,9 @@ def _request(
 ) -> Any:
     return SimpleNamespace(
         request_id="req-1",
+        conversation_id=conversation_id,
+        workspace_id=workspace_id,
+        bearer_token=bearer_token,
         origin=origin,
         page_context_json=page_context_json,
         mentions_json=mentions_json,
@@ -176,6 +183,150 @@ class TestAgentLoop:
         assert tool_log[0]["status"] == "failed"
         assert "error" in json.loads(tool_log[0]["result"])
         assert any(p["type_"] == "tool_call_completed" for p in published)
+
+    async def test_dynamic_mcp_tool_is_discovered_and_executed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(chat_worker_module, "TOOLS", [])
+        monkeypatch.setattr(chat_worker_module, "TOOLS_BY_NAME", {})
+
+        seen_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_requests.append(request)
+            if request.method == "GET":
+                assert request.url.params["workspaceId"] == "workspace-1"
+                assert request.headers["Authorization"] == "Bearer token"
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "name": "google_drive_search",
+                            "pluginKey": "google_workspace",
+                            "label": "Search Google Drive",
+                            "description": "Search files in Google Drive.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"query": {"type": "string"}},
+                                "required": ["query"],
+                            },
+                        }
+                    ],
+                )
+
+            payload = json.loads(request.content)
+            assert payload["workspaceId"] == "workspace-1"
+            assert payload["conversationId"] == "conversation-1"
+            assert payload["pluginKey"] == "google_workspace"
+            assert payload["toolName"] == "google_drive_search"
+            assert payload["arguments"] == {"query": "roadmap"}
+            return httpx.Response(200, json={"isSuccess": True, "data": {"files": []}})
+
+        assistant_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://assistant-service",
+        )
+        worker, _ = _build_worker(
+            [
+                [_completed(_function_call("google_drive_search", '{"query":"roadmap"}'))],
+                [_text_delta("No files found."), _completed(_message_item())],
+            ]
+        )
+        worker.chat_settings.web_search_enabled = False
+
+        try:
+            text, tool_log = await worker._run_agent_loop(
+                _request(),
+                [],
+                SimpleNamespace(assistant_client=assistant_client, citations=None),
+            )
+        finally:
+            await assistant_client.aclose()
+
+        assert text == "No files found."
+        assert [request.method for request in seen_requests] == ["GET", "POST"]
+        first_call_kwargs = worker._openai.responses.create.await_args_list[0].kwargs
+        assert first_call_kwargs["tools"] == [
+            {
+                "type": "function",
+                "name": "google_drive_search",
+                "description": "Search files in Google Drive.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            }
+        ]
+        assert tool_log[0]["tool"] == "google_drive_search"
+        assert json.loads(tool_log[0]["result"]) == {"isSuccess": True, "data": {"files": []}}
+
+    async def test_dynamic_mcp_tool_sends_confirmation_token_outside_arguments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(chat_worker_module, "TOOLS", [])
+        monkeypatch.setattr(chat_worker_module, "TOOLS_BY_NAME", {})
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "name": "google_calendar_create_event",
+                            "pluginKey": "google_workspace",
+                            "label": "Create Google Calendar event",
+                            "description": "Create a Google Calendar event.",
+                            "effect": "write",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "summary": {"type": "string"},
+                                },
+                                "required": ["summary"],
+                            },
+                        }
+                    ],
+                )
+
+            payload = json.loads(request.content)
+            assert payload["arguments"] == {"summary": "Roadmap review"}
+            assert payload["confirmationToken"] == "token-1"
+            return httpx.Response(200, json={"isSuccess": True, "data": {"eventId": "evt-1"}})
+
+        assistant_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://assistant-service",
+        )
+        worker, _ = _build_worker(
+            [
+                [
+                    _completed(
+                        _function_call(
+                            "google_calendar_create_event",
+                            '{"summary":"Roadmap review","confirmationToken":"token-1"}',
+                        )
+                    )
+                ],
+                [_text_delta("Created."), _completed(_message_item())],
+            ]
+        )
+        worker.chat_settings.web_search_enabled = False
+
+        try:
+            text, _ = await worker._run_agent_loop(
+                _request(),
+                [],
+                SimpleNamespace(assistant_client=assistant_client, citations=None),
+            )
+        finally:
+            await assistant_client.aclose()
+
+        assert text == "Created."
+        first_call_kwargs = worker._openai.responses.create.await_args_list[0].kwargs
+        tool_parameters = first_call_kwargs["tools"][0]["parameters"]
+        assert "confirmationToken" in tool_parameters["properties"]
+        assert tool_parameters["required"] == ["summary"]
 
     async def test_system_prompt_travels_as_instructions(self) -> None:
         """Responses carries the system prompt out of band, not as a leading message."""

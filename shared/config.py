@@ -576,6 +576,7 @@ class ChatAssistantSettings(BaseSettings):
     # buffered-unit convention (STT/TTS/AI-assistant results are never per-token either).
     chunk_flush_chars: int = 40
     workspace_service_url: str = "http://localhost:5106"
+    assistant_service_url: str = "http://localhost:5108"
     transcript_service_url: str = "http://localhost:5103"
     translation_room_service_url: str = "http://localhost:5102"
     # Reached only by get_platform_analytics, and only ever with the caller's own bearer token —
