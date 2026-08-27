@@ -158,7 +158,27 @@ class WorkerSettings(BaseSettings):
     # Overridable per deployment as VAD_THRESHOLD, with no rebuild: a close-mic studio can
     # raise it, a hall can lower it further, and neither needs this default to move again.
     vad_threshold: float = 0.35  # Speech detection threshold
-    vad_pre_speech_ms: int = 192  # Two ~96ms windows preserve word onsets
+    # WT-576 / WT-571 — FOUR ~96ms windows, raised from two.
+    #
+    # Two windows "preserve word onsets" only for an onset the VAD calls on its first frame.
+    # Silero decides per 32ms frame and needs a frame or two of evidence, so a plosive or an
+    # unvoiced fricative — the /k/ of "can", the /s/ of "start" — is already partly past by the
+    # time speech is declared. 192ms of lead-in leaves roughly one window of genuine margin, and
+    # that is the reported symptom: the first word of a turn arriving clipped or, for a short
+    # opening utterance, not arriving at all.
+    #
+    # NO LATENCY COST. This is audio already captured and held in the ring; widening it changes
+    # what is PREPENDED to a chunk, not when the chunk is sent.
+    #
+    # NO ENERGY-GATE COST EITHER, which was the thing worth checking before touching it. The
+    # ingress energy floor averages RMS over the whole padded chunk, so more padding used to mean
+    # a stricter gate for short utterances — the exact population this is meant to rescue. That
+    # dilution is already undone: the floor is scaled by sqrt(speech_samples / total_samples)
+    # (livekit_ingress_worker/worker.py, "WEIGHED AGAINST THE SPEECH, NOT AGAINST THE PADDING"),
+    # so the threshold on speech loudness is unchanged by this value.
+    #
+    # Overridable per deployment as VAD_PRE_SPEECH_MS, with no rebuild.
+    vad_pre_speech_ms: int = 384
     # Four ~96ms windows retain quiet final syllables and natural micro-pauses. A
     # two-window production replay cut "Kubernetes" to "Kuber".
     vad_silence_hangover_ms: int = 576
