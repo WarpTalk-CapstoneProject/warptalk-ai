@@ -13,10 +13,12 @@ from typing import Any
 import pytest
 
 from suggestion_worker.suggester import (
+    _DECIDE_SYSTEM_PROMPT,
     NullSuggester,
     OpenAISuggester,
     SuggestionDecision,
     TranscriptTurn,
+    _generate_system_prompt,
 )
 
 
@@ -402,3 +404,70 @@ class TestGeneratedSources:
 
         assert suggestion is not None
         assert suggestion.sources == ()
+
+
+# ── WT-582: the term category could fire but never answer ────────────────────────────────
+
+
+def test_term_may_answer_from_general_knowledge() -> None:
+    """`decide` fires `term` on a term the meeting has NOT defined, and `generate` used to be
+    told to ground every claim in the transcript or the documents and otherwise return "".
+
+    Those two rules cannot both hold. The trigger condition for the category was the same
+    condition that forced an empty answer, so "we should look into Next.js" produced a badge
+    that opened onto nothing. The reader saw an assistant that had noticed the term and had
+    nothing to say about it.
+    """
+    prompt = _generate_system_prompt(160, "term")
+
+    assert "general knowledge" in prompt
+    # The instruction that used to silence it must now be explicitly disclaimed.
+    assert "do NOT reach for it merely because the meeting never explained the term" in prompt
+
+
+def test_meeting_specific_facts_still_may_not_come_from_memory() -> None:
+    """Opening the door to public knowledge must not open it to invented meeting facts.
+
+    An invented owner or date is far worse than a missing hint: it is indistinguishable from a
+    sourced one, and it is about people in the room.
+    """
+    prompt = _generate_system_prompt(160, "term")
+
+    assert "SPECIFIC TO THIS MEETING OR THIS TEAM" in prompt
+    assert "Never supply one of those from memory" in prompt
+    for meeting_fact in ("who owns something", "dates", "figures", "decisions"):
+        assert meeting_fact in prompt
+
+
+def test_only_term_and_correction_may_use_public_knowledge() -> None:
+    """`fact` in particular must not: it means "the meeting's own documents cover this", and a
+    recalled figure reaches the reader looking exactly like a sourced one.
+    """
+    prompt = _generate_system_prompt(160, "fact")
+    assert "only the `term` and `correction` hints may use it" in prompt
+
+
+def test_correction_covers_a_claim_that_is_wrong_about_the_world() -> None:
+    """It used to mean intra-transcript contradictions only, so a statement that was simply
+    wrong — ".NET 10 for the frontend" — matched no category at all and passed in silence.
+    """
+    assert "misstates a widely established fact" in _DECIDE_SYSTEM_PROMPT
+    assert ".NET 10 for the frontend" in _DECIDE_SYSTEM_PROMPT
+
+
+def test_correction_keeps_a_high_bar_and_corrects_the_fact_not_the_person() -> None:
+    """The failure mode of a wider `correction` is an assistant that contradicts people over
+    preferences, or over an unusual-but-deliberate choice. Both are named in the prompts.
+    """
+    assert "not a matter of opinion" in _DECIDE_SYSTEM_PROMPT
+    assert "may simply be doing differently on purpose" in _DECIDE_SYSTEM_PROMPT
+
+    contract = _generate_system_prompt(160, "correction")
+    assert "Correct the FACT, never the person" in contract
+
+
+def test_term_fires_on_a_term_being_used_not_only_asked_about() -> None:
+    """ "we should look into Next.js" is a statement, not a question. Reading `term` as
+    question-shaped is why a plain mention produced nothing.
+    """
+    assert "fires on a term being USED as much as on one being asked about" in _DECIDE_SYSTEM_PROMPT
