@@ -37,6 +37,9 @@ from ai_assistant_worker.citations import (
 from ai_assistant_worker.mcp_tools import (
     build_mcp_confirmation_questions as _build_mcp_confirmation_questions,
 )
+from ai_assistant_worker.mcp_tools import (
+    build_mcp_plugin_connection_action as _build_mcp_plugin_connection_action,
+)
 from ai_assistant_worker.mcp_tools import normalize_mcp_tool_payload as _normalize_mcp_tool_payload
 from ai_assistant_worker.mcp_tools import split_mcp_tool_arguments as _split_mcp_tool_arguments
 from ai_assistant_worker.mcp_tools import (
@@ -184,6 +187,17 @@ def _format_mentions(mentions_json: str) -> str | None:
         if normalized is None:
             continue
         entity_type, entity_id, label = normalized
+        if entity_type == "plugin":
+            # A plugin mention isn't a record to look up - it's the user pointing WarpBot at a
+            # capability (e.g. "@Google Drive"). entity_id is the plugin's catalog key, or
+            # "pluginKey:resourceKey" for one product of a plugin whose tools split into several
+            # (see PluginDisplayTile on the frontend); either way the model already has that
+            # plugin's tool schemas in `tools` for this turn and picks the right one itself.
+            lines.append(
+                f'- plugin "{label}" (id={entity_id}) — the user explicitly selected this '
+                "plugin for this request; prefer its tools over any other way of answering."
+            )
+            continue
         tool_hint = _MENTION_TOOL_HINTS.get(entity_type, "an appropriate tool")
         lines.append(f'- {entity_type} "{label}" (id={entity_id}) — look it up with {tool_hint}.')
 
@@ -941,15 +955,16 @@ class ChatAssistantWorker(BaseWorker):
                 payload = {"error": "Plugin tool returned an invalid response."}
 
             if response.status_code >= 400:
+                error_payload = payload if isinstance(payload, dict) else {}
                 return json.dumps(
                     {
                         "error": (
-                            payload.get("message")
-                            or payload.get("error")
+                            error_payload.get("message")
+                            or error_payload.get("error")
                             or "Plugin tool failed."
                         ),
                         "status": response.status_code,
-                        "code": payload.get("code"),
+                        "code": error_payload.get("code") or error_payload.get("errorCode"),
                     }
                 )
 
@@ -966,6 +981,16 @@ class ChatAssistantWorker(BaseWorker):
                     tool_calls_json=json.dumps(
                         _build_mcp_confirmation_questions(normalized, tool_name=tool_name)
                     ),
+                )
+            elif (
+                isinstance(user_action, dict)
+                and user_action.get("type") == "plugin_connection_required"
+            ):
+                await self._publish_result(
+                    request,
+                    type_="question",
+                    tool_name=tool_name,
+                    tool_calls_json=json.dumps(_build_mcp_plugin_connection_action(normalized)),
                 )
 
             return json.dumps(normalized)

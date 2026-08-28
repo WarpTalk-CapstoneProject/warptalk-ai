@@ -1,12 +1,36 @@
 from ai_assistant_worker.mcp_tools import (
     build_mcp_confirmation_questions,
+    build_mcp_plugin_connection_action,
     normalize_mcp_tool_payload,
     split_mcp_tool_arguments,
     with_mcp_confirmation_parameter,
 )
 
 
-def test_connection_required_maps_to_connect_action() -> None:
+def test_connection_required_with_plugin_metadata_maps_to_plugin_connection_action() -> None:
+    payload = normalize_mcp_tool_payload(
+        {
+            "isSuccess": False,
+            "errorCode": "connection_required",
+            "message": "Your Google Drive connection has expired.",
+            "pluginKey": "google_workspace",
+            "pluginLabel": "Google Drive",
+            "connectionStatus": "expired",
+            "connectedAccountEmail": "user@example.test",
+        }
+    )
+
+    assert payload["userAction"] == {
+        "type": "plugin_connection_required",
+        "pluginKey": "google_workspace",
+        "pluginLabel": "Google Drive",
+        "connectionStatus": "expired",
+        "connectedAccountEmail": "user@example.test",
+        "message": "Your Google Drive connection has expired.",
+    }
+
+
+def test_connection_required_without_plugin_metadata_keeps_legacy_connect_action() -> None:
     payload = normalize_mcp_tool_payload(
         {
             "isSuccess": False,
@@ -16,6 +40,32 @@ def test_connection_required_maps_to_connect_action() -> None:
     )
 
     assert payload["userAction"]["type"] == "connect_plugin"
+
+
+def test_plugin_connection_action_payload_can_be_forwarded_to_clients() -> None:
+    payload = build_mcp_plugin_connection_action(
+        {
+            "userAction": {
+                "type": "plugin_connection_required",
+                "pluginKey": "google_workspace",
+                "pluginLabel": "Google Calendar",
+                "connectionStatus": "not_connected",
+                "connectedAccountEmail": None,
+                "message": "Connect Google Calendar before WarpBot can use it.",
+            }
+        }
+    )
+
+    assert payload == {
+        "pluginConnection": {
+            "type": "plugin_connection_required",
+            "pluginKey": "google_workspace",
+            "pluginLabel": "Google Calendar",
+            "connectionStatus": "not_connected",
+            "connectedAccountEmail": None,
+            "message": "Connect Google Calendar before WarpBot can use it.",
+        }
+    }
 
 
 def test_confirmation_required_keeps_confirmation_token() -> None:

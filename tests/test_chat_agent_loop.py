@@ -328,6 +328,138 @@ class TestAgentLoop:
         assert "confirmationToken" in tool_parameters["properties"]
         assert tool_parameters["required"] == ["summary"]
 
+    async def test_dynamic_mcp_tool_publishes_plugin_connection_action(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(chat_worker_module, "TOOLS", [])
+        monkeypatch.setattr(chat_worker_module, "TOOLS_BY_NAME", {})
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "name": "google_drive_search",
+                            "pluginKey": "google_workspace",
+                            "label": "Search Google Drive",
+                            "description": "Search files in Google Drive.",
+                            "effect": "read",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"query": {"type": "string"}},
+                                "required": ["query"],
+                            },
+                        }
+                    ],
+                )
+
+            return httpx.Response(
+                200,
+                json={
+                    "isSuccess": False,
+                    "errorCode": "connection_required",
+                    "message": "Your Google Drive connection has expired.",
+                    "pluginKey": "google_workspace",
+                    "pluginLabel": "Google Drive",
+                    "connectionStatus": "expired",
+                    "connectedAccountEmail": "user@example.test",
+                },
+            )
+
+        assistant_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://assistant-service",
+        )
+        worker, published = _build_worker(
+            [
+                [_completed(_function_call("google_drive_search", '{"query":"roadmap"}'))],
+                [_text_delta("Please reconnect Google Drive."), _completed(_message_item())],
+            ]
+        )
+        worker.chat_settings.web_search_enabled = False
+
+        try:
+            text, tool_log = await worker._run_agent_loop(
+                _request(),
+                [],
+                SimpleNamespace(assistant_client=assistant_client, citations=None),
+            )
+        finally:
+            await assistant_client.aclose()
+
+        assert text == "Please reconnect Google Drive."
+        question_events = [p for p in published if p["type_"] == "question"]
+        assert len(question_events) == 1
+        action_payload = json.loads(question_events[0]["tool_calls_json"])
+        assert action_payload["pluginConnection"] == {
+            "type": "plugin_connection_required",
+            "pluginKey": "google_workspace",
+            "pluginLabel": "Google Drive",
+            "connectionStatus": "expired",
+            "connectedAccountEmail": "user@example.test",
+            "message": "Your Google Drive connection has expired.",
+        }
+        tool_result = json.loads(tool_log[0]["result"])
+        assert tool_result["userAction"]["type"] == "plugin_connection_required"
+
+    async def test_dynamic_mcp_get_file_tool_is_loaded_from_catalog(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(chat_worker_module, "TOOLS", [])
+        monkeypatch.setattr(chat_worker_module, "TOOLS_BY_NAME", {})
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "name": "google_drive_get_file",
+                            "pluginKey": "google_workspace",
+                            "label": "Get Google Drive file",
+                            "description": "Read a file from Google Drive.",
+                            "effect": "read",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"fileId": {"type": "string"}},
+                                "required": ["fileId"],
+                            },
+                        }
+                    ],
+                )
+
+            payload = json.loads(request.content)
+            assert payload["toolName"] == "google_drive_get_file"
+            assert payload["arguments"] == {"fileId": "file-1"}
+            return httpx.Response(200, json={"isSuccess": True, "data": {"name": "notes.txt"}})
+
+        assistant_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://assistant-service",
+        )
+        worker, _ = _build_worker(
+            [
+                [_completed(_function_call("google_drive_get_file", '{"fileId":"file-1"}'))],
+                [_text_delta("Here is the file."), _completed(_message_item())],
+            ]
+        )
+        worker.chat_settings.web_search_enabled = False
+
+        try:
+            text, _ = await worker._run_agent_loop(
+                _request(),
+                [],
+                SimpleNamespace(assistant_client=assistant_client, citations=None),
+            )
+        finally:
+            await assistant_client.aclose()
+
+        assert text == "Here is the file."
+        assert worker._openai.responses.create.await_args_list[0].kwargs["tools"][0]["name"] == (
+            "google_drive_get_file"
+        )
+
     async def test_system_prompt_travels_as_instructions(self) -> None:
         """Responses carries the system prompt out of band, not as a leading message."""
         worker, _ = _build_worker([[_text_delta("hi"), _completed(_message_item())]])
