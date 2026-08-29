@@ -41,6 +41,14 @@ class AudioChunkMessage(BaseModel):
     vad_confidence: float = 0.0
     speech_start_ms: int = 0
     speech_end_ms: int = 0
+    #: How much of `audio_data` VAD actually called SPEECH, in ms — not how long the chunk is.
+    #: Every chunk is wrapped in pre-speech and hangover padding, so its PCM duration overstates
+    #: the speech inside it by roughly a second, and the STT-side guards that ask "was there
+    #: enough audio to justify this text" are useless when handed the padded number.
+    #:
+    #: 0 means the publisher did not say — an older ingress through a rolling deploy — and is
+    #: read downstream as unknown, never as silence.
+    speech_ms: int = 0
     input_lufs: float = 0.0
     noise_suppression_enabled: bool = False
     is_final_chunk: bool = False
@@ -65,6 +73,7 @@ class AudioChunkMessage(BaseModel):
             "vad_confidence": str(self.vad_confidence),
             "speech_start_ms": str(self.speech_start_ms),
             "speech_end_ms": str(self.speech_end_ms),
+            "speech_ms": str(self.speech_ms),
             "input_lufs": str(self.input_lufs),
             "noise_suppression_enabled": _bool_to_redis(self.noise_suppression_enabled),
             "is_final_chunk": "1" if self.is_final_chunk else "0",
@@ -87,6 +96,7 @@ class AudioChunkMessage(BaseModel):
             vad_confidence=float(d.get("vad_confidence", "0.0")),
             speech_start_ms=int(d.get("speech_start_ms", "0")),
             speech_end_ms=int(d.get("speech_end_ms", "0")),
+            speech_ms=int(d.get("speech_ms", "0")),
             input_lufs=float(d.get("input_lufs", "0.0")),
             noise_suppression_enabled=_redis_to_bool(d.get("noise_suppression_enabled", "false")),
             is_final_chunk=d.get("is_final_chunk") == "1",

@@ -741,6 +741,11 @@ class STTWorker(BaseWorker):
                 # The dub-echo guard's reference lines (see _matches_recent_dub). Fetched
                 # here because only the worker can reach Redis; the filter is pure.
                 recent_dub_texts=recent_dub_texts,
+                # What the ingress worker's VAD actually called speech in this chunk, as
+                # opposed to how long the chunk is — the two differ by the ~1s of pre-speech
+                # and hangover padding every chunk carries, which is enough to make the
+                # "too much text for this little audio" guard unable to fire at all.
+                speech_ms=chunk.speech_ms,
             )
         except Exception as exc:
             await self.redis.publish_system_event(
