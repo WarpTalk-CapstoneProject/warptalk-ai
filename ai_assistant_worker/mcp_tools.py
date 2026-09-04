@@ -81,7 +81,10 @@ def normalize_mcp_tool_payload(payload: Any) -> dict[str, Any]:
             "pluginKey": payload.get("pluginKey"),
             "pluginLabel": payload.get("pluginLabel"),
             "message": payload.get("message")
-            or "This app's provider needs credentials registered by an administrator before it can be connected.",
+            or (
+                "This app's provider needs credentials registered by an administrator "
+                "before it can be connected."
+            ),
         }
     elif error_code == "confirmation_required":
         normalized["userAction"] = {

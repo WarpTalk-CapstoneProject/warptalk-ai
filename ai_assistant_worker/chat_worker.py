@@ -39,6 +39,8 @@ from ai_assistant_worker.mcp_tools import (
 )
 from ai_assistant_worker.mcp_tools import (
     build_mcp_operator_setup_action as _build_mcp_operator_setup_action,
+)
+from ai_assistant_worker.mcp_tools import (
     build_mcp_plugin_connection_action as _build_mcp_plugin_connection_action,
 )
 from ai_assistant_worker.mcp_tools import normalize_mcp_tool_payload as _normalize_mcp_tool_payload
