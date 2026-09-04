@@ -119,3 +119,29 @@ def test_write_tool_schema_gets_optional_confirmation_token_parameter() -> None:
     assert "confirmationToken" in updated["properties"]
     assert updated["required"] == ["summary"]
     assert "confirmationToken" not in parameters["properties"]
+
+
+def test_client_registration_unsupported_does_not_offer_a_connect_action() -> None:
+    """A provider that supports no registration mechanism cannot be fixed by connecting.
+
+    Offering the connect card here is the failure this error code exists to prevent: the user
+    clicks Connect, the ladder exhausts again, and nothing in the loop says an operator has to
+    register an app. The action must name that instead.
+    """
+    normalized = normalize_mcp_tool_payload(
+        {
+            "isSuccess": False,
+            "errorCode": "client_registration_unsupported",
+            "pluginKey": "remote_app",
+            "pluginLabel": "Remote App",
+            "message": "This provider needs an administrator to register an OAuth app.",
+        }
+    )
+
+    action = normalized["userAction"]
+    assert action["type"] == "plugin_needs_operator_setup"
+    assert action["pluginLabel"] == "Remote App"
+    assert action["message"] == "This provider needs an administrator to register an OAuth app."
+
+    # And it must not be mistaken for a connect prompt by the card builder.
+    assert build_mcp_plugin_connection_action(normalized) == {}

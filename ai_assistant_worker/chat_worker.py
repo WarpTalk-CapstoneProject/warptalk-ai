@@ -38,6 +38,7 @@ from ai_assistant_worker.mcp_tools import (
     build_mcp_confirmation_questions as _build_mcp_confirmation_questions,
 )
 from ai_assistant_worker.mcp_tools import (
+    build_mcp_operator_setup_action as _build_mcp_operator_setup_action,
     build_mcp_plugin_connection_action as _build_mcp_plugin_connection_action,
 )
 from ai_assistant_worker.mcp_tools import normalize_mcp_tool_payload as _normalize_mcp_tool_payload
@@ -991,6 +992,19 @@ class ChatAssistantWorker(BaseWorker):
                     type_="question",
                     tool_name=tool_name,
                     tool_calls_json=json.dumps(_build_mcp_plugin_connection_action(normalized)),
+                )
+            elif (
+                isinstance(user_action, dict)
+                and user_action.get("type") == "plugin_needs_operator_setup"
+            ):
+                # Its own branch rather than a variant of the one above: this card carries no
+                # Connect button, because the registration ladder has already been exhausted and
+                # pressing Connect would just walk it again.
+                await self._publish_result(
+                    request,
+                    type_="question",
+                    tool_name=tool_name,
+                    tool_calls_json=json.dumps(_build_mcp_operator_setup_action(normalized)),
                 )
 
             return json.dumps(normalized)

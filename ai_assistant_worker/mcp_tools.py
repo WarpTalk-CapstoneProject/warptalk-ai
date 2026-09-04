@@ -70,6 +70,19 @@ def normalize_mcp_tool_payload(payload: Any) -> dict[str, Any]:
                 "type": "connect_plugin",
                 "message": "Ask the user to connect this plugin from Personal Settings > Plugins.",
             }
+    elif error_code == "client_registration_unsupported":
+        # Deliberately not a connect action. The plugin's authorization server supports neither
+        # metadata-document clients nor dynamic registration, so no amount of clicking Connect
+        # helps - an operator has to register an app and supply a client id. Offering the connect
+        # button here would send the user in a loop, which is the exact failure this error code
+        # exists to avoid.
+        normalized["userAction"] = {
+            "type": "plugin_needs_operator_setup",
+            "pluginKey": payload.get("pluginKey"),
+            "pluginLabel": payload.get("pluginLabel"),
+            "message": payload.get("message")
+            or "This app's provider needs credentials registered by an administrator before it can be connected.",
+        }
     elif error_code == "confirmation_required":
         normalized["userAction"] = {
             "type": "confirm_write",
@@ -105,6 +118,35 @@ def build_mcp_plugin_connection_action(payload: dict[str, Any]) -> dict[str, Any
             "pluginLabel": plugin_label,
             "connectionStatus": connection_status,
             "connectedAccountEmail": user_action.get("connectedAccountEmail"),
+            "message": user_action.get("message"),
+        }
+    }
+
+
+def build_mcp_operator_setup_action(payload: dict[str, Any]) -> dict[str, Any]:
+    """Surface a provider that no registration mechanism can reach.
+
+    Kept separate from ``build_mcp_plugin_connection_action`` on purpose: the two look similar but
+    mean opposite things to a user. One says "press Connect", the other says "no button here will
+    help". Merging them would put a Connect button on a flow that has already exhausted the
+    registration ladder.
+    """
+    user_action = payload.get("userAction")
+    if not isinstance(user_action, dict):
+        return {}
+    if user_action.get("type") != "plugin_needs_operator_setup":
+        return {}
+
+    plugin_key = str(user_action.get("pluginKey") or "").strip()
+    plugin_label = str(user_action.get("pluginLabel") or "").strip()
+    if not plugin_key or not plugin_label:
+        return {}
+
+    return {
+        "pluginOperatorSetup": {
+            "type": "plugin_needs_operator_setup",
+            "pluginKey": plugin_key,
+            "pluginLabel": plugin_label,
             "message": user_action.get("message"),
         }
     }
