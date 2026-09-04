@@ -173,8 +173,7 @@ def build_mcp_confirmation_questions(
                         "label": "Confirm",
                         "description": "Run this write action once.",
                         "value": (
-                            f"Confirm the {tool_name} plugin action. "
-                            f"confirmationToken: {token}"
+                            f"Confirm the {tool_name} plugin action. confirmationToken: {token}"
                         ),
                     },
                     {

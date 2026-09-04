@@ -187,7 +187,13 @@ class TestFormatMentions:
         """WT-565: @Google Drive isn't a record to fetch - it's the user picking a capability."""
         message = _format_mentions(
             json.dumps(
-                [{"entityType": "plugin", "entityId": "google_workspace:drive", "label": "Google Drive"}]
+                [
+                    {
+                        "entityType": "plugin",
+                        "entityId": "google_workspace:drive",
+                        "label": "Google Drive",
+                    }
+                ]
             )
         )
         assert message is not None

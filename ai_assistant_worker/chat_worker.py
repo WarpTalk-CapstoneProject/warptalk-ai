@@ -971,10 +971,7 @@ class ChatAssistantWorker(BaseWorker):
 
             normalized = _normalize_mcp_tool_payload(payload)
             user_action = normalized.get("userAction")
-            if (
-                isinstance(user_action, dict)
-                and user_action.get("type") == "confirm_write"
-            ):
+            if isinstance(user_action, dict) and user_action.get("type") == "confirm_write":
                 await self._publish_result(
                     request,
                     type_="question",
