@@ -813,6 +813,12 @@ def _filter_segments(
     chunk_offset_ms: int,
     allowed_languages: set[str] | None = None,
     real_duration_s: float | None = None,
+    #: Seconds of this chunk that VAD actually called SPEECH, when the publisher said so.
+    #: `real_duration_s` is the whole PCM including the pre-speech and hangover padding VAD
+    #: wraps every utterance in — about a second of it — so a guard that asks "was there
+    #: enough audio to justify this text" and is handed that number can never fire. This is
+    #: the number that question is actually about.
+    speech_duration_s: float | None = None,
     context_prompt: str | None = None,
     keywords: list[str] | None = None,
     min_avg_logprob: float = -0.7,
@@ -1032,21 +1038,36 @@ def _filter_segments(
             )
             continue
 
-        # Unlike no_speech/avg_logprob above, this IS a real signal — only passed for the
-        # trailing fragment in transcribe() (the whole chunk's actual PCM duration via
-        # _pcm16_duration_seconds), never for early-emitted sentences (which have no real
-        # per-sentence timing to check against, see _emit_early). No human produces this
-        # many characters, in any language, in this little audio — the classic
-        # Whisper-family failure mode of a full sentence hallucinated onto near-silence.
+        # Unlike no_speech/avg_logprob above, this IS a real signal on the production model.
+        # No human produces this many characters, in any language, in this little audio — the
+        # classic Whisper-family failure mode of a full sentence hallucinated onto near-silence.
+        #
+        # WEIGHED AGAINST THE SPEECH, NOT AGAINST THE PADDING AROUND IT. It used to read
+        # `real_duration_s`, which is the whole chunk's PCM — and VAD wraps every utterance in
+        # `vad_pre_speech_ms` + `vad_silence_hangover_ms` of padding, so that number is about a
+        # second even for a chunk holding 300ms of speech. Against a 0.5s threshold it could
+        # therefore never fire in production: the guard was live in the source and dead in the
+        # room. Exactly the defect the minimum-speech gate had at the ingress (WT-371 #7).
+        #
+        # `speech_duration_s` covers the whole chunk while `text` may be one sentence of
+        # several, so this still OVER-estimates the audio backing this particular text. That is
+        # the safe direction — it can only miss a hallucination, never drop real speech — and it
+        # is why the early-emitted path may use it without per-sentence timing of its own.
+        evidence_duration_s = (
+            speech_duration_s if speech_duration_s is not None else real_duration_s
+        )
         if (
-            real_duration_s is not None
-            and real_duration_s < _MIN_SPEECH_SECONDS_FOR_LONG_TEXT
+            evidence_duration_s is not None
+            and evidence_duration_s < _MIN_SPEECH_SECONDS_FOR_LONG_TEXT
             and len(text) > _MAX_CHARS_FOR_SHORT_AUDIO
         ):
             logger.info(
                 "filtered_text_too_long_for_audio",
                 text=text[:60],
-                duration_s=round(real_duration_s, 2),
+                duration_s=round(evidence_duration_s, 2),
+                speech_duration_s=(
+                    round(speech_duration_s, 2) if speech_duration_s is not None else None
+                ),
             )
             continue
 
@@ -1338,6 +1359,7 @@ class OpenAISTT:
         on_speculative_segment: Callable[[TranscribedSegment], Awaitable[None]] | None = None,
         streamed_epoch: int | None = None,
         recent_dub_texts: Sequence[str] | None = None,
+        speech_ms: int = 0,
     ) -> list[TranscribedSegment]:
         """Transcribe raw audio bytes via the OpenAI Realtime API.
 
@@ -1347,6 +1369,10 @@ class OpenAISTT:
             language: ISO 639-1 hint or None for auto-detect (fed to the session as
                 input_audio_transcription.language — see _get_or_create_session)
             chunk_offset_ms: Timestamp offset to add to segment times
+            speech_ms: how much of `audio_bytes` VAD called speech, as published by the
+                ingress worker. 0 means it did not say. Feeds the "too much text for this
+                little audio" guard, which against the chunk's PADDED duration could never
+                fire — see _filter_segments.
             meeting_id, speaker_id: key the reused realtime session for this speaker
             allowed_languages: the meeting's declared language set (from participants'
                 profile speak-languages). Segments outside it are dropped; the speaker's
@@ -1387,6 +1413,11 @@ class OpenAISTT:
 
         detected_language = lang_arg or "unknown"
 
+        # Seconds of real speech in this chunk, or None when the publisher did not say — an
+        # older ingress through a rolling deploy, or any caller that is not the audio pipeline
+        # (tools/, the second pass). None restores the previous behaviour exactly.
+        speech_duration_s = (speech_ms / 1000.0) if speech_ms > 0 else None
+
         async def _emit_early(sentence_text: str) -> None:
             if on_early_segment is None:
                 return
@@ -1396,13 +1427,21 @@ class OpenAISTT:
                         "text": sentence_text,
                         "start": 0.0,
                         "end": 0.0,
-                        "avg_logprob": 0.0,
+                        # NOT 0.0, which is what this said and which is a perfect score. This
+                        # path has no logprob at all — a delta carries none — and claiming the
+                        # best possible one silently exempted early sentences from every
+                        # confidence-shaped guard below. In flash mode MOST production segments
+                        # come through here, so that exemption covered most of the meeting. The
+                        # sentinel is this codebase's word for "unknown", and it routes the
+                        # blocklist to its audio-evidence fallbacks instead of to a fiction.
+                        "avg_logprob": STT_UNKNOWN_CONFIDENCE,
                         "no_speech_prob": 0.0,
                     }
                 ],
                 detected_language,
                 chunk_offset_ms,
                 allowed_languages,
+                speech_duration_s=speech_duration_s,
                 context_prompt=prompt,
                 keywords=keywords,
                 min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
@@ -1421,13 +1460,21 @@ class OpenAISTT:
                         "text": sentence_text,
                         "start": 0.0,
                         "end": 0.0,
-                        "avg_logprob": 0.0,
+                        # NOT 0.0, which is what this said and which is a perfect score. This
+                        # path has no logprob at all — a delta carries none — and claiming the
+                        # best possible one silently exempted early sentences from every
+                        # confidence-shaped guard below. In flash mode MOST production segments
+                        # come through here, so that exemption covered most of the meeting. The
+                        # sentinel is this codebase's word for "unknown", and it routes the
+                        # blocklist to its audio-evidence fallbacks instead of to a fiction.
+                        "avg_logprob": STT_UNKNOWN_CONFIDENCE,
                         "no_speech_prob": 0.0,
                     }
                 ],
                 detected_language,
                 chunk_offset_ms,
                 allowed_languages,
+                speech_duration_s=speech_duration_s,
                 context_prompt=prompt,
                 keywords=keywords,
                 min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
@@ -1527,6 +1574,12 @@ class OpenAISTT:
             chunk_offset_ms,
             allowed_languages,
             real_duration_s=duration_s,
+            # Deliberately BOTH, and deliberately different numbers. The blocklist's marginality
+            # test stays on the padded duration: tightening it onto speech-only seconds would
+            # start dropping genuine short acknowledgements, and this pipeline has measured that
+            # content loss is the failure actually happening. The too-much-text guard is not a
+            # judgement call — it is a physical impossibility — so it gets the honest number.
+            speech_duration_s=speech_duration_s,
             context_prompt=prompt,
             keywords=keywords,
             min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),

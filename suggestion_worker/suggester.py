@@ -159,11 +159,18 @@ genuinely help the participants right now.
 Judge the LATEST segment on its merits. Answer true when it matches one of these:
 - clarification: a question was asked that the transcript does not already answer. It counts \
 whether or not it ends in a question mark — the recogniser drops the mark on short utterances.
-- term: jargon, an acronym, a product name or a technical term is used that this meeting has \
-not defined, and a participant could plausibly not know it.
+- term: jargon, an acronym, a brand, a product name or a technical term is used that this \
+meeting has not defined, and a participant could plausibly not know it. This fires on a term \
+being USED as much as on one being asked about — "we should look into Next.js" wants the same \
+one-line explanation that "what is Next.js?" would.
 - action: a commitment, plan or promise is stated that is missing an owner, a date, or both.
-- correction: the segment contradicts something said earlier in the transcript, including \
-numbers, dates, names and decisions that changed.
+- correction: the segment states something that is wrong. Either it contradicts something said \
+earlier in the transcript — including numbers, dates, names and decisions that changed — OR it \
+misstates a widely established fact about a named product, technology, standard, organisation, \
+place or date. "We will use .NET 10 for the frontend" is this category: .NET is a backend and \
+application runtime, and the claim would send the team down the wrong path. Use a HIGH bar for \
+the second kind: only when the correct fact is well established and not a matter of opinion, \
+preference, or something this team may simply be doing differently on purpose.
 - fact: a figure, name or reference is discussed that the meeting's own documents cover.
 
 Answer false for greetings, small talk, agreement and acknowledgement, thinking aloud, \
@@ -201,17 +208,25 @@ _CATEGORY_CONTRACTS = {
         "question it means."
     ),
     "term": (
-        "Name the exact term or acronym as it was spoken, then define it in one clause. Define "
-        "it as it is used in THIS meeting when the transcript or the documents show that; a "
-        "generic dictionary gloss of a term the team uses differently is worse than nothing."
+        "Name the exact term, brand or acronym as it was spoken, then define it in one clause. "
+        "Prefer how it is used in THIS meeting when the transcript or the documents show that — a "
+        "generic gloss of a term the team uses differently is worse than nothing. When neither "
+        'defines it, give the widely accepted meaning and set source to "general knowledge". '
+        "THIS IS THE COMMON CASE, not the exception: the category fires precisely because the "
+        "meeting has not defined the term, so refusing everything the meeting has not already "
+        "explained would leave it able to fire and never able to answer."
     ),
     "action": (
         "State the commitment, then name precisely what is missing from it — an owner, a "
         "deadline, or both. Do not invent either one."
     ),
     "correction": (
-        "State both sides: what was just said, and the earlier statement it contradicts. A "
-        "contradiction the reader has to go and find for themselves is not a hint."
+        "State both sides. For a contradiction inside the meeting: what was just said, and the "
+        "earlier statement it contradicts — a contradiction the reader has to go and find for "
+        "themselves is not a hint. For a claim that is wrong about the wider world: what was "
+        "said, what is actually the case, and one clause on why it matters here. Correct the "
+        "FACT, never the person, and never turn a preference or an unusual-but-valid choice into "
+        "an error."
     ),
     "fact": (
         "Quote the figure or reference from the supplied documents, with enough of its source "
@@ -244,11 +259,18 @@ Rules:
 - Write in the same language as the latest segment.
 - State the hint directly. No greeting, no "I noticed", no addressing anyone by name.
 - Add information; never restate what was just said.
-- Ground every claim in the transcript or in the supplied reference documents. If you cannot \
-point to where something came from, leave it out. An invented name, number, date or definition \
-is the worst outcome here — worse than silence, because the reader has no way to tell.
+- Anything SPECIFIC TO THIS MEETING OR THIS TEAM must come from the transcript or the supplied \
+documents: who said what, who owns something, dates, figures, decisions, and how this team uses \
+a word. Never supply one of those from memory. An invented name, number, date or owner is the \
+worst outcome here — worse than silence, because the reader has no way to tell.
+- PUBLIC KNOWLEDGE IS DIFFERENT, and only the `term` and `correction` hints may use it: what a \
+named product, technology, standard or organisation generally is, and what it is generally for. \
+Say so by setting source to "general knowledge". Keep it to what is well established and stable; \
+if it depends on a version, a date or a release you are unsure of, leave that part out rather \
+than guess it.
 - If you cannot meet the contract above from what you were given, return an empty content \
-string. That is a normal, correct answer.
+string. That is a normal, correct answer — but do NOT reach for it merely because the meeting \
+never explained the term. That is the situation `term` exists for.
 
 {_UNTRUSTED_INPUT_RULE}
 
@@ -260,10 +282,12 @@ or two sentences carrying the evidence for `content` — the surrounding quote, 
 statement being contradicted, the document the figure came from. Write it whenever that \
 evidence exists, which is nearly always; use "" only when `content` is already complete on \
 its own and repeating it would add nothing.
-source is the reference document this hint came out of, copied EXACTLY as it appears in its \
-`--- Document: ... ---` header. Use "" when the hint came from the transcript rather than from \
-a document, which is the normal case. A name that is not one of the headers you were given is \
-discarded, so inventing one only loses you the credit."""
+source is where this hint came from. Use the reference document's name, copied EXACTLY as it \
+appears in its `--- Document: ... ---` header, when the hint came out of a document. Use \
+"general knowledge" when it rests on what is publicly known about a named thing rather than on \
+anything in this meeting. Use "" when it came from the transcript, which is the normal case. A \
+document name that is not one of the headers you were given is discarded, so inventing one only \
+loses you the credit."""
 
 
 #: How MeetingStartedEventConsumer labels each document inside the snapshot blob. The names in

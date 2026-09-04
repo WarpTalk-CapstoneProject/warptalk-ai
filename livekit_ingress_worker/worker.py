@@ -56,8 +56,38 @@ VAD_WINDOW_FRAMES = 3
 # A majority still rejects the isolated spike the original docstring was written to reject.
 MIN_VAD_SPEECH_FRAMES = 2
 
-VAD_WINDOW_SAMPLES = 512 * VAD_WINDOW_FRAMES
+VAD_FRAME_SAMPLES = 512
+VAD_WINDOW_SAMPLES = VAD_FRAME_SAMPLES * VAD_WINDOW_FRAMES
 VAD_WINDOW_MS = VAD_WINDOW_SAMPLES * 1000 // 16000
+# 2 bytes per sample. The unit the hangover is now counted and trimmed in.
+VAD_FRAME_BYTES = VAD_FRAME_SAMPLES * 2
+
+
+def _hangover_frames(hangover_samples: int) -> int:
+    """A hangover length in whole Silero frames.
+
+    Every hangover in this worker used to be rounded up to whole 96ms WINDOWS and compared
+    against a count of whole silent windows, which put ±96ms of slop on the one measurement the
+    turn boundary depends on — and threw away the two silent frames that so often follow a final
+    syllable inside an otherwise-speech window. Silero has already decided each of those frames.
+    """
+    return max(1, (hangover_samples + VAD_FRAME_SAMPLES - 1) // VAD_FRAME_SAMPLES)
+
+
+def _trailing_silent_frames(frame_probabilities: list[float], threshold: float) -> int:
+    """How many frames at the END of a speech window were below the threshold.
+
+    A window is speech on a MAJORITY of its frames, so a window can be speech and still finish
+    silent — which is what the end of a word sounds like. Those frames are in the buffer and the
+    speaker was not talking during them, so the hangover run starts there rather than at zero.
+    """
+    trailing = 0
+    for probability in reversed(frame_probabilities):
+        if probability >= threshold:
+            break
+        trailing += 1
+    return trailing
+
 
 # Bot participant identities used elsewhere in this pipeline — this worker's own
 # "AIBot_{room}" (join_room, below) and the TTS publisher's "ai-interpreter-{lang}"
@@ -283,7 +313,7 @@ class LiveKitIngressWorker(BaseWorker):
     consumer_group = ""
 
     # Silero VAD frame size: 512 samples = 32ms at 16kHz
-    VAD_FRAME_SIZE = 512
+    VAD_FRAME_SIZE = VAD_FRAME_SAMPLES
     SAMPLE_RATE = 16000
 
     # Declared on the class, not only in __init__, because the tests around this worker
@@ -1385,6 +1415,44 @@ class LiveKitIngressWorker(BaseWorker):
             self._note_connect_failure(room_name, error)
             return None
 
+    def _score_vad_frames(
+        self,
+        pcm_f32: npt.NDArray[np.float32],
+        vad_model: Any | None = None,
+    ) -> list[float]:
+        """Silero's probability for every 32ms frame in this window, in order.
+
+        THE RESOLUTION WE ALREADY PAY FOR. Silero decides per 512-sample frame and this loop
+        then collapsed three of them into one 96ms verdict, so every boundary — the start of a
+        word, the moment a pause begins — was quantised to ±96ms even though the evidence
+        underneath it is three times finer. The inference cost is identical either way; the
+        frames are scored regardless. Only the throwing-away was optional.
+
+        Kept separate from the verdict below so the caller can ask both questions of one pass:
+        "is this window speech" and "how long since the last speech frame".
+        """
+        model = vad_model or self._require_vad_model()
+        probabilities: list[float] = []
+        for i in range(0, len(pcm_f32) - self.VAD_FRAME_SIZE + 1, self.VAD_FRAME_SIZE):
+            frame = pcm_f32[i : i + self.VAD_FRAME_SIZE]
+            tensor = torch.from_numpy(frame).unsqueeze(0)
+            probabilities.append(model(tensor, self.SAMPLE_RATE).item())
+        return probabilities
+
+    @staticmethod
+    def _window_verdict(frame_probabilities: list[float], threshold: float) -> float:
+        """Whether a scored window counts as speech, and how strongly.
+
+        A majority of frames must clear the threshold — so one noisy frame cannot classify the
+        window as speech and one weak frame cannot disqualify it. The evidence bar and the
+        window length are separate constants on purpose; see MIN_VAD_SPEECH_FRAMES for what
+        happened when they were the same one.
+        """
+        speech_frames = sum(1 for probability in frame_probabilities if probability >= threshold)
+        if speech_frames < MIN_VAD_SPEECH_FRAMES:
+            return 0.0
+        return max(frame_probabilities, default=0.0)
+
     def _run_vad_on_window(
         self,
         pcm_f32: npt.NDArray[np.float32],
@@ -1393,26 +1461,11 @@ class LiveKitIngressWorker(BaseWorker):
     ) -> float:
         """Run Silero VAD and reject isolated probability spikes.
 
-        Silero requires 512-sample (32ms) frames. Every frame in the window is scored, and the
-        window counts as speech once MIN_VAD_SPEECH_FRAMES of them clear the threshold — a
-        majority, so one noisy frame cannot classify the window as speech and one weak frame
-        cannot disqualify it.
-
-        The evidence bar and the window length are separate constants on purpose; see
-        MIN_VAD_SPEECH_FRAMES for what happened when they were the same one.
+        The two halves above, composed. Kept as one call because that is what every caller
+        outside the audio loop wants, and because its contract — a float comparable against the
+        same threshold — is what the tests around this behaviour are written in.
         """
-        model = vad_model or self._require_vad_model()
-        max_prob = 0.0
-        speech_frames = 0
-        for i in range(0, len(pcm_f32) - self.VAD_FRAME_SIZE + 1, self.VAD_FRAME_SIZE):
-            frame = pcm_f32[i : i + self.VAD_FRAME_SIZE]
-            tensor = torch.from_numpy(frame).unsqueeze(0)
-            prob = model(tensor, self.SAMPLE_RATE).item()
-            if prob > max_prob:
-                max_prob = prob
-            if prob >= threshold:
-                speech_frames += 1
-        return max_prob if speech_frames >= MIN_VAD_SPEECH_FRAMES else 0.0
+        return self._window_verdict(self._score_vad_frames(pcm_f32, vad_model), threshold)
 
     async def process_audio_track(self, room_name: str, speaker_id: str, track: rtc.Track) -> None:
         """Stream audio from LiveKit, gate with VAD, publish only speech chunks."""
@@ -1424,6 +1477,11 @@ class LiveKitIngressWorker(BaseWorker):
 
         # VAD configuration from settings
         vad_threshold = self.settings.vad_threshold
+        # HYSTERESIS. The bar to STAY in speech, which must never be higher than the bar to enter
+        # it — a release threshold above the entry threshold is a turn that can never close, so it
+        # is clamped here rather than trusted. See `vad_release_threshold` for why the two are
+        # different numbers at all.
+        release_threshold = min(self.settings.vad_release_threshold, vad_threshold)
         pre_speech_ms = self.settings.vad_pre_speech_ms
         silence_hangover_ms = self.settings.vad_silence_hangover_ms
         min_speech_ms = self.settings.vad_min_speech_ms
@@ -1436,10 +1494,8 @@ class LiveKitIngressWorker(BaseWorker):
         vad_window_samples = VAD_WINDOW_SAMPLES
         pre_speech_samples = int(sample_rate * (pre_speech_ms / 1000.0))
         silence_hangover_samples = int(sample_rate * (silence_hangover_ms / 1000.0))
-        silence_hangover_windows = max(
-            1,
-            (silence_hangover_samples + vad_window_samples - 1) // vad_window_samples,
-        )
+        # COUNTED IN FRAMES, NOT WINDOWS — see _hangover_frames. 576ms is 18 frames exactly.
+        silence_hangover_frames = _hangover_frames(silence_hangover_samples)
         min_speech_samples = int(sample_rate * (min_speech_ms / 1000.0))
         max_chunk_samples = int(sample_rate * (max_chunk_ms / 1000.0))
 
@@ -1459,10 +1515,25 @@ class LiveKitIngressWorker(BaseWorker):
         # having said very little.
         seek_after_samples = int(sample_rate * (self.settings.vad_seek_boundary_after_ms / 1000.0))
         seek_hangover_samples = int(sample_rate * (self.settings.vad_seek_hangover_ms / 1000.0))
-        seek_hangover_windows = max(
-            1,
-            (seek_hangover_samples + vad_window_samples - 1) // vad_window_samples,
+        # 250ms is 8 frames (256ms). It used to round up to three whole windows — 288ms — so this
+        # rung now lands closer to the number the setting actually asks for.
+        seek_hangover_frames = _hangover_frames(seek_hangover_samples)
+
+        # HOLDING A SHORT TURN OPEN — the far end of the same ladder, and the fragmentation
+        # fix. A turn that has produced less than `short_turn_samples` of speech has not said
+        # enough to be a sentence, so a pause inside it is far more likely to be a breath than
+        # an ending; it waits longer before closing, and if the speaker resumes inside that
+        # window the two halves stay ONE chunk. See the settings for the trade this makes and
+        # for why the rejected "raise the hangover for everyone" is a different change.
+        #
+        # Measured on SPEECH for the same reason seeking is: the buffer also holds the
+        # pre-speech padding and every internal pause, so a hesitant speaker would otherwise
+        # look like they had said plenty.
+        short_turn_samples = int(sample_rate * (self.settings.vad_short_turn_speech_ms / 1000.0))
+        short_turn_hangover_samples = int(
+            sample_rate * (self.settings.vad_short_turn_hangover_ms / 1000.0)
         )
+        short_turn_hangover_frames = _hangover_frames(short_turn_hangover_samples)
 
         # One near-field gate per track — see near_field_gate.py. It builds a running
         # peak-amplitude reference from this track's own earlier chunks, so it must live
@@ -1517,7 +1588,7 @@ class LiveKitIngressWorker(BaseWorker):
         # padding and the hangover tail. This, not the buffer length, is what the minimum-speech
         # gate weighs; see where it is compared for what the buffer length let through.
         speech_samples = 0
-        silence_counter = 0
+        silence_frames = 0
         chunk_index = 0
         resampler = None
         first_frame_logged = False
@@ -1526,8 +1597,12 @@ class LiveKitIngressWorker(BaseWorker):
             "started_vad_audio_processing",
             track_sid=track.sid,
             vad_threshold=vad_threshold,
+            release_threshold=release_threshold,
             pre_speech_ms=pre_speech_ms,
             hangover_ms=silence_hangover_ms,
+            hangover_frames=silence_hangover_frames,
+            short_turn_hangover_frames=short_turn_hangover_frames,
+            seek_hangover_frames=seek_hangover_frames,
         )
 
         # Reset VAD model state for this track
@@ -1550,7 +1625,7 @@ class LiveKitIngressWorker(BaseWorker):
                     is_speaking = False
                     published_this_turn = False
                     speech_samples = 0
-                    silence_counter = 0
+                    silence_frames = 0
                     track_vad_model.reset_states()
                     continue
 
@@ -1589,16 +1664,24 @@ class LiveKitIngressWorker(BaseWorker):
                     window_data = bytes(raw_buffer[:window_bytes])
                     raw_buffer = raw_buffer[window_bytes:]
 
-                    # Run VAD on this ~96ms window (VAD_WINDOW_FRAMES exact Silero frames).
+                    # Score every frame in this ~96ms window once. Both questions below are
+                    # answered from that one pass — whether the window is speech, and how many
+                    # frames have gone by since the last one that was.
                     window_pcm = np.frombuffer(window_data, dtype=np.int16)
                     window_f32 = window_pcm.astype(np.float32) / 32768.0
-                    vad_prob = self._run_vad_on_window(
+                    frame_probabilities = self._score_vad_frames(
                         window_f32,
-                        threshold=vad_threshold,
                         vad_model=track_vad_model,
                     )
 
-                    if vad_prob >= vad_threshold:
+                    # HYSTERESIS, and this line is the whole of it. Entering speech asks for
+                    # `vad_threshold`; staying in it asks only for `release_threshold`. A trailing
+                    # syllable that fades under the entry bar no longer starts the hangover
+                    # countdown while the speaker is still saying the word.
+                    active_threshold = release_threshold if is_speaking else vad_threshold
+                    vad_prob = self._window_verdict(frame_probabilities, active_threshold)
+
+                    if vad_prob >= active_threshold:
                         # Speech detected
                         if not is_speaking:
                             # Speech onset — prepend pre-speech ring buffer
@@ -1621,7 +1704,14 @@ class LiveKitIngressWorker(BaseWorker):
 
                         speech_buffer.extend(window_data)
                         speech_samples += len(window_data) // 2
-                        silence_counter = 0
+                        # NOT ZERO. A window counts as speech on a majority, so it can still end
+                        # with a frame or two of silence — the fade at the end of a word. Those
+                        # frames are already in the buffer and they are already silent; starting
+                        # the run at zero pretended otherwise and cost up to 64ms of the hangover
+                        # every time a pause began inside a window rather than between two.
+                        silence_frames = _trailing_silent_frames(
+                            frame_probabilities, active_threshold
+                        )
 
                         # The pre-speech ring goes out with the first frame rather than being
                         # skipped: it is the word onset the ring exists to preserve, and a
@@ -1670,19 +1760,29 @@ class LiveKitIngressWorker(BaseWorker):
                     else:
                         # No speech in this window
                         if is_speaking:
-                            silence_counter += 1
+                            silence_frames += len(frame_probabilities)
                             speech_buffer.extend(window_data)  # Keep recording during pauses
 
-                            # A long turn takes the next real pause; a short one still waits
-                            # for the full end-of-sentence hangover. This is the whole of
-                            # boundary seeking — see seek_hangover_windows above.
-                            hangover_windows = (
-                                seek_hangover_windows
-                                if speech_samples >= seek_after_samples
-                                else silence_hangover_windows
-                            )
+                            # ONE RULE, THREE RUNGS: the more this speaker has already said,
+                            # the readier this loop is to cut. A long turn takes the next real
+                            # pause (boundary seeking); an ordinary clause waits the full
+                            # end-of-sentence hangover; a turn that has barely said anything
+                            # waits longer still, because a pause that early is far more likely
+                            # to be a breath inside a sentence than the end of one — and closing
+                            # there is what produces a two-word transcript bubble.
+                            #
+                            # Ordered longest-speech first so the rungs cannot overlap. Nothing
+                            # oscillates between them: speech_samples does not grow during the
+                            # silence being counted, so the rung chosen on the first silent
+                            # window is the rung this turn closes on.
+                            if speech_samples >= seek_after_samples:
+                                hangover = seek_hangover_frames
+                            elif speech_samples < short_turn_samples:
+                                hangover = short_turn_hangover_frames
+                            else:
+                                hangover = silence_hangover_frames
 
-                            if silence_counter >= hangover_windows:
+                            if silence_frames >= hangover:
                                 # End of speech — publish if there was enough SPEECH in it.
                                 #
                                 # WT-371 #7: this measured the whole buffer, which by this point
@@ -1694,6 +1794,20 @@ class LiveKitIngressWorker(BaseWorker):
                                 #
                                 # The padding still ships; it is just no longer counted as evidence
                                 # that somebody spoke.
+                                # THE HOLD-OPEN IS A DECISION WINDOW, NOT PADDING. Silence
+                                # counted beyond the ordinary hangover was time spent waiting to
+                                # see whether this speaker would resume. They did not, so it is
+                                # not evidence of anything and it must not ship: trailing silence
+                                # is precisely what a Whisper-family model invents text over, and
+                                # a turn that waited longer sends exactly the tail it always did.
+                                #
+                                # Self-selecting rather than asking which rung fired — the seek
+                                # rung counts FEWER windows than the ordinary hangover, so it can
+                                # never produce an excess here.
+                                excess_frames = silence_frames - silence_hangover_frames
+                                if excess_frames > 0:
+                                    del speech_buffer[-excess_frames * VAD_FRAME_BYTES :]
+
                                 if speech_samples >= min_speech_samples or published_this_turn:
                                     await self._publish_speech_chunk(
                                         room_name,
@@ -1729,7 +1843,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 published_this_turn = False
                                 speech_buffer = bytearray()
                                 speech_samples = 0
-                                silence_counter = 0
+                                silence_frames = 0
                                 # WT-371 #7: the VAD state is NOT reset here any more.
                                 #
                                 # Silero is recurrent. Resetting it discards everything it has
@@ -1974,8 +2088,12 @@ class LiveKitIngressWorker(BaseWorker):
         #
         # Not a loosening dressed up as a fix: the threshold on SPEECH loudness is now the same
         # 0.02 for every utterance length, which is what one absolute floor was always meant to be.
-        # Marginal audio that gets through still faces min_avg_logprob downstream, which this model
-        # does populate (see STTSettings for the production values that calibrated it).
+        #
+        # AND DO NOT COUNT ON THE DOWNSTREAM CONFIDENCE GATE, which this comment used to. The
+        # production model is gpt-live-transcribe; it is in _LOGPROBS_UNSUPPORTED_SEED, so every
+        # segment carries STT_UNKNOWN_CONFIDENCE and `min_avg_logprob` — and every per-language
+        # floor beneath it — is skipped by construction. This gate and the language/script
+        # evidence are what actually stand between marginal audio and a fluent invented caption.
         total_samples = len(pcm)
         floor = _ENERGY_FLOOR_RMS
         if speech_samples is not None and 0 < speech_samples < total_samples:
@@ -2022,6 +2140,16 @@ class LiveKitIngressWorker(BaseWorker):
             # the STT side reads "empty" as "the audio is in this message" and behaves as it
             # always did.
             turn_id=turn_id,
+            # HOW MUCH OF THIS CHUNK IS SPEECH, which is not the same question as how long the
+            # chunk is. Every chunk is wrapped in pre-speech and hangover padding, so its PCM
+            # duration is ~1s even when VAD only ever called 300ms of it speech — and the STT
+            # side has two hallucination guards that ask "was there enough audio to justify
+            # this text". Handed the padded duration they can never fire; handed this one they
+            # can. Same defect the minimum-speech gate had (WT-371 #7), one stage downstream.
+            #
+            # 0 means "this ingress did not say", which is what an older one sends through a
+            # rolling deploy, and the STT side reads it as unknown rather than as silence.
+            speech_ms=(speech_samples * 1000 // sample_rate) if speech_samples else 0,
             timestamp_ms=int(time.time() * 1000),
         )
 

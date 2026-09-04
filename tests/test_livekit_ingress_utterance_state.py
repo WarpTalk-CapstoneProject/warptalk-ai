@@ -99,16 +99,22 @@ def test_a_long_turn_takes_the_next_real_pause_instead_of_the_hard_cap() -> None
 
     The only place this loop can cut without severing a word is a window VAD already called
     silence, so seeking means accepting a SHORTER pause once the turn has run long. Short
-    turns must keep the full hangover, or ordinary conversation fragments.
+    turns must keep at least the full hangover, or ordinary conversation fragments.
+
+    This used to pin the ternary that chose between two thresholds. There are three now — a
+    turn that has barely spoken waits LONGER still, see test_vad_hangover_ladder.py — so what
+    is pinned here is the part this test is actually about: seeking is the exception, reached
+    only by a long turn, and everything else falls through to at least the full hangover.
     """
-    assert "seek_hangover_windows" in WORKER_SOURCE, "boundary seeking is not wired at all"
+    assert "seek_hangover_frames" in WORKER_SOURCE, "boundary seeking is not wired at all"
     assert "if speech_samples >= seek_after_samples" in WORKER_SOURCE, (
         "the seek threshold must be measured on SPEECH — the buffer also holds padding and "
         "every internal pause, so a hesitant speaker would trip it having said very little"
     )
-    assert "else silence_hangover_windows" in WORKER_SOURCE, (
-        "a short turn must still wait the full end-of-sentence hangover"
+    assert "hangover = silence_hangover_frames" in WORKER_SOURCE, (
+        "nothing falls back to the full end-of-sentence hangover any more, so an ordinary "
+        "clause is being cut on a threshold meant for long turns"
     )
-    assert "silence_counter >= hangover_windows" in WORKER_SOURCE, (
+    assert "silence_frames >= hangover" in WORKER_SOURCE, (
         "the hangover check must read the chosen threshold, not the fixed one"
     )
