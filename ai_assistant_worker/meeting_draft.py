@@ -43,7 +43,10 @@ MEETING_TYPES: tuple[str, ...] = (
     "COMPANY_MEETING",
     "VIRTUAL_APPOINTMENT",
     "LIVE_EVENT",
+    "EXTERNAL_BRIDGE",
 )
+
+EXTERNAL_PROVIDER_GOOGLE_MEET = "GOOGLE_MEET"
 
 RECURRENCE_TYPES: tuple[str, ...] = ("DAILY", "WEEKLY", "MONTHLY")
 
@@ -129,6 +132,10 @@ class MeetingDraft:
     documents: list[tuple[str, str]] = field(default_factory=list)
     #: Needed to build a document URL. Absent means documents are listed by name only.
     workspace_slug: str | None = None
+    external_provider: str | None = None
+    external_meeting_url: str | None = None
+    external_calendar_event_id: str | None = None
+    external_calendar_event_url: str | None = None
 
 
 def missing_fields(draft: MeetingDraft) -> list[str]:
@@ -202,6 +209,26 @@ def validate(draft: MeetingDraft) -> list[str]:
 
     if draft.max_participants is not None and draft.max_participants < 2:
         problems.append("max_participants must be at least 2 — a meeting needs two people.")
+
+    if draft.external_provider and draft.external_provider != EXTERNAL_PROVIDER_GOOGLE_MEET:
+        problems.append(
+            "external_provider must be GOOGLE_MEET when external meeting metadata is sent."
+        )
+
+    if (
+        any(
+            (
+                draft.external_provider,
+                draft.external_meeting_url,
+                draft.external_calendar_event_id,
+                draft.external_calendar_event_url,
+            )
+        )
+        and draft.translation_room_type != "EXTERNAL_BRIDGE"
+    ):
+        problems.append(
+            "External meeting metadata is only valid for translation_room_type EXTERNAL_BRIDGE."
+        )
 
     return problems
 
@@ -291,6 +318,15 @@ def build_payload(draft: MeetingDraft, workspace_id: str) -> dict[str, Any]:
         payload["recurrence"] = recurrence
     elif draft.scheduled_at:
         payload["scheduledAt"] = draft.scheduled_at
+
+    if draft.external_provider:
+        payload["externalProvider"] = draft.external_provider
+    if draft.external_meeting_url:
+        payload["externalMeetingUrl"] = draft.external_meeting_url
+    if draft.external_calendar_event_id:
+        payload["externalCalendarEventId"] = draft.external_calendar_event_id
+    if draft.external_calendar_event_url:
+        payload["externalCalendarEventUrl"] = draft.external_calendar_event_url
 
     return payload
 
@@ -411,4 +447,8 @@ def draft_from_arguments(arguments: dict[str, Any]) -> MeetingDraft:
         recurrence_start_date_local=recurrence_start_date_local,
         recurrence_end_date_local=as_text(args.get("recurrence_end_date_local")),
         max_participants=max_participants,
+        external_provider=(as_text(args.get("external_provider")) or "").upper() or None,
+        external_meeting_url=as_text(args.get("external_meeting_url")),
+        external_calendar_event_id=as_text(args.get("external_calendar_event_id")),
+        external_calendar_event_url=as_text(args.get("external_calendar_event_url")),
     )

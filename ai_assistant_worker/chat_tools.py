@@ -1058,6 +1058,10 @@ async def _create_meeting(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             "scheduled_at": room.get("scheduledAt"),
             "recurring": bool(created.get("series")),
             "invited_count": len(draft.invited_emails),
+            "external_provider": room.get("externalProvider"),
+            "external_meeting_url": room.get("externalMeetingUrl"),
+            "external_calendar_event_id": room.get("externalCalendarEventId"),
+            "external_calendar_event_url": room.get("externalCalendarEventUrl"),
         }
     )
 
@@ -1478,6 +1482,26 @@ TOOLS: list[ChatTool] = [
                         },
                         "required": ["title", "id"],
                     },
+                },
+                "external_provider": {
+                    "type": "string",
+                    "enum": ["GOOGLE_MEET"],
+                    "description": (
+                        "Set to GOOGLE_MEET only when a Google Meet link was just created by "
+                        "a plugin tool and this WarpTalk room should be an external bridge."
+                    ),
+                },
+                "external_meeting_url": {
+                    "type": "string",
+                    "description": "Exact Google Meet URL returned by the plugin tool.",
+                },
+                "external_calendar_event_id": {
+                    "type": "string",
+                    "description": "Exact Google Calendar event id returned by the plugin tool.",
+                },
+                "external_calendar_event_url": {
+                    "type": "string",
+                    "description": "Exact Google Calendar event URL returned by the plugin tool.",
                 },
             },
             "required": ["title", "translation_room_type", "source_language", "target_languages"],

@@ -106,6 +106,16 @@ def test_a_valid_draft_has_no_complaints() -> None:
     assert validate(_complete()) == []
 
 
+def test_external_google_meet_metadata_requires_external_bridge() -> None:
+    draft = _complete()
+    draft.external_provider = "GOOGLE_MEET"
+    draft.external_meeting_url = "https://meet.google.com/abc-defg-hij"
+
+    problems = validate(draft)
+
+    assert any("EXTERNAL_BRIDGE" in problem for problem in problems), problems
+
+
 # ── the payload ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -126,6 +136,28 @@ def test_a_recurring_booking_never_carries_scheduled_at() -> None:
     payload = build_payload(draft, WORKSPACE)
     assert "scheduledAt" not in payload
     assert payload["recurrence"]["type"] == "DAILY"
+
+
+def test_external_google_meet_metadata_is_sent_to_the_room_api() -> None:
+    draft = _complete()
+    draft.translation_room_type = "EXTERNAL_BRIDGE"
+    draft.external_provider = "GOOGLE_MEET"
+    draft.external_meeting_url = "https://meet.google.com/abc-defg-hij"
+    draft.external_calendar_event_id = "calendar-event-1"
+    draft.external_calendar_event_url = (
+        "https://calendar.google.com/calendar/event?eid=calendar-event-1"
+    )
+
+    payload = build_payload(draft, WORKSPACE)
+
+    assert validate(draft) == []
+    assert payload["externalProvider"] == "GOOGLE_MEET"
+    assert payload["externalMeetingUrl"] == "https://meet.google.com/abc-defg-hij"
+    assert payload["externalCalendarEventId"] == "calendar-event-1"
+    assert (
+        payload["externalCalendarEventUrl"]
+        == "https://calendar.google.com/calendar/event?eid=calendar-event-1"
+    )
 
 
 def test_a_recurrence_always_carries_a_time_zone() -> None:
