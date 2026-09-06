@@ -20,6 +20,7 @@ import httpx
 
 from ai_assistant_worker.citations import SourceRegistry
 from ai_assistant_worker.meeting_draft import (
+    EXTERNAL_PROVIDER_CHOICES,
     MEETING_TYPES,
     RECURRENCE_CHOICES,
     build_payload,
@@ -1416,7 +1417,13 @@ TOOLS: list[ChatTool] = [
                 "translation_room_type": {
                     "type": "string",
                     "enum": list(MEETING_TYPES),
-                    "description": "CHANNEL_MEETING suits most internal team meetings.",
+                    "description": (
+                        "CHANNEL_MEETING suits most internal team meetings. Pick "
+                        "EXTERNAL_BRIDGE only for a call hosted somewhere else whose link "
+                        "you already have - it makes a two-seat room that needs the WarpTalk "
+                        "desktop app and virtual audio devices, which is the wrong shape for "
+                        "an ordinary internal meeting."
+                    ),
                 },
                 "source_language": {
                     "type": "string",
@@ -1485,15 +1492,19 @@ TOOLS: list[ChatTool] = [
                 },
                 "external_provider": {
                     "type": "string",
-                    "enum": ["GOOGLE_MEET"],
+                    "enum": list(EXTERNAL_PROVIDER_CHOICES),
                     "description": (
-                        "Set to GOOGLE_MEET only when a Google Meet link was just created by "
-                        "a plugin tool and this WarpTalk room should be an external bridge."
+                        "NONE for an ordinary WarpTalk meeting - which is nearly always the "
+                        "answer. GOOGLE_MEET only when a Google Meet link was just created "
+                        "by a plugin tool and this room should bridge to it."
                     ),
                 },
                 "external_meeting_url": {
                     "type": "string",
-                    "description": "Exact Google Meet URL returned by the plugin tool.",
+                    "description": (
+                        "Exact Google Meet URL returned by the plugin tool. Must start with "
+                        "https://meet.google.com/ - never compose or guess one."
+                    ),
                 },
                 "external_calendar_event_id": {
                     "type": "string",

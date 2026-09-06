@@ -397,3 +397,77 @@ def test_a_seat_cap_somebody_actually_typed_is_still_checked() -> None:
     assert validate(draft_from_arguments({**PROD_ARGUMENTS, "max_participants": 1}))
     assert draft_from_arguments({**PROD_ARGUMENTS, "max_participants": 8}).max_participants == 8
     assert draft_from_arguments({**PROD_ARGUMENTS, "max_participants": "8"}).max_participants == 8
+
+
+def test_none_provider_sentinel_is_stripped_so_an_internal_meeting_stays_internal() -> None:
+    """The WT-399 trap, third instance.
+
+    A single-member enum leaves the model no way to say "not an external meeting", so it fills
+    GOOGLE_MEET on an ordinary request; validate() then refuses it, and the only escape the model
+    has is to flip the room type to EXTERNAL_BRIDGE - which passes, and hands the user a two-seat
+    bridge room for an internal meeting.
+    """
+    draft = draft_from_arguments(
+        {
+            "title": "Team sync",
+            "translation_room_type": "CHANNEL_MEETING",
+            "source_language": "vi",
+            "target_languages": ["NONE"],
+            "external_provider": "NONE",
+        }
+    )
+
+    assert draft.external_provider is None
+    assert validate(draft) == []
+    assert "externalProvider" not in build_payload(draft, "workspace-1")
+
+
+def test_provider_without_a_link_is_refused() -> None:
+    draft = draft_from_arguments(
+        {
+            "title": "Roadmap review",
+            "translation_room_type": "EXTERNAL_BRIDGE",
+            "source_language": "vi",
+            "target_languages": ["NONE"],
+            "external_provider": "GOOGLE_MEET",
+        }
+    )
+
+    problems = validate(draft)
+
+    assert any("external_meeting_url is required" in problem for problem in problems)
+
+
+def test_a_meeting_url_that_is_not_a_google_meet_link_is_refused() -> None:
+    draft = draft_from_arguments(
+        {
+            "title": "Roadmap review",
+            "translation_room_type": "EXTERNAL_BRIDGE",
+            "source_language": "vi",
+            "target_languages": ["NONE"],
+            "external_provider": "GOOGLE_MEET",
+            "external_meeting_url": "https://meet-google.attacker.test/abc-defg-hij",
+        }
+    )
+
+    problems = validate(draft)
+
+    assert any("meet.google.com" in problem for problem in problems)
+
+
+def test_lowercase_provider_from_the_plugin_gateway_is_normalised() -> None:
+    # The gateway emits "google_meet"; the room API compares against "GOOGLE_MEET" ordinally.
+    draft = draft_from_arguments(
+        {
+            "title": "Roadmap review",
+            "translation_room_type": "EXTERNAL_BRIDGE",
+            "source_language": "vi",
+            "target_languages": ["NONE"],
+            "external_provider": "google_meet",
+            "external_meeting_url": "https://meet.google.com/abc-defg-hij",
+        }
+    )
+
+    assert draft.external_provider == "GOOGLE_MEET"
+    assert validate(draft) == []
+    assert build_payload(draft, "workspace-1")["externalProvider"] == "GOOGLE_MEET"
