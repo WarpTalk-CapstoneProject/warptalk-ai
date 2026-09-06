@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 
@@ -33,9 +34,45 @@ TEMPERATURE = 0.0
 # document.
 CHARS_PER_OUTPUT_TOKEN = 2
 
-# Room for the JSON envelope, the three booleans, and the redaction markers that make masked text
-# longer than the original.
+# Room for the JSON envelope, the flags, the cited matches, and the redaction markers that make
+# masked text longer than the original.
 JSON_ENVELOPE_TOKENS = 512
+
+
+@dataclass(frozen=True)
+class SecurityScanReport:
+    """What the model OBSERVED — deliberately not what the system decides.
+
+    The asymmetry between the two fields is the point of this type.
+
+    `pii_detected` is a judgement only a model can make: "is this string somebody's name" has no
+    exact answer, and a PII hit is RECOVERABLE, because the masked text is still indexable.
+
+    A DLP hit is neither. "Does this document contain one of these words" is answered exactly, for
+    free, by a substring search over the whole file — and a hit is TERMINAL, because the ingestion
+    path has no masking route for DLP the way it has one for PII. So the model does not get to
+    return `dlpDetected`. It returns the spans it BELIEVES are blacklist hits, and `SecurityWorker`
+    decides, after checking each one against the document.
+
+    Production, 2026-09-06: of thirteen DLP-enabled scans, the blacklist appeared zero times in the
+    submitted text — and three documents were still blocked as DLP violations. Every DLP block this
+    system has ever produced was a hallucination, OR-ed on top of a local check that had it right.
+    """
+
+    pii_detected: bool
+    masked_content: str
+    dlp_terms_claimed: tuple[str, ...]
+
+
+def _claimed_terms(raw: object) -> tuple[str, ...]:
+    """The model's `dlpMatches`, read defensively.
+
+    Anything that is not a list of non-empty strings is not a claim. A malformed field must not
+    become a verdict by accident — which is exactly how a stray boolean used to block a document.
+    """
+    if not isinstance(raw, list):
+        return ()
+    return tuple(item for item in raw if isinstance(item, str) and item.strip())
 
 
 class OpenAISecurityScanner:
@@ -64,13 +101,14 @@ class OpenAISecurityScanner:
         pii_enabled: bool,
         dlp_enabled: bool,
         keywords_blacklist: list[str],
-    ) -> tuple[bool, bool, bool, str]:
-        """Scans and dynamically masks PII/DLP in text using OpenAI LLM.
+    ) -> SecurityScanReport:
+        """Scans and dynamically masks PII in text using OpenAI, and cites any DLP spans it sees.
 
-        Returns (pii_detected, dlp_detected, violation_found, masked_content).
+        Returns what the model reported. The DLP verdict is not in here on purpose — see
+        `SecurityScanReport`.
         """
         if not text:
-            return False, False, False, text
+            return SecurityScanReport(pii_detected=False, masked_content=text, dlp_terms_claimed=())
 
         max_analyze_length = self.settings.max_analyze_length or MAX_ANALYZE_LENGTH
         text_to_analyze = text
@@ -91,18 +129,19 @@ class OpenAISecurityScanner:
             "[EMAIL_REDACTED], [PHONE_REDACTED], [ID_REDACTED], "
             "[CARD_REDACTED]. Set piiDetected to true if PII is found, otherwise "
             "false.\n"
-            "2. If DLP Detection is enabled (dlp_enabled is true), check if the "
-            "text contains any of the blacklisted keywords (case-insensitive). "
-            "Set dlpDetected to true if found, otherwise false.\n"
+            "2. If DLP Detection is enabled (dlp_enabled is true), look for the blacklisted "
+            "keywords (case-insensitive). In dlpMatches, list the matching substrings copied "
+            "VERBATIM out of the text, character for character. Return an empty list if there "
+            "are none. Do not paraphrase, normalise, translate, explain or invent an entry: "
+            "every string you return is searched for in the document, and one that is not "
+            "there is discarded.\n"
             "3. Provide the complete final text with all PII masked in "
             "maskedContent. If no PII is found or PII Detection is disabled, "
-            "keep maskedContent equal to the input text.\n"
-            "4. Set violationFound to true if either piiDetected or dlpDetected is true.\n\n"
+            "keep maskedContent equal to the input text.\n\n"
             "Respond ONLY in JSON format matching this schema:\n"
             "{\n"
             '  "piiDetected": boolean,\n'
-            '  "dlpDetected": boolean,\n'
-            '  "violationFound": boolean,\n'
+            '  "dlpMatches": string[],\n'
             '  "maskedContent": string\n'
             "}"
         )
@@ -152,9 +191,11 @@ class OpenAISecurityScanner:
             )
 
         result = json.loads(content_str)
-        pii_detected = bool(result.get("piiDetected", False))
-        dlp_detected = bool(result.get("dlpDetected", False))
-        violation_found = bool(result.get("violationFound", False)) or pii_detected or dlp_detected
-        masked_content = str(result.get("maskedContent", text))
-
-        return pii_detected, dlp_detected, violation_found, masked_content
+        return SecurityScanReport(
+            pii_detected=bool(result.get("piiDetected", False)),
+            masked_content=str(result.get("maskedContent", text)),
+            # Only ever what the model CLAIMS. Note the model is shown at most
+            # `max_analyze_length` characters, so its claims cover a slice of a long document
+            # while the check that decides reads all of it.
+            dlp_terms_claimed=_claimed_terms(result.get("dlpMatches")),
+        )
