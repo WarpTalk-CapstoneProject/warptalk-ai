@@ -43,7 +43,38 @@ MEETING_TYPES: tuple[str, ...] = (
     "COMPANY_MEETING",
     "VIRTUAL_APPOINTMENT",
     "LIVE_EVENT",
+    "EXTERNAL_BRIDGE",
 )
+
+EXTERNAL_PROVIDER_GOOGLE_MEET = "GOOGLE_MEET"
+
+# "This meeting is not hosted anywhere else" - the WT-399 trap, a third time.
+#
+# external_provider was offered to the model as a single-member enum, ["GOOGLE_MEET"], whose
+# only legal value asserts the meeting IS an externally hosted bridge. A model fills every
+# property it is offered, so an ordinary internal request came back tagged GOOGLE_MEET,
+# validate() refused it for not being an EXTERNAL_BRIDGE, and the one argument the model could
+# change to escape was the room type - which passes validate() here AND the room API, and
+# produces a two-seat bridge room needing the desktop shell and virtual audio drivers for a
+# meeting that was never external at all.
+#
+# Same fix as NO_RECURRENCE and NO_TRANSLATION above: give the enum the member that means
+# "none of these", and strip it before the payload is built.
+NO_EXTERNAL_PROVIDER = "NONE"
+EXTERNAL_PROVIDER_CHOICES: tuple[str, ...] = (
+    NO_EXTERNAL_PROVIDER,
+    EXTERNAL_PROVIDER_GOOGLE_MEET,
+)
+
+# Other spellings of "not an external meeting" a model reaches for.
+_NO_EXTERNAL_PROVIDER_ALIASES = frozenset(
+    {NO_EXTERNAL_PROVIDER, "NO", "INTERNAL", "WARPTALK", "NOT_EXTERNAL", "NA"}
+)
+
+#: The only host a Google Meet join link may use. Mirrors the room API's own allow-list so a
+#: plausible-looking link the model composed itself is refused here, before it is stored and
+#: handed to every invitee as the Join button.
+GOOGLE_MEET_URL_PREFIX = "https://meet.google.com/"
 
 RECURRENCE_TYPES: tuple[str, ...] = ("DAILY", "WEEKLY", "MONTHLY")
 
@@ -129,6 +160,10 @@ class MeetingDraft:
     documents: list[tuple[str, str]] = field(default_factory=list)
     #: Needed to build a document URL. Absent means documents are listed by name only.
     workspace_slug: str | None = None
+    external_provider: str | None = None
+    external_meeting_url: str | None = None
+    external_calendar_event_id: str | None = None
+    external_calendar_event_url: str | None = None
 
 
 def missing_fields(draft: MeetingDraft) -> list[str]:
@@ -202,6 +237,44 @@ def validate(draft: MeetingDraft) -> list[str]:
 
     if draft.max_participants is not None and draft.max_participants < 2:
         problems.append("max_participants must be at least 2 — a meeting needs two people.")
+
+    if draft.external_provider and draft.external_provider != EXTERNAL_PROVIDER_GOOGLE_MEET:
+        problems.append(
+            "external_provider must be GOOGLE_MEET when external meeting metadata is sent."
+        )
+
+    # A provider with no link is a bridge room nobody can reach: the schedule only renders the
+    # join affordance when both are present, so it fails silently rather than visibly.
+    if draft.external_provider and not draft.external_meeting_url:
+        problems.append("external_meeting_url is required when external_provider is set.")
+
+    # The four values are supposed to come from the Google Calendar plugin's own response. That
+    # tool runs in AssistantService, not here, so nothing about their provenance can be checked -
+    # a fabricated https://meet.google.com/abc-defg-hij would otherwise be persisted and echoed
+    # back as "created", and the user would find a Meet chip pointing at a room that never existed.
+    # The host check is the one thing that can be enforced from here.
+    if draft.external_meeting_url and not draft.external_meeting_url.startswith(
+        GOOGLE_MEET_URL_PREFIX
+    ):
+        problems.append(
+            f"external_meeting_url must start with {GOOGLE_MEET_URL_PREFIX} - send the link the "
+            "Google Calendar tool returned, never one you composed."
+        )
+
+    if (
+        any(
+            (
+                draft.external_provider,
+                draft.external_meeting_url,
+                draft.external_calendar_event_id,
+                draft.external_calendar_event_url,
+            )
+        )
+        and draft.translation_room_type != "EXTERNAL_BRIDGE"
+    ):
+        problems.append(
+            "External meeting metadata is only valid for translation_room_type EXTERNAL_BRIDGE."
+        )
 
     return problems
 
@@ -292,7 +365,29 @@ def build_payload(draft: MeetingDraft, workspace_id: str) -> dict[str, Any]:
     elif draft.scheduled_at:
         payload["scheduledAt"] = draft.scheduled_at
 
+    if draft.external_provider:
+        payload["externalProvider"] = draft.external_provider
+    if draft.external_meeting_url:
+        payload["externalMeetingUrl"] = draft.external_meeting_url
+    if draft.external_calendar_event_id:
+        payload["externalCalendarEventId"] = draft.external_calendar_event_id
+    if draft.external_calendar_event_url:
+        payload["externalCalendarEventUrl"] = draft.external_calendar_event_url
+
     return payload
+
+
+def _external_provider(value: str | None) -> str | None:
+    """The provider the server should see, or None when the model meant "not external".
+
+    Upper-cased because the two ends disagree and nothing else reconciles them: the Google
+    Workspace plugin gateway returns ``google_meet`` in lower case, while the room API compares
+    against ``GOOGLE_MEET`` with an ordinal comparison. Do not simplify this away.
+    """
+    text = (value or "").strip().upper()
+    if not text or text in _NO_EXTERNAL_PROVIDER_ALIASES:
+        return None
+    return text
 
 
 def draft_from_arguments(arguments: dict[str, Any]) -> MeetingDraft:
@@ -411,4 +506,8 @@ def draft_from_arguments(arguments: dict[str, Any]) -> MeetingDraft:
         recurrence_start_date_local=recurrence_start_date_local,
         recurrence_end_date_local=as_text(args.get("recurrence_end_date_local")),
         max_participants=max_participants,
+        external_provider=_external_provider(as_text(args.get("external_provider"))),
+        external_meeting_url=as_text(args.get("external_meeting_url")),
+        external_calendar_event_id=as_text(args.get("external_calendar_event_id")),
+        external_calendar_event_url=as_text(args.get("external_calendar_event_url")),
     )
