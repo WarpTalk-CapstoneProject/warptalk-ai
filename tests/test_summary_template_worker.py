@@ -139,6 +139,67 @@ async def test_a_room_with_no_transcript_record_reads_as_empty_not_an_error() ->
     )
 
 
+@pytest.mark.asyncio
+async def test_a_supplied_transcript_is_used_and_the_service_is_never_called() -> None:
+    """The system-initiated path: ArtifactsFinalizer already read the stored segments.
+
+    The second assertion is the one that matters. A background finalization has no user and no
+    bearer token, so any HTTP call here would either be unauthenticated or need a privileged
+    bypass — precisely what this request's own contract refuses. Using what the publisher
+    already lawfully holds is what makes the token unnecessary rather than merely optional.
+    """
+    worker = _worker()
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=AssertionError("must not call the transcript service"))
+    worker._transcript_client = client
+
+    supplied = "[t=0] [Tu] hello\n[t=90210] [Nhi] cap it"
+    transcript = await worker._load_transcript(
+        SummaryRequestMessage(
+            request_id="r", room_id=ROOM, workspace_id="w", transcript_text=supplied
+        )
+    )
+
+    assert transcript == supplied
+    client.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_blank_supplied_transcript_falls_back_to_fetching() -> None:
+    """Whitespace is not a transcript, and must not silently summarise nothing.
+
+    Treating a string of newlines as "supplied" would skip the fetch and hand the model a blank
+    page, which is the failure this whole change exists to stop.
+    """
+    worker = _worker()
+    client = MagicMock()
+    client.get = AsyncMock(return_value=MagicMock(status_code=404))
+    worker._transcript_client = client
+
+    result = await worker._load_transcript(
+        SummaryRequestMessage(
+            request_id="r", room_id=ROOM, workspace_id="w", transcript_text="   \n  "
+        )
+    )
+
+    assert result == ""
+    client.get.assert_awaited()
+
+
+def test_a_supplied_transcript_survives_the_redis_round_trip() -> None:
+    """It travels as a stream field, so it has to serialise like every other one."""
+    message = SummaryRequestMessage(
+        request_id="r", room_id=ROOM, workspace_id="w", transcript_text="[t=0] [Tu] hi"
+    )
+
+    assert SummaryRequestMessage.from_redis(message.to_redis()).transcript_text == "[t=0] [Tu] hi"
+
+    # A message published before this field existed is the user-initiated shape, and has to keep
+    # fetching rather than summarising an empty string.
+    legacy = {k: v for k, v in message.to_redis().items() if k != "transcript_text"}
+    assert SummaryRequestMessage.from_redis(legacy).transcript_text == ""
+
+
 def test_the_worker_reads_and_writes_the_streams_the_backend_uses() -> None:
     # Renaming either side silently is how a request ends up with no consumer.
     assert SummaryTemplateWorker.input_stream == "assistant:summary_requests"

@@ -637,10 +637,22 @@ class ChatRequestMessage(BaseModel):
 class SummaryRequestMessage(BaseModel):
     """Backend → SummaryTemplateWorker: re-summarise a finished meeting.
 
-    Carries no transcript. The worker fetches the SAVED transcript itself, because the
-    in-memory accumulator AIAssistantWorker summarises from is gone once the meeting ends —
-    and gone again on every restart. Re-reading the stored segments is also what makes the
-    citations line up: they are the same segments the meeting page renders.
+    A USER-initiated rewrite carries no transcript and no `transcript_text`. The worker fetches
+    the SAVED transcript itself, as the caller, using `bearer_token` — never a privileged bypass
+    that would let a regeneration read more than its requester can. Re-reading the stored
+    segments is also what makes the citations line up: they are the same segments the meeting
+    page renders.
+
+    `transcript_text` is the SYSTEM-initiated case, and it is not an exception to that rule.
+    ArtifactsFinalizer publishes one when no summary arrived before its deadline — and it has
+    just read those same stored segments itself, over the internal gRPC mesh, to build the
+    meeting's transcript artifact. So it sends what it already lawfully holds, formatted with
+    `format_transcript_line` so the offsets a citation points at still resolve. Nothing new is
+    granted to anyone: there is no requester to escalate, and no HTTP call is made at all.
+
+    Exactly one of the two is expected. When `transcript_text` is present the worker uses it and
+    never calls the transcript service, which is what lets a background finalization run with no
+    user and no token.
     """
 
     __slots__ = ()
@@ -651,6 +663,9 @@ class SummaryRequestMessage(BaseModel):
     template_key: str = "general"
     bearer_token: str = ""
     target_languages_json: str = "[]"
+    #: Pre-read transcript, already formatted with `format_transcript_line`. Empty for a
+    #: user-initiated rewrite, which fetches instead.
+    transcript_text: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -661,6 +676,7 @@ class SummaryRequestMessage(BaseModel):
             "template_key": self.template_key,
             "bearer_token": self.bearer_token,
             "target_languages_json": self.target_languages_json,
+            "transcript_text": self.transcript_text,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -674,6 +690,9 @@ class SummaryRequestMessage(BaseModel):
             template_key=d.get("template_key", "general"),
             bearer_token=d.get("bearer_token", ""),
             target_languages_json=d.get("target_languages_json", "[]"),
+            # Absent on every message the backend published before this field existed, which is
+            # exactly the user-initiated shape — so an old request keeps fetching.
+            transcript_text=d.get("transcript_text", ""),
             timestamp_ms=int(d.get("timestamp_ms", 0) or 0),
         )
 
