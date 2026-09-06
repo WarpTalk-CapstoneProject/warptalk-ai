@@ -1,7 +1,12 @@
+import json
+
 from ai_assistant_worker.mcp_tools import (
+    MCP_MAX_DYNAMIC_TOOLS,
     build_mcp_confirmation_questions,
     build_mcp_plugin_connection_action,
     normalize_mcp_tool_payload,
+    redact_mcp_tool_payload_for_model,
+    select_mcp_tool_entries,
     split_mcp_tool_arguments,
     with_mcp_confirmation_parameter,
 )
@@ -68,7 +73,7 @@ def test_plugin_connection_action_payload_can_be_forwarded_to_clients() -> None:
     }
 
 
-def test_confirmation_required_keeps_confirmation_token() -> None:
+def test_confirmation_required_keeps_the_token_out_of_the_user_action() -> None:
     payload = normalize_mcp_tool_payload(
         {
             "isSuccess": False,
@@ -79,7 +84,40 @@ def test_confirmation_required_keeps_confirmation_token() -> None:
     )
 
     assert payload["userAction"]["type"] == "confirm_write"
-    assert payload["userAction"]["confirmationToken"] == "token-1"
+    assert "confirmationToken" not in payload["userAction"]
+    # Still on the envelope, because build_mcp_confirmation_questions reads it from there to put
+    # it in the card. Only redact_mcp_tool_payload_for_model strips it, on the way to the model.
+    assert payload["confirmationToken"] == "token-1"
+
+
+def test_redaction_removes_the_confirmation_token_the_model_could_spend() -> None:
+    """The write gate only works if the token cannot be read by the thing it gates.
+
+    The agent loop does not stop for the confirmation card, and every write tool carries a
+    ``confirmationToken`` parameter, so a token visible in the tool output is a token the model
+    can hand straight back on the next iteration - confirming the write on the user's behalf.
+    """
+    payload = normalize_mcp_tool_payload(
+        {
+            "isSuccess": False,
+            "errorCode": "confirmation_required",
+            "message": "Confirm first.",
+            "confirmationToken": "token-1",
+        }
+    )
+
+    redacted = redact_mcp_tool_payload_for_model(payload)
+
+    assert "token-1" not in json.dumps(redacted)
+    assert redacted["userAction"]["type"] == "confirm_write"
+    assert redacted["errorCode"] == "confirmation_required"
+    assert payload["confirmationToken"] == "token-1", "must not mutate the caller's payload"
+
+
+def test_redaction_leaves_an_ordinary_success_payload_alone() -> None:
+    payload = {"isSuccess": True, "result": {"eventId": "abc"}}
+
+    assert redact_mcp_tool_payload_for_model(payload) == payload
 
 
 def test_confirmation_question_carries_hidden_token_value() -> None:
@@ -145,3 +183,60 @@ def test_client_registration_unsupported_does_not_offer_a_connect_action() -> No
 
     # And it must not be mistaken for a connect prompt by the card builder.
     assert build_mcp_plugin_connection_action(normalized) == {}
+
+
+def _entry(name: str, plugin_key: str = "notion") -> dict[str, object]:
+    return {"name": name, "pluginKey": plugin_key, "description": "does a thing"}
+
+
+def test_selector_drops_names_the_responses_api_would_reject() -> None:
+    """One bad name must cost one tool, not the whole turn.
+
+    The API rejects the entire request when any function name is malformed, so an MCP server
+    calling its tool "notion.search" would take the built-in tools down with it.
+    """
+    accepted, rejected = select_mcp_tool_entries(
+        [_entry("notion.search"), _entry("x" * 65), _entry("notion_search")],
+        reserved_names=set(),
+    )
+
+    assert [item["name"] for item in accepted] == ["notion_search"]
+    assert [reason for reason, _ in rejected] == [
+        "mcp_tool_name_rejected",
+        "mcp_tool_name_rejected",
+    ]
+
+
+def test_selector_keeps_only_the_first_of_two_identically_named_tools() -> None:
+    accepted, rejected = select_mcp_tool_entries(
+        [_entry("search", "notion"), _entry("search", "linear")],
+        reserved_names=set(),
+    )
+
+    assert len(accepted) == 1
+    assert accepted[0]["pluginKey"] == "notion"
+    assert rejected == [("mcp_tool_name_duplicate", "search")]
+
+
+def test_selector_never_shadows_a_built_in_tool() -> None:
+    accepted, rejected = select_mcp_tool_entries(
+        [_entry("create_meeting"), _entry("notion_search")],
+        reserved_names={"create_meeting"},
+    )
+
+    assert [item["name"] for item in accepted] == ["notion_search"]
+    assert rejected == []
+
+
+def test_selector_caps_how_many_tools_one_turn_will_carry() -> None:
+    accepted, rejected = select_mcp_tool_entries(
+        [_entry(f"tool_{index}") for index in range(MCP_MAX_DYNAMIC_TOOLS + 5)],
+        reserved_names=set(),
+    )
+
+    assert len(accepted) == MCP_MAX_DYNAMIC_TOOLS
+    assert rejected == [("mcp_tool_budget_exhausted", f"tool_{MCP_MAX_DYNAMIC_TOOLS}")]
+
+
+def test_selector_tolerates_a_catalog_that_is_not_a_list() -> None:
+    assert select_mcp_tool_entries({"tools": []}, reserved_names=set()) == ([], [])

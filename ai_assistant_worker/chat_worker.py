@@ -35,6 +35,9 @@ from ai_assistant_worker.citations import (
     instruction as citation_instruction,
 )
 from ai_assistant_worker.mcp_tools import (
+    MCP_MAX_DESCRIPTION_CHARS as _MCP_MAX_DESCRIPTION_CHARS,
+)
+from ai_assistant_worker.mcp_tools import (
     build_mcp_confirmation_questions as _build_mcp_confirmation_questions,
 )
 from ai_assistant_worker.mcp_tools import (
@@ -44,6 +47,12 @@ from ai_assistant_worker.mcp_tools import (
     build_mcp_plugin_connection_action as _build_mcp_plugin_connection_action,
 )
 from ai_assistant_worker.mcp_tools import normalize_mcp_tool_payload as _normalize_mcp_tool_payload
+from ai_assistant_worker.mcp_tools import (
+    redact_mcp_tool_payload_for_model as _redact_mcp_tool_payload_for_model,
+)
+from ai_assistant_worker.mcp_tools import (
+    select_mcp_tool_entries as _select_mcp_tool_entries,
+)
 from ai_assistant_worker.mcp_tools import split_mcp_tool_arguments as _split_mcp_tool_arguments
 from ai_assistant_worker.mcp_tools import (
     with_mcp_confirmation_parameter as _with_mcp_confirmation_parameter,
@@ -892,25 +901,27 @@ class ChatAssistantWorker(BaseWorker):
             self.logger.warning("mcp_tool_discovery_invalid_json", request_id=request.request_id)
             return []
 
-        if not isinstance(tools_payload, list):
-            return []
+        entries, rejected = _select_mcp_tool_entries(
+            tools_payload, reserved_names=set(TOOLS_BY_NAME)
+        )
+        for reason, rejected_name in rejected:
+            self.logger.warning(
+                reason,
+                request_id=request.request_id,
+                name=rejected_name[:80],
+            )
 
         tools: list[ChatTool] = []
-        static_names = set(TOOLS_BY_NAME)
-        for item in tools_payload:
-            if not isinstance(item, dict):
-                continue
+        for item in entries:
             name = str(item.get("name") or "").strip()
             plugin_key = str(item.get("pluginKey") or "").strip()
-            if not name or not plugin_key or name in static_names:
-                continue
 
             parameters = item.get("parameters")
             if not isinstance(parameters, dict):
                 parameters = {"type": "object", "properties": {}, "additionalProperties": False}
 
             label = str(item.get("label") or name)
-            description = str(item.get("description") or label)
+            description = str(item.get("description") or label)[:_MCP_MAX_DESCRIPTION_CHARS]
             effect = str(item.get("effect") or "")
             tools.append(
                 ChatTool(
@@ -1006,7 +1017,7 @@ class ChatAssistantWorker(BaseWorker):
                     tool_calls_json=json.dumps(_build_mcp_operator_setup_action(normalized)),
                 )
 
-            return json.dumps(normalized)
+            return json.dumps(_redact_mcp_tool_payload_for_model(normalized))
 
         return handler
 
