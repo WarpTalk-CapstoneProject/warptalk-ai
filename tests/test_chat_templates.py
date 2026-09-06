@@ -183,6 +183,24 @@ class TestFormatMentions:
         for payload in ("", "not json", "{}", "[]", json.dumps(["string"]), json.dumps([{}])):
             assert _format_mentions(payload) is None
 
+    def test_plugin_mention_points_at_its_own_tools_not_a_lookup(self) -> None:
+        """WT-565: @Google Drive isn't a record to fetch - it's the user picking a capability."""
+        message = _format_mentions(
+            json.dumps(
+                [
+                    {
+                        "entityType": "plugin",
+                        "entityId": "google_workspace:drive",
+                        "label": "Google Drive",
+                    }
+                ]
+            )
+        )
+        assert message is not None
+        assert 'plugin "Google Drive" (id=google_workspace:drive)' in message
+        assert "prefer its tools" in message
+        assert "look it up" not in message
+
 
 class TestWebSearchIsTheLastResort:
     """WT — "nếu không có trong glossary thì tự search web".
