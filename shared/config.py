@@ -862,5 +862,16 @@ class SecuritySettings(BaseSettings):
     model: str = "gpt-4o-mini"
     max_tokens: int = 2000
     temperature: float = 0.0
+    # Per CHUNK, not per document. The scanner splits the text at this size and scans every piece,
+    # so this is the size of one request to the model rather than the amount of the document that
+    # gets looked at — it used to be both, which is how 93% of a 293,950-character upload went
+    # unread while the scan reported on it.
     max_analyze_length: int = 20000
+    # The whole document. Past this the scan FAILS rather than covering part of it: a guardrail
+    # that silently inspects a prefix is worse than one that says it could not cope. Mirrored by
+    # SecurityScanBudget.MaxScannedCharacters in warptalk-backend — move them together.
+    max_total_analyze_length: int = 400000
+    # Chunks are independent, so they go out together. Sequentially a 294k document would be
+    # fifteen 37-second calls — over nine minutes, against a three-minute ceiling on the caller.
+    scan_concurrency: int = 8
     result_ttl_seconds: int = 300
