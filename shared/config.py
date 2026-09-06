@@ -158,7 +158,51 @@ class WorkerSettings(BaseSettings):
     # Overridable per deployment as VAD_THRESHOLD, with no rebuild: a close-mic studio can
     # raise it, a hall can lower it further, and neither needs this default to move again.
     vad_threshold: float = 0.35  # Speech detection threshold
-    vad_pre_speech_ms: int = 192  # Two ~96ms windows preserve word onsets
+    # LEAVING SPEECH IS A DIFFERENT DECISION FROM ENTERING IT, and until now this loop made it
+    # with the same number.
+    #
+    # One threshold governed both, so the instant a trailing syllable fell below 0.35 the hangover
+    # countdown began — while the speaker was still finishing the word. Vietnamese ends a great
+    # many words on an unstressed vowel or a nasal, and an unvoiced final consonant carries almost
+    # no energy at all; those are precisely the frames that drop under an entry bar tuned to keep
+    # a speaker across a room audible. It is the mechanism behind the measurement already recorded
+    # beside `vad_silence_hangover_ms`: a production replay that cut "Kubernetes" to "Kuber".
+    #
+    # A LOWER BAR TO STAY IN SPEECH THAN TO ENTER IT is the standard answer, and it costs nothing
+    # here — the decision is already made per 32ms frame, this only changes which number the frame
+    # is compared against. No extra inference, no extra latency.
+    #
+    # 0.20 sits 0.15 under the entry bar, the margin Silero's own reference iterator uses between
+    # its onset and offset thresholds. NOT MEASURED ON THIS PRODUCT'S AUDIO — it is a starting
+    # point, and it is the first value to sweep if turns start running long in a noisy room:
+    # babble that sits between 0.20 and 0.35 will now hold a turn open until the `chunk_duration_ms`
+    # cap, where before it would have closed the turn early. That failure is visible (chunks
+    # pinned at the cap) where the one it replaces was silent (words cut off mid-syllable).
+    #
+    # Clamped to `vad_threshold` at use: a release bar ABOVE the entry bar is not hysteresis, it is
+    # a turn that can never close. Overridable as VAD_RELEASE_THRESHOLD.
+    vad_release_threshold: float = 0.20
+    # WT-576 / WT-571 — FOUR ~96ms windows, raised from two.
+    #
+    # Two windows "preserve word onsets" only for an onset the VAD calls on its first frame.
+    # Silero decides per 32ms frame and needs a frame or two of evidence, so a plosive or an
+    # unvoiced fricative — the /k/ of "can", the /s/ of "start" — is already partly past by the
+    # time speech is declared. 192ms of lead-in leaves roughly one window of genuine margin, and
+    # that is the reported symptom: the first word of a turn arriving clipped or, for a short
+    # opening utterance, not arriving at all.
+    #
+    # NO LATENCY COST. This is audio already captured and held in the ring; widening it changes
+    # what is PREPENDED to a chunk, not when the chunk is sent.
+    #
+    # NO ENERGY-GATE COST EITHER, which was the thing worth checking before touching it. The
+    # ingress energy floor averages RMS over the whole padded chunk, so more padding used to mean
+    # a stricter gate for short utterances — the exact population this is meant to rescue. That
+    # dilution is already undone: the floor is scaled by sqrt(speech_samples / total_samples)
+    # (livekit_ingress_worker/worker.py, "WEIGHED AGAINST THE SPEECH, NOT AGAINST THE PADDING"),
+    # so the threshold on speech loudness is unchanged by this value.
+    #
+    # Overridable per deployment as VAD_PRE_SPEECH_MS, with no rebuild.
+    vad_pre_speech_ms: int = 384
     # Four ~96ms windows retain quiet final syllables and natural micro-pauses. A
     # two-window production replay cut "Kubernetes" to "Kuber".
     vad_silence_hangover_ms: int = 576
@@ -187,10 +231,11 @@ class WorkerSettings(BaseSettings):
     # seeking inside it.
     #
     # THE SEEKING WINDOW IS NARROWER THAN IT LOOKS, and whoever tunes this next should know
-    # why. The cap weighs the whole BUFFER, which carries 192ms of pre-speech padding, so it
-    # fires at ~5808ms of speech rather than 6000. Seeking therefore has 4000ms -> 5808ms —
-    # about 1.8 seconds — to find a pause. A speaker who goes that long without a 288ms gap
-    # is still cut blindly.
+    # why. The cap weighs the whole BUFFER, which carries `vad_pre_speech_ms` of pre-speech
+    # padding, so it fires at ~5616ms of speech rather than 6000 — the padding was 192ms when
+    # this was written and is 384ms now, and this window narrows every time it grows. Seeking
+    # therefore has 4000ms -> 5616ms, about 1.6 seconds, to find a pause. A speaker who goes
+    # that long without a 288ms gap is still cut blindly.
     #
     # Widening it means RAISING `chunk_duration_ms`, and that is a separate decision with a
     # real cost: every speaker who genuinely does not pause then waits the larger cap before
@@ -201,6 +246,54 @@ class WorkerSettings(BaseSettings):
     # ~250ms is an ordinary inter-clause pause; 576ms is closer to an end-of-sentence one.
     # Rounded up to whole VAD windows at use, like the hangover it shadows.
     vad_seek_hangover_ms: int = 250
+
+    # HOLDING A SHORT TURN OPEN — the other end of the same ladder as boundary seeking.
+    #
+    # THE SYMPTOM: transcript arriving as two- and three-word bubbles, each one separately
+    # transcribed, translated and dubbed ("transcript bubble vun", WT-573/WT-576).
+    #
+    # WHERE IT COMES FROM, which is not where WT-576 looked. Seeking cannot be the source:
+    # `speech_samples` restarts at zero at every cut, so a seek cut cannot happen again until
+    # the speaker has produced another `vad_seek_boundary_after_ms` of speech — and a chunk
+    # holding four seconds of speech is not a fragment. What is left is the ordinary hangover,
+    # and 576ms sits INSIDE the clause-internal pause distribution of spontaneous speech, so
+    # the breath in the middle of a sentence ends the turn just as reliably as the full stop
+    # at the end of one.
+    #
+    # THE LADDER now reads as a single rule: THE MORE A SPEAKER HAS ALREADY SAID, THE READIER
+    # THIS LOOP IS TO CUT.
+    #
+    #     speech so far        hangover   why
+    #     >= 4000ms              288ms    a long turn: take the next real pause
+    #     1500-4000ms            576ms    an ordinary clause — unchanged
+    #     < 1500ms               864ms    too little to be a sentence; probably mid-thought
+    #
+    # WHY THIS IS NOT THE 800-1200ms RAISE THAT WAS REJECTED. That one added its full delta to
+    # the end of EVERY turn, complete sentences included, and dub latency is already dominated
+    # by waiting. This adds it only to turns that have said almost nothing — which are exactly
+    # the fragments — and there it usually costs no latency at all, because the speaker resumes
+    # inside the window and the two halves become ONE chunk instead of two consecutive ones.
+    #
+    # WHO PAYS: a genuine short utterance that really did end — "Vang", "OK", "Dung roi" — is
+    # dubbed ~288ms later than before. That is the whole trade, and it buys back a fragment
+    # rate on every sentence that contains a breath.
+    #
+    # ACCURACY, not only tidiness. This model is handed a fresh commit at every cut with no
+    # lexical context across it, so a sentence split into three chunks is recognised as three
+    # unrelated fragments. Fewer cuts inside a sentence is the largest accuracy lever left in
+    # a pipeline whose production model returns no confidence signal at all (see STTSettings).
+    #
+    # NO EXTRA SILENCE IS SENT. The hold-open is a decision window, not padding: silence beyond
+    # `vad_silence_hangover_ms` is trimmed from the buffer before it is published (see
+    # livekit_ingress_worker/worker.py), so a chunk that waited longer still ships exactly the
+    # tail it would have shipped before. Trailing silence is what a Whisper-family model
+    # invents text over, and this must not hand it more of it.
+    #
+    # Both overridable per deployment as VAD_SHORT_TURN_SPEECH_MS / VAD_SHORT_TURN_HANGOVER_MS.
+    vad_short_turn_speech_ms: int = 1500
+    # Nine ~96ms windows: above the clause-internal pauses that fragment a sentence, below the
+    # ~1s that reads as a finished turn. Rounded up to whole windows at use, like the others.
+    vad_short_turn_hangover_ms: int = 864
 
     # Near-field energy gate (ingress worker only, see livekit_ingress_worker/near_field_gate.py).
     # Opt-in only: a relative peak threshold cannot tell a distant speaker from a quiet
@@ -256,13 +349,14 @@ class STTSettings(BaseSettings):
     #   slower. Turning flash mode off while leaving this model on is a regression, not a
     #   rollback — put both back, or neither.
     #
-    # WHAT IS STILL ON THE TABLE
-    #   The big number — listener-perceived lag 7189ms -> 1080ms, 6.7x, per
-    #   tools/probe_streaming_lag.py — needs a third piece that is NOT done: wiring
-    #   `on_early_segment` in stt_worker/worker.py, currently None, so `_collect()` discards
-    #   every delta. That is where partial captions would come from. It is deliberately off
-    #   (hallucinated partials reached the UI once); re-enabling it is a separate change with
-    #   its own quality gate.
+    # THE THIRD PIECE IS NOW WIRED, and this note used to say it was not. `on_early_segment`
+    # is passed in stt_worker/worker.py, so a sentence the model finishes MID-chunk is
+    # published as soon as it exists rather than at the end of the turn — the quality gate the
+    # old note asked for is `exclude_emitted_from_final=True` plus the full `_filter_segments`
+    # pass, which together make an early sentence final and append-only instead of a revisable
+    # partial. The consequence worth carrying forward: in flash mode MOST production segments
+    # arrive down that path, so anything that only guards the completed path guards a minority
+    # of the meeting.
     #
     # A NOTE ON THE FIXTURE, because it cost a wrong revert. An earlier attempt was rolled
     # back on 5/5 lost utterances — this model hallucinating Han characters into Vietnamese,
@@ -576,6 +670,7 @@ class ChatAssistantSettings(BaseSettings):
     # buffered-unit convention (STT/TTS/AI-assistant results are never per-token either).
     chunk_flush_chars: int = 40
     workspace_service_url: str = "http://localhost:5106"
+    assistant_service_url: str = "http://localhost:5108"
     transcript_service_url: str = "http://localhost:5103"
     translation_room_service_url: str = "http://localhost:5102"
     # Reached only by get_platform_analytics, and only ever with the caller's own bearer token —

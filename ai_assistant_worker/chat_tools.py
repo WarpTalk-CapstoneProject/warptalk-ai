@@ -20,6 +20,7 @@ import httpx
 
 from ai_assistant_worker.citations import SourceRegistry
 from ai_assistant_worker.meeting_draft import (
+    EXTERNAL_PROVIDER_CHOICES,
     MEETING_TYPES,
     RECURRENCE_CHOICES,
     build_payload,
@@ -73,6 +74,7 @@ class ToolContext:
     #: it. Optional and last: every existing construction site keeps working, and a context
     #: without one simply produces no citations rather than failing.
     citations: SourceRegistry | None = None
+    assistant_client: httpx.AsyncClient | None = None
 
 
 @dataclass
@@ -1058,6 +1060,10 @@ async def _create_meeting(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             "scheduled_at": room.get("scheduledAt"),
             "recurring": bool(created.get("series")),
             "invited_count": len(draft.invited_emails),
+            "external_provider": room.get("externalProvider"),
+            "external_meeting_url": room.get("externalMeetingUrl"),
+            "external_calendar_event_id": room.get("externalCalendarEventId"),
+            "external_calendar_event_url": room.get("externalCalendarEventUrl"),
         }
     )
 
@@ -1412,7 +1418,13 @@ TOOLS: list[ChatTool] = [
                 "translation_room_type": {
                     "type": "string",
                     "enum": list(MEETING_TYPES),
-                    "description": "CHANNEL_MEETING suits most internal team meetings.",
+                    "description": (
+                        "CHANNEL_MEETING suits most internal team meetings. Pick "
+                        "EXTERNAL_BRIDGE only for a call hosted somewhere else whose link "
+                        "you already have - it makes a two-seat room that needs the WarpTalk "
+                        "desktop app and virtual audio devices, which is the wrong shape for "
+                        "an ordinary internal meeting."
+                    ),
                 },
                 "source_language": {
                     "type": "string",
@@ -1478,6 +1490,30 @@ TOOLS: list[ChatTool] = [
                         },
                         "required": ["title", "id"],
                     },
+                },
+                "external_provider": {
+                    "type": "string",
+                    "enum": list(EXTERNAL_PROVIDER_CHOICES),
+                    "description": (
+                        "NONE for an ordinary WarpTalk meeting - which is nearly always the "
+                        "answer. GOOGLE_MEET only when a Google Meet link was just created "
+                        "by a plugin tool and this room should bridge to it."
+                    ),
+                },
+                "external_meeting_url": {
+                    "type": "string",
+                    "description": (
+                        "Exact Google Meet URL returned by the plugin tool. Must start with "
+                        "https://meet.google.com/ - never compose or guess one."
+                    ),
+                },
+                "external_calendar_event_id": {
+                    "type": "string",
+                    "description": "Exact Google Calendar event id returned by the plugin tool.",
+                },
+                "external_calendar_event_url": {
+                    "type": "string",
+                    "description": "Exact Google Calendar event URL returned by the plugin tool.",
                 },
             },
             "required": ["title", "translation_room_type", "source_language", "target_languages"],
