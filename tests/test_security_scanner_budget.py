@@ -44,14 +44,7 @@ def _scanner(completion: SimpleNamespace) -> tuple[OpenAISecurityScanner, AsyncM
 
 
 def _ok_body(text: str) -> str:
-    return json.dumps(
-        {
-            "piiDetected": False,
-            "dlpDetected": False,
-            "violationFound": False,
-            "maskedContent": text,
-        }
-    )
+    return json.dumps({"piiDetected": False, "dlpMatches": [], "maskedContent": text})
 
 
 @pytest.mark.asyncio
@@ -98,16 +91,16 @@ async def test_a_normal_reply_is_still_parsed() -> None:
     body = json.dumps(
         {
             "piiDetected": True,
-            "dlpDetected": False,
-            "violationFound": True,
+            "dlpMatches": [],
             "maskedContent": "contact me at [EMAIL_REDACTED]",
         }
     )
     scanner, _ = _scanner(_completion(body))
 
-    pii, dlp, violation, masked = await scanner.scan_and_mask(
+    report = await scanner.scan_and_mask(
         text, pii_enabled=True, dlp_enabled=False, keywords_blacklist=[]
     )
 
-    assert (pii, dlp, violation) == (True, False, True)
-    assert masked == "contact me at [EMAIL_REDACTED]"
+    assert report.pii_detected is True
+    assert report.dlp_terms_claimed == ()
+    assert report.masked_content == "contact me at [EMAIL_REDACTED]"
