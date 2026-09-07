@@ -208,13 +208,47 @@ def _clone_language(hint: str) -> str:
     `_default_voice_id` speak English in a Vietnamese-only meeting and that starved
     `list_voices` of every non-English language.
 
-    "auto" still lands on "en", and that is the honest answer rather than a fix: it means the
-    speak language never resolved (see participant-language-preference.ts, UNRESOLVED_LANGUAGE),
-    so there is nothing better to say. It is worth knowing that the fallback is now only ever
-    reached by a language we genuinely have no support for, not by a spelling of one we do.
+    "auto" still lands on "en" HERE, because this function answers "what do I send Cartesia" and
+    it has to answer something. Whether "auto" should be sent at all is a different question, and
+    it is `_resolve_clone_language` below that asks it.
     """
     normalized = base_language(hint)
     return normalized if normalized in _CARTESIA_SUPPORTED_LANGUAGES else "en"
+
+
+#: What the pipeline says when nobody has told it which language is being spoken.
+#:
+#: `AudioChunkMessage.language` defaults to "auto", and livekit_ingress_worker returns the same
+#: string when the room's `speak_languages` hash has no entry for this speaker — which is the state
+#: anyone who joined without their language pick landing keeps for as long as it takes them to make
+#: one (see the 2.6s hub window this repeatedly loses).
+_UNRESOLVED_LANGUAGES = {"", "auto", "unknown", "und"}
+
+
+def _resolve_clone_language(hint: str) -> str | None:
+    """The language to clone in, or None when we do not yet know one.
+
+    WHY THE DIFFERENCE FROM `_clone_language` MATTERS
+        A Cartesia clone is keyed BY LANGUAGE. Cloning a Vietnamese speaker under "en" does not
+        produce a neutral voice that later speaks Vietnamese well — it produces an English voice
+        that is then asked to read Vietnamese, and that is the whole of "voice clone tiếng Việt
+        hoạt động không đồng đều, lúc nghe tiếng Việt lúc không". When the speaker's pick had
+        landed before their first twenty seconds of audio, the clone was Vietnamese and sounded
+        right; when it had not, `_clone_language("auto")` quietly returned "en" and the same
+        person, in the same room, sounded wrong for the rest of the meeting.
+
+        Both halves of that sentence are the same code path. Nothing was intermittent except the
+        arrival time of a language hint.
+
+    SO: an UNRESOLVED hint returns None and the caller waits. It costs nothing — the speaker is
+    still talking, the buffer keeps sliding, and twenty more seconds of audio is exactly what the
+    next attempt wants. An UNSUPPORTED hint (a real language Cartesia does not serve) still falls
+    back to "en", because waiting for an answer that is never coming would mean never cloning.
+    """
+    normalized = base_language(hint or "")
+    if normalized in _UNRESOLVED_LANGUAGES:
+        return None
+    return _clone_language(normalized)
 
 
 def _decode_field(data: Mapping[Any, Any], key: str) -> str:
@@ -1280,6 +1314,33 @@ class TTSWorker(BaseWorker):
         carried, _score = self.carried_clone(meeting_id, speaker_id)
         return carried
 
+    async def _cloned_language(self, meeting_id: str, speaker_id: str) -> str | None:
+        """The language the live clone for this speaker was MADE in, if there is one.
+
+        Written beside `voice_id` by `_clone_and_cache`. It exists so a clone made under the wrong
+        language can be noticed and replaced: without it the hash said only "there is a voice", and
+        a voice cloned as English because the speaker's pick had not landed yet stayed in use for
+        the whole meeting and was carried into the next one.
+
+        None means no clone, a clone from before this field existed, or a read that failed. All
+        three are read as "no evidence of a mismatch" — re-cloning is disruptive and audible, so it
+        must be triggered by a disagreement we can actually see, never by the absence of a record.
+        That is also why the read is allowed to fail quietly: an unreadable field must not be able
+        to stop cloning, and anything that broke this HGET has already broken `_get_voice_id`
+        against the same key.
+        """
+        try:
+            stored = await self.redis.hget(f"voice:{meeting_id}:{speaker_id}", "language")
+        except Exception:
+            self.logger.debug(
+                "clone_language_unreadable", meeting_id=meeting_id, speaker_id=speaker_id
+            )
+            return None
+        if not stored:
+            return None
+        decoded = stored.decode() if isinstance(stored, bytes) else stored
+        return base_language(decoded) or None
+
     async def _consume_upload_clone_requests(self) -> None:
         """Turn recordings people upload of themselves into provider voices (WT-396).
 
@@ -1620,6 +1681,45 @@ class TTSWorker(BaseWorker):
                                     key, "carried_over", score=carried_score
                                 )
 
+                        # DOES THE VOICE WE HAVE MATCH THE LANGUAGE THEY ARE ACTUALLY SPEAKING?
+                        #
+                        # A clone is keyed by language, and this speaker's language can resolve
+                        # AFTER their voice was made: the hub writes `speak_languages` when the
+                        # pick lands, and until it does the ingress worker sends "auto". A clone
+                        # built in that window is an English voice reading Vietnamese, and every
+                        # exit below this point is designed to keep an existing clone — so without
+                        # this check the mismatch is permanent for the meeting and is then carried
+                        # into the next one.
+                        #
+                        # Deliberately ahead of the upgrade budget and the score comparison. Those
+                        # two ask "is this clip BETTER", which is a quality question; this one is
+                        # "is this voice the right language at all", and a wrong-language voice is
+                        # not something a good score should be allowed to protect.
+                        #
+                        # One `_get_voice_id` answers both this question and the upgrade gate
+                        # below. Asking twice would be a Redis round trip per chunk per speaker
+                        # for a value that cannot change between the two lines.
+                        existing_voice = await self._get_voice_id(
+                            chunk.meeting_id, chunk.speaker_id
+                        )
+                        resolved_language = _resolve_clone_language(chunk.language)
+                        language_is_stale = False
+                        if existing_voice is not None and resolved_language is not None:
+                            # Only asked when there is a voice for it to disagree with. Otherwise
+                            # this is a second HGET, on every chunk of every speaker, against a
+                            # field that does not exist yet.
+                            cloned_language = await self._cloned_language(
+                                chunk.meeting_id, chunk.speaker_id
+                            )
+                            language_is_stale = (
+                                cloned_language is not None and cloned_language != resolved_language
+                            )
+                            if language_is_stale:
+                                await self._note_clone_state(
+                                    key,
+                                    f"relanguage:{cloned_language}->{resolved_language}",
+                                )
+
                         # WT-371 #9: this used to be `if already cloned: continue` — the worker
                         # stopped listening the moment it had any clone at all, so the voice was
                         # locked to whatever register the speaker opened the meeting in. Change
@@ -1627,7 +1727,7 @@ class TTSWorker(BaseWorker):
                         #
                         # It keeps listening now, but only while an upgrade is still allowed, so a
                         # speaker whose clone is already good costs nothing beyond the buffer.
-                        if await self._get_voice_id(chunk.meeting_id, chunk.speaker_id):
+                        if existing_voice is not None and not language_is_stale:
                             if (
                                 upgrades_used.get(key, 0)
                                 >= self.tts_settings.voice_clone_max_upgrades
@@ -1672,7 +1772,8 @@ class TTSWorker(BaseWorker):
                         # every other exit on this path is.
                         best_so_far = cloned_score.get(key)
                         if (
-                            best_so_far is not None
+                            not language_is_stale
+                            and best_so_far is not None
                             and best_so_far + self.tts_settings.voice_clone_upgrade_margin
                             > MAX_SAMPLE_SCORE
                         ):
@@ -1701,6 +1802,25 @@ class TTSWorker(BaseWorker):
                         )
 
                         if buffer_seconds[key] >= self.tts_settings.voice_clone_min_seconds:
+                            # NOT UNDER A GUESS ABOUT THE LANGUAGE.
+                            #
+                            # `_resolve_clone_language` returns None while the speaker's language
+                            # is still "auto", and cloning then picks "en" — for a Vietnamese
+                            # speaker that produces an English voice reading Vietnamese, locked in
+                            # for the meeting and carried into the next one. Waiting costs
+                            # nothing: the buffer slides, they are still talking, and the next
+                            # twenty seconds is exactly the sample the next attempt wants.
+                            clone_lang = _resolve_clone_language(buffer_lang.get(key, ""))
+                            if clone_lang is None:
+                                # Said out loud, like every other exit on this path. Silence here
+                                # is indistinguishable from cloning being switched off, which is
+                                # the report WT-405 arrived as.
+                                await self._note_clone_state(key, "waiting_for_language")
+                                self._trim_clone_buffer(
+                                    key, buffers, buffer_seconds, chunk.sample_rate
+                                )
+                                continue
+
                             # The clip is only a reference if it is worth referring to.
                             #
                             # This used to clone the first N seconds unconditionally, and
@@ -1738,7 +1858,11 @@ class TTSWorker(BaseWorker):
                                     f"clip_rejected:{assessment.reason}",
                                     active_speech_ratio=assessment.active_speech_ratio,
                                 )
-                            elif previous_score is None:
+                            elif previous_score is None or language_is_stale:
+                                # `language_is_stale` short-circuits the margin comparison on
+                                # purpose. The existing voice may well score higher; it is still
+                                # the wrong language, and a better English voice is not a fix for
+                                # a Vietnamese speaker.
                                 worth_cloning = True
                             else:
                                 worth_cloning = (
@@ -1748,9 +1872,14 @@ class TTSWorker(BaseWorker):
                             if worth_cloning:
                                 audio_snapshot = bytes(buffers.pop(key))
                                 del buffer_seconds[key]
-                                clone_lang = _clone_language(buffer_lang.pop(key, "en"))
+                                buffer_lang.pop(key, None)
                                 cloned_score[key] = assessment.score
-                                if is_upgrade:
+                                # A re-clone forced by a language correction does not spend an
+                                # upgrade. The budget bounds how often the voice people are
+                                # listening to may change for a BETTER likeness; being in the
+                                # right language is not that, and charging it here would let one
+                                # mistimed language hint use up the speaker's only improvement.
+                                if is_upgrade and not language_is_stale:
                                     upgrades_used[key] = upgrades_used.get(key, 0) + 1
                                 self.logger.info(
                                     "voice_clone_sample_accepted",
@@ -1957,6 +2086,12 @@ class TTSWorker(BaseWorker):
             )
             cache_key = f"voice:{meeting_id}:{speaker_id}"
             await self.redis.hset(cache_key, "voice_id", voice_id)
+            # WHICH LANGUAGE THIS VOICE IS. A Cartesia clone is keyed by language, so a voice and
+            # the language it was built from are one fact, and storing only half of it is why a
+            # clone made under an unresolved "auto" (and therefore under "en") could never be
+            # noticed, let alone replaced. `_cloned_language` reads this back and the capture loop
+            # re-clones on a disagreement.
+            await self.redis.hset(cache_key, "language", base_language(language))
             # hset has no TTL of its own — without this the key lives in Redis forever.
             await self.redis.expire(cache_key, self.tts_settings.voice_clone_key_ttl_seconds)
             self.logger.info(
@@ -1964,6 +2099,7 @@ class TTSWorker(BaseWorker):
                 meeting_id=meeting_id,
                 speaker_id=speaker_id,
                 voice_id=voice_id,
+                language=base_language(language),
             )
             await self._note_clone_state(key, "cloned", score=score)
             await self.redis.publish_system_event(

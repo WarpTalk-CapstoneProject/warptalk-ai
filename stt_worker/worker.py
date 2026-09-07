@@ -125,6 +125,20 @@ def _language_hint_for_stt(language: str) -> str | None:
     return normalized
 
 
+def _chunk_audio_duration_ms(chunk: AudioChunkMessage) -> int:
+    """How long the PCM in this chunk actually is, in milliseconds.
+
+    16-bit mono, so two bytes per sample — the same arithmetic the TTS clone buffer uses on the
+    same stream. Zero for a chunk that carries no audio of its own (a streaming turn whose frames
+    travelled separately), which is correct: there is nothing to shift it back by.
+
+    Read `_elapsed_ms` for why this is subtracted rather than merely measured.
+    """
+    sample_rate = max(chunk.sample_rate, 1)
+    samples = len(chunk.audio_data) // 2
+    return int(samples * 1000 / sample_rate)
+
+
 def _build_segment_id(
     meeting_id: str,
     speaker_id: str,
@@ -1063,6 +1077,28 @@ class STTWorker(BaseWorker):
             It is still an approximation of "room start": the anchor is the first chunk this
             pipeline saw, not the moment the host pressed Start. That is a smaller and, more
             importantly, a CONSISTENT error — every seat computes the same number.
+
+        WHY THE CHUNK'S OWN DURATION IS SUBTRACTED
+            `chunk.timestamp_ms` is set by `AudioChunkMessage`'s default_factory at construction,
+            and livekit_ingress_worker constructs the message when it PUBLISHES — that is, after
+            the speech in it has finished. So the timestamp marks the END of the audio, not the
+            start of it. The caller then adds the model's in-chunk segment offset on top
+            (`start_ms = chunk_offset_ms + seg.start * 1000`), which stamps every segment late by
+            roughly the length of its own chunk.
+
+            That is not a cosmetic drift, because the error is proportional to chunk length and
+            chunk length varies. A turn that hits the `chunk_duration_ms` cap of 6000 is stamped
+            [T, T+6000]; the short chunk that carries the rest of the same sentence is published
+            at T+1200 and stamped [T+1200, ...]. The gap between them comes out at MINUS 4.8
+            seconds — and the web's utterance merge requires `gapMs >= 0`, so the one case that
+            most needs joining (a sentence cut by the hard cap) was the one case guaranteed to
+            split into two bubbles. That is the reported "ngắt ở mỗi chunk".
+
+            Subtracting the PCM duration puts the offset back at the moment the speech started.
+            Derived from the audio rather than from `speech_ms` or `speech_start_ms` because those
+            describe how much of the chunk was speech, not where the chunk sits in time, and
+            because an older ingress leaves them at 0 — a wrong answer, where the byte length is
+            always right.
         """
         # getattr, matching how the other per-room caches in these workers are reached: this is
         # called from process(), and the test suites construct workers with __new__ rather than
@@ -1080,7 +1116,7 @@ class STTWorker(BaseWorker):
 
         # Never negative. Clock skew between the gateway and this worker is real, and a negative
         # offset formats into nonsense on the panel rather than failing loudly.
-        return max(0, chunk.timestamp_ms - anchor_ms)
+        return max(0, chunk.timestamp_ms - anchor_ms - _chunk_audio_duration_ms(chunk))
 
     async def _resolve_transcript_anchor(self, chunk: AudioChunkMessage) -> int:
         """The agreed millisecond every seat measures this meeting from."""
