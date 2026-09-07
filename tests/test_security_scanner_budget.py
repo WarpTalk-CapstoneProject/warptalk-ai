@@ -38,7 +38,12 @@ def _scanner(completion: SimpleNamespace) -> tuple[OpenAISecurityScanner, AsyncM
     create = AsyncMock(return_value=completion)
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     settings = SimpleNamespace(
-        model=None, max_tokens=None, temperature=None, max_analyze_length=None
+        model=None,
+        max_tokens=None,
+        temperature=None,
+        max_analyze_length=None,
+        max_total_analyze_length=None,
+        scan_concurrency=None,
     )
     return OpenAISecurityScanner(client, settings), create  # type: ignore[arg-type]
 
@@ -49,8 +54,8 @@ def _ok_body(text: str) -> str:
 
 @pytest.mark.asyncio
 async def test_a_long_document_is_given_room_to_come_back() -> None:
-    # 20,000 characters is exactly what max_analyze_length allows through, and it could never
-    # have fitted in the old flat 2,000-token reply budget.
+    # 20,000 characters is exactly one chunk — the most the model is ever asked to reproduce in
+    # a single reply — and it could never have fitted in the old flat 2,000-token budget.
     text = "a" * 20_000
     scanner, create = _scanner(_completion(_ok_body(text)))
 
