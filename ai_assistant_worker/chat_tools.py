@@ -301,6 +301,23 @@ async def _list_recent_meetings(ctx: ToolContext, arguments: dict[str, Any]) -> 
             )
 
         rooms = response.json().get("rooms", [])
+        # WT-647, DELIBERATE: no citation here, and the absence is the decision rather than an
+        # oversight. This is the one meeting-shaped tool that does not cite.
+        #
+        # What comes back is a set of candidates, not an account of any one of them. The model
+        # reads it to pick an id and then calls get_meeting_summary, get_room_detail or
+        # get_transcript — each of which now cites the meeting it was sent to, and cites it under
+        # the SAME identity this listing would have used, so the chip a reader ends up with is
+        # identical either way. Registering here would only change the answers that stop at the
+        # listing: "you had five meetings last week" would sprout up to five meeting chips, each
+        # claiming to be the source of a statement about the SET rather than about itself, and
+        # five of the eight slots an answer has for its real evidence would be gone.
+        #
+        # The near-neighbour that decided the other way is _search_documents, which cites its
+        # name-only results because naming a document IS quoting the thing the reader will open.
+        # A meeting row is not that: it names a container whose substance lives in the transcript
+        # and the summary, and its chip does not open anything in the client. If that changes —
+        # if a meeting chip ever routes somewhere — this is the comment to revisit.
         return json.dumps(
             [
                 {
@@ -607,8 +624,32 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     return json.dumps({"matches": cited})
 
 
-async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> str | None:
-    """None if this caller may read this meeting's derived data, else a tool-visible error.
+@dataclass(frozen=True)
+class MeetingAccess:
+    """The S2 gate's verdict, together with the room it had to read in order to reach it.
+
+    WHY THE ROOM COMES BACK AND NOT JUST THE VERDICT
+        The gate cannot decide anything without GETting the room, and the room is also the only
+        place a meeting's NAME lives: `meeting:{id}:summary` in Redis holds content and action
+        items and nothing that could go on a chip. Handing the payload back with the verdict is
+        what lets get_meeting_summary cite the meeting BY NAME without asking the same service
+        the same question twice on the same tool call.
+
+    WHY A DATACLASS RATHER THAN A TUPLE
+        `if access:` is true of every tuple ever returned, and this is the gate — the one place
+        in this module where a plausible-looking misread hands somebody another workspace's
+        meeting. A field called `denial` cannot be misread that way.
+    """
+
+    #: The tool-visible error to return verbatim, or None when this caller may read this meeting.
+    denial: str | None
+    #: The room as the service described it, and empty whenever `denial` is set: a refused caller
+    #: has been told nothing about the room and must not learn anything about it through here.
+    room: dict[str, Any]
+
+
+async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> MeetingAccess:
+    """A `denial` of None if this caller may read this meeting's derived data, else the error.
 
     S2. `meeting_id` is a MODEL-SUPPLIED tool argument — the assistant will pass whatever id
     appears in the conversation, including one a user simply typed. Tools that answer out of
@@ -629,16 +670,21 @@ async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> str | 
       authenticated user in any workspace gets one. Without the workspace comparison this
       gate would still hand a user another workspace's meeting summary, which is the bug.
     """
+    not_found = json.dumps({"error": "No meeting found with that id."})
+    unavailable = json.dumps({"error": "Could not look up the meeting summary right now."})
+
     try:
         uuid.UUID(meeting_id)
     except ValueError:
         # Not merely tidiness: the id is interpolated into a Redis key, so an unvalidated
         # value lets a crafted argument name a key that is not a meeting summary at all.
-        return json.dumps({"error": "That does not look like a valid meeting id."})
+        malformed = json.dumps({"error": "That does not look like a valid meeting id."})
+        return MeetingAccess(malformed, {})
 
     if not ctx.bearer_token:
         logger.warning("meeting_summary_denied_no_token", meeting_id=meeting_id)
-        return json.dumps({"error": "You are not signed in to view that meeting."})
+        signed_out = json.dumps({"error": "You are not signed in to view that meeting."})
+        return MeetingAccess(signed_out, {})
 
     try:
         response = await ctx.translation_room_client.get(
@@ -647,7 +693,7 @@ async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> str | 
         )
     except Exception:
         logger.exception("meeting_summary_authorization_error", meeting_id=meeting_id)
-        return json.dumps({"error": "Could not look up the meeting summary right now."})
+        return MeetingAccess(unavailable, {})
 
     if response.status_code in (401, 403, 404):
         # One indistinguishable answer for "no such meeting" and "not yours" — telling them
@@ -658,17 +704,26 @@ async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> str | 
             user_id=ctx.user_id,
             status=response.status_code,
         )
-        return json.dumps({"error": "No meeting found with that id."})
+        return MeetingAccess(not_found, {})
 
     if response.status_code != 200:
         logger.warning("meeting_summary_authorization_failed", status=response.status_code)
-        return json.dumps({"error": "Could not look up the meeting summary right now."})
+        return MeetingAccess(unavailable, {})
 
     try:
-        room_workspace_id = str(response.json().get("workspaceId") or "")
+        room = response.json()
     except ValueError:
         logger.warning("meeting_summary_authorization_unreadable", meeting_id=meeting_id)
-        return json.dumps({"error": "Could not look up the meeting summary right now."})
+        return MeetingAccess(unavailable, {})
+
+    # A body that is not an object is a body this gate cannot read a workspace out of, and
+    # `.get` on it would raise past the caller's own error handling rather than denying.
+    # Unreadable and wrong-shaped are the same fact here, and both fail closed.
+    if not isinstance(room, dict):
+        logger.warning("meeting_summary_authorization_unreadable", meeting_id=meeting_id)
+        return MeetingAccess(unavailable, {})
+
+    room_workspace_id = str(room.get("workspaceId") or "")
 
     # Fail closed: a room whose workspace we cannot read is a room we cannot clear.
     if not room_workspace_id or room_workspace_id.lower() != (ctx.workspace_id or "").lower():
@@ -677,9 +732,9 @@ async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> str | 
             meeting_id=meeting_id,
             user_id=ctx.user_id,
         )
-        return json.dumps({"error": "No meeting found with that id."})
+        return MeetingAccess(not_found, {})
 
-    return None
+    return MeetingAccess(None, cast(dict[str, Any], room))
 
 
 async def _get_meeting_summary(ctx: ToolContext, arguments: dict[str, Any]) -> str:
@@ -689,9 +744,9 @@ async def _get_meeting_summary(ctx: ToolContext, arguments: dict[str, Any]) -> s
             {"error": "A meeting_id is required — call list_recent_meetings first to find one."}
         )
 
-    denial = await _authorize_meeting_access(ctx, meeting_id)
-    if denial is not None:
-        return denial
+    access = await _authorize_meeting_access(ctx, meeting_id)
+    if access.denial is not None:
+        return access.denial
 
     try:
         summary_hash = await ctx.redis.hgetall(f"meeting:{meeting_id}:summary")
@@ -711,11 +766,28 @@ async def _get_meeting_summary(ctx: ToolContext, arguments: dict[str, Any]) -> s
             (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
             for k, v in summary_hash.items()
         }
+        # WT-647. The same summary reaches the model through two doors — this tool, and
+        # semantic_search over the chunks the summary was indexed into. Only the second one used
+        # to carry a marker, so whether the answer came out cited depended on which door the
+        # model happened to walk through, and the reader could not see which that was. One
+        # meeting is one source however it is reached; both doors issue the same kind now.
+        #
+        # The id is the room's own, not the model-supplied argument, so that a citation raised
+        # here and one raised by get_room_detail for the same meeting are the SAME source rather
+        # than two chips differing only in how somebody typed a UUID.
         return json.dumps(
-            {
-                "summary": decoded.get("content"),
-                "action_items": decoded.get("action_items"),
-            }
+            _with_marker(
+                {
+                    "summary": decoded.get("content"),
+                    "action_items": decoded.get("action_items"),
+                },
+                _cite(
+                    ctx,
+                    "meeting",
+                    access.room.get("title"),
+                    str(access.room.get("id") or meeting_id),
+                ),
+            )
         )
     except Exception:
         logger.exception("get_meeting_summary_error")
@@ -741,23 +813,77 @@ async def _get_room_detail(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             return json.dumps({"error": "Could not look up that room right now."})
 
         room = response.json()
+        # WT-647, DELIBERATE: this one cites, and list_recent_meetings does not.
+        #
+        # The line is between a tool that ANSWERS ABOUT ONE NAMED MEETING and one that offers
+        # candidates to pick from. Everything below — when it started, when it ended, who hosted
+        # it, what languages it ran in — is a fact about this meeting and nothing else, and an
+        # answer saying "it ended at 15:04" rests on it exactly the way an answer about what was
+        # decided rests on the summary. Leaving it uncited would reproduce this ticket's own
+        # defect one tool along: a factual claim about a meeting, sourced, with no chip.
+        #
+        # Same kind and same id as the summary's citation, so a turn that reads both the room
+        # and its summary produces ONE meeting chip rather than two that a reader would have to
+        # tell apart.
         return json.dumps(
-            {
-                "id": room.get("id"),
-                "title": room.get("title"),
-                "code": room.get("translationRoomCode"),
-                "status": room.get("status"),
-                "sourceLanguage": room.get("sourceLanguage"),
-                "targetLanguages": room.get("targetLanguages"),
-                "hostId": room.get("hostId"),
-                "scheduledAt": room.get("scheduledAt"),
-                "startedAt": room.get("startedAt"),
-                "endedAt": room.get("endedAt"),
-            }
+            _with_marker(
+                {
+                    "id": room.get("id"),
+                    "title": room.get("title"),
+                    "code": room.get("translationRoomCode"),
+                    "status": room.get("status"),
+                    "sourceLanguage": room.get("sourceLanguage"),
+                    "targetLanguages": room.get("targetLanguages"),
+                    "hostId": room.get("hostId"),
+                    "scheduledAt": room.get("scheduledAt"),
+                    "startedAt": room.get("startedAt"),
+                    "endedAt": room.get("endedAt"),
+                },
+                _cite(ctx, "meeting", room.get("title"), str(room.get("id") or room_id)),
+            )
         )
     except Exception:
         logger.exception("get_room_detail_error")
         return json.dumps({"error": "Could not look up that room right now."})
+
+
+async def _meeting_title(ctx: ToolContext, meeting_id: str) -> str | None:
+    """What to call this meeting on a chip, or None when it cannot be named.
+
+    WHY A TRANSCRIPT HAS TO ASK SOMEBODY ELSE WHAT IT IS CALLED
+        TranscriptDto carries ids, a status, languages and counts, and no title — the name a
+        reader would recognise ("Sprint review") lives on the translation room. So a transcript
+        either asks the room what it is called or says nothing, and saying nothing is the worse
+        of the two: a meeting-kind chip has no destination in the client, so its title is the
+        entire chip, and a row of chips all reading "Transcript" names no source at all.
+
+    WHY FAILING HERE IS NOT AN ERROR
+        None means no marker, which means an uncited answer — precisely the state the tool was
+        already in before this ticket. The transcript itself is unaffected; losing the transcript
+        because its footnote could not be labelled would be trading the answer for the citation.
+
+    WHY THIS IS NOT AN AUTHORIZATION CHECK, AND MUST NOT BE READ AS ONE
+        It declines to NAME; it never declines to READ. What decides whether this caller may see
+        the transcript is /api/v1/transcripts/..., answering the caller's own bearer token, the
+        same way every other HTTP-backed tool in this module inherits its authorization. Note the
+        asymmetry with get_meeting_summary, which answers out of Redis and therefore has to run
+        the S2 gate itself: this tool does not have that gate, and this function is not one.
+    """
+    try:
+        response = await ctx.translation_room_client.get(
+            f"/api/v1/translation-rooms/{meeting_id}",
+            headers=_auth_headers(ctx),
+        )
+        if response.status_code != 200:
+            return None
+        room = response.json()
+    except Exception:
+        logger.warning("meeting_title_lookup_failed", meeting_id=meeting_id)
+        return None
+
+    if not isinstance(room, dict):
+        return None
+    return str(room.get("title") or "").strip() or None
 
 
 async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
@@ -798,20 +924,44 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
 
         items = segments_response.json().get("items", [])
         ordered = sorted(items, key=lambda s: s.get("sequenceOrder", 0))
+
+        # WT-647. What a meeting's participants actually SAID is the strongest evidence this
+        # assistant ever hands the model, and it was the one kind that arrived anonymous: the
+        # same words retrieved through semantic_search came with a marker, retrieved through
+        # here with none. A transcript is one source — the meeting it transcribes — so it is
+        # registered once for the whole result rather than per segment, which would spend eight
+        # chip slots saying the same thing eight times.
+        #
+        # Only when there are segments. An empty transcript is not evidence, and naming it would
+        # cost a request to learn a title for a chip nobody should be offered.
+        #
+        # The ref is the argument rather than the room's own id, unlike the two meeting-kind
+        # citations above. Those two can name the same meeting within one turn and had to agree
+        # on an id to come out as one chip; this kind is registered by exactly one tool, so the
+        # only way to split it would be two get_transcript calls for the same meeting typed two
+        # different ways — and the price of that is a duplicate chip, not a wrong one.
+        marker = (
+            _cite(ctx, "transcript", await _meeting_title(ctx, meeting_id), meeting_id)
+            if ordered
+            else None
+        )
         return json.dumps(
-            {
-                "transcriptId": transcript_id,
-                "status": transcript.get("status"),
-                "segments": [
-                    {
-                        "speaker": s.get("speakerName"),
-                        "language": s.get("originalLanguage"),
-                        "text": s.get("originalText"),
-                        "startMs": s.get("startTimeMs"),
-                    }
-                    for s in ordered
-                ],
-            }
+            _with_marker(
+                {
+                    "transcriptId": transcript_id,
+                    "status": transcript.get("status"),
+                    "segments": [
+                        {
+                            "speaker": s.get("speakerName"),
+                            "language": s.get("originalLanguage"),
+                            "text": s.get("originalText"),
+                            "startMs": s.get("startTimeMs"),
+                        }
+                        for s in ordered
+                    ],
+                },
+                marker,
+            )
         )
     except Exception:
         logger.exception("get_transcript_error")
