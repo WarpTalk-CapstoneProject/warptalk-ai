@@ -7,6 +7,21 @@ from typing import Any
 
 from shared.config import VectorDbSettings
 
+#: Source types that belong to ONE MEETING, and the payload key holding that meeting's id.
+#:
+#: They differ because two producers chose differently and both are already in the index:
+#: TranscriptRedisConsumerService sets `source_id` to the TRANSCRIPT id and puts the room id in
+#: the chunk metadata as `translation_room_id`, while a meeting summary is published with
+#: `source_id` set to the room id itself. Filtering has to know which key to read for which type;
+#: guessing one would silently return nothing for the other, which is a failure that looks like
+#: "the assistant found nothing" rather than like a bug.
+ROOM_SCOPED_SOURCES: dict[str, str] = {
+    "transcript": "translation_room_id",
+    "meeting_summary": "source_id",
+}
+
+ROOM_SCOPED_SOURCE_KEYS: tuple[str, ...] = tuple(ROOM_SCOPED_SOURCES)
+
 
 class VectorStore(ABC):
     """Interface for storing text embeddings."""
@@ -30,12 +45,18 @@ class VectorStore(ABC):
         top_k: int,
         filters: dict[str, Any] | None = None,
         exclude: dict[str, list[str]] | None = None,
+        allowed_room_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Return the top_k nearest payloads (with score) for `vector`.
 
         `filters` are ANDed exact matches. `exclude` maps a payload key to values that must NOT
         appear — WT-463 needs it to keep document-sourced chunks out of an unprivileged caller's
         results, which `filters` alone cannot express.
+
+        `allowed_room_ids` narrows the two MEETING-scoped source types (see
+        `ROOM_SCOPED_SOURCES`) to meetings this caller can actually open. `None` means do not
+        scope, which is what a privileged caller sends; an empty list is a real answer — a member
+        who can open no meetings — and matches none of them.
 
         The exclusion belongs in the QUERY, not in a pass over the results: post-filtering still
         spends the top_k budget on points the caller may not see, so a workspace whose best
@@ -101,6 +122,7 @@ class QdrantVectorStore(VectorStore):
         top_k: int,
         filters: dict[str, Any] | None = None,
         exclude: dict[str, list[str]] | None = None,
+        allowed_room_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         client = await self._get_client()
 
@@ -129,6 +151,59 @@ class QdrantVectorStore(VectorStore):
             for key, values in (exclude or {}).items()
             for value in values
         ]
+        # WT-463: the per-MEETING gate, for the two source types that belong to one meeting
+        # rather than to the whole workspace.
+        #
+        # A transcript and a meeting summary are readable through the product only by people who
+        # can open that meeting — `BuildListableRoomsQueryAsync` decides it, and it is a
+        # per-participant question. `ai_retrieval` cannot express that: it is one global flag
+        # meaning "the AI may use this at all", with no subject in it. So a workspace member could
+        # ask WarpBot a question and receive the verbatim transcript of a meeting they were never
+        # in, and the summary of one whose record was never shared with them.
+        #
+        # Filterable WITHOUT a re-index, which is what makes fixing it possible now rather than
+        # after a migration: transcript points already carry `translation_room_id`
+        # (TranscriptRedisConsumerService writes it into the chunk metadata and the embedding
+        # worker spreads metadata into the payload), and meeting summaries are indexed with
+        # `source_id` set to the room id.
+        #
+        # `None` means "do not scope" and is what a privileged caller sends. An EMPTY list is a
+        # real answer — a member who can open no meetings — and correctly matches nothing.
+        if allowed_room_ids is not None:
+            must.append(
+                models.Filter(
+                    should=[
+                        # Everything not tied to one meeting — glossary terms, workspace context —
+                        # is unaffected. Written as "not one of the room-scoped types" so a new
+                        # source type is reachable by default; the alternative silently hides any
+                        # future type until somebody notices.
+                        models.Filter(
+                            must_not=[
+                                models.FieldCondition(
+                                    key="source_type",
+                                    match=models.MatchAny(any=list(ROOM_SCOPED_SOURCE_KEYS)),
+                                )
+                            ]
+                        ),
+                        *[
+                            models.Filter(
+                                must=[
+                                    models.FieldCondition(
+                                        key="source_type",
+                                        match=models.MatchValue(value=source_type),
+                                    ),
+                                    models.FieldCondition(
+                                        key=room_key,
+                                        match=models.MatchAny(any=allowed_room_ids),
+                                    ),
+                                ]
+                            )
+                            for source_type, room_key in ROOM_SCOPED_SOURCES.items()
+                        ],
+                    ]
+                )
+            )
+
         if must or must_not:
             query_filter = models.Filter(must=must or None, must_not=must_not or None)
 

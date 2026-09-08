@@ -119,3 +119,81 @@ def test_privilege_survives_the_redis_round_trip() -> None:
     for value in (True, False):
         restored = EmbeddingSearchRequest.from_redis(_request(privileged=value))
         assert restored.privileged is value
+
+
+# ── The per-MEETING half: transcripts and summaries ────────────────────────────────────────
+#
+# Excluding documents left the bigger door open. A transcript is the verbatim conversation and a
+# meeting summary defaults to HOST_ONLY, and BOTH were returned to every member of the workspace:
+# they were not in UNPRIVILEGED_EXCLUDED_SOURCES, and the search worker's own comment called that
+# out as "a second, real instance of the same bug".
+#
+# They are narrowed rather than dropped because, unlike documents, their meeting id IS in the
+# payload already — so no re-index was needed to start filtering on it.
+
+
+@pytest.mark.asyncio
+async def test_a_member_is_scoped_to_the_meetings_they_can_open() -> None:
+    worker, store = _worker()
+
+    await worker.process(
+        b"msg-1",
+        _request(privileged=False, allowed_room_ids_json='["room-a", "room-b"]'),
+    )
+
+    assert store.search_mock.await_args.kwargs["allowed_room_ids"] == ["room-a", "room-b"]
+
+
+@pytest.mark.asyncio
+async def test_an_owner_or_admin_is_not_scoped_to_any_meeting_list() -> None:
+    """None, not []. An admin can open every meeting through the product; narrowing them here
+    would hide from the assistant what the meetings list already hands them."""
+    worker, store = _worker()
+
+    await worker.process(b"msg-1", _request(privileged=True))
+
+    assert store.search_mock.await_args.kwargs["allowed_room_ids"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_member_who_can_open_nothing_matches_nothing() -> None:
+    """[] and "" are different answers and the gate lives in the difference.
+
+    An empty ARRAY is a real answer — a member with no meetings — and must match none. Reading it
+    as "unrestricted" would hand that member every transcript in the workspace, which is the leak
+    inverted rather than closed.
+    """
+    worker, store = _worker()
+
+    await worker.process(b"msg-1", _request(privileged=False, allowed_room_ids_json="[]"))
+
+    assert store.search_mock.await_args.kwargs["allowed_room_ids"] == []
+
+
+def test_an_unreadable_allowlist_is_read_as_no_meetings() -> None:
+    """Malformed is not unrestricted. If we cannot establish what the caller may open, the safe
+    reading is nothing — it costs one search, where the other way costs a confidentiality
+    boundary."""
+    request = EmbeddingSearchRequest(
+        job_id="j",
+        workspace_id="w",
+        collection_id="c",
+        query="q",
+        allowed_room_ids_json="{not json",
+    )
+
+    assert request.allowed_room_ids() == []
+
+
+def test_the_allowlist_survives_the_redis_round_trip() -> None:
+    # It crosses a Redis stream as a string. An array that serialises and parses back as None
+    # would silently reopen the leak for every member.
+    raw = _request(privileged=False, allowed_room_ids_json='["room-a"]')
+    assert EmbeddingSearchRequest.from_redis(raw).allowed_room_ids() == ["room-a"]
+
+    absent = _request(privileged=False)
+    del absent["allowed_room_ids_json"]
+    # Absent means "not scoped" — the shape every request had before this field existed. The
+    # document exclusion still applies to those callers, so an old producer loses nothing and
+    # gains nothing.
+    assert EmbeddingSearchRequest.from_redis(absent).allowed_room_ids() is None

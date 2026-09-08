@@ -411,6 +411,51 @@ async def _caller_is_privileged(ctx: ToolContext) -> bool:
         return False
 
 
+#: How many meetings one allowlist may name.
+#:
+#: Every id travels in the Redis request and then into a Qdrant MatchAny, so this is a real cost,
+#: not a guess. A member with more meetings than this loses the tail rather than the search: the
+#: newest are kept, because a question about a meeting is overwhelmingly a question about a
+#: recent one, and the alternative — refusing to scope — is the leak this exists to close.
+MAX_SCOPED_ROOM_IDS = 200
+
+
+async def _visible_meeting_ids(ctx: ToolContext) -> list[str]:
+    """The meetings this caller may open, newest first.
+
+    Read through `/translation-rooms/history` AS THE CALLER, which is the same authorized read
+    the meetings list uses and which applies `BuildListableRoomsQueryAsync` — the product's own
+    answer to "which meetings may this person see". Deriving it here from participant rows would
+    be a second copy of that rule, and the copy that drifts is always the one guarding the path
+    nobody looks at.
+
+    An empty list on failure, and that is deliberate: if we cannot establish what this caller may
+    open, the safe reading is "nothing", not "everything". It costs a member their transcript
+    search for one request; the alternative hands them somebody else's meeting.
+    """
+    try:
+        response = await ctx.translation_room_client.get(
+            "/api/v1/translation-rooms/history",
+            params={"page": 1, "pageSize": MAX_SCOPED_ROOM_IDS},
+            headers=_auth_headers(ctx),
+        )
+        if response.status_code != 200:
+            logger.warning("visible_meetings_lookup_failed", status=response.status_code)
+            return []
+
+        rooms = (response.json() or {}).get("rooms") or []
+        ids: list[str] = []
+        for item in rooms:
+            room = item.get("room") if isinstance(item, dict) else None
+            room_id = (room or {}).get("id") if isinstance(room, dict) else None
+            if room_id:
+                ids.append(str(room_id))
+        return ids
+    except Exception:
+        logger.exception("visible_meetings_lookup_error")
+        return []
+
+
 async def _run_embedding_search(
     ctx: ToolContext,
     *,
@@ -419,6 +464,7 @@ async def _run_embedding_search(
     query: str,
     top_k: int,
     privileged: bool,
+    allowed_room_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """One request/reply round-trip against EmbeddingSearchWorker for a single collection.
 
@@ -437,6 +483,11 @@ async def _run_embedding_search(
         # WT-463: the search worker treats an absent value as unprivileged, so this must be sent
         # explicitly on every request rather than only when true.
         "privileged": "true" if privileged else "false",
+        # WT-463: the meetings this caller may open, for the two source types that belong to one
+        # meeting. "" means do not scope, which is what a privileged caller and the global
+        # glossary collection both send; a JSON array — including an empty one — is a real
+        # answer and is honoured literally.
+        "allowed_room_ids_json": ("" if allowed_room_ids is None else json.dumps(allowed_room_ids)),
         "timestamp_ms": str(int(time.time() * 1000)),
     }
 
@@ -576,6 +627,10 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     # no per-subject dimension to honour — passing the caller's privilege there would imply a
     # restriction that does not exist.
     privileged = await _caller_is_privileged(ctx)
+    # Only an unprivileged caller is scoped. An owner or admin can already open every meeting in
+    # the workspace through the product, so narrowing them here would hide from the assistant
+    # what the meetings list hands them anyway.
+    allowed_room_ids = None if privileged else await _visible_meeting_ids(ctx)
 
     try:
         workspace_matches, global_matches = await asyncio.gather(
@@ -586,6 +641,7 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
                 query=query,
                 top_k=top_k,
                 privileged=privileged,
+                allowed_room_ids=allowed_room_ids,
             ),
             _run_embedding_search(
                 ctx,

@@ -100,6 +100,12 @@ class EmbeddingSearchWorker(BaseWorker):
                 top_k=request.top_k,
                 filters={"workspace_id": request.workspace_id, "ai_retrieval": True},
                 exclude=None if request.privileged else UNPRIVILEGED_EXCLUDED_SOURCES,
+                # The per-MEETING half of the same gate. `exclude` above drops documents
+                # wholesale because their ACL is not in the payload; transcripts and meeting
+                # summaries DO carry their meeting's id, so they are narrowed rather than
+                # dropped — which is what lets the assistant still answer from the meetings this
+                # caller actually attended.
+                allowed_room_ids=request.allowed_room_ids(),
             )
             await self._reply(result_key, {"matches": matches})
         except Exception as exc:
