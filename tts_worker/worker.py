@@ -110,6 +110,50 @@ _PREVIEW_TEXT: dict[str, str] = {
     "zh": "你好，这就是别人用其他语言收听时我的声音。",
 }
 
+
+def _preview_failure(exc: BaseException) -> tuple[str, str]:
+    """A preview failure as (code, message), from whatever the provider SDK threw.
+
+    WHY A CODE AND NOT JUST A TRUNCATED STRING
+        This used to be `str(exc)[:200]`, under a comment that had the diagnosis exactly right —
+        "a Cartesia stack trace is not a message for one" — and then answered it by making the
+        stack trace shorter. What reached somebody pressing play was
+
+            Error code: 404 - {'error_code': 'voice_not_found', 'message': 'The requested voice
+            was not found.', 'title': 'Voice not found', 'request_id': 'e9d42fe9-...'}
+
+        A request id and a Python dict, on a play button. Truncation cannot fix that, because the
+        problem is not the length: a provider's exception is written for whoever reads the logs,
+        and the person here is not that reader.
+
+        So the CODE goes on the wire and AuthService picks the sentence. The message is kept
+        beside it for the logs, and is never what the person sees.
+
+    WHY THE MAPPING IS HERE AND NOT IN AuthService
+        This is the only side that holds the Cartesia key, so it is the only side that can tell a
+        voice that does not exist from a key that has expired. AuthService would be guessing from
+        a string.
+    """
+    name = type(exc).__name__
+
+    # Ordered most specific first; every branch names a different thing to DO about it.
+    if name == "NotFoundError":
+        return "VOICE_NOT_FOUND", "the provider does not have this voice"
+    if name in ("AuthenticationError", "PermissionDeniedError"):
+        return "PROVIDER_REJECTED", "the voice provider rejected our credentials"
+    if name == "RateLimitError":
+        return "PROVIDER_BUSY", "the voice provider is rate limiting us"
+    if name in ("APITimeoutError", "APIConnectionError"):
+        return "PROVIDER_UNREACHABLE", "the voice provider could not be reached"
+    if name in ("InternalServerError", "APIStatusError", "APIError"):
+        return "PROVIDER_UNAVAILABLE", "the voice provider returned an error"
+    if name in ("BadRequestError", "UnprocessableEntityError"):
+        return "VOICE_NOT_RENDERABLE", "the provider refused to render this voice"
+
+    # Unknown: the code says so plainly rather than inventing a cause, and the message still
+    # carries something for the logs.
+    return "UNKNOWN", str(exc)[:200]
+
 # WT-B — a clone that outlives the meeting it was made in.
 #
 # WHY THE HAND-OFF EXISTS AT ALL
@@ -1466,17 +1510,24 @@ class TTSWorker(BaseWorker):
 
         result_key = f"{_PREVIEW_RESULT_PREFIX}{voice_id}:{language}"
 
-        async def answer(audio: bytes | None, error: str | None) -> None:
+        async def answer(
+            audio: bytes | None, error: str | None, error_code: str | None = None
+        ) -> None:
             # An answer is always written, including for failure — the same rule the clone
             # hand-off follows. A missing key and a key that has not been written yet look
             # identical to the waiting request, so silence would render as "still loading"
             # until it timed out, for every retry, forever.
+            #
+            # error_code travels beside the message so the reader decides the copy. AuthService
+            # shows the person a sentence chosen from the code, and never this string — see
+            # _preview_failure for why the string alone was not enough.
             await self.redis.set_with_ttl(
                 result_key,
                 json.dumps(
                     {
                         "audio": base64.b64encode(audio).decode("ascii") if audio else None,
                         "error": error,
+                        "error_code": error_code,
                     }
                 ),
                 _PREVIEW_RESULT_TTL_SECONDS,
@@ -1488,7 +1539,7 @@ class TTSWorker(BaseWorker):
                 text, language, voice_id
             )
             if not audio_bytes:
-                await answer(None, "the provider returned no audio for this voice")
+                await answer(None, "the provider returned no audio for this voice", "NO_AUDIO")
                 return
             await answer(audio_bytes, None)
             self.logger.info(
@@ -1500,9 +1551,8 @@ class TTSWorker(BaseWorker):
             )
         except Exception as exc:
             self.logger.exception("voice_preview_failed", voice_id=voice_id, language=language)
-            # Truncated because it goes on the wire to a person pressing a play button, and a
-            # Cartesia stack trace is not a message for one.
-            await answer(None, str(exc)[:200])
+            code, message = _preview_failure(exc)
+            await answer(None, message, code)
 
     async def _sweep_orphan_voices(self) -> None:
         """Delete in-meeting clones from the Cartesia account once nothing can reach them.
