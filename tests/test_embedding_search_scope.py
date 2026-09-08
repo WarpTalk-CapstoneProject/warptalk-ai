@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from embedding_worker.schemas import EmbeddingSearchRequest
-from embedding_worker.search_worker import UNPRIVILEGED_EXCLUDED_SOURCES, EmbeddingSearchWorker
+from embedding_worker.search_worker import EmbeddingSearchWorker
 from embedding_worker.vector_store import VectorStore
 
 
@@ -68,14 +68,23 @@ def _request(**overrides) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_a_member_cannot_reach_document_chunks() -> None:
+async def test_a_member_is_scoped_to_the_documents_they_may_retrieve() -> None:
+    """Documents are NARROWED now, not dropped.
+
+    They used to be excluded wholesale for anyone unprivileged, because their per-subject ACL
+    could not be consulted from here. That was safe and blunt: it never revealed anything, and it
+    hid every document answer a member was entitled to while leaving `ai_retrieval` — a real
+    permission the ACL has always implemented — enforced by nothing.
+    """
     worker, store = _worker()
 
-    await worker.process(b"msg-1", _request(privileged=False))
+    await worker.process(
+        b"msg-1",
+        _request(privileged=False, allowed_document_ids_json='["doc-a", "doc-b"]'),
+    )
 
     kwargs = store.search_mock.await_args.kwargs
-    assert kwargs["exclude"] == UNPRIVILEGED_EXCLUDED_SOURCES
-    assert "document" in kwargs["exclude"]["source_type"]
+    assert kwargs["allowed_document_ids"] == ["doc-a", "doc-b"]
 
 
 @pytest.mark.asyncio
@@ -84,7 +93,9 @@ async def test_an_owner_or_admin_still_reaches_everything() -> None:
 
     await worker.process(b"msg-1", _request(privileged=True))
 
-    assert store.search_mock.await_args.kwargs["exclude"] is None
+    kwargs = store.search_mock.await_args.kwargs
+    assert kwargs["allowed_document_ids"] is None
+    assert kwargs["allowed_room_ids"] is None
 
 
 @pytest.mark.asyncio
@@ -98,7 +109,28 @@ async def test_a_request_that_omits_privilege_is_treated_as_a_member() -> None:
     worker, store = _worker()
     await worker.process(b"msg-1", raw)
 
-    assert store.search_mock.await_args.kwargs["exclude"] == UNPRIVILEGED_EXCLUDED_SOURCES
+    assert store.search_mock.await_args.kwargs["allowed_document_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_unprivileged_request_that_carries_no_allowlists_reaches_nothing_scoped() -> None:
+    """The hole that opens if presence-of-field decides scoping instead of privilege.
+
+    An absent allowlist PARSES to None, and None means "unscoped". So reading a missing field
+    that way would let an old producer, a replayed stream entry or a hand-built request reach
+    every document and every transcript in the workspace — the leak reopened by omission rather
+    than by a bug. An unprivileged caller is always scoped on both dimensions.
+    """
+    raw = _request(privileged=False)
+    del raw["allowed_room_ids_json"]
+    del raw["allowed_document_ids_json"]
+
+    worker, store = _worker()
+    await worker.process(b"msg-1", raw)
+
+    kwargs = store.search_mock.await_args.kwargs
+    assert kwargs["allowed_document_ids"] == []
+    assert kwargs["allowed_room_ids"] == []
 
 
 @pytest.mark.asyncio
@@ -193,7 +225,25 @@ def test_the_allowlist_survives_the_redis_round_trip() -> None:
 
     absent = _request(privileged=False)
     del absent["allowed_room_ids_json"]
-    # Absent means "not scoped" — the shape every request had before this field existed. The
-    # document exclusion still applies to those callers, so an old producer loses nothing and
-    # gains nothing.
+    # The SCHEMA reports what was sent, and absent is None — "this request carried no allowlist".
+    # Turning that into a scoping decision is the worker's job, not the schema's, and the worker
+    # reads it as [] for an unprivileged caller (see the test above). Keeping the two separate is
+    # what stops "nobody told us" from quietly becoming "everything".
     assert EmbeddingSearchRequest.from_redis(absent).allowed_room_ids() is None
+
+
+def test_the_document_allowlist_survives_the_redis_round_trip() -> None:
+    raw = _request(privileged=False, allowed_document_ids_json='["doc-a"]')
+    assert EmbeddingSearchRequest.from_redis(raw).allowed_document_ids() == ["doc-a"]
+
+
+def test_an_unreadable_document_allowlist_is_read_as_no_documents() -> None:
+    request = EmbeddingSearchRequest(
+        job_id="j",
+        workspace_id="w",
+        collection_id="c",
+        query="q",
+        allowed_document_ids_json="{not json",
+    )
+
+    assert request.allowed_document_ids() == []

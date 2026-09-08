@@ -456,6 +456,56 @@ async def _visible_meeting_ids(ctx: ToolContext) -> list[str]:
         return []
 
 
+MAX_SCOPED_DOCUMENT_IDS = 200
+
+
+async def _visible_document_ids(ctx: ToolContext) -> list[str]:
+    """The documents this caller may have the assistant answer from.
+
+    Read through `/workspaces/{id}/documents/ai-retrievable` AS THE CALLER, which evaluates the
+    `ai_retrieval` permission in DocumentAccessEvaluator — status, retention, ingestion,
+    AiEligible, then the per-subject policies and the hierarchy above them. That permission has
+    existed as long as the ACL and, until this endpoint, no production caller had ever asked for
+    it: semantic search could not read a document's ACL, so it dropped documents wholesale for
+    anyone who was not an Owner or Admin.
+
+    Deriving the set here would be a second copy of an ACL with three subject types, a
+    deny-before-allow precedence and a permission hierarchy. The copy that drifts is always the
+    one guarding the path nobody looks at.
+
+    An empty list on failure, and that is deliberate: if we cannot establish what this caller may
+    retrieve, the safe reading is "nothing". It costs them their document answers for one
+    request; the alternative hands them a document they cannot open.
+    """
+    try:
+        response = await ctx.workspace_client.get(
+            f"/api/v1/workspaces/{ctx.workspace_id}/documents/ai-retrievable",
+            params={"limit": MAX_SCOPED_DOCUMENT_IDS},
+            headers=_auth_headers(ctx),
+        )
+        if response.status_code != 200:
+            # Includes the window before the endpoint is deployed, where this reads as "no
+            # documents" — which is exactly the behaviour the wholesale exclusion had.
+            logger.warning("visible_documents_lookup_failed", status=response.status_code)
+            return []
+
+        body = response.json() or {}
+        ids = [str(item) for item in (body.get("documentIds") or [])]
+        if body.get("truncated"):
+            # Worth a line: past the cap the assistant answers from a subset without knowing it,
+            # and "I have no record of that document" is indistinguishable from a permission
+            # refusal to the person who asked.
+            logger.warning(
+                "visible_documents_truncated",
+                workspace_id=ctx.workspace_id,
+                returned=len(ids),
+            )
+        return ids
+    except Exception:
+        logger.exception("visible_documents_lookup_error")
+        return []
+
+
 async def _run_embedding_search(
     ctx: ToolContext,
     *,
@@ -465,6 +515,7 @@ async def _run_embedding_search(
     top_k: int,
     privileged: bool,
     allowed_room_ids: list[str] | None = None,
+    allowed_document_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """One request/reply round-trip against EmbeddingSearchWorker for a single collection.
 
@@ -488,6 +539,11 @@ async def _run_embedding_search(
         # glossary collection both send; a JSON array — including an empty one — is a real
         # answer and is honoured literally.
         "allowed_room_ids_json": ("" if allowed_room_ids is None else json.dumps(allowed_room_ids)),
+        # WT-463: the documents this caller may retrieve, resolved by the workspace service from
+        # the `ai_retrieval` permission. Same three states as the room list.
+        "allowed_document_ids_json": (
+            "" if allowed_document_ids is None else json.dumps(allowed_document_ids)
+        ),
         "timestamp_ms": str(int(time.time() * 1000)),
     }
 
@@ -630,7 +686,17 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     # Only an unprivileged caller is scoped. An owner or admin can already open every meeting in
     # the workspace through the product, so narrowing them here would hide from the assistant
     # what the meetings list hands them anyway.
-    allowed_room_ids = None if privileged else await _visible_meeting_ids(ctx)
+    # Both allowlists, resolved once per search and applied to the workspace collection only.
+    # Gathered rather than awaited in sequence: they are two independent authorized reads against
+    # two different services, and a chat turn is already waiting on the model.
+    if privileged:
+        allowed_room_ids: list[str] | None = None
+        allowed_document_ids: list[str] | None = None
+    else:
+        allowed_room_ids, allowed_document_ids = await asyncio.gather(
+            _visible_meeting_ids(ctx),
+            _visible_document_ids(ctx),
+        )
 
     try:
         workspace_matches, global_matches = await asyncio.gather(
@@ -642,6 +708,7 @@ async def _semantic_search(ctx: ToolContext, arguments: dict[str, Any]) -> str:
                 top_k=top_k,
                 privileged=privileged,
                 allowed_room_ids=allowed_room_ids,
+                allowed_document_ids=allowed_document_ids,
             ),
             _run_embedding_search(
                 ctx,

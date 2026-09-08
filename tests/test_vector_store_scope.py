@@ -1,4 +1,4 @@
-"""The Qdrant filter that keeps one meeting's words inside that meeting.
+"""The Qdrant filter that keeps one meeting's words, and one document's, where they belong.
 
 WHY THIS IS ITS OWN FILE
     The search worker's tests prove the allowlist REACHES the vector store. They cannot prove the
@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from embedding_worker.vector_store import (
+    DOCUMENT_SCOPED_SOURCES,
     ROOM_SCOPED_SOURCES,
     QdrantVectorStore,
 )
@@ -139,3 +140,100 @@ async def test_sources_that_belong_to_the_workspace_are_not_narrowed() -> None:
     # One escape hatch for non-meeting sources, plus one branch per meeting-scoped type.
     assert len(branches) == 1 + len(ROOM_SCOPED_SOURCES)
     assert any(getattr(branch, "must_not", None) for branch in branches)
+
+
+# ── The per-DOCUMENT dimension ─────────────────────────────────────────────────────────────
+#
+# Documents used to be dropped wholesale for an unprivileged caller, because their per-subject
+# ACL could not be consulted from the worker. They are narrowed now, from an allowlist the
+# workspace service resolves through the `ai_retrieval` permission — and no re-index was needed,
+# because `source_id` has carried the document id since the first document was indexed.
+
+
+@pytest.mark.asyncio
+async def test_documents_are_constrained_by_their_own_key() -> None:
+    store, captured = _store_with_captured_filter()
+
+    await store.search(
+        collection="workspace_1",
+        vector=[0.1, 0.2],
+        top_k=5,
+        filters={"workspace_id": "w1", "ai_retrieval": True},
+        allowed_document_ids=["doc-a"],
+    )
+
+    keys = {condition.key for condition in _flatten(captured["query_filter"])}
+    assert DOCUMENT_SCOPED_SOURCES == {"document": "source_id"}
+    assert "source_id" in keys
+
+
+@pytest.mark.asyncio
+async def test_an_empty_document_allowlist_still_constrains() -> None:
+    """[] is a caller entitled to no documents, and must not fall through to unrestricted.
+
+    The bug this guards is the same falsy check the room list has: `if allowed_document_ids:`
+    would read the empty list as "not scoped" and hand that caller every document in the
+    workspace — the leak inverted rather than closed.
+    """
+    store, captured = _store_with_captured_filter()
+
+    await store.search(
+        collection="workspace_1",
+        vector=[0.1, 0.2],
+        top_k=5,
+        filters={"workspace_id": "w1"},
+        allowed_document_ids=[],
+    )
+
+    keys = {condition.key for condition in _flatten(captured["query_filter"])}
+    assert "source_id" in keys
+
+
+@pytest.mark.asyncio
+async def test_scoping_documents_does_not_narrow_transcripts() -> None:
+    """The two dimensions are independent, and the escape hatch has to know which.
+
+    The "not scoped" branch lists the types scoped by THIS request. If it listed every type that
+    could ever be scoped, then scoping documents alone would also hide transcripts from a caller
+    nobody meant to restrict — a silent, total loss of meeting answers.
+    """
+    store, captured = _store_with_captured_filter()
+
+    await store.search(
+        collection="workspace_1",
+        vector=[0.1, 0.2],
+        top_k=5,
+        filters={"workspace_id": "w1"},
+        allowed_document_ids=["doc-a"],
+        allowed_room_ids=None,
+    )
+
+    scope = [item for item in (captured["query_filter"].must or []) if not hasattr(item, "key")]
+    assert len(scope) == 1
+    branches = scope[0].should or []
+    assert len(branches) == 1 + len(DOCUMENT_SCOPED_SOURCES)
+
+    escape_hatch = branches[0].must_not[0]
+    assert escape_hatch.match.any == ["document"]
+
+
+@pytest.mark.asyncio
+async def test_both_dimensions_scope_side_by_side() -> None:
+    """One branch per scoped type, plus one escape hatch — for the ordinary member's search."""
+    store, captured = _store_with_captured_filter()
+
+    await store.search(
+        collection="workspace_1",
+        vector=[0.1, 0.2],
+        top_k=5,
+        filters={"workspace_id": "w1"},
+        allowed_room_ids=["room-a"],
+        allowed_document_ids=["doc-a"],
+    )
+
+    scope = [item for item in (captured["query_filter"].must or []) if not hasattr(item, "key")]
+    branches = scope[0].should or []
+    assert len(branches) == 1 + len(ROOM_SCOPED_SOURCES) + len(DOCUMENT_SCOPED_SOURCES)
+
+    escape_hatch = branches[0].must_not[0]
+    assert set(escape_hatch.match.any) == set(ROOM_SCOPED_SOURCES) | set(DOCUMENT_SCOPED_SOURCES)
