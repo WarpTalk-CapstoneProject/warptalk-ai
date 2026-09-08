@@ -24,31 +24,39 @@ from shared.config import EmbeddingSettings, VectorDbSettings
 
 RESULT_TTL_SECONDS = 30
 
-# WT-463 phase 0. What an unprivileged caller may not reach through semantic search.
+
+# WT-463. Who this caller is allowed to hear from, resolved from the request.
 #
-# THE HOLE THIS PLUGS
-#   The filter here was `workspace_id` + `ai_retrieval` and nothing else. `ai_retrieval` is a real
-#   gate but a GLOBAL one — it decides whether the AI may use a resource at all, for everyone, and
-#   has no per-subject dimension. Documents DO have a per-subject ACL
-#   (WorkspaceDocumentAccessPolicy, enforced by DocumentAccessEvaluator on every REST read), and
-#   this path never consulted it. So a member could ask WarpBot a question and receive passages
-#   from a document they are not allowed to open.
+# WHAT THIS REPLACES
+#   Documents used to be dropped WHOLESALE for an unprivileged caller
+#   (`exclude={"source_type": ["document"]}`), because their per-subject ACL could not be
+#   consulted from here. Safe and blunt: it could never reveal something a member was not
+#   entitled to, but it hid every document answer they WERE entitled to, and it left
+#   `ai_retrieval` — a real per-subject permission the ACL has always implemented — enforced by
+#   nothing at all.
 #
-# WHY BY SOURCE TYPE, WHICH IS BLUNT
-#   Filtering by the document's actual ACL requires that ACL to be IN the vector payload, and
-#   nothing indexed so far carries it — a per-subject filter would need a re-index of everything
-#   already stored (phase 2). Excluding the class outright is lossy for members, and it is correct
-#   in the only direction that matters here: it can hide something a member was entitled to, never
-#   reveal something they were not.
+#   Documents are now narrowed instead, the same way meetings already were. The allowlist is
+#   produced by the workspace service (`GET /documents/ai-retrievable`, read as the caller,
+#   evaluating `ai_retrieval` through DocumentAccessEvaluator), so the ACL stays in the service
+#   that owns it and is never re-derived in Python.
 #
-#   `meeting_summary` is deliberately NOT in this list, though its artifacts have their own access
-#   levels (HOST_ONLY / ALL_PARTICIPANTS). That is a second, real instance of the same bug; it is
-#   recorded in WT-463 rather than fixed by widening a blunt instrument here.
-#
-# WHAT STAYS REACHABLE
-#   transcript, glossary_term, global_glossary_term, meeting_summary — everything a workspace
-#   member can already read through the product's own surfaces.
-UNPRIVILEGED_EXCLUDED_SOURCES: dict[str, list[str]] = {"source_type": ["document"]}
+# WHY PRIVILEGE DECIDES, NOT THE PRESENCE OF A FIELD
+#   An absent allowlist parses to None, and None means "unscoped". Reading a MISSING field that
+#   way would mean an old producer, a replayed stream entry or a hand-built request silently
+#   reached every document and every transcript in the workspace — the leak reopened by
+#   omission. So an unprivileged caller is ALWAYS scoped on both dimensions, and a request that
+#   told us nothing is read as entitled to nothing.
+def resolve_scopes(request: EmbeddingSearchRequest) -> tuple[list[str] | None, list[str] | None]:
+    """(allowed_room_ids, allowed_document_ids) to pass to the vector store."""
+    if request.privileged:
+        # An owner or admin already reaches every meeting and every document through the product.
+        # Narrowing them here would hide from the assistant what the UI hands them anyway.
+        return None, None
+
+    return (
+        request.allowed_room_ids() or [],
+        request.allowed_document_ids() or [],
+    )
 
 
 class EmbeddingSearchWorker(BaseWorker):
@@ -94,12 +102,16 @@ class EmbeddingSearchWorker(BaseWorker):
                 await self._reply(result_key, {"matches": []})
                 return
 
+            allowed_room_ids, allowed_document_ids = resolve_scopes(request)
             matches = await vector_store.search(
                 collection=request.collection_id,
                 vector=vectors[0],
                 top_k=request.top_k,
+                # `ai_retrieval` stays: it is the GLOBAL question — may the AI use this resource
+                # at all — and the allowlists below are the per-subject one. Both have to hold.
                 filters={"workspace_id": request.workspace_id, "ai_retrieval": True},
-                exclude=None if request.privileged else UNPRIVILEGED_EXCLUDED_SOURCES,
+                allowed_room_ids=allowed_room_ids,
+                allowed_document_ids=allowed_document_ids,
             )
             await self._reply(result_key, {"matches": matches})
         except Exception as exc:

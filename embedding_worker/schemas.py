@@ -119,6 +119,23 @@ class EmbeddingSearchRequest(BaseModel):
     collection_id: str
     query: str
     top_k: int = 5
+    #: JSON array of meeting ids this caller may open, or "" for "do not scope".
+    #:
+    #: A STRING because Redis stream fields are strings; the worker parses it. Empty string and
+    #: an empty array mean different things and both are real: "" is a privileged caller who is
+    #: not scoped at all, [] is a member who can open no meetings and must therefore match none.
+    allowed_room_ids_json: str = ""
+    #: JSON array of document ids this caller may have the assistant answer from, or "" for
+    #: "do not scope".
+    #:
+    #: Produced by GET /workspaces/{id}/documents/ai-retrievable, read AS THE CALLER, which
+    #: evaluates the `ai_retrieval` permission through DocumentAccessEvaluator. The ACL therefore
+    #: stays in the service that owns it and is never re-derived here — this end only filters on
+    #: ids it was handed.
+    #:
+    #: Same three states as the room list, and the same reason: "" is a request that carried no
+    #: allowlist, [] is a caller entitled to no documents and must match none, unreadable is [].
+    allowed_document_ids_json: str = ""
     # WT-463 phase 0. Who is asking — until now, nobody.
     #
     # The search filtered on workspace_id and ai_retrieval alone. `ai_retrieval` is a real gate
@@ -138,6 +155,26 @@ class EmbeddingSearchRequest(BaseModel):
     privileged: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
+    def allowed_room_ids(self) -> list[str] | None:
+        """The meeting allowlist, or None when this request is not room-scoped.
+
+        The two empty cases are NOT the same and the distinction is the whole gate: `""` is a
+        privileged caller who should see every meeting, `"[]"` is a member who can open none and
+        must therefore match none. Collapsing them either way is a silent failure — one way opens
+        the leak this closes, the other hides every meeting from everybody — so the parsing lives
+        here rather than being re-derived at each call site.
+        """
+        return _parse_id_allowlist(self.allowed_room_ids_json)
+
+    def allowed_document_ids(self) -> list[str] | None:
+        """The document allowlist, or None when this request carried none.
+
+        Reports what was SENT. Whether a caller may go UNSCOPED is a policy question, and it is
+        answered in EmbeddingSearchWorker.process — so that a request which simply omits the field
+        cannot quietly come to mean "every document in the workspace".
+        """
+        return _parse_id_allowlist(self.allowed_document_ids_json)
+
     def to_redis(self) -> dict[str, str]:
         return {
             "job_id": self.job_id,
@@ -145,6 +182,8 @@ class EmbeddingSearchRequest(BaseModel):
             "collection_id": self.collection_id,
             "query": self.query,
             "top_k": str(self.top_k),
+            "allowed_room_ids_json": self.allowed_room_ids_json,
+            "allowed_document_ids_json": self.allowed_document_ids_json,
             "privileged": _bool_to_redis(self.privileged),
             "timestamp_ms": str(self.timestamp_ms),
         }
@@ -158,10 +197,34 @@ class EmbeddingSearchRequest(BaseModel):
             collection_id=d["collection_id"],
             query=d.get("query", ""),
             top_k=int(d.get("top_k", "5")),
+            # Absent means "not scoped", which is the shape every request had before this field
+            # existed — an old producer keeps exactly the behaviour it had.
+            allowed_room_ids_json=d.get("allowed_room_ids_json", ""),
+            allowed_document_ids_json=d.get("allowed_document_ids_json", ""),
             # "false" on absence, matching the field's default: unknown is not privileged.
             privileged=_redis_to_bool(d.get("privileged", "false")),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
+
+
+def _parse_id_allowlist(raw_json: str) -> list[str] | None:
+    """Parse one allowlist field: None for "carried no allowlist", a list otherwise.
+
+    The two empty cases are NOT the same and the distinction is the whole gate: `""` means the
+    request carried nothing, `"[]"` means it carried an empty allowlist — a caller entitled to
+    nothing, which must therefore match nothing. Collapsing them either way is a silent failure,
+    so the parsing lives in one place rather than being written out once per field.
+    """
+    raw = raw_json.strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # Unreadable is not "unrestricted". A malformed allowlist means we cannot establish what
+        # this caller may see, and the safe reading of that is "nothing".
+        return []
+    return [str(item) for item in parsed] if isinstance(parsed, list) else []
 
 
 def _decode_dict(data: Mapping[Any, Any]) -> dict[str, str]:
