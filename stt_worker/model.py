@@ -1893,58 +1893,75 @@ class OpenAISTT:
 
         Tried in order, keeping as much context as possible at each rung:
 
-            1. drop structured context (`languages` + `keywords`), keep prompt + logprobs
+            1. drop structured context (`languages` + `keywords`), keep prompt
             2. also drop the logprobs selector
-            3. bare config — the previous behaviour's only option
+            3. also drop the prompt — language and noise reduction survive
+            4. bare config, which auto-detects the language
 
         Whatever succeeds is recorded per model, so a process pays this at most once
         rather than re-deriving it for every speaker in every room.
+
+        RUNG 3 EXISTS BECAUSE THE FALL WAS TOO FAR. There was nothing between "drop the
+        logprobs selector" and a bare config, and a bare config sends no `language` — so a
+        model that rejected some field for any reason of its own ended up transcribing a
+        Vietnamese meeting with nothing pinned at all. This module argues everywhere else that
+        an unpinned session auto-detects and "sometimes hallucinates a completely different
+        script mid-sentence"; production on 2026-09-08 logged exactly that, kana inside a
+        Vietnamese sentence, in a meeting whose sessions had all landed on the bare rung
+        (`session_optional_fields_rejected` x4, each with `has_language: true`).
         """
+        # `logprobs` on the first rung follows what is already KNOWN about the model rather
+        # than asserting True. Asserting it re-added a selector the seed list had already
+        # ruled out for this family, so the rung could only fail — a guaranteed wasted round
+        # trip on every session, and the reason the ladder started one step lower than it looks.
         attempts = [
-            ("structured_context", {"structured_context": False, "logprobs": True}),
-            ("logprobs", {"structured_context": False, "logprobs": False}),
+            ("structured_context", False, _supports_logprobs(self.model), True),
+            ("logprobs", False, False, True),
+            ("prompt", False, False, False),
         ]
-        for rejected, flags in attempts:
+        for rejected, structured, wants_logprobs, keep_prompt in attempts:
             try:
                 await conn.session.update(
                     session=cast(
                         Any,
                         self._session_payload(
                             language,
-                            prompt,
+                            prompt if keep_prompt else None,
                             allowed_languages,
                             keywords,
                             noise_reduction=noise_reduction,
-                            # Named rather than splatted: **flags is dict[str, bool] and would
-                            # otherwise be a candidate for every keyword parameter, including the
-                            # string one added for per-room noise reduction.
-                            structured_context=flags["structured_context"],
-                            logprobs=flags["logprobs"],
+                            structured_context=structured,
+                            logprobs=wants_logprobs,
                         ),
                     )
                 )
             except Exception:
                 continue
 
-            _STRUCTURED_CONTEXT_SUPPORT[self.model] = bool(flags["structured_context"])
-            _LOGPROBS_SUPPORT[self.model] = bool(flags["logprobs"])
+            _STRUCTURED_CONTEXT_SUPPORT[self.model] = structured
+            _LOGPROBS_SUPPORT[self.model] = wants_logprobs
             logger.warning(
                 "stt_session_capability_downgraded",
                 model=self.model,
                 unsupported=rejected,
-                structured_context=flags["structured_context"],
-                logprobs=flags["logprobs"],
+                structured_context=structured,
+                logprobs=wants_logprobs,
+                prompt_kept=keep_prompt,
                 keyword_count=len(keywords),
             )
             return
 
-        # Nothing optional survived. Keep the session rather than lose the speaker.
+        # Nothing optional survived — INCLUDING THE LANGUAGE. Keep the session rather than
+        # lose the speaker, but say plainly what this costs: from here the model auto-detects,
+        # which is the state kana got into a Vietnamese transcript from. This is the rung to
+        # look at first when a meeting's transcript is fluent and wrong.
         logger.warning(
             "session_optional_fields_rejected",
             model=self.model,
             has_language=bool(language),
             has_prompt=bool(prompt),
             has_keywords=bool(keywords),
+            language_pin_lost=bool(language),
         )
         _STRUCTURED_CONTEXT_SUPPORT[self.model] = False
         _LOGPROBS_SUPPORT[self.model] = False
