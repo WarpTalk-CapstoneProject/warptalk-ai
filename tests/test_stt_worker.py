@@ -1551,20 +1551,28 @@ class TestSTTWorker:
 
         mock_redis_client._redis.xadd.assert_not_called()
 
-    async def test_process_skips_ready_room_before_translation_starts(
+    async def test_process_skips_a_room_that_has_ended(
         self,
         mock_redis_client,
         worker_settings: WorkerSettings,
         sample_audio_bytes: bytes,
     ) -> None:
-        """A stale or rogue audio chunk must not bypass the ingress lifecycle gate."""
+        """A stale audio chunk must not append to a finished meeting's transcript.
+
+        This test used to assert the opposite of what it now asserts: that a room which had
+        not reached IN_PROGRESS was skipped. That gate is what left a live meeting with no
+        transcript at all until somebody pressed Start Translation — the JOIN path publishes
+        ``room_status: "WAITING"``, and every chunk for the room died on it. See
+        STTWorker._room_state_allows_stt. What survives is the narrow case the gate is
+        actually good for: audio arriving for a room that is over.
+        """
         worker = STTWorker.__new__(STTWorker)
         worker.settings = worker_settings
         worker.redis = mock_redis_client
         worker.logger = MagicMock()
         worker.stt_settings = STTSettings()
         worker._paused_rooms = set()
-        worker._route_states = {"meeting-1": "READY"}
+        worker._route_states = {"meeting-1": "ENDED"}
         worker.model = MagicMock()
         worker.model.transcribe = AsyncMock()
 

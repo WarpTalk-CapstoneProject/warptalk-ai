@@ -16,7 +16,7 @@ from collections import deque
 from collections.abc import Mapping
 from typing import Any
 
-from shared.base_worker import BaseWorker
+from shared.base_worker import TERMINAL_ROOM_STATUSES, BaseWorker
 from shared.config import STTSettings, resolve_openai_api_key
 from shared.prosody import (
     SpeakerBaseline,
@@ -115,7 +115,6 @@ _MAX_STT_KEYWORDS = 16
 # its own. Matches the horizon the other per-room keys use.
 _TRANSCRIPT_ANCHOR_TTL_S = 6 * 60 * 60
 _CONTEXT_MIN_CONFIDENCE = -0.35
-_ACTIVE_TRANSLATION_STATES = {"IN_PROGRESS", "AUDIO_ROUTING_ACTIVE"}
 
 
 def _language_hint_for_stt(language: str) -> str | None:
@@ -532,9 +531,9 @@ class STTWorker(BaseWorker):
         """Process one audio chunk: transcribe and publish results."""
         chunk = AudioChunkMessage.from_redis(data)
 
-        if not await self._translation_state_allows_stt(chunk.meeting_id):
+        if not await self._room_state_allows_stt(chunk.meeting_id):
             self.logger.info(
-                "skipping_inactive_room",
+                "skipping_ended_room",
                 meeting_id=chunk.meeting_id,
                 route_state=getattr(self, "_route_states", {}).get(chunk.meeting_id),
             )
@@ -986,13 +985,30 @@ class STTWorker(BaseWorker):
             # hand-over to a restart or a sibling replica is lost.
             self.logger.warning("prosody_baseline_write_failed", exc_info=True)
 
-    async def _translation_state_allows_stt(self, meeting_id: str) -> bool:
-        """Reject queued audio when the authoritative room state is known inactive.
+    async def _room_state_allows_stt(self, meeting_id: str) -> bool:
+        """Reject queued audio only for a room that is OVER.
 
-        LiveKit ingress is the primary capture gate. This second gate prevents a stale
-        Redis chunk (or a producer regression) from creating transcript before Start.
-        Unknown legacy state remains fail-open so an unavailable cache cannot erase valid
-        live speech; current rooms persist ``audio_routes`` before publishing audio.
+        THIS USED TO ASK "HAS TRANSLATION STARTED", AND THAT WAS THE WRONG QUESTION.
+        It admitted only IN_PROGRESS/AUDIO_ROUTING_ACTIVE, so a room where people had
+        joined and were talking but nobody had pressed Start yet published
+        ``room_status: "WAITING"`` — written by the JOIN path itself, via
+        PublishRoutesUpdateAsync — and every chunk for that room was dropped here. The
+        meeting produced no transcript at all until somebody started translation, which
+        is exactly the behaviour ai#36 removed from the ingress worker one stage up
+        ("transcribe every live meeting, translate only when asked"). The gate was not
+        deleted then, only moved, so the decision was half-applied and the symptom
+        survived it.
+
+        Room status cannot answer "is translation running" anyway — since WT-339 a room
+        is IN_PROGRESS from the moment somebody opens it. The backend publishes
+        ``translation_active`` on this same payload for that question, and the stage that
+        actually costs a translation is the one that should read it.
+
+        What remains worth refusing is audio for a room that has ENDED: a stale queued
+        chunk appending to a finished meeting's transcript. Everything else — WAITING,
+        SCHEDULED, an unknown legacy state, an unreadable cache — is transcribed, because
+        being wrong that way loses a live meeting's words and being wrong the other way
+        costs one late line.
         """
         route_states = getattr(self, "_route_states", None)
         if route_states is None:
@@ -1016,7 +1032,7 @@ class STTWorker(BaseWorker):
                     exc_info=True,
                 )
 
-        return state is None or state in _ACTIVE_TRANSLATION_STATES
+        return state not in TERMINAL_ROOM_STATUSES
 
     def _require_model(self) -> OpenAISTT:
         if self.model is None:
@@ -1413,7 +1429,7 @@ class STTWorker(BaseWorker):
     async def _get_configured_room_languages(self, meeting_id: str) -> set[str]:
         """The room's own language configuration, from the audio_routes payload.
 
-        Same key `_translation_state_allows_stt` already reads, so this adds no round trip
+        Same key `_room_state_allows_stt` already reads, so this adds no round trip
         beyond the one this worker was making anyway. Best-effort: an unreadable or
         older-format payload (one published before `room_languages` existed) yields an
         empty set and the speak-languages half stands alone, which is exactly the previous
