@@ -21,9 +21,15 @@ THE CROSS-REPO CONTRACT
     Written by     warptalk-backend (translation-room), on TranscriptPaused / TranscriptResumed
     Read by        this repo, and by the backend's own
                    `TranscriptRedisConsumerService.IsRoomTranscriptPausedAsync`
-    Value          any truthy string ("1", "true") while recording is paused. The key is
-                   ABSENT — not "0" — while it is not. Both are honoured here so neither side
-                   has to care which one the other writes.
+    Value          THE KEY'S EXISTENCE is the signal. The backend writes a JSON diagnostic
+                   payload — `{"paused":true,"paused_at":"2026-09-09T22:40:00.0000000Z"}` —
+                   and DELETES the key on resume; it never writes a "false" one, so nothing
+                   here parses it. TTL 12 hours, a safety net for a Resume whose write was
+                   lost, not the flag's lifetime.
+                   Read as a value rather than as `exists` on purpose: a flag someone clears
+                   by writing "0" instead of deleting must not read as paused, because that
+                   stops recording a meeting nobody paused. Any other string — the payload
+                   above included — means paused.
 
     It is a DURABLE key rather than a pub/sub event, and that is the whole point. The backend
     also publishes `TranscriptPaused` on `warptalk:translation-room:commands`, but pub/sub has

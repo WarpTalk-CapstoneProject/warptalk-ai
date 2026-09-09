@@ -130,6 +130,22 @@ class TestTheCrossRepoContract:
     def test_a_truthy_flag_means_paused(self, raw: bytes | str) -> None:
         assert means_paused(raw) is True
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            '{"paused":true,"paused_at":"2026-09-09T22:40:00.0000000Z"}',
+            b'{"paused":true,"paused_at":"2026-09-09T22:40:00.0000000Z"}',
+        ],
+    )
+    def test_the_payload_the_backend_actually_writes_means_paused(self, raw: bytes | str) -> None:
+        """Pinned as a literal, not built from a helper, because it is the OTHER repository's
+        output. `TranscriptPauseKey` (warptalk-backend) writes this JSON and treats the key's
+        existence as the signal; this side never parses it. If someone there ever starts
+        writing a `"paused":false` payload on resume instead of deleting the key, this test
+        keeps passing and the gate silently inverts — so that change has to come with a change
+        here, and this literal is where they will find out."""
+        assert means_paused(raw) is True
+
     @pytest.mark.parametrize("raw", [None, "", "0", "false", b"0"])
     def test_an_absent_or_cleared_flag_means_recording(self, raw: bytes | str | None) -> None:
         """The backend deletes the key, but a flag left behind as "0" must not read as paused:
