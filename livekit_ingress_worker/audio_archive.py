@@ -67,6 +67,24 @@ class SpeechSpan:
 
     start_ms: int
     end_ms: int
+    #: True when the host had TRANSCRIPT RECORDING paused while this was spoken. WT-605.
+    #:
+    #: WHY THE AUDIO IS STILL HERE
+    #:     Recording is an independent switch, and the host may well have it on. Pausing the
+    #:     transcript is a decision about the written record, not an instruction to stop
+    #:     capturing the meeting, so dropping the chunk would quietly break a feature the host
+    #:     did not touch. The audio stays; what changes is what it is allowed to become.
+    #:
+    #: WHY THE FLAG HAS TO TRAVEL WITH IT
+    #:     A second pass re-transcribes this file and merges the result into the meeting's
+    #:     transcript. Unmarked, it would re-derive — accurately, from good audio — exactly the
+    #:     sentences the host deliberately kept out, and write them into the record hours after
+    #:     the fact. That is WT-605 all over again, arriving through the one door nobody would
+    #:     think to check, and the merge has no other way to tell this audio apart.
+    #:
+    #: Absent from the sidecar means False: an archive written before this field existed
+    #: predates the pause feature entirely, so nothing in it was recorded under a pause.
+    transcript_paused: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,14 +150,20 @@ class _SpeakerTrack:
             self.frames += step
             missing -= step
 
-    def write(self, samples: npt.NDArray[np.int16]) -> None:
+    def write(self, samples: npt.NDArray[np.int16], transcript_paused: bool = False) -> None:
         # Recorded from the write head rather than from the requested start: an overlapping
         # utterance is clamped forward (see append), and the span has to describe where the audio
         # ACTUALLY is, not where it asked to be.
         start_ms = int(self.frames * 1000 / self.sample_rate)
         self._file.write(samples)
         self.frames += len(samples)
-        self.spans.append(SpeechSpan(start_ms, int(self.frames * 1000 / self.sample_rate)))
+        self.spans.append(
+            SpeechSpan(
+                start_ms,
+                int(self.frames * 1000 / self.sample_rate),
+                transcript_paused=transcript_paused,
+            )
+        )
 
     def close(self) -> None:
         self._file.close()
@@ -176,11 +200,15 @@ class MeetingAudioArchive:
         sample_rate: int,
         *,
         now: float | None = None,
+        transcript_paused: bool = False,
     ) -> None:
         """Place one finished utterance on this speaker's timeline.
 
         `now` is the moment the utterance ENDED (its arrival), injectable so the placement
         rule can be tested without sleeping.
+
+        `transcript_paused` marks the utterance as spoken while the host had recording paused —
+        kept, but off the record for good. See `SpeechSpan.transcript_paused`.
         """
         if not pcm or sample_rate <= 0 or meeting_id in self._failed:
             return
@@ -201,7 +229,7 @@ class MeetingAudioArchive:
             # the honest repair: never move audio backwards over audio already written.
             start_frame = int(round((arrived - duration - started) * sample_rate))
             track.pad_to(max(start_frame, track.frames))
-            track.write(samples)
+            track.write(samples, transcript_paused=transcript_paused)
         except Exception:
             # Named, then abandoned for this meeting: a track that stopped part-way through
             # would be a timeline with a hole in it, and a hole nobody can see is worse than
@@ -297,8 +325,14 @@ def _write_spans(track: ArchivedTrack) -> None:
                     "speakerId": track.speaker_id,
                     "sampleRate": track.sample_rate,
                     "frames": track.frames,
+                    # `transcriptPaused` is emitted only when it is true. The ordinary meeting
+                    # writes thousands of spans and none of them are paused; a false on every
+                    # one would be pure weight in a file that already ships beside the audio.
+                    # `retranscribe_worker.merge.load_spans` reads its absence as false.
                     "spans": [
-                        {"startMs": span.start_ms, "endMs": span.end_ms} for span in track.spans
+                        {"startMs": span.start_ms, "endMs": span.end_ms}
+                        | ({"transcriptPaused": True} if span.transcript_paused else {})
+                        for span in track.spans
                     ],
                 },
                 ensure_ascii=False,
