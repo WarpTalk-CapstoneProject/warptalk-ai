@@ -226,3 +226,38 @@ async def test_a_real_summary_is_still_published_as_completed() -> None:
     await worker.process(b"1", _request(template_key="standup"))
 
     assert _published(worker).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_transcript_sent_with_the_request_is_used_as_is() -> None:
+    """The fallback ArtifactsFinalizer fires when the live path produced no summary.
+
+    Nobody asked for that one, so it carries no bearer token — and a fetch with no token reads
+    nothing. The finalizer sends the segments it has just read instead, and this worker must
+    summarise them rather than going back to the network for words it was already given.
+    """
+    worker = _worker()
+    worker._transcript_client = MagicMock()
+    worker._transcript_client.get = AsyncMock(side_effect=AssertionError("must not fetch"))
+
+    await worker.process(b"1", _request(transcript_text="[t=0] [Vân] mở trang script"))
+
+    kwargs = worker.assistant.generate_structured_summary.await_args.kwargs
+    assert worker.assistant.generate_structured_summary.await_args.args[0] == (
+        "[t=0] [Vân] mở trang script"
+    )
+    assert kwargs["template_key"] == "general"
+    assert _published(worker).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_blank_transcript_on_the_request_still_reads_the_saved_one() -> None:
+    # Every ordinary regeneration sends this field empty; it must not become a second way to
+    # ask for a summary of nothing.
+    worker = _worker()
+    worker._load_transcript = AsyncMock(return_value="[t=0] [Tu] hello")  # type: ignore[method-assign]
+
+    await worker.process(b"1", _request(transcript_text="   "))
+
+    worker._load_transcript.assert_awaited_once()  # type: ignore[attr-defined]
+    assert _published(worker).status == "completed"

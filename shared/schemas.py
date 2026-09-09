@@ -635,12 +635,18 @@ class ChatRequestMessage(BaseModel):
 
 
 class SummaryRequestMessage(BaseModel):
-    """Backend → SummaryTemplateWorker: re-summarise a finished meeting.
+    """Backend → SummaryTemplateWorker: summarise a finished meeting from its SAVED transcript.
 
-    Carries no transcript. The worker fetches the SAVED transcript itself, because the
-    in-memory accumulator AIAssistantWorker summarises from is gone once the meeting ends —
-    and gone again on every restart. Re-reading the stored segments is also what makes the
-    citations line up: they are the same segments the meeting page renders.
+    Normally carries no transcript: the worker fetches the stored segments itself as the person
+    who asked, because the in-memory accumulator AIAssistantWorker summarises from is gone once
+    the meeting ends — and gone again on every restart. Re-reading the stored segments is also
+    what makes the citations line up: they are the same segments the meeting page renders.
+
+    `transcript_text` is the exception, and it exists for the request NOBODY made. When
+    ArtifactsFinalizer finds that the live path produced no summary at all, it asks for one here
+    — with no user behind it and therefore no bearer token to read a transcript with. It sends
+    the segments it has just read instead, already formatted by `format_transcript_line`, so the
+    fallback needs no credential of its own.
     """
 
     __slots__ = ()
@@ -651,6 +657,8 @@ class SummaryRequestMessage(BaseModel):
     template_key: str = "general"
     bearer_token: str = ""
     target_languages_json: str = "[]"
+    #: Pre-formatted transcript lines. Empty means "read the saved transcript yourself".
+    transcript_text: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -661,6 +669,7 @@ class SummaryRequestMessage(BaseModel):
             "template_key": self.template_key,
             "bearer_token": self.bearer_token,
             "target_languages_json": self.target_languages_json,
+            "transcript_text": self.transcript_text,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -674,6 +683,7 @@ class SummaryRequestMessage(BaseModel):
             template_key=d.get("template_key", "general"),
             bearer_token=d.get("bearer_token", ""),
             target_languages_json=d.get("target_languages_json", "[]"),
+            transcript_text=d.get("transcript_text", ""),
             timestamp_ms=int(d.get("timestamp_ms", 0) or 0),
         )
 

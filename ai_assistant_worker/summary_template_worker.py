@@ -129,6 +129,13 @@ class SummaryTemplateWorker(BaseWorker):
 
     async def _load_transcript(self, request: SummaryRequestMessage) -> str:
         """The saved transcript, formatted with the moments the model must cite."""
+        # Already formatted and already ours to read. ArtifactsFinalizer sends the segments it
+        # just read from TranscriptService when it asks for the summary the live path failed to
+        # produce — there is no user behind that request and so no token to fetch with, and a
+        # round trip to re-read words that came WITH the message would be one anyway.
+        if request.transcript_text.strip():
+            return request.transcript_text
+
         client = self._transcript_client
         assert client is not None, "load_model() must run before process()"
         headers = {"Authorization": request.bearer_token} if request.bearer_token else {}
