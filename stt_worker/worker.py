@@ -189,6 +189,10 @@ class STTWorker(BaseWorker):
         # whose frames have been appended but which no chunk has committed yet. Absent means
         # the buffer cannot be trusted — see _append_speech_frame.
         self._streamed_turns: dict[tuple[str, str], tuple[str, int, int]] = {}
+        # (meeting_id, speaker_id) -> (turn_id, how many of its frames arrived afterwards) for
+        # the turn whose streaming has already ENDED — committed by its chunk, or abandoned.
+        # Its trailing frames are not a gap in anything; see _append_speech_frame.
+        self._closed_turns: dict[tuple[str, str], tuple[str, int]] = {}
         # (meeting_id, speaker_id) -> how that speaker normally sounds in THIS room. Held in
         # memory and mirrored to Redis so a restart or a second replica does not start every
         # speaker from scratch — see _speaker_baseline.
@@ -258,6 +262,26 @@ class STTWorker(BaseWorker):
                 self.logger.exception("stt_frame_consumer_error")
                 await asyncio.sleep(1.0)
 
+    def _close_turn(self, key: tuple[str, str], turn_id: str) -> None:
+        """Record that `turn_id` is over, so its remaining frames are dropped rather than read
+        as a gap in whatever comes next — see the closed-turn guard in _append_speech_frame.
+
+        Holds exactly one turn per speaker: the one that just ended. Its predecessor's tally is
+        reported here, which is the only moment at which that number is final.
+        """
+        closed: dict[tuple[str, str], tuple[str, int]] = getattr(self, "_closed_turns", {})
+        self._closed_turns = closed
+        previous = closed.get(key)
+        if previous is not None and previous[0] != turn_id and previous[1]:
+            self.logger.debug(
+                "stt_stream_turn_late_frames",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                turn_id=previous[0],
+                late_frames=previous[1],
+            )
+        closed[key] = (turn_id, 0)
+
     async def _append_speech_frame(self, data: dict[bytes, bytes]) -> None:
         try:
             frame = AudioFrameMessage.from_redis(data)
@@ -272,6 +296,33 @@ class STTWorker(BaseWorker):
         if streaming is None:
             streaming = {}
             self._streamed_turns = streaming
+        closed: dict[tuple[str, str], tuple[str, int]] | None = getattr(self, "_closed_turns", None)
+        if closed is None:
+            closed = {}
+            self._closed_turns = closed
+
+        # A FRAME OF A TURN THAT IS ALREADY OVER. Nothing is wrong here and nothing needs
+        # undoing: the chunk that closes a turn is published while the speaker's last frames are
+        # still in flight, so a handful of them always arrive after their own commit.
+        #
+        # This used to fall through to the sequence check below, where it read as a gap — the
+        # committed turn's state had been popped, so `expected_seq` was 0 while the frame said 7.
+        # Every one of those took the full abandon path, and abandon DISCARDS THE BUFFER. On the
+        # 2026-09-08 meeting that produced 204 `frame_gap` lines in 71 seconds, and the real
+        # hazard is not the noise: once the next turn has appended its own frames, a straggler
+        # from the previous one throws THAT turn's audio away.
+        #
+        # Counted rather than logged one by one, and reported when the next turn opens, so the
+        # number stays visible without a line per frame.
+        closed_turn = closed.get(key)
+        if closed_turn is not None and closed_turn[0] == frame.turn_id:
+            closed[key] = (closed_turn[0], closed_turn[1] + 1)
+            return
+
+        # DELIBERATELY NOT CLEARED WHEN THE NEXT TURN OPENS. The straggler that matters arrives
+        # after the next turn has started appending — that is the whole hazard — so forgetting
+        # the closed turn at that moment forgets it exactly one frame too early. It is replaced
+        # when the NEXT turn closes, in _close_turn, which is also where its tally is reported.
 
         # A NEW TURN ARRIVING WHILE THE PREVIOUS ONE IS STILL OPEN means that previous turn will
         # never be committed — the utterance was too short for ingress to publish, or its chunk
@@ -281,7 +332,7 @@ class STTWorker(BaseWorker):
         #
         # One rule, no extra protocol. A marker message from ingress would have covered only the
         # case ingress knows about.
-        async def abandon(reason: str, **fields: Any) -> None:
+        async def abandon(reason: str, closing_turn: str | None = None, **fields: Any) -> None:
             """Stop trusting this speaker's buffer, and empty it.
 
             THE RULE THIS ENFORCES, AND WHY IT IS ABSOLUTE
@@ -296,6 +347,9 @@ class STTWorker(BaseWorker):
                 buffer stops the partial from being read as the opening of the next turn.
             """
             streaming.pop(key, None)
+            # Remembered so this turn's remaining frames are dropped in one place rather than
+            # re-entering abandon once each — see the closed-turn guard above.
+            self._close_turn(key, closing_turn or frame.turn_id)
             await self._require_model().discard_streamed_audio(key)
             self.logger.info(
                 "stt_stream_turn_abandoned",
@@ -309,7 +363,14 @@ class STTWorker(BaseWorker):
         if previous is not None and previous[0] != frame.turn_id:
             # The previous turn will never be committed: too short for ingress to publish, or
             # its chunk was lost, or ingress died mid-turn.
-            await abandon("previous_turn_never_committed", abandoned_turn=previous[0])
+            # `closing_turn` is the PREVIOUS turn, not this frame's. Recording this frame's id
+            # here would mark the turn that is only just starting as already over, and every
+            # frame of it would then be dropped by the guard above.
+            await abandon(
+                "previous_turn_never_committed",
+                closing_turn=previous[0],
+                abandoned_turn=previous[0],
+            )
             previous = None
 
         # A GAP MEANS THE BUFFER IS NO LONGER THE TURN. `seq` exists for exactly this: the
@@ -507,6 +568,8 @@ class STTWorker(BaseWorker):
             self._speaker_noise_reduction.pop(noise_key, None)
         for streamed_key in [k for k in getattr(self, "_streamed_turns", {}) if k[0] == room_id]:
             self._streamed_turns.pop(streamed_key, None)
+        for closed_key in [k for k in getattr(self, "_closed_turns", {}) if k[0] == room_id]:
+            self._closed_turns.pop(closed_key, None)
         stale_speakers = [key for key in self._speaker_locks if key[0] == room_id]
         for key in stale_speakers:
             self._speaker_locks.pop(key, None)
@@ -694,6 +757,13 @@ class STTWorker(BaseWorker):
                 self, "_streamed_turns", {}
             )
             streamed = streamed_turns.pop((chunk.meeting_id, chunk.speaker_id), None)
+            # This chunk ENDS chunk.turn_id. The speaker's last frames for it are still on their
+            # way — ingress publishes the chunk without waiting for them to be consumed — and
+            # without this they arrive to find the state popped and are read as a sequence gap,
+            # which discards the buffer the NEXT turn may already be filling. Empty turn_id is an
+            # older ingress that streams nothing, so there is nothing to strand.
+            if chunk.turn_id:
+                self._close_turn((chunk.meeting_id, chunk.speaker_id), chunk.turn_id)
             streamed_epoch = (
                 streamed[1] if streamed is not None and streamed[0] == chunk.turn_id else None
             )
