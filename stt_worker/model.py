@@ -25,6 +25,7 @@ from openai import AsyncOpenAI
 from shared.config import STTSettings
 from shared.lang import base_language
 from shared.logger import get_logger
+from shared.openai_options import realtime_session_expired
 from shared.schemas import STT_UNKNOWN_CONFIDENCE
 from shared.text_utils import split_into_sentences
 
@@ -1240,7 +1241,34 @@ class OpenAISTT:
             raise RuntimeError("OpenAI STT is not loaded")
         manager = client.realtime.connect(extra_query={"intent": "transcription"})
         conn = await manager.__aenter__()
-        return {"manager": manager, "conn": conn}
+        # Stamped at OPEN, and carried into the session that later claims it. OpenAI's
+        # 60-minute cap runs from here, not from the moment somebody starts speaking into it.
+        return {"manager": manager, "conn": conn, "opened_at": time.monotonic()}
+
+    async def _claim_warm_socket(self) -> dict[str, Any] | None:
+        """Take a live socket from the warm pool, discarding any that has aged out.
+
+        A pool with no clock hands out whatever it happens to be holding. Ours was filled at
+        worker startup and, on a quiet deployment, still holding those four sockets hours
+        later — so the first speaker of the evening claimed a connection OpenAI had already
+        closed, and paid for it with the first sentence of their meeting.
+        """
+        warm_sessions = getattr(self, "_warm_sessions", None)
+        if not warm_sessions:
+            return None
+
+        discarded = 0
+        while warm_sessions:
+            candidate: dict[str, Any] = warm_sessions.popleft()
+            if not realtime_session_expired(candidate.get("opened_at")):
+                if discarded:
+                    logger.info("stt_warm_sockets_expired", discarded=discarded)
+                return candidate
+            discarded += 1
+            asyncio.create_task(self._close_session(candidate))
+
+        logger.info("stt_warm_sockets_expired", discarded=discarded)
+        return None
 
     async def warm_up(self, pool_size: int = 4) -> None:
         """Open reusable transcription sockets before the first participant speaks."""
@@ -2096,19 +2124,21 @@ class OpenAISTT:
         client = self._client
         if client is None:
             raise RuntimeError("OpenAI STT is not loaded")
-        warm_sessions = getattr(self, "_warm_sessions", None)
-        if warm_sessions:
-            warm = warm_sessions.popleft()
+        warm = await self._claim_warm_socket()
+        if warm is not None:
             manager = warm["manager"]
             conn = warm["conn"]
+            opened_at = warm["opened_at"]
             # Replace what we just took, in the background, so the NEXT speaker is also
             # instant. Without this the pool drained permanently after four claims.
             self._schedule_warm_refill()
         else:
             manager = client.realtime.connect(extra_query={"intent": "transcription"})
             conn = await manager.__aenter__()
-            # Empty pool means the refill has not caught up (or has never run) — ask for
-            # one now so this speaker is the last to pay the handshake.
+            opened_at = time.monotonic()
+            # Empty pool means the refill has not caught up, has never run, or was holding
+            # nothing but expired sockets — ask for one now so this speaker is the last to
+            # pay the handshake.
             self._schedule_warm_refill()
 
         try:
@@ -2150,6 +2180,10 @@ class OpenAISTT:
             "conn": conn,
             "epoch": self._session_epoch,
             "last_used": time.monotonic(),
+            # The SOCKET's age, inherited from the warm pool when it came from there. Reading
+            # this as "when the session was created" would restart a clock OpenAI does not
+            # restart, and hand a nearly-expired connection a fresh-looking lease.
+            "opened_at": opened_at,
             "language": language,
             "prompt": prompt,
             "languages": languages,
@@ -2224,14 +2258,37 @@ class OpenAISTT:
             logger.debug("stt_stream_clear_failed", meeting_id=key[0], exc_info=True)
 
     def _sweep_idle_sessions(self) -> None:
+        """Drop sessions nobody is using, and sessions OpenAI is about to close on us.
+
+        The second half is the one that was missing. Idleness and age are independent: a
+        session used every couple of minutes for an hour is never idle and is nevertheless
+        dead the moment it crosses 60 minutes. Sweeping only the first left the second to be
+        discovered by whoever spoke next — see shared.openai_options.
+        """
         now = time.monotonic()
-        stale = [
+        idle = [
             k for k, s in self._sessions.items() if now - s["last_used"] > SESSION_IDLE_TIMEOUT_S
         ]
-        for k in stale:
+        aged = [
+            k
+            for k, s in self._sessions.items()
+            if k not in idle and realtime_session_expired(s.get("opened_at"), now)
+        ]
+        for k in idle:
             session = self._sessions.pop(k)
             asyncio.create_task(self._close_session(session))
             logger.info("realtime_session_idle_closed", meeting_id=k[0], speaker_id=k[1])
+        for k in aged:
+            session = self._sessions.pop(k)
+            asyncio.create_task(self._close_session(session))
+            # Distinct from the idle event on purpose: this one is a session that was still
+            # in active use, and its rate is what says whether the headroom is right.
+            logger.info(
+                "realtime_session_max_age_closed",
+                meeting_id=k[0],
+                speaker_id=k[1],
+                age_s=round(now - (session.get("opened_at") or now), 1),
+            )
 
     @staticmethod
     async def _close_session(session: dict[str, Any]) -> None:
