@@ -132,6 +132,37 @@ def _demote_capability_from_error(model: str, error_text: str) -> str | None:
     return None
 
 
+def _is_connection_error(error: BaseException) -> bool:
+    """Whether the socket died, as opposed to the model refusing a field.
+
+    THE TWO WERE INDISTINGUISHABLE HERE AND THE CONSEQUENCES ARE OPPOSITE. `session.update` is
+    the first thing sent down a freshly claimed socket, so it is also where a socket that is
+    already closed surfaces — as `ConnectionClosedOK: received 1001 (going away) Your session
+    hit the maximum duration of 60 minutes`. Read as a capability rejection, that walks the
+    whole degrade ladder (every rung failing for the same reason), lands on the bare rung, and
+    writes `structured_context=False, logprobs=False` into a PROCESS-WIDE memo. One stale
+    socket then degrades every session the worker opens afterwards.
+
+    Production, 2026-09-08: `session_optional_fields_rejected` four times in one meeting, and
+    `stt_session_capability_downgraded` — the log that means a model actually refused something
+    — zero times. The four were all dead sockets.
+
+    Matched on the exception type first, message text second, because a 1001 arrives as a
+    websockets exception whose text is the provider's own wording rather than an API error body.
+    """
+    if isinstance(error, ConnectionError):
+        return True
+    if type(error).__name__.startswith("ConnectionClosed"):
+        return True
+    text = str(error).lower()
+    return (
+        "going away" in text
+        or "maximum duration" in text
+        or "connection closed" in text
+        or "connection is closed" in text
+    )
+
+
 def reset_capability_memo() -> None:
     """Forget everything learned at runtime, back to the seeds. For tests."""
     _STRUCTURED_CONTEXT_SUPPORT.clear()
@@ -1935,7 +1966,9 @@ class OpenAISTT:
                         ),
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                if _is_connection_error(exc):
+                    raise
                 continue
 
             _STRUCTURED_CONTEXT_SUPPORT[self.model] = structured
@@ -1963,8 +1996,6 @@ class OpenAISTT:
             has_keywords=bool(keywords),
             language_pin_lost=bool(language),
         )
-        _STRUCTURED_CONTEXT_SUPPORT[self.model] = False
-        _LOGPROBS_SUPPORT[self.model] = False
         await conn.session.update(
             session=cast(
                 Any,
@@ -1976,6 +2007,11 @@ class OpenAISTT:
                 ),
             )
         )
+        # AFTER the update, not before. Written first, the memo recorded a verdict this call had
+        # not yet earned — and when the update then threw, the verdict outlived the session that
+        # never opened, degrading every later one.
+        _STRUCTURED_CONTEXT_SUPPORT[self.model] = False
+        _LOGPROBS_SUPPORT[self.model] = False
 
     def _session_payload(
         self,
@@ -2171,7 +2207,14 @@ class OpenAISTT:
                     ),
                 )
             )
-        except Exception:
+        except Exception as exc:
+            # A dead socket says nothing about what this model accepts, and degrading on it
+            # poisons the memo for every later session — see _is_connection_error. Raising hands
+            # it to transcribe()'s existing reconnect (realtime_session_retry), which is the path
+            # that can actually fix it.
+            if _is_connection_error(exc):
+                await self._close_session({"manager": manager})
+                raise
             if not language and not prompt and not normalized_keywords:
                 raise
             # Step DOWN one capability at a time instead of collapsing straight to a bare

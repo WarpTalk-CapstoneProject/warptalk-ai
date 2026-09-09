@@ -199,3 +199,64 @@ class TestTranslatorPool:
 
         assert connection is live
         assert live.closed is False
+
+
+# ── A dead socket is not a verdict on the model ──────────────────────────────────────────
+#
+# `session.update` is the first thing sent down a freshly claimed socket, so it is also where an
+# already-closed one surfaces. Read as "the model refused these fields", that walks the whole
+# degrade ladder and writes the bare rung's verdict into a PROCESS-WIDE memo — one stale socket
+# degrading every session the worker opens afterwards.
+#
+# The 2026-09-08 meeting logged `session_optional_fields_rejected` four times and
+# `stt_session_capability_downgraded` — the log that means a model actually refused something —
+# zero times. All four were dead sockets.
+
+
+class _ClosedConnectionError(Exception):
+    """Stands in for websockets' ConnectionClosedOK, matched by class-name prefix."""
+
+
+# The predicate matches on the exception's class NAME, so the stand-in has to carry the
+# provider's. (The class itself is named for ruff's N818, which is about source style.)
+_ClosedConnectionError.__name__ = "ConnectionClosedOK"
+
+
+class TestConnectionErrorIsNotACapabilityVerdict:
+    def test_a_provider_close_is_recognised_by_its_wording(self):
+        from stt_worker.model import _is_connection_error
+
+        assert _is_connection_error(
+            RuntimeError("received 1001 (going away) Your session hit the maximum duration")
+        )
+
+    def test_a_real_parameter_rejection_is_not(self):
+        from stt_worker.model import _is_connection_error
+
+        assert not _is_connection_error(
+            RuntimeError("Unknown parameter: 'keywords' is not supported for this model.")
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_dead_socket_does_not_degrade_the_model_memo(self):
+        from stt_worker.model import (
+            OpenAISTT,
+            _supports_structured_context,
+            reset_capability_memo,
+        )
+
+        reset_capability_memo()
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.model = "some-capable-model"
+        stt.noise_reduction = "off"
+
+        conn = MagicMock()
+        conn.session.update = AsyncMock(
+            side_effect=_ClosedConnectionError("received 1001 (going away) ... 60 minutes.")
+        )
+
+        with pytest.raises(_ClosedConnectionError):
+            await stt._degrade_session_config(conn, "vi", "topic", {"vi"}, ["Codex"])
+
+        # Untouched: nothing was learned, because nothing was tested.
+        assert _supports_structured_context("some-capable-model") is True

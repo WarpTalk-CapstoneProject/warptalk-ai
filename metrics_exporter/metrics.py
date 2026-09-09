@@ -1,9 +1,46 @@
+"""Prometheus exporter for the Redis Streams the WarpTalk pipeline runs on.
+
+WHAT IS EXPORTED
+    For every consumer group on every reported stream: `redis_stream_group_lag`,
+    `redis_stream_group_messages_pending` and `redis_stream_group_consumers`; per stream,
+    `redis_stream_groups`; per dead-letter stream, `redis_stream_length`. Plus the worker
+    heartbeat counts and the stage-latency histograms the workers write into Redis.
+
+    Groups are DISCOVERED, with XINFO GROUPS, on every scrape — never listed. A group that
+    appears in Redis is in the next scrape without a code change, and a group that is destroyed
+    is gone from it: the exporter keeps no state between scrapes, so there is no stale series
+    to keep an alert firing, or to keep one quiet.
+
+    WT-391. This module used to carry three (stream, group) pairs. Production runs about
+    eighteen groups on the global streams — `stt:results` alone fans out to six — so
+    `redis_stream_group_lag` had no series for most of them and WarpTalkAiStreamLag, a loaded
+    and correct alert, could not fire for any of them. `billing-stt-workers` sat dead at lag 949
+    on `stt:results` for four days, pinned the stream's trim floor, and nothing said so.
+
+WHICH STREAMS ARE ASKED — the cardinality bound
+    Global streams, always. `METRICS_GLOBAL_STREAMS` (comma-separated; default
+    `shared.config.DEFAULT_GLOBAL_STREAMS`, every global stream this repo and the backend
+    publish to) names them, and a named stream is reported whether or not its key exists: an
+    absent one gets `redis_stream_groups{stream="..."} 0`, and the three core pipeline pairs get
+    a 0 lag line, because an absent series reads as "no data" on a dashboard and as nothing at
+    all in an alert expression. Any further non-room stream present in Redis is reported too,
+    so a stream nobody listed — the backend's `:dlq` streams were the example — is not invisible.
+
+    Per-room streams, only with `METRICS_EXPORT_PER_ROOM_STREAMS=true`. `BaseWorker.publish`
+    writes every message to `<stream>:<roomId>` as well as `<stream>`, so there is one set of
+    streams per meeting ever held; labelling them puts a room id in a label and grows the series
+    count without bound. Their groups are the same groups, on the same workers, already counted
+    on the global stream. The flag is for a local look at one room, not for production.
+"""
+
+import uuid
 from collections.abc import AsyncIterator, Awaitable
 from typing import Any, Protocol
 
 from redis.exceptions import ResponseError
 
-from shared.redis_client import LATENCY_BUCKETS_MS, LATENCY_KEY_PREFIX, is_per_room_stream
+from shared.config import MetricsSettings
+from shared.redis_client import LATENCY_BUCKETS_MS, LATENCY_KEY_PREFIX
 
 # The three hops of the live pipeline. These are reported even when the stream is absent, so the
 # spine of the system always has a series; everything else is discovered.
@@ -75,36 +112,57 @@ async def _groups(redis: RedisMetricsClient, stream: str) -> list[dict[Any, Any]
         raise
 
 
-async def _global_streams(redis: RedisMetricsClient) -> list[str]:
-    """Every permanent stream in Redis, per-room ones excluded.
+def is_room_scoped_stream(stream: str) -> bool:
+    """Whether this stream belongs to one room (or one conversation, one workspace).
 
-    Discovered rather than listed. The hardcoded list this replaces named three of the roughly
-    thirteen consumer groups the platform runs, so `redis_stream_group_lag` had no series at all
-    for the other ten — and the lag alert that reads it was loaded, correct, and incapable of
-    firing for any of them. A list in this file drifts every time a worker is added; asking Redis
-    does not.
+    ANY segment that parses as a UUID, not only the last one. `shared.redis_client.
+    is_per_room_stream` — the predicate that decides which streams may EXPIRE — looks at the
+    last segment only, and defaults to "permanent" on purpose: being wrong that way costs disk,
+    being wrong the other way deleted `translate:results` and its consumer groups (WT-402).
 
-    Per-room streams are skipped because there is one set per meeting: including them would put a
-    room id in a label and make the series count grow without bound. Their groups are the same
-    groups, on the same workers, already counted here from the global stream.
+    Here the safe direction is the opposite. This predicate decides what gets a LABEL, and
+    over-including a stream costs one missing series while under-including one puts an
+    unbounded id into the label set. So `meeting:<uuid>:events` is room-scoped to the exporter
+    even though the expiry rule would (correctly) leave it alone.
     """
-    streams: list[str] = []
+    for segment in stream.split(":"):
+        try:
+            uuid.UUID(segment)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+async def _streams_to_report(redis: RedisMetricsClient, settings: MetricsSettings) -> list[str]:
+    """The configured global streams, plus whatever else Redis holds that is not room-scoped.
+
+    Configured first so a global stream is reported while its key is absent; discovered second
+    so a stream nobody configured is reported while it exists. Per-room streams are dropped
+    from the discovered set unless explicitly enabled — see the module docstring.
+    """
+    streams: set[str] = set(settings.global_stream_names())
     async for key in redis.scan_iter(match="*", count=200, _type="stream"):
         decoded = _decode(key)
-        if is_per_room_stream(decoded):
+        if is_room_scoped_stream(decoded) and not settings.export_per_room_streams:
             continue
-        streams.append(decoded)
+        streams.add(decoded)
     return sorted(streams)
 
 
-async def collect_metrics(redis: RedisMetricsClient) -> str:
+async def collect_metrics(
+    redis: RedisMetricsClient,
+    settings: MetricsSettings | None = None,
+) -> str:
+    """One scrape. Stateless: every line is computed from what Redis holds right now."""
+    settings = settings or MetricsSettings()
     lag_lines: list[str] = []
     pending_lines: list[str] = []
     consumer_lines: list[str] = []
     group_count_lines: list[str] = []
     dead_letter_lines: list[str] = []
 
-    streams = await _global_streams(redis)
+    streams = await _streams_to_report(redis, settings)
     # Absent from Redis is not absent from the report. A core stream that has been deleted still
     # gets a 0 lag line, because a vanished series reads as "no data" on a dashboard and as
     # nothing at all in an alert expression.
@@ -152,7 +210,7 @@ async def collect_metrics(redis: RedisMetricsClient) -> str:
         "# HELP redis_stream_group_consumers Consumers currently registered in the group.",
         "# TYPE redis_stream_group_consumers gauge",
         *consumer_lines,
-        "# HELP redis_stream_groups Consumer groups present on a permanent WarpTalk stream.",
+        "# HELP redis_stream_groups Consumer groups present on a reported WarpTalk stream.",
         "# TYPE redis_stream_groups gauge",
         *group_count_lines,
     ]

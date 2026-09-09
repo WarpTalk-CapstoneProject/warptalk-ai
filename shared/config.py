@@ -875,3 +875,75 @@ class SecuritySettings(BaseSettings):
     # fifteen 37-second calls — over nine minutes, against a three-minute ceiling on the caller.
     scan_concurrency: int = 8
     result_ttl_seconds: int = 300
+
+
+# Every GLOBAL stream the platform publishes to — the `<prefix>` half of BaseWorker.publish,
+# which writes each message to `<prefix>:<roomId>` AND to `<prefix>`. Global streams are
+# permanent, shared infrastructure with one set for the whole platform; the per-room copies are
+# one set per meeting ever held, and are deliberately NOT here (see MetricsSettings).
+#
+# Compiled from every `input_stream`, `*_STREAM` constant and publish call in this repository
+# plus the backend's PublishStreamMessageAsync / StreamAddAsync / consumer registrations. It is
+# the DEFAULT for METRICS_GLOBAL_STREAMS, not a hard limit: the exporter also reports any
+# further non-room stream it finds in Redis, so a stream missing from here is still exported
+# while it exists — what it loses is the guaranteed series while it is absent.
+DEFAULT_GLOBAL_STREAMS: tuple[str, ...] = (
+    # The live pipeline, in order.
+    "audio:frames",
+    "audio:chunks",
+    "stt:results",
+    "translate:results",
+    "tts:results",
+    # Assistant, suggestions, knowledge.
+    "ai_assistant:results",
+    "assistant:chat_requests",
+    "assistant:chat_results",
+    "assistant:summary_requests",
+    "assistant:summary_results",
+    "knowledge:fact_requests",
+    # Embeddings and search.
+    "embedding:index_requests",
+    "embedding:index_results",
+    "embedding:search_requests",
+    # Voice lifecycle.
+    "voice:clone_requests",
+    "voice:preview_requests",
+    "voice:auto_clone_ready",
+    "voice:delete_requests",
+    # Post-meeting work.
+    "translate:backfill_requests",
+    "translate:backfill_results",
+    "security:scan_requests",
+    # Backend-owned.
+    "meeting:domain-events",
+    "translationRoom:system_events",
+    "translationRoom:system_events:dlq",
+)
+
+
+class MetricsSettings(BaseSettings):
+    """Redis metrics exporter settings (metrics_exporter). WT-391.
+
+    The exporter discovers consumer GROUPS with XINFO GROUPS on every scrape — nothing here
+    lists a group, and nothing should. What these settings decide is which STREAMS are asked.
+    """
+
+    model_config = {"env_prefix": "METRICS_"}
+
+    # Comma-separated stream names reported on EVERY scrape, whether or not the key currently
+    # exists in Redis. A named stream that is absent still gets `redis_stream_groups{...} 0`
+    # rather than no series: an absent series reads as "no data" on a dashboard and as nothing
+    # at all in an alert expression, which is how a deleted global stream (WT-402) stays quiet.
+    global_streams: str = ",".join(DEFAULT_GLOBAL_STREAMS)
+
+    # Also report the `<stream>:<roomId>` copies. OFF, and meant to stay off in production:
+    # there is one set per meeting ever held, so this puts a room id in a label and grows the
+    # series count without bound. Their consumer groups are the same groups, on the same
+    # workers, already counted on the global stream. The switch exists for a local
+    # investigation of one room, not for a dashboard.
+    export_per_room_streams: bool = False
+
+    def global_stream_names(self) -> tuple[str, ...]:
+        """The configured list, trimmed, de-duplicated, in the order given."""
+        names = (name.strip() for name in self.global_streams.split(","))
+        return tuple(dict.fromkeys(name for name in names if name))
