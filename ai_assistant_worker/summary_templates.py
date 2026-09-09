@@ -9,6 +9,14 @@ A template names the sections a kind of meeting actually has, and the prompt and
 schema are both generated from it. Adding a new kind of meeting is adding a record here, not
 editing a prompt string.
 
+LANGUAGE
+    Which language a summary came out in used to be the model's decision, taken from one
+    sentence telling it to write in the language the meeting was held in. That is a fine
+    default and a bad contract: nobody could choose, nothing recorded what had been
+    chosen, and a room whose members read different languages had no answer at all.
+    `build_system_prompt` now takes the language as an argument; passing none keeps the
+    old sentence, which is what every summary already in storage was written under.
+
 CITATIONS
     Every item a template produces must carry `atMs` — the moment in the meeting it came
     from. This is not decoration. A claim that cannot point at a moment in the transcript is
@@ -21,6 +29,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+
+from shared.languages import language_name, normalize_language_code
 
 
 @dataclass(frozen=True)
@@ -221,8 +231,14 @@ def resolve_template(key: str | None) -> SummaryTemplate:
     return TEMPLATES.get(key.strip().lower(), GENERAL)
 
 
-def build_system_prompt(template: SummaryTemplate) -> str:
-    """Generate the system prompt and the JSON shape from the template."""
+def build_system_prompt(template: SummaryTemplate, language: str | None = None) -> str:
+    """Generate the system prompt and the JSON shape from the template.
+
+    Args:
+        template: The shape the summary takes — its sections, and what belongs in each.
+        language: ISO 639-1 code the summary must be WRITTEN in, whatever language the
+            meeting was held in. None means nobody chose — see LANGUAGE above.
+    """
     lines = [
         "You are a meeting analyst. Read the transcript and return a single JSON object "
         "only — no markdown, no commentary.",
@@ -263,14 +279,43 @@ def build_system_prompt(template: SummaryTemplate) -> str:
         lines.append(f"- {section.key} ({section.title}): {section.guidance}")
 
     lines.append("")
+    lines.append(_language_rule(language))
+    lines.append("")
     lines.append(
-        "Write in the language the meeting was held in. Summarise what the transcript "
-        "actually contains, however short that is — two sentences of real content is a "
-        "valid summary. Never claim the transcript is empty or has no substantive "
-        "content: whether there is enough to summarise is decided before you are called, "
-        "so you are only ever given a transcript that has something in it."
+        "Summarise what the transcript actually contains, however short that is — two "
+        "sentences of real content is a valid summary. Never claim the transcript is empty "
+        "or has no substantive content: whether there is enough to summarise is decided "
+        "before you are called, so you are only ever given a transcript that has something "
+        "in it."
     )
     return "\n".join(lines)
+
+
+def _language_rule(language: str | None) -> str:
+    """The one paragraph that decides what language the summary comes out in.
+
+    Spelled out field by field rather than as a bare "write in X", because the failure this
+    guards against is not a model refusing to translate — it is a model translating the
+    overview and leaving the owner labels, or half the action items, in the transcript's
+    language. That produces a document in two languages with no stated original, which is
+    worse than one in the wrong language: the reader cannot tell which half to trust.
+    """
+    code = normalize_language_code(language)
+    if not code:
+        # Nobody chose. The behaviour every summary written before this argument existed was
+        # produced under, and still the right answer for a room that never expressed one.
+        return "Write in the language the meeting was held in."
+
+    name = language_name(code)
+    return (
+        f"WRITE THE ENTIRE SUMMARY IN {name.upper()}. The transcript may be in another "
+        f"language; translate as you summarise. Every string you produce is in {name} — the "
+        "overview, every item of every section, and any owner label you write. Proper names "
+        "of people, products and companies stay as they were said. Do not add a note about "
+        "having translated, and do not repeat the original wording alongside the "
+        f"translation: the reader asked for this summary in {name} and wants one document, "
+        "not a bilingual one."
+    )
 
 
 def format_transcript_line(at_ms: int, speaker: str, text: str) -> str:

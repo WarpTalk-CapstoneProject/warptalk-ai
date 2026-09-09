@@ -663,6 +663,10 @@ class SummaryRequestMessage(BaseModel):
     template_key: str = "general"
     bearer_token: str = ""
     target_languages_json: str = "[]"
+    #: ISO 639-1 the summary must be WRITTEN in, chosen by whoever asked for it. Empty means
+    #: nobody chose and the model follows the transcript, which is what every request published
+    #: before this field existed meant — so an old message keeps its old behaviour.
+    summary_language: str = ""
     #: Pre-read transcript, already formatted with `format_transcript_line`. Empty for a
     #: user-initiated rewrite, which fetches instead.
     transcript_text: str = ""
@@ -676,6 +680,7 @@ class SummaryRequestMessage(BaseModel):
             "template_key": self.template_key,
             "bearer_token": self.bearer_token,
             "target_languages_json": self.target_languages_json,
+            "summary_language": self.summary_language,
             "transcript_text": self.transcript_text,
             "timestamp_ms": str(self.timestamp_ms),
         }
@@ -690,6 +695,7 @@ class SummaryRequestMessage(BaseModel):
             template_key=d.get("template_key", "general"),
             bearer_token=d.get("bearer_token", ""),
             target_languages_json=d.get("target_languages_json", "[]"),
+            summary_language=d.get("summary_language", ""),
             # Absent on every message the backend published before this field existed, which is
             # exactly the user-initiated shape — so an old request keeps fetching.
             transcript_text=d.get("transcript_text", ""),

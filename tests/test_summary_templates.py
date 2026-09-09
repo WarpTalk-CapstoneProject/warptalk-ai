@@ -121,3 +121,44 @@ def test_the_prompt_never_asks_the_model_to_declare_the_transcript_empty() -> No
     prompt = build_system_prompt(GENERAL)
     assert "no substantive content, say so" not in prompt
     assert "Never claim the transcript is empty" in prompt
+
+
+class TestTheLanguageTheSummaryIsWrittenIn:
+    """Which language a summary comes out in is a choice, not a guess.
+
+    It used to be neither: one sentence told the model to follow the meeting, nothing recorded
+    what it landed on, and nobody could ask for anything else. These tests pin the two halves
+    of the replacement — that a chosen language is stated unmissably, and that choosing nothing
+    still means exactly what it used to.
+    """
+
+    def test_choosing_nothing_keeps_the_original_instruction(self) -> None:
+        # Every summary already in storage was written under this sentence. A default that
+        # quietly changed would rewrite the meaning of documents nobody asked to touch.
+        for language in (None, "", "   "):
+            prompt = build_system_prompt(GENERAL, language)
+            assert "Write in the language the meeting was held in." in prompt
+
+    def test_a_chosen_language_is_named_not_coded(self) -> None:
+        prompt = build_system_prompt(GENERAL, "ja")
+
+        # The model is given a language, not a tag to echo back into its output.
+        assert "JAPANESE" in prompt
+        assert "Write in the language the meeting was held in." not in prompt
+
+    def test_a_locale_tag_means_the_same_as_its_bare_code(self) -> None:
+        # Rooms store `vi-VN`; requests carry `vi`. A summary must not depend on which
+        # spelling happened to reach it.
+        assert build_system_prompt(GENERAL, "vi-VN") == build_system_prompt(GENERAL, "vi")
+
+    def test_an_unknown_code_still_produces_an_instruction(self) -> None:
+        # Falling back to the code is a worse prompt; raising would be a missing summary.
+        prompt = build_system_prompt(GENERAL, "xx")
+        assert "XX" in prompt
+
+    def test_the_rule_covers_every_string_not_only_the_prose(self) -> None:
+        # The failure this guards against is a half-translated document: prose in Japanese,
+        # owner labels left in the transcript's language, and no stated original.
+        prompt = build_system_prompt(GENERAL, "ja").lower()
+        assert "owner label" in prompt
+        assert "not a bilingual one" in prompt
