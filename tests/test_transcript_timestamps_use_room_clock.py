@@ -58,12 +58,19 @@ def _worker(redis: Any) -> STTWorker:
     return worker
 
 
-def _chunk(index: int, timestamp_ms: int, meeting_id: str = "m1") -> AudioChunkMessage:
+def _chunk(
+    index: int,
+    timestamp_ms: int,
+    meeting_id: str = "m1",
+    audio_ms: int = 0,
+) -> AudioChunkMessage:
+    # 16-bit mono at 16 kHz: 32 bytes per millisecond. `audio_ms` defaults to ~0 so the tests
+    # above measure the anchor arithmetic alone.
     return AudioChunkMessage(
         meeting_id=meeting_id,
         speaker_id="s1",
         chunk_index=index,
-        audio_data=b"\x00\x00",
+        audio_data=b"\x00\x00" * max(1, audio_ms * 16),
         language="vi",
         sample_rate=16000,
         timestamp_ms=timestamp_ms,
@@ -160,3 +167,64 @@ async def test_an_unavailable_redis_keeps_transcribing() -> None:
     assert first == 0
     assert later == 20_000
     cast(MagicMock, worker.logger).warning.assert_called()
+
+
+# ── the chunk's own length ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_offset_marks_when_the_speech_started_not_when_it_was_published() -> None:
+    """`timestamp_ms` is stamped when the chunk is PUBLISHED, i.e. after the speech ended.
+
+    The caller adds the model's in-chunk segment offset on top of whatever this returns, so
+    returning the publish instant stamps every segment late by the length of its own chunk.
+    """
+    worker = _worker(_AnchorRedis())
+
+    await worker._elapsed_ms(_chunk(0, ANCHOR_MS))
+    # Six seconds of audio, published at T+16s: the speech ran from T+10s to T+16s.
+    offset = await worker._elapsed_ms(_chunk(1, ANCHOR_MS + 16_000, audio_ms=6_000))
+
+    assert offset == 10_000
+
+
+@pytest.mark.asyncio
+async def test_a_long_chunk_no_longer_overlaps_the_short_one_after_it() -> None:
+    """The production shape, and the reason transcripts broke into one bubble per chunk.
+
+    A turn that hits the 6s `chunk_duration_ms` cap, then the short chunk carrying the rest of the
+    same sentence. Under the publish-time offset the second was stamped BEFORE the first ended —
+    a gap of about minus five seconds — and the web merge required a non-negative gap, so the one
+    case that most needed joining was the one case guaranteed to split.
+    """
+    worker = _worker(_AnchorRedis())
+    await worker._elapsed_ms(_chunk(0, ANCHOR_MS))
+
+    capped_start = await worker._elapsed_ms(_chunk(1, ANCHOR_MS + 6_000, audio_ms=6_000))
+    tail_start = await worker._elapsed_ms(_chunk(2, ANCHOR_MS + 7_200, audio_ms=1_200))
+
+    capped_end = capped_start + 6_000
+    assert tail_start >= capped_end, (
+        f"the tail of the sentence starts at {tail_start} but the capped chunk "
+        f"runs to {capped_end} — they overlap, which is what split the bubble"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_chunk_carrying_no_audio_is_not_shifted() -> None:
+    # A streaming turn commits with its frames already sent separately. There is no duration to
+    # subtract, and inventing one would move the commit backwards past the speech it closes.
+    worker = _worker(_AnchorRedis())
+    await worker._elapsed_ms(_chunk(0, ANCHOR_MS))
+
+    empty = AudioChunkMessage(
+        meeting_id="m1",
+        speaker_id="s1",
+        chunk_index=1,
+        audio_data=b"",
+        language="vi",
+        sample_rate=16000,
+        timestamp_ms=ANCHOR_MS + 12_000,
+    )
+
+    assert await worker._elapsed_ms(empty) == 12_000

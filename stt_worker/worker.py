@@ -16,7 +16,7 @@ from collections import deque
 from collections.abc import Mapping
 from typing import Any
 
-from shared.base_worker import BaseWorker
+from shared.base_worker import TERMINAL_ROOM_STATUSES, BaseWorker
 from shared.config import STTSettings, resolve_openai_api_key
 from shared.prosody import (
     SpeakerBaseline,
@@ -115,7 +115,6 @@ _MAX_STT_KEYWORDS = 16
 # its own. Matches the horizon the other per-room keys use.
 _TRANSCRIPT_ANCHOR_TTL_S = 6 * 60 * 60
 _CONTEXT_MIN_CONFIDENCE = -0.35
-_ACTIVE_TRANSLATION_STATES = {"IN_PROGRESS", "AUDIO_ROUTING_ACTIVE"}
 
 
 def _language_hint_for_stt(language: str) -> str | None:
@@ -123,6 +122,20 @@ def _language_hint_for_stt(language: str) -> str | None:
     if not normalized or normalized == "auto":
         return None
     return normalized
+
+
+def _chunk_audio_duration_ms(chunk: AudioChunkMessage) -> int:
+    """How long the PCM in this chunk actually is, in milliseconds.
+
+    16-bit mono, so two bytes per sample — the same arithmetic the TTS clone buffer uses on the
+    same stream. Zero for a chunk that carries no audio of its own (a streaming turn whose frames
+    travelled separately), which is correct: there is nothing to shift it back by.
+
+    Read `_elapsed_ms` for why this is subtracted rather than merely measured.
+    """
+    sample_rate = max(chunk.sample_rate, 1)
+    samples = len(chunk.audio_data) // 2
+    return int(samples * 1000 / sample_rate)
 
 
 def _build_segment_id(
@@ -176,6 +189,10 @@ class STTWorker(BaseWorker):
         # whose frames have been appended but which no chunk has committed yet. Absent means
         # the buffer cannot be trusted — see _append_speech_frame.
         self._streamed_turns: dict[tuple[str, str], tuple[str, int, int]] = {}
+        # (meeting_id, speaker_id) -> (turn_id, how many of its frames arrived afterwards) for
+        # the turn whose streaming has already ENDED — committed by its chunk, or abandoned.
+        # Its trailing frames are not a gap in anything; see _append_speech_frame.
+        self._closed_turns: dict[tuple[str, str], tuple[str, int]] = {}
         # (meeting_id, speaker_id) -> how that speaker normally sounds in THIS room. Held in
         # memory and mirrored to Redis so a restart or a second replica does not start every
         # speaker from scratch — see _speaker_baseline.
@@ -245,6 +262,26 @@ class STTWorker(BaseWorker):
                 self.logger.exception("stt_frame_consumer_error")
                 await asyncio.sleep(1.0)
 
+    def _close_turn(self, key: tuple[str, str], turn_id: str) -> None:
+        """Record that `turn_id` is over, so its remaining frames are dropped rather than read
+        as a gap in whatever comes next — see the closed-turn guard in _append_speech_frame.
+
+        Holds exactly one turn per speaker: the one that just ended. Its predecessor's tally is
+        reported here, which is the only moment at which that number is final.
+        """
+        closed: dict[tuple[str, str], tuple[str, int]] = getattr(self, "_closed_turns", {})
+        self._closed_turns = closed
+        previous = closed.get(key)
+        if previous is not None and previous[0] != turn_id and previous[1]:
+            self.logger.debug(
+                "stt_stream_turn_late_frames",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                turn_id=previous[0],
+                late_frames=previous[1],
+            )
+        closed[key] = (turn_id, 0)
+
     async def _append_speech_frame(self, data: dict[bytes, bytes]) -> None:
         try:
             frame = AudioFrameMessage.from_redis(data)
@@ -259,6 +296,33 @@ class STTWorker(BaseWorker):
         if streaming is None:
             streaming = {}
             self._streamed_turns = streaming
+        closed: dict[tuple[str, str], tuple[str, int]] | None = getattr(self, "_closed_turns", None)
+        if closed is None:
+            closed = {}
+            self._closed_turns = closed
+
+        # A FRAME OF A TURN THAT IS ALREADY OVER. Nothing is wrong here and nothing needs
+        # undoing: the chunk that closes a turn is published while the speaker's last frames are
+        # still in flight, so a handful of them always arrive after their own commit.
+        #
+        # This used to fall through to the sequence check below, where it read as a gap — the
+        # committed turn's state had been popped, so `expected_seq` was 0 while the frame said 7.
+        # Every one of those took the full abandon path, and abandon DISCARDS THE BUFFER. On the
+        # 2026-09-08 meeting that produced 204 `frame_gap` lines in 71 seconds, and the real
+        # hazard is not the noise: once the next turn has appended its own frames, a straggler
+        # from the previous one throws THAT turn's audio away.
+        #
+        # Counted rather than logged one by one, and reported when the next turn opens, so the
+        # number stays visible without a line per frame.
+        closed_turn = closed.get(key)
+        if closed_turn is not None and closed_turn[0] == frame.turn_id:
+            closed[key] = (closed_turn[0], closed_turn[1] + 1)
+            return
+
+        # DELIBERATELY NOT CLEARED WHEN THE NEXT TURN OPENS. The straggler that matters arrives
+        # after the next turn has started appending — that is the whole hazard — so forgetting
+        # the closed turn at that moment forgets it exactly one frame too early. It is replaced
+        # when the NEXT turn closes, in _close_turn, which is also where its tally is reported.
 
         # A NEW TURN ARRIVING WHILE THE PREVIOUS ONE IS STILL OPEN means that previous turn will
         # never be committed — the utterance was too short for ingress to publish, or its chunk
@@ -268,7 +332,7 @@ class STTWorker(BaseWorker):
         #
         # One rule, no extra protocol. A marker message from ingress would have covered only the
         # case ingress knows about.
-        async def abandon(reason: str, **fields: Any) -> None:
+        async def abandon(reason: str, closing_turn: str | None = None, **fields: Any) -> None:
             """Stop trusting this speaker's buffer, and empty it.
 
             THE RULE THIS ENFORCES, AND WHY IT IS ABSOLUTE
@@ -283,6 +347,9 @@ class STTWorker(BaseWorker):
                 buffer stops the partial from being read as the opening of the next turn.
             """
             streaming.pop(key, None)
+            # Remembered so this turn's remaining frames are dropped in one place rather than
+            # re-entering abandon once each — see the closed-turn guard above.
+            self._close_turn(key, closing_turn or frame.turn_id)
             await self._require_model().discard_streamed_audio(key)
             self.logger.info(
                 "stt_stream_turn_abandoned",
@@ -296,7 +363,14 @@ class STTWorker(BaseWorker):
         if previous is not None and previous[0] != frame.turn_id:
             # The previous turn will never be committed: too short for ingress to publish, or
             # its chunk was lost, or ingress died mid-turn.
-            await abandon("previous_turn_never_committed", abandoned_turn=previous[0])
+            # `closing_turn` is the PREVIOUS turn, not this frame's. Recording this frame's id
+            # here would mark the turn that is only just starting as already over, and every
+            # frame of it would then be dropped by the guard above.
+            await abandon(
+                "previous_turn_never_committed",
+                closing_turn=previous[0],
+                abandoned_turn=previous[0],
+            )
             previous = None
 
         # A GAP MEANS THE BUFFER IS NO LONGER THE TURN. `seq` exists for exactly this: the
@@ -333,26 +407,54 @@ class STTWorker(BaseWorker):
         streaming[key] = (frame.turn_id, epoch, frame.seq + 1)
 
     async def _listen_for_track_prewarm(self) -> None:
-        """Prepare the speaker's Realtime socket during room join, before first speech."""
-        pubsub = self.redis.redis.pubsub()
-        try:
-            await pubsub.subscribe("meeting.track_published")
-            while not self._shutdown_event.is_set():
-                message = await pubsub.get_message(
-                    ignore_subscribe_messages=True,
-                    timeout=1.0,
-                )
-                if message:
-                    await self._prewarm_from_track_event(message["data"])
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.logger.exception("stt_prewarm_listener_failed")
-        finally:
+        """Prepare the speaker's Realtime socket during room join, before first speech.
+
+        SURVIVES ITS OWN FAILURES, which it did not. The `try` used to sit OUTSIDE the loop, so
+        the first exception from any single event ended the subscription for the lifetime of the
+        process — one log line, and then a feature that simply never ran again. Nothing restarts
+        this task and nothing reports that it stopped; the only visible symptom is that every
+        speaker from then on pays the Realtime handshake on their first sentence, which reads as
+        "the transcript lagged" and not as a fault.
+
+        Production, 2026-09-08 17:33:18, fifteen seconds before the meeting's first chunk: a
+        `prepare_session` for a newly published track claimed a warm socket the provider had
+        already closed at its 60-minute cap, and `session.update` raised ConnectionClosedOK. The
+        listener exited there.
+
+        Shaped like _consume_speech_frames now: one event's failure costs that event, a
+        subscription failure costs a second, and neither costs the feature.
+        """
+        while not self._shutdown_event.is_set():
+            pubsub = self.redis.redis.pubsub()
             try:
-                await pubsub.close()
+                await pubsub.subscribe("meeting.track_published")
+                while not self._shutdown_event.is_set():
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=1.0,
+                    )
+                    if not message:
+                        continue
+                    try:
+                        await self._prewarm_from_track_event(message["data"])
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # This speaker gets no prepared socket and pays the handshake on their
+                        # first sentence. That is the whole cost, and it is the cost this
+                        # feature exists to avoid — not a reason to stop avoiding it for
+                        # everybody who joins later.
+                        self.logger.exception("stt_prewarm_event_failed")
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                self.logger.warning("stt_prewarm_listener_close_failed")
+                self.logger.exception("stt_prewarm_listener_failed")
+                await asyncio.sleep(1.0)
+            finally:
+                try:
+                    await pubsub.close()
+                except Exception:
+                    self.logger.warning("stt_prewarm_listener_close_failed")
 
     async def _prewarm_from_track_event(self, serialized_event: bytes | str) -> None:
         try:
@@ -494,6 +596,8 @@ class STTWorker(BaseWorker):
             self._speaker_noise_reduction.pop(noise_key, None)
         for streamed_key in [k for k in getattr(self, "_streamed_turns", {}) if k[0] == room_id]:
             self._streamed_turns.pop(streamed_key, None)
+        for closed_key in [k for k in getattr(self, "_closed_turns", {}) if k[0] == room_id]:
+            self._closed_turns.pop(closed_key, None)
         stale_speakers = [key for key in self._speaker_locks if key[0] == room_id]
         for key in stale_speakers:
             self._speaker_locks.pop(key, None)
@@ -518,9 +622,9 @@ class STTWorker(BaseWorker):
         """Process one audio chunk: transcribe and publish results."""
         chunk = AudioChunkMessage.from_redis(data)
 
-        if not await self._translation_state_allows_stt(chunk.meeting_id):
+        if not await self._room_state_allows_stt(chunk.meeting_id):
             self.logger.info(
-                "skipping_inactive_room",
+                "skipping_ended_room",
                 meeting_id=chunk.meeting_id,
                 route_state=getattr(self, "_route_states", {}).get(chunk.meeting_id),
             )
@@ -681,6 +785,13 @@ class STTWorker(BaseWorker):
                 self, "_streamed_turns", {}
             )
             streamed = streamed_turns.pop((chunk.meeting_id, chunk.speaker_id), None)
+            # This chunk ENDS chunk.turn_id. The speaker's last frames for it are still on their
+            # way — ingress publishes the chunk without waiting for them to be consumed — and
+            # without this they arrive to find the state popped and are read as a sequence gap,
+            # which discards the buffer the NEXT turn may already be filling. Empty turn_id is an
+            # older ingress that streams nothing, so there is nothing to strand.
+            if chunk.turn_id:
+                self._close_turn((chunk.meeting_id, chunk.speaker_id), chunk.turn_id)
             streamed_epoch = (
                 streamed[1] if streamed is not None and streamed[0] == chunk.turn_id else None
             )
@@ -972,13 +1083,30 @@ class STTWorker(BaseWorker):
             # hand-over to a restart or a sibling replica is lost.
             self.logger.warning("prosody_baseline_write_failed", exc_info=True)
 
-    async def _translation_state_allows_stt(self, meeting_id: str) -> bool:
-        """Reject queued audio when the authoritative room state is known inactive.
+    async def _room_state_allows_stt(self, meeting_id: str) -> bool:
+        """Reject queued audio only for a room that is OVER.
 
-        LiveKit ingress is the primary capture gate. This second gate prevents a stale
-        Redis chunk (or a producer regression) from creating transcript before Start.
-        Unknown legacy state remains fail-open so an unavailable cache cannot erase valid
-        live speech; current rooms persist ``audio_routes`` before publishing audio.
+        THIS USED TO ASK "HAS TRANSLATION STARTED", AND THAT WAS THE WRONG QUESTION.
+        It admitted only IN_PROGRESS/AUDIO_ROUTING_ACTIVE, so a room where people had
+        joined and were talking but nobody had pressed Start yet published
+        ``room_status: "WAITING"`` — written by the JOIN path itself, via
+        PublishRoutesUpdateAsync — and every chunk for that room was dropped here. The
+        meeting produced no transcript at all until somebody started translation, which
+        is exactly the behaviour ai#36 removed from the ingress worker one stage up
+        ("transcribe every live meeting, translate only when asked"). The gate was not
+        deleted then, only moved, so the decision was half-applied and the symptom
+        survived it.
+
+        Room status cannot answer "is translation running" anyway — since WT-339 a room
+        is IN_PROGRESS from the moment somebody opens it. The backend publishes
+        ``translation_active`` on this same payload for that question, and the stage that
+        actually costs a translation is the one that should read it.
+
+        What remains worth refusing is audio for a room that has ENDED: a stale queued
+        chunk appending to a finished meeting's transcript. Everything else — WAITING,
+        SCHEDULED, an unknown legacy state, an unreadable cache — is transcribed, because
+        being wrong that way loses a live meeting's words and being wrong the other way
+        costs one late line.
         """
         route_states = getattr(self, "_route_states", None)
         if route_states is None:
@@ -1002,7 +1130,7 @@ class STTWorker(BaseWorker):
                     exc_info=True,
                 )
 
-        return state is None or state in _ACTIVE_TRANSLATION_STATES
+        return state not in TERMINAL_ROOM_STATUSES
 
     def _require_model(self) -> OpenAISTT:
         if self.model is None:
@@ -1063,6 +1191,28 @@ class STTWorker(BaseWorker):
             It is still an approximation of "room start": the anchor is the first chunk this
             pipeline saw, not the moment the host pressed Start. That is a smaller and, more
             importantly, a CONSISTENT error — every seat computes the same number.
+
+        WHY THE CHUNK'S OWN DURATION IS SUBTRACTED
+            `chunk.timestamp_ms` is set by `AudioChunkMessage`'s default_factory at construction,
+            and livekit_ingress_worker constructs the message when it PUBLISHES — that is, after
+            the speech in it has finished. So the timestamp marks the END of the audio, not the
+            start of it. The caller then adds the model's in-chunk segment offset on top
+            (`start_ms = chunk_offset_ms + seg.start * 1000`), which stamps every segment late by
+            roughly the length of its own chunk.
+
+            That is not a cosmetic drift, because the error is proportional to chunk length and
+            chunk length varies. A turn that hits the `chunk_duration_ms` cap of 6000 is stamped
+            [T, T+6000]; the short chunk that carries the rest of the same sentence is published
+            at T+1200 and stamped [T+1200, ...]. The gap between them comes out at MINUS 4.8
+            seconds — and the web's utterance merge requires `gapMs >= 0`, so the one case that
+            most needs joining (a sentence cut by the hard cap) was the one case guaranteed to
+            split into two bubbles. That is the reported "ngắt ở mỗi chunk".
+
+            Subtracting the PCM duration puts the offset back at the moment the speech started.
+            Derived from the audio rather than from `speech_ms` or `speech_start_ms` because those
+            describe how much of the chunk was speech, not where the chunk sits in time, and
+            because an older ingress leaves them at 0 — a wrong answer, where the byte length is
+            always right.
         """
         # getattr, matching how the other per-room caches in these workers are reached: this is
         # called from process(), and the test suites construct workers with __new__ rather than
@@ -1080,7 +1230,7 @@ class STTWorker(BaseWorker):
 
         # Never negative. Clock skew between the gateway and this worker is real, and a negative
         # offset formats into nonsense on the panel rather than failing loudly.
-        return max(0, chunk.timestamp_ms - anchor_ms)
+        return max(0, chunk.timestamp_ms - anchor_ms - _chunk_audio_duration_ms(chunk))
 
     async def _resolve_transcript_anchor(self, chunk: AudioChunkMessage) -> int:
         """The agreed millisecond every seat measures this meeting from."""
@@ -1377,7 +1527,7 @@ class STTWorker(BaseWorker):
     async def _get_configured_room_languages(self, meeting_id: str) -> set[str]:
         """The room's own language configuration, from the audio_routes payload.
 
-        Same key `_translation_state_allows_stt` already reads, so this adds no round trip
+        Same key `_room_state_allows_stt` already reads, so this adds no round trip
         beyond the one this worker was making anyway. Best-effort: an unreadable or
         older-format payload (one published before `room_languages` existed) yields an
         empty set and the speak-languages half stands alone, which is exactly the previous

@@ -10,11 +10,45 @@ That is exactly the trap ASSISTANT_MODEL=gpt-5.6-luna would have walked into.
 Keep this the single place that encodes the rule. A worker that builds its own
 options dict is a worker that will break the next time a model family changes its
 parameter contract.
+
+The same argument now covers one non-generation rule: how long a Realtime socket may be
+held before OpenAI closes it. Two workers pool those sockets, both learned the 60-minute
+cap the same way on the same evening, and a number that lives in one of them is a number
+the other will get wrong.
 """
 
 from __future__ import annotations
 
+import time
 from typing import Any
+
+# OpenAI closes a Realtime session at 60 minutes, whoever is holding it and whatever it is
+# doing, with `1001 (going away) Your session hit the maximum duration of 60 minutes`.
+#
+# THIS IS A CLOCK ON THE SOCKET, NOT ON ITS USE, which is what both pools got wrong. They
+# evicted on idleness and on failure — neither of which a still-connected, recently-used,
+# 61-minute-old socket triggers. Production, 2026-09-08 17:33Z: the first audio chunk of the
+# only meeting held that evening claimed a socket the STT warm pool had opened at worker
+# startup, 4h40m earlier. It failed. So did translation's, at the same moment, on its own
+# pooled connection. The user experience of that is ~6 extra seconds before the first caption
+# of the meeting, and it lands on whoever speaks first after a quiet hour.
+#
+# Ten minutes of headroom under the cap: enough that a session claimed just under the line
+# cannot cross it mid-utterance, and cheap, because retiring one costs a background reconnect
+# while failing on one costs a real sentence.
+REALTIME_SESSION_MAX_AGE_S = 50 * 60.0
+
+
+def realtime_session_expired(opened_at: float | None, now: float | None = None) -> bool:
+    """Whether a Realtime socket opened at `opened_at` is too old to hand to a caller.
+
+    `opened_at` is a `time.monotonic()` reading. None means "nobody stamped it", which is
+    treated as EXPIRED: an unstamped socket is one this rule cannot vouch for, and the cost of
+    being wrong is a reconnect, not a failed transcription.
+    """
+    if opened_at is None:
+        return True
+    return (time.monotonic() if now is None else now) - opened_at >= REALTIME_SESSION_MAX_AGE_S
 
 
 def completion_options(

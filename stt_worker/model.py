@@ -25,6 +25,7 @@ from openai import AsyncOpenAI
 from shared.config import STTSettings
 from shared.lang import base_language
 from shared.logger import get_logger
+from shared.openai_options import realtime_session_expired
 from shared.schemas import STT_UNKNOWN_CONFIDENCE
 from shared.text_utils import split_into_sentences
 
@@ -129,6 +130,37 @@ def _demote_capability_from_error(model: str, error_text: str) -> str | None:
         return "logprobs"
 
     return None
+
+
+def _is_connection_error(error: BaseException) -> bool:
+    """Whether the socket died, as opposed to the model refusing a field.
+
+    THE TWO WERE INDISTINGUISHABLE HERE AND THE CONSEQUENCES ARE OPPOSITE. `session.update` is
+    the first thing sent down a freshly claimed socket, so it is also where a socket that is
+    already closed surfaces — as `ConnectionClosedOK: received 1001 (going away) Your session
+    hit the maximum duration of 60 minutes`. Read as a capability rejection, that walks the
+    whole degrade ladder (every rung failing for the same reason), lands on the bare rung, and
+    writes `structured_context=False, logprobs=False` into a PROCESS-WIDE memo. One stale
+    socket then degrades every session the worker opens afterwards.
+
+    Production, 2026-09-08: `session_optional_fields_rejected` four times in one meeting, and
+    `stt_session_capability_downgraded` — the log that means a model actually refused something
+    — zero times. The four were all dead sockets.
+
+    Matched on the exception type first, message text second, because a 1001 arrives as a
+    websockets exception whose text is the provider's own wording rather than an API error body.
+    """
+    if isinstance(error, ConnectionError):
+        return True
+    if type(error).__name__.startswith("ConnectionClosed"):
+        return True
+    text = str(error).lower()
+    return (
+        "going away" in text
+        or "maximum duration" in text
+        or "connection closed" in text
+        or "connection is closed" in text
+    )
 
 
 def reset_capability_memo() -> None:
@@ -1240,7 +1272,34 @@ class OpenAISTT:
             raise RuntimeError("OpenAI STT is not loaded")
         manager = client.realtime.connect(extra_query={"intent": "transcription"})
         conn = await manager.__aenter__()
-        return {"manager": manager, "conn": conn}
+        # Stamped at OPEN, and carried into the session that later claims it. OpenAI's
+        # 60-minute cap runs from here, not from the moment somebody starts speaking into it.
+        return {"manager": manager, "conn": conn, "opened_at": time.monotonic()}
+
+    async def _claim_warm_socket(self) -> dict[str, Any] | None:
+        """Take a live socket from the warm pool, discarding any that has aged out.
+
+        A pool with no clock hands out whatever it happens to be holding. Ours was filled at
+        worker startup and, on a quiet deployment, still holding those four sockets hours
+        later — so the first speaker of the evening claimed a connection OpenAI had already
+        closed, and paid for it with the first sentence of their meeting.
+        """
+        warm_sessions = getattr(self, "_warm_sessions", None)
+        if not warm_sessions:
+            return None
+
+        discarded = 0
+        while warm_sessions:
+            candidate: dict[str, Any] = warm_sessions.popleft()
+            if not realtime_session_expired(candidate.get("opened_at")):
+                if discarded:
+                    logger.info("stt_warm_sockets_expired", discarded=discarded)
+                return candidate
+            discarded += 1
+            asyncio.create_task(self._close_session(candidate))
+
+        logger.info("stt_warm_sockets_expired", discarded=discarded)
+        return None
 
     async def warm_up(self, pool_size: int = 4) -> None:
         """Open reusable transcription sockets before the first participant speaks."""
@@ -1865,61 +1924,78 @@ class OpenAISTT:
 
         Tried in order, keeping as much context as possible at each rung:
 
-            1. drop structured context (`languages` + `keywords`), keep prompt + logprobs
+            1. drop structured context (`languages` + `keywords`), keep prompt
             2. also drop the logprobs selector
-            3. bare config — the previous behaviour's only option
+            3. also drop the prompt — language and noise reduction survive
+            4. bare config, which auto-detects the language
 
         Whatever succeeds is recorded per model, so a process pays this at most once
         rather than re-deriving it for every speaker in every room.
+
+        RUNG 3 EXISTS BECAUSE THE FALL WAS TOO FAR. There was nothing between "drop the
+        logprobs selector" and a bare config, and a bare config sends no `language` — so a
+        model that rejected some field for any reason of its own ended up transcribing a
+        Vietnamese meeting with nothing pinned at all. This module argues everywhere else that
+        an unpinned session auto-detects and "sometimes hallucinates a completely different
+        script mid-sentence"; production on 2026-09-08 logged exactly that, kana inside a
+        Vietnamese sentence, in a meeting whose sessions had all landed on the bare rung
+        (`session_optional_fields_rejected` x4, each with `has_language: true`).
         """
+        # `logprobs` on the first rung follows what is already KNOWN about the model rather
+        # than asserting True. Asserting it re-added a selector the seed list had already
+        # ruled out for this family, so the rung could only fail — a guaranteed wasted round
+        # trip on every session, and the reason the ladder started one step lower than it looks.
         attempts = [
-            ("structured_context", {"structured_context": False, "logprobs": True}),
-            ("logprobs", {"structured_context": False, "logprobs": False}),
+            ("structured_context", False, _supports_logprobs(self.model), True),
+            ("logprobs", False, False, True),
+            ("prompt", False, False, False),
         ]
-        for rejected, flags in attempts:
+        for rejected, structured, wants_logprobs, keep_prompt in attempts:
             try:
                 await conn.session.update(
                     session=cast(
                         Any,
                         self._session_payload(
                             language,
-                            prompt,
+                            prompt if keep_prompt else None,
                             allowed_languages,
                             keywords,
                             noise_reduction=noise_reduction,
-                            # Named rather than splatted: **flags is dict[str, bool] and would
-                            # otherwise be a candidate for every keyword parameter, including the
-                            # string one added for per-room noise reduction.
-                            structured_context=flags["structured_context"],
-                            logprobs=flags["logprobs"],
+                            structured_context=structured,
+                            logprobs=wants_logprobs,
                         ),
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                if _is_connection_error(exc):
+                    raise
                 continue
 
-            _STRUCTURED_CONTEXT_SUPPORT[self.model] = bool(flags["structured_context"])
-            _LOGPROBS_SUPPORT[self.model] = bool(flags["logprobs"])
+            _STRUCTURED_CONTEXT_SUPPORT[self.model] = structured
+            _LOGPROBS_SUPPORT[self.model] = wants_logprobs
             logger.warning(
                 "stt_session_capability_downgraded",
                 model=self.model,
                 unsupported=rejected,
-                structured_context=flags["structured_context"],
-                logprobs=flags["logprobs"],
+                structured_context=structured,
+                logprobs=wants_logprobs,
+                prompt_kept=keep_prompt,
                 keyword_count=len(keywords),
             )
             return
 
-        # Nothing optional survived. Keep the session rather than lose the speaker.
+        # Nothing optional survived — INCLUDING THE LANGUAGE. Keep the session rather than
+        # lose the speaker, but say plainly what this costs: from here the model auto-detects,
+        # which is the state kana got into a Vietnamese transcript from. This is the rung to
+        # look at first when a meeting's transcript is fluent and wrong.
         logger.warning(
             "session_optional_fields_rejected",
             model=self.model,
             has_language=bool(language),
             has_prompt=bool(prompt),
             has_keywords=bool(keywords),
+            language_pin_lost=bool(language),
         )
-        _STRUCTURED_CONTEXT_SUPPORT[self.model] = False
-        _LOGPROBS_SUPPORT[self.model] = False
         await conn.session.update(
             session=cast(
                 Any,
@@ -1931,6 +2007,11 @@ class OpenAISTT:
                 ),
             )
         )
+        # AFTER the update, not before. Written first, the memo recorded a verdict this call had
+        # not yet earned — and when the update then threw, the verdict outlived the session that
+        # never opened, degrading every later one.
+        _STRUCTURED_CONTEXT_SUPPORT[self.model] = False
+        _LOGPROBS_SUPPORT[self.model] = False
 
     def _session_payload(
         self,
@@ -2096,19 +2177,21 @@ class OpenAISTT:
         client = self._client
         if client is None:
             raise RuntimeError("OpenAI STT is not loaded")
-        warm_sessions = getattr(self, "_warm_sessions", None)
-        if warm_sessions:
-            warm = warm_sessions.popleft()
+        warm = await self._claim_warm_socket()
+        if warm is not None:
             manager = warm["manager"]
             conn = warm["conn"]
+            opened_at = warm["opened_at"]
             # Replace what we just took, in the background, so the NEXT speaker is also
             # instant. Without this the pool drained permanently after four claims.
             self._schedule_warm_refill()
         else:
             manager = client.realtime.connect(extra_query={"intent": "transcription"})
             conn = await manager.__aenter__()
-            # Empty pool means the refill has not caught up (or has never run) — ask for
-            # one now so this speaker is the last to pay the handshake.
+            opened_at = time.monotonic()
+            # Empty pool means the refill has not caught up, has never run, or was holding
+            # nothing but expired sockets — ask for one now so this speaker is the last to
+            # pay the handshake.
             self._schedule_warm_refill()
 
         try:
@@ -2124,7 +2207,14 @@ class OpenAISTT:
                     ),
                 )
             )
-        except Exception:
+        except Exception as exc:
+            # A dead socket says nothing about what this model accepts, and degrading on it
+            # poisons the memo for every later session — see _is_connection_error. Raising hands
+            # it to transcribe()'s existing reconnect (realtime_session_retry), which is the path
+            # that can actually fix it.
+            if _is_connection_error(exc):
+                await self._close_session({"manager": manager})
+                raise
             if not language and not prompt and not normalized_keywords:
                 raise
             # Step DOWN one capability at a time instead of collapsing straight to a bare
@@ -2150,6 +2240,10 @@ class OpenAISTT:
             "conn": conn,
             "epoch": self._session_epoch,
             "last_used": time.monotonic(),
+            # The SOCKET's age, inherited from the warm pool when it came from there. Reading
+            # this as "when the session was created" would restart a clock OpenAI does not
+            # restart, and hand a nearly-expired connection a fresh-looking lease.
+            "opened_at": opened_at,
             "language": language,
             "prompt": prompt,
             "languages": languages,
@@ -2224,14 +2318,37 @@ class OpenAISTT:
             logger.debug("stt_stream_clear_failed", meeting_id=key[0], exc_info=True)
 
     def _sweep_idle_sessions(self) -> None:
+        """Drop sessions nobody is using, and sessions OpenAI is about to close on us.
+
+        The second half is the one that was missing. Idleness and age are independent: a
+        session used every couple of minutes for an hour is never idle and is nevertheless
+        dead the moment it crosses 60 minutes. Sweeping only the first left the second to be
+        discovered by whoever spoke next — see shared.openai_options.
+        """
         now = time.monotonic()
-        stale = [
+        idle = [
             k for k, s in self._sessions.items() if now - s["last_used"] > SESSION_IDLE_TIMEOUT_S
         ]
-        for k in stale:
+        aged = [
+            k
+            for k, s in self._sessions.items()
+            if k not in idle and realtime_session_expired(s.get("opened_at"), now)
+        ]
+        for k in idle:
             session = self._sessions.pop(k)
             asyncio.create_task(self._close_session(session))
             logger.info("realtime_session_idle_closed", meeting_id=k[0], speaker_id=k[1])
+        for k in aged:
+            session = self._sessions.pop(k)
+            asyncio.create_task(self._close_session(session))
+            # Distinct from the idle event on purpose: this one is a session that was still
+            # in active use, and its rate is what says whether the headroom is right.
+            logger.info(
+                "realtime_session_max_age_closed",
+                meeting_id=k[0],
+                speaker_id=k[1],
+                age_s=round(now - (session.get("opened_at") or now), 1),
+            )
 
     @staticmethod
     async def _close_session(session: dict[str, Any]) -> None:

@@ -38,26 +38,24 @@ def _scanner(completion: SimpleNamespace) -> tuple[OpenAISecurityScanner, AsyncM
     create = AsyncMock(return_value=completion)
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     settings = SimpleNamespace(
-        model=None, max_tokens=None, temperature=None, max_analyze_length=None
+        model=None,
+        max_tokens=None,
+        temperature=None,
+        max_analyze_length=None,
+        max_total_analyze_length=None,
+        scan_concurrency=None,
     )
     return OpenAISecurityScanner(client, settings), create  # type: ignore[arg-type]
 
 
 def _ok_body(text: str) -> str:
-    return json.dumps(
-        {
-            "piiDetected": False,
-            "dlpDetected": False,
-            "violationFound": False,
-            "maskedContent": text,
-        }
-    )
+    return json.dumps({"piiDetected": False, "dlpMatches": [], "maskedContent": text})
 
 
 @pytest.mark.asyncio
 async def test_a_long_document_is_given_room_to_come_back() -> None:
-    # 20,000 characters is exactly what max_analyze_length allows through, and it could never
-    # have fitted in the old flat 2,000-token reply budget.
+    # 20,000 characters is exactly one chunk — the most the model is ever asked to reproduce in
+    # a single reply — and it could never have fitted in the old flat 2,000-token budget.
     text = "a" * 20_000
     scanner, create = _scanner(_completion(_ok_body(text)))
 
@@ -98,16 +96,16 @@ async def test_a_normal_reply_is_still_parsed() -> None:
     body = json.dumps(
         {
             "piiDetected": True,
-            "dlpDetected": False,
-            "violationFound": True,
+            "dlpMatches": [],
             "maskedContent": "contact me at [EMAIL_REDACTED]",
         }
     )
     scanner, _ = _scanner(_completion(body))
 
-    pii, dlp, violation, masked = await scanner.scan_and_mask(
+    report = await scanner.scan_and_mask(
         text, pii_enabled=True, dlp_enabled=False, keywords_blacklist=[]
     )
 
-    assert (pii, dlp, violation) == (True, False, True)
-    assert masked == "contact me at [EMAIL_REDACTED]"
+    assert report.pii_detected is True
+    assert report.dlp_terms_claimed == ()
+    assert report.masked_content == "contact me at [EMAIL_REDACTED]"

@@ -7,6 +7,32 @@ from typing import Any
 
 from shared.config import VectorDbSettings
 
+#: Source types that belong to ONE MEETING, and the payload key holding that meeting's id.
+#:
+#: They differ because two producers chose differently and both are already in the index:
+#: TranscriptRedisConsumerService sets `source_id` to the TRANSCRIPT id and puts the room id in
+#: the chunk metadata as `translation_room_id`, while a meeting summary is published with
+#: `source_id` set to the room id itself. Filtering has to know which key to read for which type;
+#: guessing one would silently return nothing for the other, which is a failure that looks like
+#: "the assistant found nothing" rather than like a bug.
+ROOM_SCOPED_SOURCES: dict[str, str] = {
+    "transcript": "translation_room_id",
+    "meeting_summary": "source_id",
+}
+
+#: Source types scoped to ONE DOCUMENT, and the payload key holding that document's id.
+#:
+#: `source_id` has carried the document id since the first document was indexed —
+#: RedisEmbeddingIndexPublisher writes it beside `source_type: "document"`. That is what made
+#: filtering documents possible without a re-index: the phase-2 note this replaces assumed the
+#: DOCUMENT'S ACL had to travel in the payload, but an allowlist does not need the ACL, only the
+#: id, and the id was already here.
+DOCUMENT_SCOPED_SOURCES: dict[str, str] = {
+    "document": "source_id",
+}
+
+ROOM_SCOPED_SOURCE_KEYS: tuple[str, ...] = tuple(ROOM_SCOPED_SOURCES)
+
 
 class VectorStore(ABC):
     """Interface for storing text embeddings."""
@@ -30,12 +56,23 @@ class VectorStore(ABC):
         top_k: int,
         filters: dict[str, Any] | None = None,
         exclude: dict[str, list[str]] | None = None,
+        allowed_room_ids: list[str] | None = None,
+        allowed_document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Return the top_k nearest payloads (with score) for `vector`.
 
         `filters` are ANDed exact matches. `exclude` maps a payload key to values that must NOT
         appear — WT-463 needs it to keep document-sourced chunks out of an unprivileged caller's
         results, which `filters` alone cannot express.
+
+        `allowed_room_ids` narrows the two MEETING-scoped source types (see
+        `ROOM_SCOPED_SOURCES`) to meetings this caller can actually open, and
+        `allowed_document_ids` does the same for documents (see `DOCUMENT_SCOPED_SOURCES`).
+        `None` means do not scope that dimension, which is what a privileged caller sends; an
+        empty list is a real answer — a caller entitled to nothing — and matches none.
+
+        The two dimensions are independent: scoping documents leaves transcripts untouched and
+        vice versa, so a caller can be narrowed on one and unrestricted on the other.
 
         The exclusion belongs in the QUERY, not in a pass over the results: post-filtering still
         spends the top_k budget on points the caller may not see, so a workspace whose best
@@ -101,6 +138,8 @@ class QdrantVectorStore(VectorStore):
         top_k: int,
         filters: dict[str, Any] | None = None,
         exclude: dict[str, list[str]] | None = None,
+        allowed_room_ids: list[str] | None = None,
+        allowed_document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         client = await self._get_client()
 
@@ -129,6 +168,82 @@ class QdrantVectorStore(VectorStore):
             for key, values in (exclude or {}).items()
             for value in values
         ]
+        # WT-463: the per-MEETING gate, for the two source types that belong to one meeting
+        # rather than to the whole workspace.
+        #
+        # A transcript and a meeting summary are readable through the product only by people who
+        # can open that meeting — `BuildListableRoomsQueryAsync` decides it, and it is a
+        # per-participant question. `ai_retrieval` cannot express that: it is one global flag
+        # meaning "the AI may use this at all", with no subject in it. So a workspace member could
+        # ask WarpBot a question and receive the verbatim transcript of a meeting they were never
+        # in, and the summary of one whose record was never shared with them.
+        #
+        # Filterable WITHOUT a re-index, which is what makes fixing it possible now rather than
+        # after a migration: transcript points already carry `translation_room_id`
+        # (TranscriptRedisConsumerService writes it into the chunk metadata and the embedding
+        # worker spreads metadata into the payload), and meeting summaries are indexed with
+        # `source_id` set to the room id.
+        #
+        # `None` means "do not scope" and is what a privileged caller sends. An EMPTY list is a
+        # real answer — a member who can open no meetings — and correctly matches nothing.
+        # WT-463: the per-SUBJECT gate, for the source types that belong to one meeting or one
+        # document rather than to the whole workspace.
+        #
+        # A transcript and a meeting summary are readable through the product only by people who
+        # can open that meeting; a document only by people its ACL admits. `ai_retrieval` cannot
+        # express either: it is one global flag meaning "the AI may use this at all", with no
+        # subject in it. So a workspace member could ask WarpBot a question and receive the
+        # verbatim transcript of a meeting they were never in, or a passage from a document they
+        # cannot open.
+        #
+        # Both are filterable WITHOUT a re-index, which is what made fixing them possible now
+        # rather than after a migration. Transcript points carry `translation_room_id`, meeting
+        # summaries are indexed with `source_id` set to the room id, and document chunks have
+        # carried `source_id` set to the document id since the first one was indexed.
+        #
+        # The two dimensions are INDEPENDENT. `None` means "do not scope this dimension" and is
+        # what a privileged caller sends for both; an EMPTY list is a real answer — a caller
+        # entitled to nothing — and correctly matches nothing.
+        scopes: list[tuple[dict[str, str], list[str]]] = []
+        if allowed_room_ids is not None:
+            scopes.append((ROOM_SCOPED_SOURCES, allowed_room_ids))
+        if allowed_document_ids is not None:
+            scopes.append((DOCUMENT_SCOPED_SOURCES, allowed_document_ids))
+
+        if scopes:
+            scoped_types = [source_type for mapping, _ in scopes for source_type in mapping]
+            # Written as "not one of the types scoped by THIS request" so that a source type
+            # nobody scopes stays reachable by default, and so that scoping documents does not
+            # accidentally hide transcripts. The alternative silently hides any future type until
+            # somebody notices.
+            branches: list[Any] = [
+                models.Filter(
+                    must_not=[
+                        models.FieldCondition(
+                            key="source_type",
+                            match=models.MatchAny(any=scoped_types),
+                        )
+                    ]
+                )
+            ]
+            for mapping, allowed_ids in scopes:
+                branches.extend(
+                    models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="source_type",
+                                match=models.MatchValue(value=source_type),
+                            ),
+                            models.FieldCondition(
+                                key=id_key,
+                                match=models.MatchAny(any=allowed_ids),
+                            ),
+                        ]
+                    )
+                    for source_type, id_key in mapping.items()
+                )
+            must.append(models.Filter(should=branches))
+
         if must or must_not:
             query_filter = models.Filter(must=must or None, must_not=must_not or None)
 

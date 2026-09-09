@@ -129,11 +129,19 @@ class SummaryTemplateWorker(BaseWorker):
 
     async def _load_transcript(self, request: SummaryRequestMessage) -> str:
         """The saved transcript, formatted with the moments the model must cite."""
-        # Already formatted and already ours to read. ArtifactsFinalizer sends the segments it
-        # just read from TranscriptService when it asks for the summary the live path failed to
-        # produce — there is no user behind that request and so no token to fetch with, and a
-        # round trip to re-read words that came WITH the message would be one anyway.
+        # A system-initiated request brings the transcript with it, because the publisher —
+        # ArtifactsFinalizer, finalising a meeting that has just ended — already read those same
+        # stored segments over the internal gRPC mesh and holds them. Using them here is what
+        # lets a background finalization summarise with no user and no bearer token, without
+        # anyone inventing a privileged HTTP path into the transcript service.
+        #
+        # Checked BEFORE the client assert on purpose: this path makes no HTTP call at all.
         if request.transcript_text.strip():
+            self.logger.info(
+                "summary_transcript_supplied",
+                room_id=request.room_id,
+                chars=len(request.transcript_text),
+            )
             return request.transcript_text
 
         client = self._transcript_client
