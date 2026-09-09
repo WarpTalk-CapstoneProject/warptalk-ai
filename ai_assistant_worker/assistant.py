@@ -11,6 +11,7 @@ from typing import Any, cast
 
 from openai import AsyncOpenAI
 
+from ai_assistant_worker.summary_grounding import ground_summary
 from ai_assistant_worker.summary_templates import (
     build_system_prompt,
     resolve_template,
@@ -213,7 +214,16 @@ When extracting action items:
                 **completion_options(self.model, self.max_tokens, self.temperature),
                 response_format={"type": "json_object"},
             )
-            raw = response.choices[0].message.content or "{}"
+            choice = response.choices[0]
+            # Nobody read `finish_reason`, and that left two very different failures wearing
+            # the same face. A response that runs into `max_tokens` comes back as truncated
+            # JSON; `json.loads` raises; the branch below reports `generationFailed` — so a
+            # ceiling set too low for the meeting is recorded, in the only place anybody
+            # looks, as a model that could not write a summary. Logging the reason is what
+            # makes the two tellable apart. Read defensively: the real client always sets it,
+            # test doubles standing in for a choice do not.
+            finish_reason: str | None = getattr(choice, "finish_reason", None)
+            raw = choice.message.content or "{}"
             parsed = cast(dict[str, Any], json.loads(raw))
             parsed.setdefault("summary", "")
             # Every section the template declared, so a consumer never has to guess whether
@@ -226,7 +236,37 @@ When extracting action items:
             parsed.setdefault("citations", [])
             parsed["templateKey"] = template.key
             parsed["insufficientData"] = False
-            return parsed
+
+            # Last thing before the summary leaves this process, because this is the last
+            # place that still knows which moments the model was shown. Downstream a cited
+            # `atMs` is just a number, and the meeting page will happily scroll to a number
+            # that came from nowhere — see summary_grounding.
+            grounded = ground_summary(parsed, transcript)
+            logger.info(
+                "structured_summary_generated",
+                template=template.key,
+                finish_reason=finish_reason,
+                moments_checked=grounded.moments_checked,
+                moments_dropped=grounded.moments_dropped,
+                items_uncited=grounded.items_uncited,
+            )
+            if finish_reason != "stop":
+                # "length" here means the summary is short because the budget ran out, not
+                # because the meeting was.
+                logger.warning(
+                    "structured_summary_finished_unexpectedly",
+                    finish_reason=finish_reason,
+                    template=template.key,
+                )
+            if grounded.moments_dropped:
+                logger.warning(
+                    "structured_summary_moments_unverifiable",
+                    template=template.key,
+                    moments_checked=grounded.moments_checked,
+                    moments_dropped=grounded.moments_dropped,
+                    items_uncited=grounded.items_uncited,
+                )
+            return grounded.summary
         except Exception:
             logger.exception("structured_summary_generation_failed")
             # WT-530. Two keys here are load-bearing, and their absence was the bug.
