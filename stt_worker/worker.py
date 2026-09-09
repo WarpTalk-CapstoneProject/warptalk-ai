@@ -407,26 +407,54 @@ class STTWorker(BaseWorker):
         streaming[key] = (frame.turn_id, epoch, frame.seq + 1)
 
     async def _listen_for_track_prewarm(self) -> None:
-        """Prepare the speaker's Realtime socket during room join, before first speech."""
-        pubsub = self.redis.redis.pubsub()
-        try:
-            await pubsub.subscribe("meeting.track_published")
-            while not self._shutdown_event.is_set():
-                message = await pubsub.get_message(
-                    ignore_subscribe_messages=True,
-                    timeout=1.0,
-                )
-                if message:
-                    await self._prewarm_from_track_event(message["data"])
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.logger.exception("stt_prewarm_listener_failed")
-        finally:
+        """Prepare the speaker's Realtime socket during room join, before first speech.
+
+        SURVIVES ITS OWN FAILURES, which it did not. The `try` used to sit OUTSIDE the loop, so
+        the first exception from any single event ended the subscription for the lifetime of the
+        process — one log line, and then a feature that simply never ran again. Nothing restarts
+        this task and nothing reports that it stopped; the only visible symptom is that every
+        speaker from then on pays the Realtime handshake on their first sentence, which reads as
+        "the transcript lagged" and not as a fault.
+
+        Production, 2026-09-08 17:33:18, fifteen seconds before the meeting's first chunk: a
+        `prepare_session` for a newly published track claimed a warm socket the provider had
+        already closed at its 60-minute cap, and `session.update` raised ConnectionClosedOK. The
+        listener exited there.
+
+        Shaped like _consume_speech_frames now: one event's failure costs that event, a
+        subscription failure costs a second, and neither costs the feature.
+        """
+        while not self._shutdown_event.is_set():
+            pubsub = self.redis.redis.pubsub()
             try:
-                await pubsub.close()
+                await pubsub.subscribe("meeting.track_published")
+                while not self._shutdown_event.is_set():
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=1.0,
+                    )
+                    if not message:
+                        continue
+                    try:
+                        await self._prewarm_from_track_event(message["data"])
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # This speaker gets no prepared socket and pays the handshake on their
+                        # first sentence. That is the whole cost, and it is the cost this
+                        # feature exists to avoid — not a reason to stop avoiding it for
+                        # everybody who joins later.
+                        self.logger.exception("stt_prewarm_event_failed")
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                self.logger.warning("stt_prewarm_listener_close_failed")
+                self.logger.exception("stt_prewarm_listener_failed")
+                await asyncio.sleep(1.0)
+            finally:
+                try:
+                    await pubsub.close()
+                except Exception:
+                    self.logger.warning("stt_prewarm_listener_close_failed")
 
     async def _prewarm_from_track_event(self, serialized_event: bytes | str) -> None:
         try:
