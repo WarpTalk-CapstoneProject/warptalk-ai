@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from shared.config import TTSSettings, WorkerSettings
-from tts_worker.worker import _PREVIEW_TEXT, TTSWorker
+from tts_worker.worker import _PREVIEW_TEXT, TTSWorker, _preview_failure
 
 
 class _Redis:
@@ -189,3 +189,85 @@ async def test_a_request_with_no_voice_is_dropped_without_calling_the_provider()
 
     assert cartesia.calls == []
     assert store.written == {}
+
+
+# ── WT-649: what a failed preview says ──────────────────────────────────────────
+#
+# A preview of a voice Cartesia does not have used to answer with the SDK's own exception,
+# truncated to 200 characters:
+#
+#     Error code: 404 - {'error_code': 'voice_not_found', 'message': 'The requested voice was
+#     not found.', 'title': 'Voice not found', 'request_id': 'e9d42fe9-…'}
+#
+# That went to somebody pressing a play button. The comment above the truncation had the
+# diagnosis right — a stack trace is not a message for one — and truncating only made it a
+# shorter stack trace. The classification happens here because this is the only side holding the
+# Cartesia key: it is the only side that can tell a voice that does not exist from a key that has
+# expired. AuthService picks the sentence from the code.
+
+
+class _NotFoundError(Exception):
+    pass
+
+
+NotFoundError = _NotFoundError
+NotFoundError.__name__ = "NotFoundError"
+
+
+def _named(name: str) -> Exception:
+    """An exception carrying the SDK's type NAME, which is what the mapping keys on."""
+    return type(name, (Exception,), {})("provider said something internal")
+
+
+@pytest.mark.parametrize(
+    ("exception_name", "expected_code"),
+    [
+        ("NotFoundError", "VOICE_NOT_FOUND"),
+        ("AuthenticationError", "PROVIDER_REJECTED"),
+        ("PermissionDeniedError", "PROVIDER_REJECTED"),
+        ("RateLimitError", "PROVIDER_BUSY"),
+        ("APITimeoutError", "PROVIDER_UNREACHABLE"),
+        ("APIConnectionError", "PROVIDER_UNREACHABLE"),
+        ("InternalServerError", "PROVIDER_UNAVAILABLE"),
+        ("BadRequestError", "VOICE_NOT_RENDERABLE"),
+    ],
+)
+def test_each_provider_failure_gets_a_code_naming_what_went_wrong(
+    exception_name: str, expected_code: str
+) -> None:
+    code, _message = _preview_failure(_named(exception_name))
+
+    assert code == expected_code
+
+
+def test_an_unknown_exception_says_so_rather_than_inventing_a_cause() -> None:
+    code, message = _preview_failure(_named("SomethingNobodyHasSeen"))
+
+    assert code == "UNKNOWN"
+    # The message still carries something, but only for the log — AuthService shows the generic
+    # line for an unrecognised code.
+    assert "provider said something internal" in message
+
+
+@pytest.mark.asyncio
+async def test_a_failed_render_writes_a_code_beside_the_message() -> None:
+    # The end the bug was reported at: the answer written to Redis, which is what AuthService
+    # reads and what ultimately decides what a person is told.
+    cartesia = _Cartesia(raises=_named("NotFoundError"))
+    worker, store = _worker(cartesia)
+
+    await worker._handle_preview_request(_request("voice-abc", "vi"))
+
+    answer = _answer(store, "voice:preview:voice-abc:vi")
+    assert answer["audio"] is None
+    assert answer["error_code"] == "VOICE_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_no_audio_is_a_named_outcome_too() -> None:
+    worker, store = _worker(_Cartesia(audio=b""))
+
+    await worker._handle_preview_request(_request("voice-abc", "vi"))
+
+    answer = _answer(store, "voice:preview:voice-abc:vi")
+    assert answer["error_code"] == "NO_AUDIO"
