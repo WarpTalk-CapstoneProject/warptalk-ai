@@ -5,9 +5,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from metrics_exporter.metrics import collect_metrics
+from shared.config import MetricsSettings
 from shared.redis_client import RedisStreamClient
 
 redis_client = RedisStreamClient()
+# Read once, at startup: which streams to ask, and whether per-room copies are wanted.
+metrics_settings = MetricsSettings()
 
 
 @asynccontextmanager
@@ -38,7 +41,7 @@ async def ready() -> dict[str, str]:
 
 @app.get("/metrics", response_class=PlainTextResponse)
 async def metrics() -> PlainTextResponse:
-    body = await collect_metrics(redis_client.redis)
+    body = await collect_metrics(redis_client.redis, metrics_settings)
     return PlainTextResponse(
         body,
         media_type="text/plain; version=0.0.4; charset=utf-8",
