@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 import unicodedata
 import uuid
 from difflib import SequenceMatcher
@@ -16,7 +17,7 @@ from openai import AsyncOpenAI
 
 from shared.config import TranslationSettings
 from shared.logger import get_logger
-from shared.openai_options import completion_options
+from shared.openai_options import completion_options, realtime_session_expired
 from translation_worker import valence as valence_mod
 from translation_worker.transcript_guardian import guardian_instruction
 
@@ -364,6 +365,10 @@ class OpenAITranslator:
         self.temperature = temperature
         self._client: AsyncOpenAI | None = None
         self._realtime_connections: list[Any | None] = [None] * self.realtime_pool_size
+        # When each slot's socket was opened. The pool replaced a connection only when a
+        # translation FAILED on it, so a healthy, well-used, over-age one was never
+        # replaced — and OpenAI closed it out from under the next caller instead.
+        self._realtime_opened_at: list[float | None] = [None] * self.realtime_pool_size
         self._realtime_available: asyncio.Queue[int] = asyncio.Queue()
         for index in range(self.realtime_pool_size):
             self._realtime_available.put_nowait(index)
@@ -439,6 +444,7 @@ class OpenAITranslator:
         """Close persistent Realtime sockets and the HTTP client."""
         connections = list(getattr(self, "_realtime_connections", []))
         self._realtime_connections = [None] * len(connections)
+        self._realtime_opened_at = [None] * len(connections)
         await asyncio.gather(
             *(connection.close() for connection in connections if connection is not None),
             return_exceptions=True,
@@ -472,6 +478,7 @@ class OpenAITranslator:
                     first_error = first_error or result
                 else:
                     self._realtime_connections[index] = result
+                    self._realtime_opened_at[index] = time.monotonic()
             if first_error is not None and all(
                 connection is None for connection in self._realtime_connections
             ):
@@ -481,10 +488,27 @@ class OpenAITranslator:
         await self._ensure_realtime_pool()
         index = await self._realtime_available.get()
         connection = self._realtime_connections[index]
+
+        # Retire it BEFORE handing it over, not after a translation fails on it. Production,
+        # 2026-09-08 17:33Z: four of these came back
+        # `1001 ... Your session hit the maximum duration of 60 minutes` within twenty seconds
+        # of a meeting starting, each one costing a fallback to chat completions — and the
+        # pool had no way to know, because nothing in it was unhealthy or idle, only old.
+        if connection is not None and realtime_session_expired(self._realtime_opened_at[index]):
+            self._realtime_connections[index] = None
+            self._realtime_opened_at[index] = None
+            try:
+                await connection.close()
+            except Exception:
+                logger.debug("openai_realtime_expired_close_failed", exc_info=True)
+            logger.info("openai_realtime_connection_retired_on_age", slot=index)
+            connection = None
+
         if connection is None:
             try:
                 connection = await self._connect_realtime()
                 self._realtime_connections[index] = connection
+                self._realtime_opened_at[index] = time.monotonic()
             except Exception:
                 self._realtime_available.put_nowait(index)
                 raise
@@ -494,6 +518,7 @@ class OpenAITranslator:
         if not healthy:
             connection = self._realtime_connections[index]
             self._realtime_connections[index] = None
+            self._realtime_opened_at[index] = None
             if connection is not None:
                 try:
                     await connection.close()

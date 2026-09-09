@@ -398,6 +398,66 @@ class TestOpenAISTT:
             is None
         )
 
+    async def test_the_language_pin_survives_a_prompt_the_model_will_not_take(self) -> None:
+        """The rung that was missing, and what its absence cost.
+
+        There used to be nothing between "drop the logprobs selector" and a bare config, and a
+        bare config sends no `language` at all. So a model that refused the prompt — for any
+        reason of its own — ended up auto-detecting for the rest of the meeting. Production,
+        2026-09-08: `session_optional_fields_rejected` four times, every one with
+        `has_language: true`, in the meeting whose transcript came back with kana inside a
+        Vietnamese sentence.
+        """
+        reset_capability_memo()
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.model = "some-fussy-model"
+        stt.noise_reduction = "near_field"
+
+        accepted: list[dict] = []
+
+        async def update(session: dict) -> None:
+            transcription = session["audio"]["input"]["transcription"]
+            if "keywords" in transcription or "prompt" in transcription:
+                raise RuntimeError("unknown parameter")
+            accepted.append(session)
+
+        conn = MagicMock()
+        conn.session.update = AsyncMock(side_effect=update)
+
+        await stt._degrade_session_config(conn, "vi", "WarpTalk meeting.", {"vi", "en"}, ["Codex"])
+
+        assert len(accepted) == 1
+        transcription = accepted[0]["audio"]["input"]["transcription"]
+        assert transcription["language"] == "vi", "the session was left to auto-detect"
+        assert "prompt" not in transcription
+
+    async def test_the_first_rung_does_not_re_add_a_known_bad_selector(self) -> None:
+        """`logprobs=True` was asserted rather than looked up.
+
+        For a model already on the unsupported seed list that made the first rung fail by
+        construction — a wasted round trip on every single session, and a ladder that silently
+        started one step below where it reads.
+        """
+        reset_capability_memo()
+        stt = OpenAISTT.__new__(OpenAISTT)
+        stt.model = "gpt-live-transcribe"  # seeded as not supporting logprobs
+        stt.noise_reduction = "off"
+
+        seen: list[dict] = []
+
+        async def update(session: dict) -> None:
+            seen.append(session)
+            if "keywords" in session["audio"]["input"]["transcription"]:
+                raise RuntimeError("unknown parameter: keywords")
+
+        conn = MagicMock()
+        conn.session.update = AsyncMock(side_effect=update)
+
+        await stt._degrade_session_config(conn, "vi", None, {"vi", "en"}, ["Codex"])
+
+        assert len(seen) == 1, "a rung was spent re-offering a selector known to be refused"
+        assert "include" not in seen[0]
+
     def test_gpt_transcribe_payload_uses_expected_languages_and_keywords(self) -> None:
         stt = OpenAISTT.__new__(OpenAISTT)
         stt.model = "gpt-transcribe"
@@ -1551,20 +1611,28 @@ class TestSTTWorker:
 
         mock_redis_client._redis.xadd.assert_not_called()
 
-    async def test_process_skips_ready_room_before_translation_starts(
+    async def test_process_skips_a_room_that_has_ended(
         self,
         mock_redis_client,
         worker_settings: WorkerSettings,
         sample_audio_bytes: bytes,
     ) -> None:
-        """A stale or rogue audio chunk must not bypass the ingress lifecycle gate."""
+        """A stale audio chunk must not append to a finished meeting's transcript.
+
+        This test used to assert the opposite of what it now asserts: that a room which had
+        not reached IN_PROGRESS was skipped. That gate is what left a live meeting with no
+        transcript at all until somebody pressed Start Translation — the JOIN path publishes
+        ``room_status: "WAITING"``, and every chunk for the room died on it. See
+        STTWorker._room_state_allows_stt. What survives is the narrow case the gate is
+        actually good for: audio arriving for a room that is over.
+        """
         worker = STTWorker.__new__(STTWorker)
         worker.settings = worker_settings
         worker.redis = mock_redis_client
         worker.logger = MagicMock()
         worker.stt_settings = STTSettings()
         worker._paused_rooms = set()
-        worker._route_states = {"meeting-1": "READY"}
+        worker._route_states = {"meeting-1": "ENDED"}
         worker.model = MagicMock()
         worker.model.transcribe = AsyncMock()
 

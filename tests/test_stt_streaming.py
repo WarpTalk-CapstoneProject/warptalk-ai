@@ -292,3 +292,85 @@ async def test_a_frame_arriving_during_a_commit_is_not_appended() -> None:
     assert len(model.appended) == appended_before, "nothing was appended mid-commit"
     assert worker._streamed_turns == {}, "and the turn is no longer trusted"
     assert isinstance(lock, _asyncio.Lock)
+
+
+# ── A turn that is already over ──────────────────────────────────────────────────────────
+#
+# Production, 2026-09-08: 204 `frame_gap` lines in 71 seconds, every one of them reporting
+# `expected_seq: 0` against a frame that said 1, 2, 3… They were not gaps. They were the
+# trailing frames of turns that had already ended — ingress publishes the closing chunk while
+# the speaker's last frames are still in flight — arriving to find the turn state popped.
+#
+# The log noise was the harmless half. Each one took the abandon path, and abandon DISCARDS THE
+# BUFFER: once the next turn has begun appending, a straggler from the previous one throws that
+# turn's audio away.
+
+
+@pytest.mark.asyncio
+async def test_a_frame_arriving_after_its_own_turn_was_abandoned_is_dropped_quietly() -> None:
+    model = _Model()
+    worker = _worker(model)
+
+    await worker._append_speech_frame(_frame("T1", 0))
+    await worker._append_speech_frame(_frame("T1", 2))  # the gap that abandons T1
+    assert model.discards == 1
+
+    # Everything T1 still had in flight.
+    for seq in (3, 4, 5):
+        await worker._append_speech_frame(_frame("T1", seq))
+
+    assert model.discards == 1, "an abandoned turn was re-abandoned once per remaining frame"
+    assert worker._closed_turns[(MEETING, SPEAKER)] == ("T1", 3)
+
+
+@pytest.mark.asyncio
+async def test_a_straggler_does_not_discard_the_next_turns_audio() -> None:
+    """The reason this matters at all, rather than being a logging fix."""
+    model = _Model()
+    worker = _worker(model)
+
+    await worker._append_speech_frame(_frame("T1", 0))
+    await worker._append_speech_frame(_frame("T1", 2))  # T1 abandoned
+    await worker._append_speech_frame(_frame("T2", 0, audio=b"live"))  # T2 opens
+    discards_before = model.discards
+
+    await worker._append_speech_frame(_frame("T1", 3))  # a straggler, arriving late
+
+    assert model.discards == discards_before, "the live turn's buffer was thrown away"
+    assert worker._streamed_turns[(MEETING, SPEAKER)] == ("T2", 7, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_committed_turn_strands_no_frames() -> None:
+    """process() ends a turn too, not only abandon()."""
+    model = _Model()
+    worker = _worker(model)
+    await worker._append_speech_frame(_frame("T1", 0))
+
+    # What process() records once the chunk closing T1 has been handled.
+    worker._streamed_turns.pop((MEETING, SPEAKER), None)
+    worker._closed_turns = {(MEETING, SPEAKER): ("T1", 0)}
+
+    await worker._append_speech_frame(_frame("T1", 1))
+
+    assert model.discards == 0, "a frame of a committed turn was read as a gap"
+
+
+@pytest.mark.asyncio
+async def test_a_new_turn_is_never_marked_closed_by_the_turn_it_replaces() -> None:
+    """The trap in recording 'which turn just ended'.
+
+    `previous_turn_never_committed` fires while handling the FIRST frame of the new turn, and it
+    closes the OLD one. Recording this frame's id there would mark the turn that is only just
+    starting as already over, and every frame of it would be dropped in silence — a worse
+    failure than the one being fixed, and an invisible one.
+    """
+    model = _Model()
+    worker = _worker(model)
+    await worker._append_speech_frame(_frame("T1", 0))
+
+    await worker._append_speech_frame(_frame("T2", 0, audio=b"new"))
+
+    assert worker._closed_turns[(MEETING, SPEAKER)] == ("T1", 0)
+    assert worker._streamed_turns[(MEETING, SPEAKER)] == ("T2", 7, 1)
+    assert model.appended[-1] == b"new", "the new turn's first frame was swallowed"
