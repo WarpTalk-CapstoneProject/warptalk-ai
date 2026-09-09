@@ -154,6 +154,7 @@ def _preview_failure(exc: BaseException) -> tuple[str, str]:
     # carries something for the logs.
     return "UNKNOWN", str(exc)[:200]
 
+
 # WT-B — a clone that outlives the meeting it was made in.
 #
 # WHY THE HAND-OFF EXISTS AT ALL
