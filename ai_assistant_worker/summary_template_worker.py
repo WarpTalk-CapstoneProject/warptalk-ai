@@ -130,6 +130,10 @@ class SummaryTemplateWorker(BaseWorker):
                 room_id=request.room_id,
                 template_key=template.key,
                 status="completed",
+                # Echoed, never decided here. Whether this answer replaces the room's summary or
+                # fills one reader's cache is the requester's act, and the content cannot tell
+                # the two apart — see SummaryRequestMessage.delivery.
+                delivery=request.delivery,
                 content_json=json.dumps(content, ensure_ascii=False),
             ).to_redis(),
         )
@@ -220,6 +224,11 @@ class SummaryTemplateWorker(BaseWorker):
                 room_id=request.room_id,
                 template_key=template_key,
                 status="failed",
+                # Carried on the failure too. The backend drops a failed result without writing
+                # anything, so this changes no behaviour today — but a result that omitted it
+                # would read as canonical, and the next person to give the failure path a
+                # side effect would inherit a silent misroute.
+                delivery=request.delivery,
                 error=error,
             ).to_redis(),
         )
