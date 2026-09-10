@@ -2156,8 +2156,24 @@ class LiveKitIngressWorker(BaseWorker):
         # Tapped here, from the bytes this message carries, so a second pass is handed
         # exactly what the first pass was handed. Archiving from anywhere else would make a
         # pass-1-vs-pass-2 accuracy comparison a comparison of two audio paths instead.
+        #
+        # WT-605 — MARKED, NOT DROPPED. Recording is its own switch and the host may have it on,
+        # so audio spoken while the TRANSCRIPT is paused still belongs in the archive. What it
+        # must not do is come back: a second pass would re-transcribe it faithfully and merge
+        # the host's off-the-record sentences into the meeting hours later. The flag rides on
+        # the span index so `retranscribe_worker.merge` can refuse it.
+        #
+        # Asked once per published chunk, and only when there is an archive to mark. That is the
+        # same cadence as the `_speaker_language` HGET three lines above — one round trip per
+        # utterance, not per 96ms frame — so the per-frame streaming path stays untouched.
         if self._archive is not None:
-            self._archive.append(room_name, speaker_id, msg.audio_data, sample_rate)
+            self._archive.append(
+                room_name,
+                speaker_id,
+                msg.audio_data,
+                sample_rate,
+                transcript_paused=await self.is_transcript_paused(room_name),
+            )
 
         payload = msg.to_redis()
         for attempt in range(1, 4):

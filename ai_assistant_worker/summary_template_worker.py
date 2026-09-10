@@ -11,6 +11,13 @@ WHY IT REFETCHES THE TRANSCRIPT
     reads the SAVED transcript instead — which is also what makes the citations line up,
     because those are the exact segments the meeting page renders and scrolls to.
 
+WHAT A REWRITE CAN CHANGE
+    Two things, and they are independent: the SHAPE (`template_key` — is this a standup or an
+    interview) and the LANGUAGE (`summary_language`). Both arrive on the request rather than
+    being inferred, because both are the requester's decision and neither is recoverable from
+    the transcript. An empty language means the request did not express one, and the model
+    falls back to following the transcript exactly as it always did.
+
 WHY IT CARRIES A BEARER TOKEN
     The same reason ChatAssistantWorker does: tool calls hit sibling services' existing
     authenticated endpoints as the person who asked, never through a privileged bypass. A
@@ -97,6 +104,7 @@ class SummaryTemplateWorker(BaseWorker):
             transcript,
             target_languages=target_languages,
             template_key=template.key,
+            summary_language=request.summary_language,
         )
 
         # WT-530: a generation that failed is not a rewrite that succeeded.
@@ -125,7 +133,12 @@ class SummaryTemplateWorker(BaseWorker):
                 content_json=json.dumps(content, ensure_ascii=False),
             ).to_redis(),
         )
-        self.logger.info("summary_regenerated", room_id=request.room_id, template=template.key)
+        self.logger.info(
+            "summary_regenerated",
+            room_id=request.room_id,
+            template=template.key,
+            language=request.summary_language or "as-spoken",
+        )
 
     async def _load_transcript(self, request: SummaryRequestMessage) -> str:
         """The saved transcript, formatted with the moments the model must cite."""
@@ -167,6 +180,24 @@ class SummaryTemplateWorker(BaseWorker):
         # Offsets are already relative to the meeting start in the stored transcript, which
         # is the same origin the live path uses — so a cited atMs means the same thing
         # whichever worker produced the summary.
+        #
+        # WT-605 — THE TWO PATHS NOW AGREE ON CONTENT, NOT YET ON SHAPE.
+        #     Since the live path started gating on the pause flag, both paths summarise the
+        #     same words: the saved transcript never held what was said during a pause, and now
+        #     neither does the accumulator. What only the live path can say is WHERE the gaps
+        #     were — it watched them happen, and emits `format_pause_marker` for each one.
+        #
+        #     Here there is nothing to emit from. A pause arrives as a jump in startTimeMs and
+        #     is indistinguishable from a room that simply went quiet, so a marker inferred from
+        #     the gap would be a guess, and a wrong one every time a meeting paused for thought.
+        #     Left unmarked deliberately rather than approximated.
+        #
+        #     To close it, the transcript service would have to return the pause windows it
+        #     already knows about — it is the component that skips segments while paused (see
+        #     TranscriptRedisConsumerService) — as e.g. `pauseWindows: [{startMs, endMs}]` on
+        #     GET /api/v1/transcripts/by-room/{roomId}. Given that, this method feeds them
+        #     through the same `format_pause_marker` the live path uses and the two paths
+        #     produce identical transcripts. Nothing else here needs to change.
         lines = [
             format_transcript_line(
                 int(segment.get("startTimeMs") or 0),
