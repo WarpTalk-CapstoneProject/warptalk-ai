@@ -693,6 +693,13 @@ class SummaryRequestMessage(BaseModel):
     #: nobody chose and the model follows the transcript, which is what every request published
     #: before this field existed meant — so an old message keeps its old behaviour.
     summary_language: str = ""
+    #: What the answer is FOR, and the one thing the backend cannot read back off the result:
+    #: "canonical" replaces the room's summary artifact, "variant" lands in the per-language
+    #: cache beside it. A Standup-in-Japanese summary is byte-identical either way, so only the
+    #: publisher knows which act it was. This worker never interprets it — it echoes it onto the
+    #: result so the backend can route. Empty means canonical, which every request published
+    #: before this field existed was.
+    delivery: str = "canonical"
     #: Pre-read transcript, already formatted with `format_transcript_line`. Empty for a
     #: user-initiated rewrite, which fetches instead.
     transcript_text: str = ""
@@ -707,6 +714,7 @@ class SummaryRequestMessage(BaseModel):
             "bearer_token": self.bearer_token,
             "target_languages_json": self.target_languages_json,
             "summary_language": self.summary_language,
+            "delivery": self.delivery,
             "transcript_text": self.transcript_text,
             "timestamp_ms": str(self.timestamp_ms),
         }
@@ -722,6 +730,10 @@ class SummaryRequestMessage(BaseModel):
             bearer_token=d.get("bearer_token", ""),
             target_languages_json=d.get("target_languages_json", "[]"),
             summary_language=d.get("summary_language", ""),
+            # Absent means canonical: every request published before this field existed was a
+            # rewrite of the room's summary, so an in-flight message at deploy time keeps the
+            # meaning it was published with rather than quietly becoming a cache row.
+            delivery=d.get("delivery") or "canonical",
             # Absent on every message the backend published before this field existed, which is
             # exactly the user-initiated shape — so an old request keeps fetching.
             transcript_text=d.get("transcript_text", ""),
@@ -738,6 +750,11 @@ class SummaryResultMessage(BaseModel):
     room_id: str
     template_key: str
     status: str  # "completed" | "failed"
+    #: Echoed verbatim from the request. The backend routes on it — canonical replaces the
+    #: room's summary, variant fills the cache — and getting it wrong in one direction loses a
+    #: reader's rendering while the other destroys what the host published. Echoed rather than
+    #: re-decided here because this worker has no idea which act the request was.
+    delivery: str = "canonical"
     content_json: str = ""
     error: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
@@ -748,6 +765,7 @@ class SummaryResultMessage(BaseModel):
             "room_id": self.room_id,
             "template_key": self.template_key,
             "status": self.status,
+            "delivery": self.delivery,
             "content_json": self.content_json,
             "error": self.error,
             "timestamp_ms": str(self.timestamp_ms),
@@ -761,6 +779,7 @@ class SummaryResultMessage(BaseModel):
             room_id=d["room_id"],
             template_key=d.get("template_key", "general"),
             status=d.get("status", "failed"),
+            delivery=d.get("delivery") or "canonical",
             content_json=d.get("content_json", ""),
             error=d.get("error", ""),
             timestamp_ms=int(d.get("timestamp_ms", 0) or 0),
