@@ -18,6 +18,7 @@ from ai_assistant_worker.summary_templates import (
     spoken_text_only,
 )
 from shared.config import AssistantSettings
+from shared.languages import normalize_language_code
 from shared.logger import get_logger
 from shared.openai_options import completion_options
 
@@ -147,23 +148,30 @@ When extracting action items:
         target_languages: list[str] | None = None,
         context_snapshot: str = "",
         template_key: str | None = None,
+        summary_language: str | None = None,
     ) -> dict[str, Any]:
         """Generate a structured {summary, decisions[], actionItems[]} JSON object.
 
         Args:
             transcript: Formatted meeting transcript.
             target_languages: The room's configured target language(s). When more than
-                one is configured, the response additionally includes a "translations"
-                map keyed by language code with the same {summary, decisions, actionItems}
-                shape translated into that language — so a bilingual/multilingual room gets
-                a bilingual summary instead of one arbitrarily-chosen language.
+                one is configured, and no `summary_language` was chosen, the response
+                additionally includes a "translations" map keyed by language code with the
+                same {summary, decisions, actionItems} shape translated into that language.
             context_snapshot: Extracted text from RAG documents.
+            summary_language: ISO 639-1 code the summary must be WRITTEN in. None means
+                nobody chose, and the model follows the transcript — how every summary
+                already in storage was produced.
 
         Returns:
             Parsed JSON dict. On any failure (empty transcript, malformed model output),
             returns a safe fallback dict with insufficientData=True instead of raising —
             callers should never have to special-case exceptions from this method.
         """
+        # Normalised once, here, so `vi-VN` from a room and `vi` from a request mean the same
+        # thing to the prompt and to the key written back into the content.
+        language = normalize_language_code(summary_language)
+
         # WT-478: tested against the SPOKEN WORDS, not the formatted transcript. A transcript
         # of segments with empty text is a wall of "[t=0] [Nhi] " scaffolding — non-empty to
         # `.strip()`, empty to a reader. That gap is what sent a contentless transcript to the
@@ -179,6 +187,7 @@ When extracting action items:
                 "actionItems": [],
                 "citations": [],
                 "templateKey": resolve_template(template_key).key,
+                "summaryLanguage": language,
                 "insufficientData": True,
             }
 
@@ -186,12 +195,16 @@ When extracting action items:
         # asked for a "concise overview paragraph" and got exactly that — three thin
         # sentences for every meeting, whatever kind of meeting it was.
         template = resolve_template(template_key)
-        system_content = build_system_prompt(template)
+        system_content = build_system_prompt(template, language)
         if context_snapshot:
             system_content += f"\n\nMeeting Context (Reference Documents):\n{context_snapshot}"
 
+        # Only when nobody chose a language. Asking for the whole summary in Japanese and then
+        # for a "translations" map beside it are contradictory instructions, and a model given
+        # both answers one of them at random. A chosen language means one document — that is
+        # what choosing it says.
         languages = [lang for lang in (target_languages or []) if lang]
-        if len(languages) > 1:
+        if not language and len(languages) > 1:
             system_content += (
                 "\n\nThis meeting has multiple target languages: "
                 f"{', '.join(languages)}. In addition to the top-level fields (in the "
@@ -235,6 +248,12 @@ When extracting action items:
             parsed.setdefault("actionItems", [])
             parsed.setdefault("citations", [])
             parsed["templateKey"] = template.key
+            # Recorded, never inferred. The web has to be able to show WHICH language this
+            # summary is in, and asking a language detector afterwards would be answering a
+            # question we already knew the answer to — and getting it wrong on short text.
+            # Empty means nobody chose, which is honest: the model followed the transcript
+            # and no code here can say what it landed on.
+            parsed["summaryLanguage"] = language
             parsed["insufficientData"] = False
 
             # Last thing before the summary leaves this process, because this is the last
@@ -290,6 +309,7 @@ When extracting action items:
                 "insufficientData": True,
                 "generationFailed": True,
                 "templateKey": template.key,
+                "summaryLanguage": language,
             }
 
     def _require_client(self) -> AsyncOpenAI:

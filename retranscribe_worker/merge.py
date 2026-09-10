@@ -18,6 +18,17 @@ WHY SILENCE HAS TO BE FILTERED OUT AFTERWARDS
 
     Dropped, not trimmed: a model that produced a sentence over silence did not mishear something,
     it invented it, and there is nothing in it worth keeping.
+
+WHY A PAUSED SPAN IS TREATED AS SILENCE (WT-605)
+    A host who pauses the transcript is not pausing the meeting — translation and dubbing carry
+    on, and so does the audio archive, because recording is a separate switch they may well have
+    left on. The archive therefore holds clean audio of sentences the host deliberately kept out
+    of the record, and this is the one place that audio can climb back in: re-transcribed
+    accurately, merged into the meeting, published hours later under a summary nobody re-read.
+
+    So a span the archive marked `transcriptPaused` is not evidence that anything belongs in the
+    transcript. It is excluded from the overlap the filter measures — which drops a segment that
+    sits inside it, for the same reason and by the same rule as one that sits inside silence.
 """
 
 from __future__ import annotations
@@ -31,6 +42,8 @@ class SpeechSpan:
 
     start_ms: int
     end_ms: int
+    #: The host had transcript recording paused here. WT-605 — see the module docstring.
+    transcript_paused: bool = False
 
 
 @dataclass(frozen=True)
@@ -75,22 +88,34 @@ def overlap_ms(start_ms: int, end_ms: int, spans: list[SpeechSpan]) -> int:
 def is_within_speech(
     segment: SpeakerSegment, spans: list[SpeechSpan], min_overlap: float = MIN_SPEECH_OVERLAP
 ) -> bool:
-    """Whether this segment sits where the speaker was actually speaking.
+    """Whether this segment sits where the speaker was actually speaking, ON THE RECORD.
 
     With NO span index — an archive written before the sidecar, or one whose write failed — every
     segment is believed. The index makes the filter possible; its absence must not silently throw
     a meeting's transcript away.
+
+    A PAUSED SPAN IS NOT AN ABSENT ONE. Overlap is measured against the recordable spans only, so
+    a segment lying inside a paused stretch scores zero and is dropped — but the emptiness test
+    above is still asked of the FULL list. Filtering first and then testing would turn a meeting
+    that was paused end to end into "no index at all", which means "believe everything", which is
+    precisely the recording the host switched off.
     """
     if not spans:
         return True
 
+    recordable = [span for span in spans if not span.transcript_paused]
+
     duration = segment.end_ms - segment.start_ms
     if duration <= 0:
-        # A zero-length segment carries no evidence either way. Kept: it costs a line, and
-        # dropping it would lose a real one-word utterance the model timed badly.
-        return True
+        # A zero-length segment carries no evidence either way. Kept — it costs a line, and
+        # dropping it would lose a real one-word utterance the model timed badly — unless it
+        # landed inside a pause, where "no evidence" is not a reason to publish it.
+        return not any(
+            span.transcript_paused and span.start_ms <= segment.start_ms <= span.end_ms
+            for span in spans
+        )
 
-    return overlap_ms(segment.start_ms, segment.end_ms, spans) / duration >= min_overlap
+    return overlap_ms(segment.start_ms, segment.end_ms, recordable) / duration >= min_overlap
 
 
 def merge_speakers(
@@ -133,6 +158,10 @@ def load_spans(payload: dict[str, object] | None) -> list[SpeechSpan]:
 
     Tolerant on purpose: a malformed index yields no spans, which the filter reads as "believe
     everything" rather than as "drop everything".
+
+    `transcriptPaused` is written only when true (see `audio_archive._write_spans`), and its
+    absence therefore means false — which is also the right reading of a sidecar written before
+    the field existed, since that archive predates the pause feature.
     """
     raw = (payload or {}).get("spans")
     if not isinstance(raw, list):
@@ -144,5 +173,7 @@ def load_spans(payload: dict[str, object] | None) -> list[SpeechSpan]:
             continue
         start, end = entry.get("startMs"), entry.get("endMs")
         if isinstance(start, int) and isinstance(end, int) and end > start:
-            spans.append(SpeechSpan(start, end))
+            spans.append(
+                SpeechSpan(start, end, transcript_paused=bool(entry.get("transcriptPaused")))
+            )
     return spans

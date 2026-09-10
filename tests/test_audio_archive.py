@@ -223,3 +223,30 @@ def test_a_meeting_with_no_speech_writes_no_index(tmp_path: Path):
 
     assert archive.close_meeting("silent-room") == []
     assert list(tmp_path.rglob("*.json")) == []
+
+
+def test_speech_heard_while_recording_was_paused_is_kept_but_flagged(tmp_path: Path):
+    """WT-605. Recording is its own switch, so the audio stays — but it must not come back.
+
+    A second pass re-transcribes these files. Unflagged, this utterance would be recovered
+    accurately from good audio and merged into the meeting hours later, putting exactly what
+    the host took off the record back into it through the one door nobody watches.
+    """
+    archive = MeetingAudioArchive(tmp_path)
+    archive.append("room", "alice", _tone(1.0), SR, now=100.0)
+    archive.append("room", "alice", _tone(1.0), SR, now=102.0, transcript_paused=True)
+    track = archive.close_meeting("room")[0]
+
+    assert [span.transcript_paused for span in track.spans] == [False, True]
+
+    spans = json.loads(track.spans_path.read_text(encoding="utf-8"))["spans"]
+    # Written only when true: an ordinary meeting is thousands of spans and none of them are
+    # paused, so a false on every one would be pure weight in a file shipped beside the audio.
+    assert "transcriptPaused" not in spans[0]
+    assert spans[1]["transcriptPaused"] is True
+
+    # And the audio itself is untouched — this marks, it does not drop. Three seconds, not
+    # two: the second utterance arrived a second after the first one ended, so the gap between
+    # them is padded exactly as it would be for any other pair.
+    audio = _read(track.path)
+    assert len(audio) == pytest.approx(SR * 3, abs=2)
