@@ -13,11 +13,18 @@ import pytest
 from ai_assistant_worker.summary_templates import (
     GENERAL,
     TEMPLATES,
+    TRACEABLE,
     build_system_prompt,
     format_transcript_line,
     resolve_template,
     spoken_text_only,
+    transcript_offsets,
 )
+
+
+def _shape_line(prompt: str, key: str) -> str:
+    """The one line of the JSON skeleton that declares `key`."""
+    return next(row for row in prompt.splitlines() if row.strip().startswith(f'"{key}"'))
 
 
 def test_an_unknown_template_falls_back_rather_than_failing() -> None:
@@ -121,3 +128,123 @@ def test_the_prompt_never_asks_the_model_to_declare_the_transcript_empty() -> No
     prompt = build_system_prompt(GENERAL)
     assert "no substantive content, say so" not in prompt
     assert "Never claim the transcript is empty" in prompt
+
+
+# WT-663 — the traceable template: no overview paragraph, every sentence carrying its moments.
+
+
+def test_the_traceable_template_resolves_without_disturbing_the_fallback() -> None:
+    assert resolve_template("traceable") is TRACEABLE
+    assert resolve_template("does-not-exist") is GENERAL
+
+
+def test_the_traceable_template_has_no_overview_to_hide_a_claim_in() -> None:
+    # The absence is the design, not an omission: an overview paragraph is the one part of
+    # a summary that points at the meeting in general and so at nothing in particular.
+    assert "summary" not in {section.key for section in TRACEABLE.sections}
+    assert build_system_prompt(TRACEABLE).count('"summary": "<text>"') == 0
+
+
+def test_every_narrative_sentence_may_rest_on_more_than_one_moment() -> None:
+    line = _shape_line(build_system_prompt(TRACEABLE), "narrative")
+    assert '"text": "<text>"' in line
+    assert '"atMs": <number>' in line
+    assert '"alsoAtMs": [<number>, ...]' in line
+
+
+@pytest.mark.parametrize("key", ["decisions", "actionItems", "openQuestions"])
+def test_a_cited_list_stays_one_claim_per_moment(key: str) -> None:
+    # `alsoAtMs` belongs to the sentence kind alone. Widening the list items to accept it
+    # would let a decision quietly cite three places at once — deliberately out of scope.
+    assert "alsoAtMs" not in _shape_line(build_system_prompt(TRACEABLE), key)
+
+
+def test_a_template_without_a_paragraph_is_not_asked_for_the_paragraph_citations() -> None:
+    # "citations" is the overview's evidence. With no overview it names a field the model
+    # was never told to write, which is an invitation to invent one.
+    prompt = build_system_prompt(TRACEABLE)
+    assert "citations" not in prompt
+
+
+def test_dropping_the_citations_line_leaves_the_skeleton_well_formed() -> None:
+    # The last entry of a JSON object carries no comma, and citations used to be it.
+    prompt = build_system_prompt(TRACEABLE)
+    shape = prompt.splitlines()
+    closing = shape.index("}")
+    assert not shape[closing - 1].endswith(","), shape[closing - 1]
+    assert all(row.endswith(",") for row in shape[closing - len(TRACEABLE.sections) : closing - 1])
+
+
+def test_the_general_prompt_is_left_exactly_as_it_was() -> None:
+    prompt = build_system_prompt(GENERAL)
+    assert '  "summary": "<text>",' in prompt
+    assert '  "citations": [{"key": "summary", "atMs": <number>}]' in prompt
+    assert "the moments the overview paragraph draws on" in prompt
+    assert "alsoAtMs" not in prompt
+
+
+# The set a cited moment has to be a member of, exactly.
+
+
+def test_transcript_offsets_returns_the_moments_the_model_was_handed() -> None:
+    transcript = "\n".join(
+        [
+            format_transcript_line(0, "Nhi", "mở đầu"),
+            format_transcript_line(4200, "Ky", "chốt ngân sách"),
+            format_transcript_line(90210, "Tu", "cap it at 500"),
+        ]
+    )
+    assert transcript_offsets(transcript) == {0, 4200, 90210}
+
+
+def test_a_timestamp_somebody_said_out_loud_is_not_a_moment() -> None:
+    # Only the prefix marks a moment. If spoken text could mint one, a model could cite a
+    # number it had itself just read back out of the words — the fabrication, laundered.
+    transcript = format_transcript_line(700, "Tu", "xem lại đoạn [t=999999] nhé")
+    assert transcript_offsets(transcript) == {700}
+
+
+def test_transcript_offsets_of_nothing_is_the_empty_set() -> None:
+    assert transcript_offsets("") == set()
+    assert transcript_offsets("\n\n") == set()
+
+
+class TestTheLanguageTheSummaryIsWrittenIn:
+    """Which language a summary comes out in is a choice, not a guess.
+
+    It used to be neither: one sentence told the model to follow the meeting, nothing recorded
+    what it landed on, and nobody could ask for anything else. These tests pin the two halves
+    of the replacement — that a chosen language is stated unmissably, and that choosing nothing
+    still means exactly what it used to.
+    """
+
+    def test_choosing_nothing_keeps_the_original_instruction(self) -> None:
+        # Every summary already in storage was written under this sentence. A default that
+        # quietly changed would rewrite the meaning of documents nobody asked to touch.
+        for language in (None, "", "   "):
+            prompt = build_system_prompt(GENERAL, language)
+            assert "Write in the language the meeting was held in." in prompt
+
+    def test_a_chosen_language_is_named_not_coded(self) -> None:
+        prompt = build_system_prompt(GENERAL, "ja")
+
+        # The model is given a language, not a tag to echo back into its output.
+        assert "JAPANESE" in prompt
+        assert "Write in the language the meeting was held in." not in prompt
+
+    def test_a_locale_tag_means_the_same_as_its_bare_code(self) -> None:
+        # Rooms store `vi-VN`; requests carry `vi`. A summary must not depend on which
+        # spelling happened to reach it.
+        assert build_system_prompt(GENERAL, "vi-VN") == build_system_prompt(GENERAL, "vi")
+
+    def test_an_unknown_code_still_produces_an_instruction(self) -> None:
+        # Falling back to the code is a worse prompt; raising would be a missing summary.
+        prompt = build_system_prompt(GENERAL, "xx")
+        assert "XX" in prompt
+
+    def test_the_rule_covers_every_string_not_only_the_prose(self) -> None:
+        # The failure this guards against is a half-translated document: prose in Japanese,
+        # owner labels left in the transcript's language, and no stated original.
+        prompt = build_system_prompt(GENERAL, "ja").lower()
+        assert "owner label" in prompt
+        assert "not a bilingual one" in prompt

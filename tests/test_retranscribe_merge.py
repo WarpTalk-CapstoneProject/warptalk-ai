@@ -120,3 +120,57 @@ def test_a_zero_length_segment_is_kept():
     # No evidence either way, and dropping it would lose a real one-word utterance the model
     # happened to time badly.
     assert is_within_speech(seg(5000, 5000), [SpeechSpan(0, 1000)]) is True
+
+
+def test_a_span_the_host_paused_is_not_evidence_a_line_belongs_in_the_meeting():
+    """WT-605. The second pass is the last door paused speech can come back through.
+
+    The audio is archived deliberately (recording is a separate switch the host may have left
+    on), so the merge is the stage that has to refuse it — and the archive's own flag is the
+    only thing that can tell this audio apart from any other.
+    """
+    spans = [
+        SpeechSpan(0, 1000),
+        SpeechSpan(2000, 3000, transcript_paused=True),
+    ]
+
+    assert is_within_speech(seg(0, 1000), spans) is True
+    assert is_within_speech(seg(2000, 3000), spans) is False
+
+
+def test_a_meeting_paused_end_to_end_does_not_collapse_into_believe_everything():
+    """The trap in filtering before the emptiness test.
+
+    `is_within_speech` reads an EMPTY span list as "no index — believe everything", which is
+    right for an archive whose sidecar was lost. Dropping the paused spans first would make a
+    fully paused meeting look exactly like that, and publish the whole of it.
+    """
+    spans = [SpeechSpan(0, 1000, transcript_paused=True)]
+
+    assert is_within_speech(seg(0, 1000), spans) is False
+    # A zero-length segment is normally kept — "no evidence either way" — but not here.
+    assert is_within_speech(seg(500, 500), spans) is False
+
+
+def test_the_pause_flag_survives_a_round_trip_through_the_sidecar():
+    spans = load_spans(
+        {
+            "spans": [
+                {"startMs": 0, "endMs": 1000},
+                {"startMs": 2000, "endMs": 3000, "transcriptPaused": True},
+            ]
+        }
+    )
+
+    # Absent means false, which is also the right reading of an archive written before the
+    # field existed: it predates the pause feature entirely.
+    assert [span.transcript_paused for span in spans] == [False, True]
+
+
+def test_a_paused_stretch_is_dropped_from_the_merged_meeting():
+    merged = merge_speakers(
+        {"nhi": [seg(0, 1000, "trên hồ sơ"), seg(2000, 3000, "ngoài hồ sơ")]},
+        spans={"nhi": [SpeechSpan(0, 1000), SpeechSpan(2000, 3000, transcript_paused=True)]},
+    )
+
+    assert [m.text for m in merged] == ["trên hồ sơ"]

@@ -9,6 +9,14 @@ A template names the sections a kind of meeting actually has, and the prompt and
 schema are both generated from it. Adding a new kind of meeting is adding a record here, not
 editing a prompt string.
 
+LANGUAGE
+    Which language a summary came out in used to be the model's decision, taken from one
+    sentence telling it to write in the language the meeting was held in. That is a fine
+    default and a bad contract: nobody could choose, nothing recorded what had been
+    chosen, and a room whose members read different languages had no answer at all.
+    `build_system_prompt` now takes the language as an argument; passing none keeps the
+    old sentence, which is what every summary already in storage was written under.
+
 CITATIONS
     Every item a template produces must carry `atMs` — the moment in the meeting it came
     from. This is not decoration. A claim that cannot point at a moment in the transcript is
@@ -22,6 +30,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from shared.languages import language_name, normalize_language_code
+
 
 @dataclass(frozen=True)
 class SummarySection:
@@ -30,7 +40,8 @@ class SummarySection:
     key: str
     title: str
     guidance: str
-    #  "paragraph" renders as prose; "items" as a cited list.
+    #  "paragraph" renders as prose; "items" as a cited list; "sentences" as prose that has
+    #  been broken along its sentence boundaries so each unit can carry its own moments.
     kind: str = "items"
 
 
@@ -51,6 +62,27 @@ _OVERVIEW = SummarySection(
         "Name the people, the systems and the numbers that were discussed rather than "
         "describing the conversation in the abstract. Never write that a meeting was "
         "'informal' or 'had no clear agenda' — say what was talked about instead."
+    ),
+)
+
+_NARRATIVE = SummarySection(
+    key="narrative",
+    title="What happened",
+    kind="sentences",
+    guidance=(
+        "The overview, broken into units a reader can check: each element is ONE complete "
+        "sentence, and read in order the sentences must form a single continuous paragraph. "
+        "This is prose split along its sentence boundaries, not a bullet list. Write 3–6 "
+        "sentences. Every sentence carries `atMs`, and `alsoAtMs` holds the OTHER moments the "
+        "same sentence rests on — at most two more, so no sentence stands on more than three "
+        "moments. Only join moments that are far apart when the later one directly answers, "
+        "confirms or reverses the earlier one; everything else becomes two sentences. "
+        "Gathering scattered remarks into one general observation is the General template's "
+        "job, not this one — a sentence that cannot point at where it was said is exactly "
+        "what this template exists to prevent. A merged sentence's `atMs` is the EARLIEST of "
+        "its moments, and the sentences are ordered by that moment, so the summary runs in "
+        "meeting order. Stay close to what was said: condense the words, do not interpret "
+        "them."
     ),
 )
 
@@ -203,8 +235,20 @@ TECHNICAL = SummaryTemplate(
     ),
 )
 
+#: The one template with no overview paragraph, and that absence is the whole design. An
+#: overview is the part of a summary nobody can check — it draws on the meeting in general,
+#: so a fabricated clause hides in it perfectly. Replacing it with sentences that each name
+#: their moments costs the reader nothing (read end to end they are still a paragraph) and
+#: leaves the model nowhere to put an uncitable claim.
+TRACEABLE = SummaryTemplate(
+    key="traceable",
+    label="Traceable summary",
+    description="Every sentence carries the moments it came from.",
+    sections=(_NARRATIVE, _DECISIONS, _ACTION_ITEMS, _OPEN_QUESTIONS),
+)
+
 TEMPLATES: dict[str, SummaryTemplate] = {
-    template.key: template for template in (GENERAL, STANDUP, INTERVIEW, DEMO, TECHNICAL)
+    template.key: template for template in (GENERAL, STANDUP, INTERVIEW, DEMO, TECHNICAL, TRACEABLE)
 }
 
 DEFAULT_TEMPLATE_KEY = GENERAL.key
@@ -221,8 +265,14 @@ def resolve_template(key: str | None) -> SummaryTemplate:
     return TEMPLATES.get(key.strip().lower(), GENERAL)
 
 
-def build_system_prompt(template: SummaryTemplate) -> str:
-    """Generate the system prompt and the JSON shape from the template."""
+def build_system_prompt(template: SummaryTemplate, language: str | None = None) -> str:
+    """Generate the system prompt and the JSON shape from the template.
+
+    Args:
+        template: The shape the summary takes — its sections, and what belongs in each.
+        language: ISO 639-1 code the summary must be WRITTEN in, whatever language the
+            meeting was held in. None means nobody chose — see LANGUAGE above.
+    """
     lines = [
         "You are a meeting analyst. Read the transcript and return a single JSON object "
         "only — no markdown, no commentary.",
@@ -239,38 +289,88 @@ def build_system_prompt(template: SummaryTemplate) -> str:
         "{",
     ]
 
+    shape: list[str] = []
     for section in template.sections:
         if section.kind == "paragraph":
-            lines.append(f'  "{section.key}": "<text>",')
+            shape.append(f'  "{section.key}": "<text>",')
+        elif section.kind == "sentences":
+            # `alsoAtMs` lives on this kind alone. A cited list is one claim per moment and
+            # stays that way; only a sentence carved out of a paragraph can legitimately
+            # rest on more than one.
+            shape.append(
+                f'  "{section.key}": [{{"text": "<text>", "atMs": <number>, '
+                '"alsoAtMs": [<number>, ...]}],'
+            )
         elif section.key == "actionItems":
-            lines.append(
+            shape.append(
                 f'  "{section.key}": [{{"task": "<text>", "owner": "<name or empty>", '
                 '"atMs": <number>}],'
             )
         else:
-            lines.append(f'  "{section.key}": [{{"text": "<text>", "atMs": <number>}}],')
+            shape.append(f'  "{section.key}": [{{"text": "<text>", "atMs": <number>}}],')
 
-    lines.append('  "citations": [{"key": "summary", "atMs": <number>}]')
+    # "citations" is the overview paragraph's evidence and nothing else's. A template built
+    # without an overview (traceable) has no field for it to point at, so asking for it
+    # invites the model to invent one — and a JSON key nobody declared is the fabrication
+    # this whole file is arranged to make impossible.
+    has_paragraph = any(section.kind == "paragraph" for section in template.sections)
+    if has_paragraph:
+        shape.append('  "citations": [{"key": "summary", "atMs": <number>}]')
+    else:
+        # The last entry of an object carries no comma, and the citations line was it.
+        shape[-1] = shape[-1].rstrip(",")
+
+    lines.extend(shape)
     lines.append("}")
     lines.append("")
-    lines.append(
-        'The "citations" array carries the moments the overview paragraph draws on — at '
-        "least one, at most five."
-    )
-    lines.append("")
+    if has_paragraph:
+        lines.append(
+            'The "citations" array carries the moments the overview paragraph draws on — at '
+            "least one, at most five."
+        )
+        lines.append("")
     lines.append("What belongs in each section:")
     for section in template.sections:
         lines.append(f"- {section.key} ({section.title}): {section.guidance}")
 
     lines.append("")
+    lines.append(_language_rule(language))
+    lines.append("")
     lines.append(
-        "Write in the language the meeting was held in. Summarise what the transcript "
-        "actually contains, however short that is — two sentences of real content is a "
-        "valid summary. Never claim the transcript is empty or has no substantive "
-        "content: whether there is enough to summarise is decided before you are called, "
-        "so you are only ever given a transcript that has something in it."
+        "Summarise what the transcript actually contains, however short that is — two "
+        "sentences of real content is a valid summary. Never claim the transcript is empty "
+        "or has no substantive content: whether there is enough to summarise is decided "
+        "before you are called, so you are only ever given a transcript that has something "
+        "in it."
     )
     return "\n".join(lines)
+
+
+def _language_rule(language: str | None) -> str:
+    """The one paragraph that decides what language the summary comes out in.
+
+    Spelled out field by field rather than as a bare "write in X", because the failure this
+    guards against is not a model refusing to translate — it is a model translating the
+    overview and leaving the owner labels, or half the action items, in the transcript's
+    language. That produces a document in two languages with no stated original, which is
+    worse than one in the wrong language: the reader cannot tell which half to trust.
+    """
+    code = normalize_language_code(language)
+    if not code:
+        # Nobody chose. The behaviour every summary written before this argument existed was
+        # produced under, and still the right answer for a room that never expressed one.
+        return "Write in the language the meeting was held in."
+
+    name = language_name(code)
+    return (
+        f"WRITE THE ENTIRE SUMMARY IN {name.upper()}. The transcript may be in another "
+        f"language; translate as you summarise. Every string you produce is in {name} — the "
+        "overview, every item of every section, and any owner label you write. Proper names "
+        "of people, products and companies stay as they were said. Do not add a note about "
+        "having translated, and do not repeat the original wording alongside the "
+        f"translation: the reader asked for this summary in {name} and wants one document, "
+        "not a bilingual one."
+    )
 
 
 def format_transcript_line(at_ms: int, speaker: str, text: str) -> str:
@@ -284,8 +384,35 @@ def format_transcript_line(at_ms: int, speaker: str, text: str) -> str:
     return f"[t={max(at_ms, 0)}] [{speaker}] {text}"
 
 
+#: The pseudo-speaker a pause marker is attributed to. Bracketed like a real speaker label so
+#: `spoken_text_only` and anything else parsing these lines needs no special case.
+PAUSE_MARKER_SPEAKER = "transcript paused"
+
+
+def format_pause_marker(start_ms: int, end_ms: int) -> str:
+    """A gap the host asked for, said out loud so the model does not have to guess. WT-605.
+
+    Without it a paused stretch reaches the model as nothing at all — the line before the pause
+    and the line after it sit next to each other with only a jump in `t=` between them. Every
+    reading of that is wrong in a different way: that the room went quiet, that two unrelated
+    remarks are one thought, or — worst — that something was settled in a silence.
+
+    Marked rather than filled, because what was said in the gap is exactly what must not reach
+    the summary. The line states the boundaries and stops there.
+    """
+    start = max(start_ms, 0)
+    end = max(end_ms, start)
+    return (
+        f"[t={start}] [{PAUSE_MARKER_SPEAKER}] the host paused recording until t={end}. "
+        "Anything said in this gap is deliberately absent — do not summarise it, cite it, "
+        "or infer what it contained."
+    )
+
+
 #: The `[t=<ms>] [<speaker>] ` that `format_transcript_line` puts in front of every line.
-_TRANSCRIPT_LINE_PREFIX = re.compile(r"^\[t=\d+\]\s*\[[^\]]*\]\s*")
+#: The moment is captured so `transcript_offsets` can read it back; one pattern, so the set
+#: we check citations against can never drift from the prefix we actually strip.
+_TRANSCRIPT_LINE_PREFIX = re.compile(r"^\[t=(\d+)\]\s*\[[^\]]*\]\s*")
 
 
 def spoken_text_only(transcript: str) -> str:
@@ -307,3 +434,24 @@ def spoken_text_only(transcript: str) -> str:
         for line in transcript.splitlines()
         if (stripped := _TRANSCRIPT_LINE_PREFIX.sub("", line).strip())
     )
+
+
+def transcript_offsets(transcript: str) -> set[int]:
+    """Every moment we handed the model, as the set its `atMs` must be a member of.
+
+    Requiring a citation only means something if the citation is checkable, and the check is
+    exact membership with zero tolerance: not "near a real line", not "within a second of
+    one". A nearest-match fallback would silently repair the single failure the citation
+    exists to expose — a number the model produced from nothing. An `atMs` outside this set
+    points at a moment that was never in the meeting, so the claim resting on it is not a
+    claim about the meeting.
+
+    Only the `[t=<ms>]` that opens a line is a moment. Somebody who says "[t=500]" out loud
+    has said words, not marked a timestamp, and must not hand a fabricated citation a place
+    to land.
+    """
+    return {
+        int(match.group(1))
+        for line in transcript.splitlines()
+        if (match := _TRANSCRIPT_LINE_PREFIX.match(line))
+    }

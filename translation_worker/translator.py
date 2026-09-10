@@ -16,6 +16,7 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from shared.config import TranslationSettings
+from shared.languages import language_name
 from shared.logger import get_logger
 from shared.openai_options import completion_options, realtime_session_expired
 from translation_worker import valence as valence_mod
@@ -30,25 +31,6 @@ OUT_OF_MEETING_SCOPE = "[OUT_OF_MEETING_SCOPE]"
 # instantiation in sync with config.py without anyone having to remember both places.
 _DEFAULTS = TranslationSettings()
 
-# ISO 639-1 → human-readable name for system prompt clarity
-_LANG_NAMES: dict[str, str] = {
-    "en": "English",
-    "vi": "Vietnamese",
-    "zh": "Chinese (Simplified)",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "fr": "French",
-    "de": "German",
-    "es": "Spanish",
-    "th": "Thai",
-    "id": "Indonesian",
-    "ms": "Malay",
-    "ru": "Russian",
-    "ar": "Arabic",
-    "hi": "Hindi",
-    "pt": "Portuguese",
-    "it": "Italian",
-}
 
 # The input is speech recognition output, and saying so is most of the work.
 #
@@ -325,8 +307,9 @@ def _select_relevant_glossary_terms(
 _BATCH_LINE_RE = re.compile(r"^\s*\[(\d+)\]\s*(.*)$")
 
 
-def _lang_name(iso_code: str) -> str:
-    return _LANG_NAMES.get(iso_code.split("-")[0], iso_code)
+#: The shared map, aliased so existing callers and tests keep importing it from here.
+#: See shared/languages.py for why one copy rather than two.
+_lang_name = language_name
 
 
 class OpenAITranslator:
