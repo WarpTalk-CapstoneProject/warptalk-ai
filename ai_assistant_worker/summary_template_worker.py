@@ -11,6 +11,13 @@ WHY IT REFETCHES THE TRANSCRIPT
     reads the SAVED transcript instead — which is also what makes the citations line up,
     because those are the exact segments the meeting page renders and scrolls to.
 
+WHAT A REWRITE CAN CHANGE
+    Two things, and they are independent: the SHAPE (`template_key` — is this a standup or an
+    interview) and the LANGUAGE (`summary_language`). Both arrive on the request rather than
+    being inferred, because both are the requester's decision and neither is recoverable from
+    the transcript. An empty language means the request did not express one, and the model
+    falls back to following the transcript exactly as it always did.
+
 WHY IT CARRIES A BEARER TOKEN
     The same reason ChatAssistantWorker does: tool calls hit sibling services' existing
     authenticated endpoints as the person who asked, never through a privileged bypass. A
@@ -97,6 +104,7 @@ class SummaryTemplateWorker(BaseWorker):
             transcript,
             target_languages=target_languages,
             template_key=template.key,
+            summary_language=request.summary_language,
         )
 
         # WT-530: a generation that failed is not a rewrite that succeeded.
@@ -122,10 +130,19 @@ class SummaryTemplateWorker(BaseWorker):
                 room_id=request.room_id,
                 template_key=template.key,
                 status="completed",
+                # Echoed, never decided here. Whether this answer replaces the room's summary or
+                # fills one reader's cache is the requester's act, and the content cannot tell
+                # the two apart — see SummaryRequestMessage.delivery.
+                delivery=request.delivery,
                 content_json=json.dumps(content, ensure_ascii=False),
             ).to_redis(),
         )
-        self.logger.info("summary_regenerated", room_id=request.room_id, template=template.key)
+        self.logger.info(
+            "summary_regenerated",
+            room_id=request.room_id,
+            template=template.key,
+            language=request.summary_language or "as-spoken",
+        )
 
     async def _load_transcript(self, request: SummaryRequestMessage) -> str:
         """The saved transcript, formatted with the moments the model must cite."""
@@ -207,6 +224,11 @@ class SummaryTemplateWorker(BaseWorker):
                 room_id=request.room_id,
                 template_key=template_key,
                 status="failed",
+                # Carried on the failure too. The backend drops a failed result without writing
+                # anything, so this changes no behaviour today — but a result that omitted it
+                # would read as canonical, and the next person to give the failure path a
+                # side effect would inherit a silent misroute.
+                delivery=request.delivery,
                 error=error,
             ).to_redis(),
         )

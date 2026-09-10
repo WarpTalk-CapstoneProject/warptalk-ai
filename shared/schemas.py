@@ -269,6 +269,25 @@ class STTResultMessage(BaseModel):
     confidence: float = 0.0
     start_ms: int = 0  # Segment start time relative to meeting
     end_ms: int = 0  # Segment end time relative to meeting
+    # WHAT "RELATIVE TO MEETING" IS RELATIVE TO — the unix epoch millisecond that start_ms and
+    # end_ms above are counted from. The two numbers are offsets and an offset without its origin
+    # cannot be turned back into an instant, so the origin has to travel on the wire beside them.
+    #
+    # It is the anchor stt_worker agreed on for this room (see STTWorker._elapsed_ms): the first
+    # chunk any replica saw, claimed with SET NX so every replica, every reconnect and every
+    # restart measures from the same instant. NOT the moment the host pressed Start — a smaller
+    # and, more to the point, a CONSISTENT error.
+    #
+    # WHY 0 IS "NOT STATED" RATHER THAN "THE EPOCH". Every consumer of this stream older than
+    # this field reads it as absent, and the default has to mean the same thing as absent or an
+    # upgraded producer talking to a not-yet-upgraded consumer would look like a claim. Nobody
+    # meets in January 1970, so 0 is free to carry "no origin was stated" — and the persisting
+    # consumer is written against exactly that reading: it stores the anchor only when the value
+    # is > 0 and the column is still NULL — first write wins, and a later value never overwrites
+    # it. Which also means the stored origin stays put under the STT worker's Redis-unavailable
+    # fallback, where each chunk is anchored to itself: whichever value lands first is the one the
+    # meeting keeps, rather than the origin drifting for the rest of the recording.
+    anchor_ms: int = 0
     chunk_index: int = 0
     is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
@@ -301,6 +320,10 @@ class STTResultMessage(BaseModel):
             "confidence": str(self.confidence),
             "start_ms": str(self.start_ms),
             "end_ms": str(self.end_ms),
+            # Always sent, unlike `prosody` below, because 0 is a real answer here ("no origin
+            # was stated") and not a placeholder standing in for a measurement that was skipped.
+            # The persisting consumer keys off the name `anchor_ms` exactly; do not rename it.
+            "anchor_ms": str(self.anchor_ms),
             "chunk_index": str(self.chunk_index),
             "is_final_chunk": "1" if self.is_final_chunk else "0",
             "is_early": "1" if self.is_early else "0",
@@ -324,6 +347,9 @@ class STTResultMessage(BaseModel):
             confidence=float(d.get("confidence", "0.0")),
             start_ms=int(d.get("start_ms", "0")),
             end_ms=int(d.get("end_ms", "0")),
+            # Absent on anything published before this field existed, and 0 is what absent means:
+            # "this message states no origin for its offsets". See the field's declaration.
+            anchor_ms=int(d.get("anchor_ms", "0")),
             chunk_index=int(d.get("chunk_index", "0")),
             is_final_chunk=d.get("is_final_chunk") == "1",
             # Absent on anything published before this field existed, which reads as False —
@@ -663,6 +689,17 @@ class SummaryRequestMessage(BaseModel):
     template_key: str = "general"
     bearer_token: str = ""
     target_languages_json: str = "[]"
+    #: ISO 639-1 the summary must be WRITTEN in, chosen by whoever asked for it. Empty means
+    #: nobody chose and the model follows the transcript, which is what every request published
+    #: before this field existed meant — so an old message keeps its old behaviour.
+    summary_language: str = ""
+    #: What the answer is FOR, and the one thing the backend cannot read back off the result:
+    #: "canonical" replaces the room's summary artifact, "variant" lands in the per-language
+    #: cache beside it. A Standup-in-Japanese summary is byte-identical either way, so only the
+    #: publisher knows which act it was. This worker never interprets it — it echoes it onto the
+    #: result so the backend can route. Empty means canonical, which every request published
+    #: before this field existed was.
+    delivery: str = "canonical"
     #: Pre-read transcript, already formatted with `format_transcript_line`. Empty for a
     #: user-initiated rewrite, which fetches instead.
     transcript_text: str = ""
@@ -676,6 +713,8 @@ class SummaryRequestMessage(BaseModel):
             "template_key": self.template_key,
             "bearer_token": self.bearer_token,
             "target_languages_json": self.target_languages_json,
+            "summary_language": self.summary_language,
+            "delivery": self.delivery,
             "transcript_text": self.transcript_text,
             "timestamp_ms": str(self.timestamp_ms),
         }
@@ -690,6 +729,11 @@ class SummaryRequestMessage(BaseModel):
             template_key=d.get("template_key", "general"),
             bearer_token=d.get("bearer_token", ""),
             target_languages_json=d.get("target_languages_json", "[]"),
+            summary_language=d.get("summary_language", ""),
+            # Absent means canonical: every request published before this field existed was a
+            # rewrite of the room's summary, so an in-flight message at deploy time keeps the
+            # meaning it was published with rather than quietly becoming a cache row.
+            delivery=d.get("delivery") or "canonical",
             # Absent on every message the backend published before this field existed, which is
             # exactly the user-initiated shape — so an old request keeps fetching.
             transcript_text=d.get("transcript_text", ""),
@@ -706,6 +750,11 @@ class SummaryResultMessage(BaseModel):
     room_id: str
     template_key: str
     status: str  # "completed" | "failed"
+    #: Echoed verbatim from the request. The backend routes on it — canonical replaces the
+    #: room's summary, variant fills the cache — and getting it wrong in one direction loses a
+    #: reader's rendering while the other destroys what the host published. Echoed rather than
+    #: re-decided here because this worker has no idea which act the request was.
+    delivery: str = "canonical"
     content_json: str = ""
     error: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
@@ -716,6 +765,7 @@ class SummaryResultMessage(BaseModel):
             "room_id": self.room_id,
             "template_key": self.template_key,
             "status": self.status,
+            "delivery": self.delivery,
             "content_json": self.content_json,
             "error": self.error,
             "timestamp_ms": str(self.timestamp_ms),
@@ -729,6 +779,7 @@ class SummaryResultMessage(BaseModel):
             room_id=d["room_id"],
             template_key=d.get("template_key", "general"),
             status=d.get("status", "failed"),
+            delivery=d.get("delivery") or "canonical",
             content_json=d.get("content_json", ""),
             error=d.get("error", ""),
             timestamp_ms=int(d.get("timestamp_ms", 0) or 0),

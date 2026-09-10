@@ -288,6 +288,27 @@ class AIAssistantWorker(BaseWorker):
         except Exception:
             self.logger.warning("failed_to_read_target_languages", meeting_id=meeting_id)
 
+        # The language the FIRST summary is written in, published by TranslationRoomService
+        # alongside the target languages as the room's declared source language.
+        #
+        # Best-effort, and deliberately so. Missing means the model falls back to following
+        # the transcript, which is what this path did for every meeting before the key
+        # existed — a summary in a plausible language beats no summary because a cache entry
+        # expired. What it buys when present is that the first summary and a later rewrite
+        # agree: without it, the automatic one guessed and the rewrite obeyed, so simply
+        # asking for the shape you already had could silently change the language.
+        summary_language = ""
+        try:
+            summary_language_bytes = await self.redis.get(f"meeting:{meeting_id}:summary_language")
+            if summary_language_bytes:
+                summary_language = (
+                    summary_language_bytes.decode("utf-8")
+                    if isinstance(summary_language_bytes, bytes)
+                    else str(summary_language_bytes)
+                )
+        except Exception:
+            self.logger.warning("failed_to_read_summary_language", meeting_id=meeting_id)
+
         # Generate summary
         assistant = self._require_assistant()
         summary = await assistant.summarize(
@@ -343,6 +364,7 @@ class AIAssistantWorker(BaseWorker):
             transcript_text,
             target_languages=target_languages,
             context_snapshot=context_snapshot,
+            summary_language=summary_language,
         )
         await self.redis.hset(
             f"meeting:{meeting_id}:summary",
