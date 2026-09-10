@@ -238,8 +238,7 @@ TRACEABLE = SummaryTemplate(
 )
 
 TEMPLATES: dict[str, SummaryTemplate] = {
-    template.key: template
-    for template in (GENERAL, STANDUP, INTERVIEW, DEMO, TECHNICAL, TRACEABLE)
+    template.key: template for template in (GENERAL, STANDUP, INTERVIEW, DEMO, TECHNICAL, TRACEABLE)
 }
 
 DEFAULT_TEMPLATE_KEY = GENERAL.key
