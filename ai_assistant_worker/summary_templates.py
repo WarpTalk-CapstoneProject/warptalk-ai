@@ -40,7 +40,8 @@ class SummarySection:
     key: str
     title: str
     guidance: str
-    #  "paragraph" renders as prose; "items" as a cited list.
+    #  "paragraph" renders as prose; "items" as a cited list; "sentences" as prose that has
+    #  been broken along its sentence boundaries so each unit can carry its own moments.
     kind: str = "items"
 
 
@@ -61,6 +62,27 @@ _OVERVIEW = SummarySection(
         "Name the people, the systems and the numbers that were discussed rather than "
         "describing the conversation in the abstract. Never write that a meeting was "
         "'informal' or 'had no clear agenda' — say what was talked about instead."
+    ),
+)
+
+_NARRATIVE = SummarySection(
+    key="narrative",
+    title="What happened",
+    kind="sentences",
+    guidance=(
+        "The overview, broken into units a reader can check: each element is ONE complete "
+        "sentence, and read in order the sentences must form a single continuous paragraph. "
+        "This is prose split along its sentence boundaries, not a bullet list. Write 3–6 "
+        "sentences. Every sentence carries `atMs`, and `alsoAtMs` holds the OTHER moments the "
+        "same sentence rests on — at most two more, so no sentence stands on more than three "
+        "moments. Only join moments that are far apart when the later one directly answers, "
+        "confirms or reverses the earlier one; everything else becomes two sentences. "
+        "Gathering scattered remarks into one general observation is the General template's "
+        "job, not this one — a sentence that cannot point at where it was said is exactly "
+        "what this template exists to prevent. A merged sentence's `atMs` is the EARLIEST of "
+        "its moments, and the sentences are ordered by that moment, so the summary runs in "
+        "meeting order. Stay close to what was said: condense the words, do not interpret "
+        "them."
     ),
 )
 
@@ -213,8 +235,20 @@ TECHNICAL = SummaryTemplate(
     ),
 )
 
+#: The one template with no overview paragraph, and that absence is the whole design. An
+#: overview is the part of a summary nobody can check — it draws on the meeting in general,
+#: so a fabricated clause hides in it perfectly. Replacing it with sentences that each name
+#: their moments costs the reader nothing (read end to end they are still a paragraph) and
+#: leaves the model nowhere to put an uncitable claim.
+TRACEABLE = SummaryTemplate(
+    key="traceable",
+    label="Traceable summary",
+    description="Every sentence carries the moments it came from.",
+    sections=(_NARRATIVE, _DECISIONS, _ACTION_ITEMS, _OPEN_QUESTIONS),
+)
+
 TEMPLATES: dict[str, SummaryTemplate] = {
-    template.key: template for template in (GENERAL, STANDUP, INTERVIEW, DEMO, TECHNICAL)
+    template.key: template for template in (GENERAL, STANDUP, INTERVIEW, DEMO, TECHNICAL, TRACEABLE)
 }
 
 DEFAULT_TEMPLATE_KEY = GENERAL.key
@@ -255,25 +289,46 @@ def build_system_prompt(template: SummaryTemplate, language: str | None = None) 
         "{",
     ]
 
+    shape: list[str] = []
     for section in template.sections:
         if section.kind == "paragraph":
-            lines.append(f'  "{section.key}": "<text>",')
+            shape.append(f'  "{section.key}": "<text>",')
+        elif section.kind == "sentences":
+            # `alsoAtMs` lives on this kind alone. A cited list is one claim per moment and
+            # stays that way; only a sentence carved out of a paragraph can legitimately
+            # rest on more than one.
+            shape.append(
+                f'  "{section.key}": [{{"text": "<text>", "atMs": <number>, '
+                '"alsoAtMs": [<number>, ...]}],'
+            )
         elif section.key == "actionItems":
-            lines.append(
+            shape.append(
                 f'  "{section.key}": [{{"task": "<text>", "owner": "<name or empty>", '
                 '"atMs": <number>}],'
             )
         else:
-            lines.append(f'  "{section.key}": [{{"text": "<text>", "atMs": <number>}}],')
+            shape.append(f'  "{section.key}": [{{"text": "<text>", "atMs": <number>}}],')
 
-    lines.append('  "citations": [{"key": "summary", "atMs": <number>}]')
+    # "citations" is the overview paragraph's evidence and nothing else's. A template built
+    # without an overview (traceable) has no field for it to point at, so asking for it
+    # invites the model to invent one — and a JSON key nobody declared is the fabrication
+    # this whole file is arranged to make impossible.
+    has_paragraph = any(section.kind == "paragraph" for section in template.sections)
+    if has_paragraph:
+        shape.append('  "citations": [{"key": "summary", "atMs": <number>}]')
+    else:
+        # The last entry of an object carries no comma, and the citations line was it.
+        shape[-1] = shape[-1].rstrip(",")
+
+    lines.extend(shape)
     lines.append("}")
     lines.append("")
-    lines.append(
-        'The "citations" array carries the moments the overview paragraph draws on — at '
-        "least one, at most five."
-    )
-    lines.append("")
+    if has_paragraph:
+        lines.append(
+            'The "citations" array carries the moments the overview paragraph draws on — at '
+            "least one, at most five."
+        )
+        lines.append("")
     lines.append("What belongs in each section:")
     for section in template.sections:
         lines.append(f"- {section.key} ({section.title}): {section.guidance}")
@@ -355,7 +410,9 @@ def format_pause_marker(start_ms: int, end_ms: int) -> str:
 
 
 #: The `[t=<ms>] [<speaker>] ` that `format_transcript_line` puts in front of every line.
-_TRANSCRIPT_LINE_PREFIX = re.compile(r"^\[t=\d+\]\s*\[[^\]]*\]\s*")
+#: The moment is captured so `transcript_offsets` can read it back; one pattern, so the set
+#: we check citations against can never drift from the prefix we actually strip.
+_TRANSCRIPT_LINE_PREFIX = re.compile(r"^\[t=(\d+)\]\s*\[[^\]]*\]\s*")
 
 
 def spoken_text_only(transcript: str) -> str:
@@ -377,3 +434,24 @@ def spoken_text_only(transcript: str) -> str:
         for line in transcript.splitlines()
         if (stripped := _TRANSCRIPT_LINE_PREFIX.sub("", line).strip())
     )
+
+
+def transcript_offsets(transcript: str) -> set[int]:
+    """Every moment we handed the model, as the set its `atMs` must be a member of.
+
+    Requiring a citation only means something if the citation is checkable, and the check is
+    exact membership with zero tolerance: not "near a real line", not "within a second of
+    one". A nearest-match fallback would silently repair the single failure the citation
+    exists to expose — a number the model produced from nothing. An `atMs` outside this set
+    points at a moment that was never in the meeting, so the claim resting on it is not a
+    claim about the meeting.
+
+    Only the `[t=<ms>]` that opens a line is a moment. Somebody who says "[t=500]" out loud
+    has said words, not marked a timestamp, and must not hand a fabricated citation a place
+    to land.
+    """
+    return {
+        int(match.group(1))
+        for line in transcript.splitlines()
+        if (match := _TRANSCRIPT_LINE_PREFIX.match(line))
+    }
