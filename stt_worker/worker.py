@@ -647,6 +647,11 @@ class STTWorker(BaseWorker):
         )
 
         chunk_offset_ms = await self._elapsed_ms(chunk)
+        # Read AFTER _elapsed_ms, which is what resolves and caches it. Every publish below the
+        # offsets it stamps must carry the origin those offsets were measured from, or the
+        # transcript is a list of durations nobody can map onto the recording — see
+        # _cached_transcript_anchor.
+        anchor_ms = self._cached_transcript_anchor(chunk.meeting_id)
         language_hint = _language_hint_for_stt(chunk.language)
         allowed_languages = await self._get_room_languages(chunk.meeting_id)
         keywords = await self._get_stt_keywords(chunk.meeting_id)
@@ -741,6 +746,10 @@ class STTWorker(BaseWorker):
                     confidence=STT_UNKNOWN_CONFIDENCE,
                     start_ms=chunk_offset_ms,
                     end_ms=chunk_offset_ms,
+                    # The origin those two offsets are counted from. Carried here as well as on
+                    # the completed segment because in flash mode MOST lines arrive down this
+                    # path, and a line without an anchor cannot be seeked to.
+                    anchor_ms=anchor_ms,
                     chunk_index=chunk.chunk_index,
                     is_final_chunk=False,
                     # Billing must not charge this. The completed segment for this same chunk
@@ -910,6 +919,9 @@ class STTWorker(BaseWorker):
                 confidence=segment.confidence,
                 start_ms=segment.start_ms,
                 end_ms=segment.end_ms,
+                # `segment.start_ms`/`end_ms` are chunk_offset_ms plus the model's in-chunk
+                # offsets, so they are measured from the same anchor and it travels with them.
+                anchor_ms=anchor_ms,
                 chunk_index=chunk.chunk_index,
                 is_final_chunk=chunk.is_final_chunk,
                 timestamp_ms=chunk.timestamp_ms,
@@ -956,6 +968,11 @@ class STTWorker(BaseWorker):
                 speaker_id=chunk.speaker_id,
                 text="",
                 language=chunk.language,
+                # Carried even though this marker has no text and no offsets of its own. A room
+                # whose only audible chunk produced nothing still has an origin, and this may be
+                # the only message the meeting ever publishes — dropping the anchor here would
+                # leave that meeting's recording unseekable for the sake of one line.
+                anchor_ms=anchor_ms,
                 is_final_chunk=True,
                 timestamp_ms=chunk.timestamp_ms,
             )
@@ -1231,6 +1248,36 @@ class STTWorker(BaseWorker):
         # Never negative. Clock skew between the gateway and this worker is real, and a negative
         # offset formats into nonsense on the panel rather than failing loudly.
         return max(0, chunk.timestamp_ms - anchor_ms - _chunk_audio_duration_ms(chunk))
+
+    def _cached_transcript_anchor(self, meeting_id: str) -> int:
+        """This room's already-resolved anchor, as a unix epoch millisecond. 0 if none is known.
+
+        WHY IT IS PUBLISHED AT ALL (WT-655)
+            `start_ms` and `end_ms` are offsets from the anchor, and an offset without its origin
+            cannot be turned back into an instant. So "click a transcript line, the recording
+            seeks to that moment" needs the origin as well, and the only place that knows it is
+            this worker — which is why STTResultMessage.anchor_ms exists and all three of
+            process()'s publishes carry it.
+
+        WHY IT READS THE CACHE RATHER THAN RESOLVING
+            `_elapsed_ms` runs once per chunk, before anything is published, and leaves the
+            resolved value in `_transcript_anchors`. Calling `_resolve_transcript_anchor` again
+            here would buy a second Redis round trip per SEGMENT on the hot path for a value
+            that cannot change — and, on the Redis-unavailable path, could hand back a
+            different number than the offsets beside it were computed from.
+
+        WHY 0 IS THE ANSWER WHEN NOTHING IS CACHED
+            Nothing on the ordinary path reaches a publish without `_elapsed_ms` having run, so
+            0 here means a caller that skipped it. 0 travels as "no origin stated" and the
+            persisting consumer ignores it, which is the honest outcome: no anchor is strictly
+            better than an invented one, since the stored origin is first-write-wins and a wrong
+            first write can never be corrected.
+
+        getattr for the same reason `_elapsed_ms` uses it: the test suites build workers with
+        __new__, so the attribute may legitimately not exist yet.
+        """
+        anchors: dict[str, int] = getattr(self, "_transcript_anchors", None) or {}
+        return anchors.get(meeting_id, 0)
 
     async def _resolve_transcript_anchor(self, chunk: AudioChunkMessage) -> int:
         """The agreed millisecond every seat measures this meeting from."""
