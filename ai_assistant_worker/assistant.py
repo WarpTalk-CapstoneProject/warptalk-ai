@@ -11,6 +11,7 @@ from typing import Any, cast
 
 from openai import AsyncOpenAI
 
+from ai_assistant_worker.minutes_translation import collect_translatable, merge_translation
 from ai_assistant_worker.summary_grounding import ground_summary
 from ai_assistant_worker.summary_templates import (
     build_system_prompt,
@@ -154,10 +155,14 @@ When extracting action items:
 
         Args:
             transcript: Formatted meeting transcript.
-            target_languages: The room's configured target language(s). When more than
-                one is configured, and no `summary_language` was chosen, the response
-                additionally includes a "translations" map keyed by language code with the
-                same {summary, decisions, actionItems} shape translated into that language.
+            target_languages: The room's configured target language(s). When more than one is
+                configured the response additionally includes a "translations" map keyed by
+                language code, each value having the same shape translated into that language —
+                this is what makes a biên bản bilingual. It is produced one of two ways, and
+                which one is invisible to the caller: inline with the summary when nobody chose
+                a language, and by a second pass afterwards when somebody did (WT-665). Both
+                exist because asking one prompt to write in Japanese AND to translate itself is
+                a contradiction; see minutes_translation.
             context_snapshot: Extracted text from RAG documents.
             summary_language: ISO 639-1 code the summary must be WRITTEN in. None means
                 nobody chose, and the model follows the transcript — how every summary
@@ -201,8 +206,13 @@ When extracting action items:
 
         # Only when nobody chose a language. Asking for the whole summary in Japanese and then
         # for a "translations" map beside it are contradictory instructions, and a model given
-        # both answers one of them at random. A chosen language means one document — that is
-        # what choosing it says.
+        # both answers one of them at random.
+        #
+        # WT-665: what that used to mean was that choosing a summary language ALSO cancelled the
+        # biên bản's other languages — a minutes document silently lost half of itself because
+        # of a choice made about a different artifact on a different tab. The contradiction is
+        # real, so it is still avoided here; the translating just moved to its own pass below,
+        # where it is a separate question asked separately. See minutes_translation.
         languages = [lang for lang in (target_languages or []) if lang]
         if not language and len(languages) > 1:
             system_content += (
@@ -285,7 +295,18 @@ When extracting action items:
                     moments_dropped=grounded.moments_dropped,
                     items_uncited=grounded.items_uncited,
                 )
-            return grounded.summary
+
+            # WT-665: the biên bản's other languages, when the branch above could not ask for
+            # them. Deliberately AFTER grounding — this translates the summary that survived the
+            # citation check, so a moment dropped for being unverifiable is not reintroduced by
+            # its own translation.
+            summary = grounded.summary
+            if language and len(languages) > 1:
+                translations = await self._translate_for_minutes(summary, languages, language)
+                if translations:
+                    summary["translations"] = translations
+
+            return summary
         except Exception:
             logger.exception("structured_summary_generation_failed")
             # WT-530. Two keys here are load-bearing, and their absence was the bug.
@@ -311,6 +332,95 @@ When extracting action items:
                 "templateKey": template.key,
                 "summaryLanguage": language,
             }
+
+    async def _translate_for_minutes(
+        self,
+        summary: dict[str, Any],
+        target_languages: list[str],
+        summary_language: str,
+    ) -> dict[str, dict[str, Any]] | None:
+        """The same summary in the meeting's other languages, for the biên bản. WT-665.
+
+        A separate call on purpose — see minutes_translation for why translating cannot share a
+        prompt with summarising, and why the model is shown strings and never structure.
+
+        Returns None whenever there is nothing to do or anything at all goes wrong. The minutes
+        are then single-language, which is exactly what they are today: a degradation back to
+        the current behaviour, never a half-built document.
+        """
+        wanted = [
+            lang
+            for lang in dict.fromkeys(normalize_language_code(lang) for lang in target_languages)
+            # The summary is already written in this one. Asking for it again would put the same
+            # text on both sides of a bilingual page.
+            if lang and lang != summary_language
+        ]
+        if not wanted:
+            return None
+
+        payload = collect_translatable(summary)
+        if not payload:
+            return None
+
+        try:
+            client = self._require_client()
+            response = await client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You translate a meeting summary that has already been written. "
+                            f"The source is {summary_language}. Return a JSON object keyed by "
+                            f"each of these language codes: {', '.join(wanted)}. Each value has "
+                            "EXACTLY the same keys as the input, and every array has EXACTLY the "
+                            "same number of elements in the same order — each element is the "
+                            "translation of the element in that position. Translate the words "
+                            "only: do not merge, split, reorder, add or drop anything, and do "
+                            "not add commentary. Keep people's names as they are written."
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                **completion_options(self.model, self.max_tokens, self.temperature),
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content or "{}"
+            answered = cast(dict[str, Any], json.loads(raw))
+        except Exception:
+            # Warning, not exception: the summary itself succeeded and is about to be published.
+            # This is the biên bản losing its second language, which is worth knowing about and
+            # is not a reason to fail the summary that already exists.
+            logger.warning(
+                "minutes_translation_failed",
+                summary_language=summary_language,
+                languages=wanted,
+                exc_info=True,
+            )
+            return None
+
+        translations: dict[str, dict[str, Any]] = {}
+        for lang in wanted:
+            merged = merge_translation(summary, answered.get(lang))
+            if merged:
+                translations[lang] = merged
+            else:
+                # Named per language rather than as one failure: a model that mangles Japanese
+                # and gets Korean right should cost the minutes only its Japanese half.
+                logger.warning(
+                    "minutes_translation_unusable",
+                    language=lang,
+                    summary_language=summary_language,
+                )
+
+        if translations:
+            logger.info(
+                "minutes_translation_produced",
+                summary_language=summary_language,
+                languages=sorted(translations),
+            )
+
+        return translations or None
 
     def _require_client(self) -> AsyncOpenAI:
         if self._client is None:
