@@ -11,7 +11,7 @@ from typing import Any, cast
 
 from openai import AsyncOpenAI
 
-from ai_assistant_worker.summary_grounding import ground_summary
+from ai_assistant_worker.summary_grounding import ground_summary, strip_all_citations
 from ai_assistant_worker.summary_templates import (
     build_system_prompt,
     resolve_template,
@@ -241,7 +241,21 @@ When extracting action items:
             # place that still knows which moments the model was shown. Downstream a cited
             # `atMs` is just a number, and the meeting page will happily scroll to a number
             # that came from nowhere — see summary_grounding.
-            grounded = ground_summary(parsed, transcript)
+            # The grounding pass is a CHECK, and a check that crashes must not be able to
+            # destroy the thing it was checking. Inside the outer `except` this would surface as
+            # `generationFailed` — the summary discarded, the previous one left standing, and
+            # nothing said to anybody, because a failed rewrite has no path back to the browser.
+            # See strip_all_citations for why the fallback keeps the words and drops the links.
+            try:
+                grounded = ground_summary(parsed, transcript)
+            except Exception:
+                logger.exception("summary_grounding_failed", template=template.key)
+                logger.warning(
+                    "structured_summary_published_uncited",
+                    template=template.key,
+                    finish_reason=finish_reason,
+                )
+                return strip_all_citations(parsed)
             logger.info(
                 "structured_summary_generated",
                 template=template.key,
