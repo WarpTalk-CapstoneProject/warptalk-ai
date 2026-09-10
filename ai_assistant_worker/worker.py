@@ -18,7 +18,7 @@ from typing import Any, cast
 
 from ai_assistant_worker.assistant import MeetingAssistant
 from ai_assistant_worker.speaker_names import SpeakerNamer, parse_speaker_names
-from ai_assistant_worker.summary_templates import format_transcript_line
+from ai_assistant_worker.summary_templates import format_pause_marker, format_transcript_line
 from ai_assistant_worker.transcript_buffer import (
     BUFFER_TTL_S,
     MAX_BUFFERED_SEGMENTS,
@@ -82,6 +82,20 @@ class AIAssistantWorker(BaseWorker):
         self.assistant: MeetingAssistant | None = None
         # In-memory transcript accumulator: {meeting_id: [(speaker, text, timestamp), ...]}
         self._transcripts: dict[str, list[tuple[str, str, int]]] = {}
+        # WT-605. Where recording was paused, as [start_ms, end_ms] windows on the same wall
+        # clock the segments carry — one window per uninterrupted run of dropped segments.
+        #
+        # In memory only, unlike the transcript itself, and that asymmetry is deliberate. The
+        # thing a restart must not lose is the CONTENT rule, and it cannot: paused speech never
+        # reaches the Redis buffer either, so a recovered meeting is still correctly redacted.
+        # Losing a marker costs the model one explanation of a gap it will otherwise see as a
+        # jump in timestamps — which is exactly today's behaviour, not a regression. Persisting
+        # these would mean putting non-speech rows in the summary buffer, and a meeting that was
+        # paused end to end would then look like it had content.
+        self._pause_gaps: dict[str, list[list[int]]] = {}
+        # Meetings whose most recent segment was dropped, so the next dropped one extends that
+        # window instead of opening a second one beside it.
+        self._gap_open: set[str] = set()
 
     async def load_model(self) -> None:
         """Initialize OpenAI client."""
@@ -96,6 +110,32 @@ class AIAssistantWorker(BaseWorker):
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Accumulate transcript segment and check for summary trigger."""
         stt_result = STTResultMessage.from_redis(data)
+
+        # WT-605 — SPEECH SAID WHILE RECORDING IS PAUSED IS NOT PART OF THE RECORD.
+        #
+        # Pausing the transcript stops the meeting being written down; it does not stop the
+        # meeting. Translation, dubbing and captions carry on, so this stream carries on too —
+        # and this worker used to accumulate every segment on it and hand the lot to the model.
+        # Production showed the result plainly: sentences spoken during a pause came back in
+        # ACTION ITEMS and OPEN QUESTIONS with citations at 0:11 and 0:45, pointing at moments
+        # the saved transcript's three entries do not contain. The host had switched recording
+        # off and the summary quoted them anyway.
+        #
+        # TESTED AFTER `is_control_marker`, NEVER BEFORE IT. The `__MEETING_END__` sentinel
+        # travels down this same stream, so a gate in front of it would swallow the end of the
+        # meeting whenever the host forgot to press Resume: no summary would ever be generated,
+        # and `_transcripts` would hold that meeting for the life of the process.
+        # `translation_worker.process` orders its own gates the same way for the same reason.
+        is_end_marker = is_control_marker(stt_result.text)
+        if not is_end_marker and await self.is_transcript_paused(stt_result.meeting_id):
+            self._note_pause_gap(stt_result.meeting_id, stt_result.timestamp_ms)
+            self.logger.debug(
+                "transcript_segment_skipped_paused",
+                meeting_id=stt_result.meeting_id,
+                segment_id=stt_result.segment_id,
+            )
+            return
+        self._gap_open.discard(stt_result.meeting_id)
 
         # Accumulate transcript
         if stt_result.meeting_id not in self._transcripts:
@@ -138,8 +178,21 @@ class AIAssistantWorker(BaseWorker):
         # the ONLY one that knew the sentinel was not speech — translation_worker translated it
         # and tts_worker sang it. Anything reading stt:results has to be able to ask the same
         # question, and the answer has to be in one place.
-        if is_control_marker(stt_result.text):
+        if is_end_marker:
             await self._generate_summary(stt_result.meeting_id)
+
+    def _note_pause_gap(self, meeting_id: str, timestamp_ms: int) -> None:
+        """Remember that this moment was dropped, so the gap can be named in the transcript.
+
+        Consecutive drops collapse into one window: a five-minute pause is one gap in the
+        meeting, not eighty of them, and eighty markers would be more misleading than none.
+        """
+        gaps = self._pause_gaps.setdefault(meeting_id, [])
+        if meeting_id in self._gap_open and gaps:
+            gaps[-1][1] = max(gaps[-1][1], timestamp_ms)
+            return
+        gaps.append([timestamp_ms, timestamp_ms])
+        self._gap_open.add(meeting_id)
 
     async def _generate_summary(self, meeting_id: str) -> None:
         """Generate and publish meeting summary."""
@@ -202,11 +255,7 @@ class AIAssistantWorker(BaseWorker):
             published_names=len(speaker_names),
         )
 
-        transcript_lines = [
-            format_transcript_line(ts - base_ms, namer.name_for(speaker), text.strip())
-            for speaker, text, ts in segments
-        ]
-        transcript_text = "\n".join(transcript_lines)
+        transcript_text = self._render_transcript(meeting_id, segments, namer, base_ms)
 
         self.logger.info(
             "generating_summary",
@@ -336,6 +385,37 @@ class AIAssistantWorker(BaseWorker):
         # published and stored.
         await self._forget_meeting(meeting_id)
 
+    def _render_transcript(
+        self,
+        meeting_id: str,
+        segments: list[TranscriptSegment],
+        namer: SpeakerNamer,
+        base_ms: int,
+    ) -> str:
+        """The lines the model reads: what was said, and where recording was off. WT-605.
+
+        Interleaved by timestamp rather than appended, because a marker's only job is to sit
+        between the two lines it separates — collected at the end it would explain nothing.
+
+        GAPS OUTSIDE THE TRANSCRIPT ARE DROPPED. A pause before anybody spoke, or after the last
+        thing anybody said, has no pair of lines to come between; rendered anyway it would clamp
+        to `t=0` and read as a gap at the start of a meeting that did not have one.
+        """
+        last_ms = max(ts for _, _, ts in segments)
+        lines: list[tuple[int, int, str]] = [
+            # The 1 keeps a spoken line after a marker that opens at the same instant: the
+            # marker describes the gap that ENDS there, so it belongs above.
+            (ts, 1, format_transcript_line(ts - base_ms, namer.name_for(speaker), text.strip()))
+            for speaker, text, ts in segments
+        ]
+        lines.extend(
+            (start, 0, format_pause_marker(start - base_ms, end - base_ms))
+            for start, end in self._pause_gaps.get(meeting_id, [])
+            if base_ms < end and start < last_ms
+        )
+        lines.sort(key=lambda line: (line[0], line[1]))
+        return "\n".join(text for _, _, text in lines)
+
     async def _forget_meeting(self, meeting_id: str) -> None:
         """Release both copies of a finished meeting's transcript.
 
@@ -344,6 +424,8 @@ class AIAssistantWorker(BaseWorker):
         that never ends properly; dropping it here is what keeps the normal case tidy.
         """
         self._transcripts.pop(meeting_id, None)
+        self._pause_gaps.pop(meeting_id, None)
+        self._gap_open.discard(meeting_id)
         try:
             await self.redis.delete(buffer_key(meeting_id))
         except Exception:

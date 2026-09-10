@@ -180,6 +180,24 @@ class SummaryTemplateWorker(BaseWorker):
         # Offsets are already relative to the meeting start in the stored transcript, which
         # is the same origin the live path uses — so a cited atMs means the same thing
         # whichever worker produced the summary.
+        #
+        # WT-605 — THE TWO PATHS NOW AGREE ON CONTENT, NOT YET ON SHAPE.
+        #     Since the live path started gating on the pause flag, both paths summarise the
+        #     same words: the saved transcript never held what was said during a pause, and now
+        #     neither does the accumulator. What only the live path can say is WHERE the gaps
+        #     were — it watched them happen, and emits `format_pause_marker` for each one.
+        #
+        #     Here there is nothing to emit from. A pause arrives as a jump in startTimeMs and
+        #     is indistinguishable from a room that simply went quiet, so a marker inferred from
+        #     the gap would be a guess, and a wrong one every time a meeting paused for thought.
+        #     Left unmarked deliberately rather than approximated.
+        #
+        #     To close it, the transcript service would have to return the pause windows it
+        #     already knows about — it is the component that skips segments while paused (see
+        #     TranscriptRedisConsumerService) — as e.g. `pauseWindows: [{startMs, endMs}]` on
+        #     GET /api/v1/transcripts/by-room/{roomId}. Given that, this method feeds them
+        #     through the same `format_pause_marker` the live path uses and the two paths
+        #     produce identical transcripts. Nothing else here needs to change.
         lines = [
             format_transcript_line(
                 int(segment.get("startTimeMs") or 0),

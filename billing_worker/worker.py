@@ -13,6 +13,24 @@ and its assistant without spending anything; it pays for translation and for dub
 Those two streams still exist and are still read by the transcript pipeline — this
 worker simply has no business with them.
 
+WT-605 — SPEECH SAID WHILE THE TRANSCRIPT IS PAUSED IS STILL BILLED. THIS IS DELIBERATE.
+    Pausing the transcript stops the meeting being written DOWN. It does not stop the
+    meeting: translation_worker still translates every segment and tts_worker still renders
+    and publishes the dub, so listeners on the other language keep hearing the speaker for
+    the whole pause. The service was delivered in full, on purpose — the host asked for no
+    record, not for no interpreting.
+
+    So this worker has no pause gate and must not grow one. Adding one would hand out free
+    translation and free dubbing to anyone who pressed Pause Transcript first, and would do
+    it invisibly, since nothing downstream compares billed minutes against transcript lines.
+    If a later ticket reports "we charged for a paused meeting" as a bug, it is not one: the
+    charge follows translate:results and tts:results, which exist only because real work was
+    done.
+
+    The gates that DO belong to WT-605 sit where the written record is produced —
+    ai_assistant_worker (summary) and suggestion_worker (badges). See
+    shared/transcript_pause.py for the flag and the cross-repo contract behind it.
+
 Does not subclass shared.base_worker.BaseWorker: that class is built around one
 input_stream per instance plus a route-status pub/sub listener for the real-time
 pipeline. This worker needs two streams and has nothing to react to in real time —

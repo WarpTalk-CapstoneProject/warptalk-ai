@@ -185,6 +185,33 @@ class SuggestionWorker(BaseWorker):
         if not self._is_room_active(room_id):
             return
 
+        # WT-605 — A BADGE NEEDS A TRANSCRIPT LINE TO SIT ON.
+        #
+        # `SuggestionResultMessage` carries `segment_id`, and the client pins the badge to the
+        # transcript row with that id. While recording is paused that row is never written, so
+        # every suggestion made here is pinned to nothing: the gateway pushes it, the client
+        # looks for the segment, and the hint lands nowhere. Two model calls — decide, then
+        # generate — spent per segment for a badge that cannot be displayed, and a burnt
+        # cooldown slot that silences the room for the next 45 seconds once it resumes.
+        #
+        # Gated ahead of the context window, not just ahead of the model. The window is what the
+        # decide stage is shown, and feeding it speech the host took off the record would put
+        # that speech back into the prompt one segment later, which is the same leak by a
+        # slower route. A gap in the window matches the gap in the transcript, which is what the
+        # host asked for.
+        #
+        # No control-marker exception is needed here, unlike ai_assistant_worker: nothing in this
+        # worker is triggered by `__MEETING_END__`, and stage 0's word-count floor rejects it
+        # anyway. See `BaseWorker.is_transcript_paused` — and note it is NOT `_paused_rooms`,
+        # checked in `_is_room_active` above, which is the whole-room translation pause.
+        if await self.is_transcript_paused(room_id):
+            self.logger.debug(
+                "suggestion_skipped_transcript_paused",
+                meeting_id=room_id,
+                segment_id=stt_result.segment_id,
+            )
+            return
+
         # Context first, gating second: a segment too short to be worth suggesting on is
         # still worth remembering, because it may be what makes the NEXT one meaningful.
         window = self._windows.setdefault(

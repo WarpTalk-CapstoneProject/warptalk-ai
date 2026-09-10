@@ -23,6 +23,7 @@ from shared.config import RedisSettings, WorkerSettings
 from shared.health_probe import heartbeat_key
 from shared.logger import get_logger
 from shared.redis_client import RedisStreamClient
+from shared.transcript_pause import is_transcript_paused as _read_transcript_paused
 
 # WT-314. The room lifecycle states after which a worker must release everything it holds
 # for that room — for livekit_ingress_worker that is the bot's LiveKit connection, and
@@ -398,6 +399,24 @@ class BaseWorker(ABC):
             "IN_PROGRESS",
             "AUDIO_ROUTING_ACTIVE",
         }
+
+    async def is_transcript_paused(self, room_id: str) -> bool:
+        """Whether the host has paused RECORDING for this room. WT-605.
+
+        NOT `_paused_rooms`, which is a few lines up and means the opposite kind of thing: that
+        is *Pause Translation Room*, which stops the whole translation session and takes the
+        room's dubbed audio with it. This one stops only what gets written down — every stage
+        of the live pipeline keeps running, STT included, because `translation_worker` has no
+        input but `stt:results`.
+
+        Deliberately reads a durable Redis key instead of listening for the backend's
+        `TranscriptPaused` command: see shared/transcript_pause.py, which carries the key name,
+        the value shape and why a pub/sub-only flag would be wrong for exactly the reason
+        `_load_route_snapshot` above exists.
+
+        Fails open — an unreadable flag answers False and the segment is kept.
+        """
+        return await _read_transcript_paused(self.redis, room_id, self.logger)
 
     async def _on_route_status_changed(self, room_id: str, new_status: str) -> None:
         """Override in subclasses to react to route status changes."""

@@ -329,6 +329,31 @@ def format_transcript_line(at_ms: int, speaker: str, text: str) -> str:
     return f"[t={max(at_ms, 0)}] [{speaker}] {text}"
 
 
+#: The pseudo-speaker a pause marker is attributed to. Bracketed like a real speaker label so
+#: `spoken_text_only` and anything else parsing these lines needs no special case.
+PAUSE_MARKER_SPEAKER = "transcript paused"
+
+
+def format_pause_marker(start_ms: int, end_ms: int) -> str:
+    """A gap the host asked for, said out loud so the model does not have to guess. WT-605.
+
+    Without it a paused stretch reaches the model as nothing at all — the line before the pause
+    and the line after it sit next to each other with only a jump in `t=` between them. Every
+    reading of that is wrong in a different way: that the room went quiet, that two unrelated
+    remarks are one thought, or — worst — that something was settled in a silence.
+
+    Marked rather than filled, because what was said in the gap is exactly what must not reach
+    the summary. The line states the boundaries and stops there.
+    """
+    start = max(start_ms, 0)
+    end = max(end_ms, start)
+    return (
+        f"[t={start}] [{PAUSE_MARKER_SPEAKER}] the host paused recording until t={end}. "
+        "Anything said in this gap is deliberately absent — do not summarise it, cite it, "
+        "or infer what it contained."
+    )
+
+
 #: The `[t=<ms>] [<speaker>] ` that `format_transcript_line` puts in front of every line.
 _TRANSCRIPT_LINE_PREFIX = re.compile(r"^\[t=\d+\]\s*\[[^\]]*\]\s*")
 
