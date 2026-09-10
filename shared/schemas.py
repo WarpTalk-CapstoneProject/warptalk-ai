@@ -269,6 +269,25 @@ class STTResultMessage(BaseModel):
     confidence: float = 0.0
     start_ms: int = 0  # Segment start time relative to meeting
     end_ms: int = 0  # Segment end time relative to meeting
+    # WHAT "RELATIVE TO MEETING" IS RELATIVE TO — the unix epoch millisecond that start_ms and
+    # end_ms above are counted from. The two numbers are offsets and an offset without its origin
+    # cannot be turned back into an instant, so the origin has to travel on the wire beside them.
+    #
+    # It is the anchor stt_worker agreed on for this room (see STTWorker._elapsed_ms): the first
+    # chunk any replica saw, claimed with SET NX so every replica, every reconnect and every
+    # restart measures from the same instant. NOT the moment the host pressed Start — a smaller
+    # and, more to the point, a CONSISTENT error.
+    #
+    # WHY 0 IS "NOT STATED" RATHER THAN "THE EPOCH". Every consumer of this stream older than
+    # this field reads it as absent, and the default has to mean the same thing as absent or an
+    # upgraded producer talking to a not-yet-upgraded consumer would look like a claim. Nobody
+    # meets in January 1970, so 0 is free to carry "no origin was stated" — and the persisting
+    # consumer is written against exactly that reading: it stores the anchor only when the value
+    # is > 0 and the column is still NULL — first write wins, and a later value never overwrites
+    # it. Which also means the stored origin stays put under the STT worker's Redis-unavailable
+    # fallback, where each chunk is anchored to itself: whichever value lands first is the one the
+    # meeting keeps, rather than the origin drifting for the rest of the recording.
+    anchor_ms: int = 0
     chunk_index: int = 0
     is_final_chunk: bool = False
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
@@ -301,6 +320,10 @@ class STTResultMessage(BaseModel):
             "confidence": str(self.confidence),
             "start_ms": str(self.start_ms),
             "end_ms": str(self.end_ms),
+            # Always sent, unlike `prosody` below, because 0 is a real answer here ("no origin
+            # was stated") and not a placeholder standing in for a measurement that was skipped.
+            # The persisting consumer keys off the name `anchor_ms` exactly; do not rename it.
+            "anchor_ms": str(self.anchor_ms),
             "chunk_index": str(self.chunk_index),
             "is_final_chunk": "1" if self.is_final_chunk else "0",
             "is_early": "1" if self.is_early else "0",
@@ -324,6 +347,9 @@ class STTResultMessage(BaseModel):
             confidence=float(d.get("confidence", "0.0")),
             start_ms=int(d.get("start_ms", "0")),
             end_ms=int(d.get("end_ms", "0")),
+            # Absent on anything published before this field existed, and 0 is what absent means:
+            # "this message states no origin for its offsets". See the field's declaration.
+            anchor_ms=int(d.get("anchor_ms", "0")),
             chunk_index=int(d.get("chunk_index", "0")),
             is_final_chunk=d.get("is_final_chunk") == "1",
             # Absent on anything published before this field existed, which reads as False —
