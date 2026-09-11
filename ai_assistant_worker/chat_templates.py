@@ -27,7 +27,7 @@ THE ID PROBLEM
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 # The shared persona every template embeds, and the one place the retrieve-before-answering
 # rule is stated. Re-exported by chat_worker as SYSTEM_PROMPT because it is still literally
@@ -260,6 +260,37 @@ MEETING = ChatTemplate(
     binding=_MEETING_BINDING,
 )
 
+#: WT-620. The private WarpBot tab in the desktop app's always-on-top Google Meet widget.
+#:
+#: A MEETING in every way that decides what gets retrieved — the entity id is still the bridge
+#: room, so it keeps MEETING's sources and its entity_id → meeting_id binding for get_transcript.
+#: Derived with `replace` rather than written out again so the two cannot drift: a source added to
+#: MEETING reaches the widget without anybody remembering it has a copy.
+#:
+#: What differs is only what the model cannot see from the page context alone: the call is not in
+#: WarpTalk, the far side has no per-person identity yet, and the answer lands in a window a few
+#: hundred pixels wide. Left unsaid, the model names people it cannot tell apart and writes the
+#: report-length answer MEETING's own page has room for.
+EXTERNAL_MEETING_WIDGET = replace(
+    MEETING,
+    key="external_meeting_widget",
+    label="Google Meet widget",
+    situation=(
+        f"{MEETING.situation} The call itself is happening in Google Meet, not in WarpTalk — "
+        "WarpTalk is listening alongside it and transcribing. There is no per-person "
+        "diarization of the far side yet: everybody on the Meet side arrives in the transcript "
+        'as ONE speaker named "Other side", so never guess which of them said something. '
+        'Questions like "what did they just say?" or "what did they propose?" are about the '
+        "most recent part of the transcript — get_transcript returns the latest segments by "
+        "default, and the last ones are the newest."
+    ),
+    style=(
+        "Your reply renders in a narrow (~460px) always-on-top window beside the call. Lead "
+        "with the answer in the first sentence, keep the rest to a few short sentences or "
+        "bullets, and skip the preamble."
+    ),
+)
+
 DOCUMENT = ChatTemplate(
     key="document",
     label="Document page",
@@ -303,7 +334,15 @@ HISTORY = ChatTemplate(
 
 TEMPLATES: dict[str, ChatTemplate] = {
     template.key: template
-    for template in (GENERAL, MEETING_CHAT, MEETING, DOCUMENT, DOCUMENTS, HISTORY)
+    for template in (
+        GENERAL,
+        MEETING_CHAT,
+        MEETING,
+        EXTERNAL_MEETING_WIDGET,
+        DOCUMENT,
+        DOCUMENTS,
+        HISTORY,
+    )
 }
 
 DEFAULT_TEMPLATE_KEY = GENERAL.key
@@ -315,6 +354,9 @@ _PAGE_TEMPLATES: dict[str, ChatTemplate] = {
     "meeting_chat": MEETING_CHAT,
     "in_meeting": MEETING,
     "room_detail": MEETING,
+    # WT-620: the desktop Meet widget. Until the web app sends this it registers "in_meeting",
+    # which lands on MEETING — the same retrieval, without the surface notes.
+    "external_meeting_widget": EXTERNAL_MEETING_WIDGET,
     "document_detail": DOCUMENT,
     "documents": DOCUMENTS,
     "history": HISTORY,
