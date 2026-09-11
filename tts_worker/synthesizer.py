@@ -346,6 +346,56 @@ class CartesiaSynthesizer:
         # meant for a language nobody has a voice for, not for a spelling of one we do.
         return defaults.get(base_language(language), defaults["en"])
 
+    async def list_voices_by_language(
+        self, max_scanned: int = 2000
+    ) -> dict[str, list[dict[str, Any]]]:
+        """The WHOLE public library, bucketed by primary language subtag.
+
+        WHY THIS EXISTS BESIDE list_voices.
+            Cartesia's /voices has no language filter, so `list_voices` walks the library and
+            keeps the matches for ONE language. That is the right shape for a caller who needs
+            one language and can stop early. It is the wrong shape for filling the catalog for
+            every language the product speaks: the library is ordered with English first, so a
+            language whose voices sit near the end is only reached after scanning nearly all of
+            it — and doing that once per language means walking ~843 voices forty times over to
+            learn what one walk already knew.
+
+        No per-language limit. Every voice Cartesia publishes for a language is one a person may
+        legitimately want to be dubbed in, and the page that lists them has its own search.
+
+        Best-effort like its sibling: any failure returns what was collected so far rather than
+        raising. A caller warming a cache must never be able to take synthesis down with it.
+        """
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        scanned = 0
+        try:
+            client = self._require_client()
+            async for voice in client.voices.list(is_owner=False, limit=100):
+                scanned += 1
+                language = base_language(voice.language or "")
+                if language:
+                    buckets.setdefault(language, []).append(
+                        {
+                            "id": voice.id,
+                            "name": voice.name,
+                            "gender": voice.gender or "",
+                        }
+                    )
+                if scanned >= max_scanned:
+                    # The same runaway guard list_voices carries, and the same warning: this
+                    # firing means the library outgrew the cap and some language is now being
+                    # silently starved, which is exactly how `vi` was unreachable for weeks.
+                    logger.warning(
+                        "cartesia_list_voices_by_language_scan_capped",
+                        scanned=scanned,
+                        languages=len(buckets),
+                    )
+                    break
+        except Exception:
+            logger.exception("cartesia_list_voices_by_language_failed", scanned=scanned)
+
+        return buckets
+
     async def list_voices(
         self, language: str, limit: int = 12, max_scanned: int = 2000
     ) -> list[dict[str, Any]]:

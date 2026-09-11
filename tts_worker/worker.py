@@ -432,6 +432,8 @@ class TTSWorker(BaseWorker):
         asyncio.create_task(self._consume_voice_delete_requests())
         if self.tts_settings.orphan_voice_sweep_enabled:
             asyncio.create_task(self._sweep_orphan_voices())
+        if self.tts_settings.voice_catalog_warm_enabled:
+            asyncio.create_task(self._warm_voice_catalogs())
         self.logger.info("tts_worker_ready", model=self.tts_settings.model)
 
     async def _consume_loop(self) -> None:
@@ -864,6 +866,53 @@ class TTSWorker(BaseWorker):
 
         return variants
 
+    async def _warm_voice_catalogs(self) -> None:
+        """Fill `voice_catalog:{lang}` for EVERY language, so the page never has to wait.
+
+        THE BUG THIS ENDS.
+            These keys were only ever written by _stand_in_voice_id, during a meeting, for the
+            one language being dubbed into. The Voice Profiles page reads the same keys — on
+            purpose, so it cannot drift from the in-meeting picker and so TTS_API_KEY stays
+            confined to these workers — and therefore showed a language NOTHING until somebody
+            had already held a meeting in it, then lost it again six hours later. A person could
+            not pick a Vietnamese voice until they had already been dubbed in Vietnamese.
+
+        ONE WALK, NOT ONE PER LANGUAGE. Cartesia's /voices has no language filter, the library
+        is ordered with English first, and a language near the end is only reached after
+        scanning almost all of it — so asking per language would walk ~843 voices once for each
+        of the forty-odd languages to learn what a single walk already knows.
+
+        WRITTEN WITH THE SAME KEY, SHAPE AND TTL the lazy path uses, so the two cannot disagree
+        about what exists. The lazy path stays exactly as it was: it is the cold-start fallback
+        for the minutes before the first warm, and for a deployment that turns warming off.
+
+        Never raises. A catalog that could not be refreshed leaves the previous one in place
+        until it expires, and an expired one falls back to _default_voice_id — which is what
+        happens today anyway. Warming must not be able to take synthesis down.
+        """
+        while True:
+            try:
+                buckets = await self._require_cartesia().list_voices_by_language()
+                for language, voices in buckets.items():
+                    if not voices:
+                        continue
+                    await self.redis.set_with_ttl(
+                        f"voice_catalog:{language}",
+                        json.dumps(voices),
+                        self.tts_settings.voice_catalog_cache_ttl_seconds,
+                    )
+                self.logger.info(
+                    "voice_catalog_warmed",
+                    languages=len(buckets),
+                    voices=sum(len(v) for v in buckets.values()),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.exception("voice_catalog_warm_failed")
+
+            await asyncio.sleep(self.tts_settings.voice_catalog_refresh_seconds)
+
     async def _get_voice_catalog(self, language: str) -> list[dict[str, Any]]:
         """Redis-cached (TTL) list of public Cartesia voices for a language.
 
@@ -879,6 +928,10 @@ class TTSWorker(BaseWorker):
             except Exception:
                 self.logger.warning("voice_catalog_cache_corrupt", language=language)
 
+        # The COLD-START path: warming has not run yet, or is disabled. Capped at
+        # voice_catalog_size because this one is paying for the walk while a speaker waits for
+        # their first dubbed sentence — a full library scan belongs in the background pass, not
+        # in the latency of somebody's voice.
         voices = await self._require_cartesia().list_voices(
             language, limit=self.tts_settings.voice_catalog_size
         )
