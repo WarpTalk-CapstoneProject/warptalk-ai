@@ -16,6 +16,7 @@ import json
 
 from ai_assistant_worker.chat_templates import (
     DOCUMENT,
+    EXTERNAL_MEETING_WIDGET,
     GENERAL,
     MEETING,
     MEETING_CHAT,
@@ -97,6 +98,57 @@ class TestBuildSystemPrompt:
     def test_meeting_chat_carries_its_style_and_others_do_not(self) -> None:
         assert "STYLE" in build_system_prompt(MEETING_CHAT)
         assert "STYLE" not in build_system_prompt(GENERAL)
+
+
+class TestExternalMeetingWidget:
+    """WT-620: the private WarpBot tab in the desktop app's Google Meet widget.
+
+    Before this page type existed it fell back to GENERAL, which drops MEETING's entity_id →
+    meeting_id binding — so the widget's own room id reached the model as trivia and "what did
+    they just say?" went unanswered from the transcript sitting one tool call away.
+    """
+
+    def test_the_widget_page_type_resolves_to_its_own_template(self) -> None:
+        assert resolve_template(page_type="external_meeting_widget") is EXTERNAL_MEETING_WIDGET
+        assert (
+            resolve_template(origin="assistant", page_type=" External_Meeting_Widget ")
+            is EXTERNAL_MEETING_WIDGET
+        )
+
+    def test_it_is_not_the_general_fallback(self) -> None:
+        assert resolve_template(page_type="external_meeting_widget") is not GENERAL
+
+    def test_it_retrieves_exactly_like_a_meeting(self) -> None:
+        """Composed from MEETING, so a source added there reaches the widget too."""
+        assert EXTERNAL_MEETING_WIDGET.sources == MEETING.sources
+        assert EXTERNAL_MEETING_WIDGET.binding == MEETING.binding
+        assert ("get_transcript", "meeting_id") in EXTERNAL_MEETING_WIDGET.binding.arguments
+
+    def test_the_prompt_binds_the_entity_id_to_the_transcript(self) -> None:
+        prompt = build_system_prompt(EXTERNAL_MEETING_WIDGET)
+        assert "THE ID YOU WERE GIVEN" in prompt
+        assert "meeting_id of get_transcript" in prompt
+
+    def test_the_prompt_carries_the_surface_notes(self) -> None:
+        prompt = build_system_prompt(EXTERNAL_MEETING_WIDGET)
+        assert "Google Meet, not in WarpTalk" in prompt
+        assert '"Other side"' in prompt
+        assert "most recent part of the transcript" in prompt
+        assert "460px" in prompt
+        assert "Lead with the answer" in prompt
+
+    def test_it_keeps_the_meeting_situation_and_only_adds_to_it(self) -> None:
+        assert EXTERNAL_MEETING_WIDGET.situation.startswith(MEETING.situation)
+
+    def test_the_surface_notes_stay_off_the_ordinary_meeting_page(self) -> None:
+        """The in_meeting page is still MEETING — the web app's meeting page is not a Meet call."""
+        assert resolve_template(page_type="in_meeting") is MEETING
+        prompt = build_system_prompt(MEETING)
+        assert "Google Meet" not in prompt
+        assert "460px" not in prompt
+
+    def test_it_is_a_registered_template(self) -> None:
+        assert TEMPLATES["external_meeting_widget"] is EXTERNAL_MEETING_WIDGET
 
 
 class TestPageContext:

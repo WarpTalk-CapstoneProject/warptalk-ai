@@ -28,6 +28,7 @@ from ai_assistant_worker.meeting_draft import (
     missing_fields,
     validate,
 )
+from shared.control_markers import is_external_bridge_speaker
 from shared.logger import get_logger
 from shared.openai_options import completion_options
 from shared.redis_client import RedisStreamClient
@@ -35,7 +36,18 @@ from shared.redis_client import RedisStreamClient
 logger = get_logger(__name__)
 
 SEMANTIC_SEARCH_TIMEOUT_SECONDS = 8.0
+#: How many segments one get_transcript call hands the model — a WINDOW, not a cap on the meeting.
+#: Which window is the caller's choice (see _read_transcript_window); by default it is the last one.
 TRANSCRIPT_SEGMENT_LIMIT = 200
+#: get_transcript's `range` values. The first is the default.
+TRANSCRIPT_RANGES = ("latest", "beginning")
+#: Upper bound on reads for one before_sequence window. One read is the normal case and two covers
+#: gaps in the numbering; the bound only exists so a pathological transcript cannot loop.
+TRANSCRIPT_WINDOW_MAX_READS = 4
+#: What get_transcript calls the EXTERNAL_BRIDGE stand-in (WT-525/WT-620). The seat is not a user,
+#: so TranscriptService's name lookup fails and the stored segment keeps the raw participant uuid
+#: as its speakerName — which the model would otherwise quote as a person's name.
+EXTERNAL_BRIDGE_SPEAKER_LABEL = "Other side"
 DOCUMENT_EXCERPT_CHAR_LIMIT = 4000
 # search_documents returns names and ids for the model to choose from, not content, so a
 # handful is enough to disambiguate "the onboarding spec" — and the cap keeps a workspace
@@ -1009,12 +1021,156 @@ async def _meeting_title(ctx: ToolContext, meeting_id: str) -> str | None:
     return str(room.get("title") or "").strip() or None
 
 
+class _SegmentReadError(Exception):
+    """The segments endpoint answered with something other than a page."""
+
+
+@dataclass
+class _SegmentWindow:
+    """A contiguous run of one transcript's segments, and where it sits in the whole.
+
+    `skip` is the index of the first segment in `items` among ALL the transcript's segments, so
+    `skip > 0` means earlier segments exist and `skip + len(items) < total` means later ones do.
+    """
+
+    items: list[dict[str, Any]]
+    total: int
+    skip: int
+
+
+def _sequence_of(segment: dict[str, Any]) -> int:
+    try:
+        return int(segment.get("sequenceOrder") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _read_segment_page(
+    ctx: ToolContext, transcript_id: str, skip: int, take: int
+) -> tuple[list[dict[str, Any]], int | None]:
+    """One page of GET /api/v1/transcripts/{id}/segments, ascending, plus its totalCount.
+
+    totalCount is None when the responder did not send one; callers fall back to what they read.
+    """
+    response = await ctx.transcript_client.get(
+        f"/api/v1/transcripts/{transcript_id}/segments",
+        params={"skip": skip, "take": take},
+        headers=_auth_headers(ctx),
+    )
+    if response.status_code != 200:
+        logger.warning("get_transcript_segments_failed", status=response.status_code)
+        raise _SegmentReadError
+    body = response.json() or {}
+    items = [s for s in (body.get("items") or []) if isinstance(s, dict)]
+    total = body.get("totalCount")
+    known = total if isinstance(total, int) and not isinstance(total, bool) else None
+    return sorted(items, key=_sequence_of), known
+
+
+async def _read_transcript_window(
+    ctx: ToolContext, transcript_id: str, *, from_beginning: bool, before: int | None
+) -> _SegmentWindow:
+    """The TRANSCRIPT_SEGMENT_LIMIT segments the caller asked for.
+
+    WHY THE DEFAULT IS THE END
+        This used to read `skip=0, take=200` and stop, so in a meeting past 200 segments the
+        latest speech — exactly what somebody in a live call asks about ("what did they just
+        propose?") — was never returned at all, and the model answered from the opening minutes
+        as though they were the whole meeting. The endpoint is ordered ascending with no way to
+        ask for the tail, so the tail is found by learning totalCount first. The first page is
+        the probe: it IS the answer for any meeting that fits in one window, which keeps short
+        meetings at one read.
+
+    before_sequence — PRECISE, NOT AN ESTIMATE
+        Segments come out of TranscriptService numbered 1, 2, 3… per transcript by an atomic
+        counter (UnitOfWork.AdvanceTranscriptForNewSegmentAsync), so at most `before - 1` of them
+        can precede `before`, and index i always carries a number ≥ i + 1. That makes
+        `skip = before - 1 - LIMIT` exact whenever the numbering has no holes — one read.
+
+        It can have holes: the counter is bumped by its own statement before the segment row is
+        saved, so a failed save (and its redelivery) burns a number. A window aimed by arithmetic
+        then overshoots — it contains segments numbered ≥ `before`. Those are filtered out, and
+        because what remains is a prefix of the page, it says exactly how many segments precede
+        `before`; one more read re-aims the window so it is full again. A window that holds
+        nothing below `before` (more holes than a window is long) only narrows the upper bound
+        and reads again, capped at TRANSCRIPT_WINDOW_MAX_READS.
+    """
+    limit = TRANSCRIPT_SEGMENT_LIMIT
+
+    if before is None:
+        items, total = await _read_segment_page(ctx, transcript_id, 0, limit)
+        # A responder without totalCount leaves the first page as all this can know.
+        if from_beginning or total is None or total <= limit:
+            return _SegmentWindow(items, total if total is not None else len(items), 0)
+        skip = total - limit
+        items, latest_total = await _read_segment_page(ctx, transcript_id, skip, limit)
+        # A live meeting keeps growing between the two reads; report the newer count, so a
+        # segment spoken in between shows up as omittedLater rather than vanishing.
+        return _SegmentWindow(items, max(total, latest_total or 0), skip)
+
+    # `end` is always an upper bound on how many segments precede `before`.
+    end = max(before - 1, 0)
+    window = _SegmentWindow([], 0, 0)
+    for _ in range(TRANSCRIPT_WINDOW_MAX_READS):
+        skip = max(0, end - limit)
+        page, total = await _read_segment_page(ctx, transcript_id, skip, limit)
+        known_total = total if total is not None else skip + len(page)
+        below = [s for s in page if _sequence_of(s) < before]
+        window = _SegmentWindow(below, known_total, skip)
+        if below or skip == 0:
+            exact_end = skip + len(below)
+            if max(0, exact_end - limit) == skip:
+                return window
+            end = exact_end
+        else:
+            end = min(skip, known_total)
+    logger.warning("get_transcript_window_not_settled", transcript_id=transcript_id, before=before)
+    return window
+
+
+def _transcript_window_arguments(
+    arguments: dict[str, Any],
+) -> tuple[bool, int | None] | str:
+    """(from_beginning, before_sequence), or the error to hand back to the model."""
+    raw_range = str(arguments.get("range") or TRANSCRIPT_RANGES[0]).strip().lower()
+    if raw_range not in TRANSCRIPT_RANGES:
+        return f'range must be one of {", ".join(TRANSCRIPT_RANGES)} (default "latest").'
+
+    raw_before = arguments.get("before_sequence")
+    if raw_before is None or raw_before == "":
+        return raw_range == "beginning", None
+    if isinstance(raw_before, bool):
+        return "before_sequence must be a positive integer."
+    try:
+        before = int(raw_before)
+    except (TypeError, ValueError):
+        return "before_sequence must be a positive integer."
+    if before < 1:
+        return "before_sequence must be a positive integer."
+    # An explicit position outranks `range`: it already says which part of the meeting.
+    return False, before
+
+
+def _speaker_label(segment: dict[str, Any]) -> Any:
+    """The segment's speaker as the model should repeat it."""
+    for candidate in (segment.get("speakerParticipantId"), segment.get("speakerName")):
+        if isinstance(candidate, str) and is_external_bridge_speaker(candidate):
+            return EXTERNAL_BRIDGE_SPEAKER_LABEL
+    return segment.get("speakerName")
+
+
 async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
-    meeting_id = ((arguments or {}).get("meeting_id") or "").strip()
+    arguments = arguments or {}
+    meeting_id = (arguments.get("meeting_id") or "").strip()
     if not meeting_id:
         return json.dumps(
             {"error": "A meeting_id is required — call list_recent_meetings first to find one."}
         )
+
+    parsed = _transcript_window_arguments(arguments)
+    if isinstance(parsed, str):
+        return json.dumps({"error": parsed})
+    from_beginning, before = parsed
 
     try:
         transcript_response = await ctx.transcript_client.get(
@@ -1036,17 +1192,18 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
                 {"segments": [], "note": "No transcript exists for this meeting yet."}
             )
 
-        segments_response = await ctx.transcript_client.get(
-            f"/api/v1/transcripts/{transcript_id}/segments",
-            params={"skip": 0, "take": TRANSCRIPT_SEGMENT_LIMIT},
-            headers=_auth_headers(ctx),
-        )
-        if segments_response.status_code != 200:
-            logger.warning("get_transcript_segments_failed", status=segments_response.status_code)
+        try:
+            window = await _read_transcript_window(
+                ctx, str(transcript_id), from_beginning=from_beginning, before=before
+            )
+        except _SegmentReadError:
             return json.dumps({"error": "Could not look up the transcript segments right now."})
 
-        items = segments_response.json().get("items", [])
-        ordered = sorted(items, key=lambda s: s.get("sequenceOrder", 0))
+        ordered = window.items
+        omitted_earlier = window.skip > 0
+        omitted_later = window.skip + len(ordered) < window.total
+        returned_from = _sequence_of(ordered[0]) if ordered else None
+        returned_to = _sequence_of(ordered[-1]) if ordered else None
 
         # WT-647. What a meeting's participants actually SAID is the strongest evidence this
         # assistant ever hands the model, and it was the one kind that arrived anonymous: the
@@ -1068,24 +1225,43 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             if ordered
             else None
         )
-        return json.dumps(
-            _with_marker(
+        result: dict[str, Any] = {
+            "transcriptId": transcript_id,
+            "status": transcript.get("status"),
+            "totalSegments": window.total,
+            "returnedFrom": returned_from,
+            "returnedTo": returned_to,
+            "omittedEarlier": omitted_earlier,
+            "omittedLater": omitted_later,
+            "segments": [
                 {
-                    "transcriptId": transcript_id,
-                    "status": transcript.get("status"),
-                    "segments": [
-                        {
-                            "speaker": s.get("speakerName"),
-                            "language": s.get("originalLanguage"),
-                            "text": s.get("originalText"),
-                            "startMs": s.get("startTimeMs"),
-                        }
-                        for s in ordered
-                    ],
-                },
-                marker,
+                    "speaker": _speaker_label(s),
+                    "language": s.get("originalLanguage"),
+                    "text": s.get("originalText"),
+                    "startMs": s.get("startTimeMs"),
+                }
+                for s in ordered
+            ],
+        }
+        # Said in the result as well as in the tool description: the description is read once
+        # per turn, and this is the moment the model decides whether it has the whole meeting.
+        hints = []
+        if omitted_earlier and returned_from is not None:
+            hints.append(
+                "Earlier segments exist and are not included; to read them, call get_transcript "
+                f"again with before_sequence={returned_from}."
             )
-        )
+        # Only for range=beginning. A before_sequence page omits later segments by definition —
+        # the model just came from them — and a latest window only does so by the odd segment
+        # spoken between its two reads.
+        if omitted_later and from_beginning:
+            hints.append(
+                "Later segments exist and are not included; call get_transcript without range "
+                "or before_sequence to read the most recent part."
+            )
+        if hints:
+            result["note"] = " ".join(hints)
+        return json.dumps(_with_marker(result, marker))
     except Exception:
         logger.exception("get_transcript_error")
         return json.dumps({"error": "Could not look up the transcript right now."})
@@ -1965,7 +2141,14 @@ TOOLS: list[ChatTool] = [
             "Get the transcribed segments (speaker, language, text) for a specific "
             "meeting's transcript. Use this when the user asks what was said, wants a "
             "quote, or wants something found within the meeting's transcript. Call "
-            "list_recent_meetings first to find the meeting's id if you don't have one."
+            "list_recent_meetings first to find the meeting's id if you don't have one. "
+            f"Returns at most {TRANSCRIPT_SEGMENT_LIMIT} segments per call, and BY DEFAULT "
+            "THE MOST RECENT ONES — the right window for 'what did they just say'. The result "
+            "reports totalSegments, the returnedFrom/returnedTo sequence numbers, and "
+            "omittedEarlier/omittedLater. When omittedEarlier is true and the question is "
+            "about an earlier part of the meeting, call again with "
+            "before_sequence=<returnedFrom> to page backwards, or range='beginning' to read "
+            "how the meeting opened."
         ),
         parameters={
             "type": "object",
@@ -1975,6 +2158,24 @@ TOOLS: list[ChatTool] = [
                     "description": (
                         "The meeting/room's id, from page context or a prior "
                         "list_recent_meetings call."
+                    ),
+                },
+                "range": {
+                    "type": "string",
+                    "enum": list(TRANSCRIPT_RANGES),
+                    "description": (
+                        "Which end of the transcript to read: 'latest' (default) returns the "
+                        "most recent segments, 'beginning' the first ones. Ignored when "
+                        "before_sequence is given."
+                    ),
+                },
+                "before_sequence": {
+                    "type": "integer",
+                    "description": (
+                        "Page backwards: return the segments immediately before this sequence "
+                        "number (those with a smaller one), ending right before it. A positive "
+                        "integer — pass the returnedFrom of the previous call to read the part "
+                        "before it."
                     ),
                 },
             },
