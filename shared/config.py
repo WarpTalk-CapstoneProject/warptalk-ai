@@ -564,10 +564,22 @@ class TTSSettings(BaseSettings):
     # How many public Cartesia voices to offer per language — both for the per-speaker
     # hashed default (auto-diversity when nobody has cloned/chosen a voice) and for the
     # control-bar voice picker's option list.
+    #: Kept for the LAZY path only, which fills one language on demand during a meeting. The
+    #: warming pass below writes every voice a language has — see `voice_catalog_refresh_seconds`
+    #: — so this is a floor for a cold start, never the size of the catalog a person browses.
     voice_catalog_size: int = 6
     # Cartesia's public library doesn't churn often — cache the per-language catalog
     # in Redis this long before re-fetching, to avoid a /voices call on every miss.
     voice_catalog_cache_ttl_seconds: int = 21600  # 6h
+    #: How often the whole library is re-walked and every language's key rewritten.
+    #:
+    #: MUST stay comfortably below the TTL above. The Voice Profiles page reads these keys, so
+    #: a refresh slower than the expiry opens a window where the page says a language has no
+    #: voices — which is the bug this warming exists to end, reappearing on a timer.
+    voice_catalog_refresh_seconds: int = 3600  # 1h, against a 6h TTL
+    #: Warming costs one walk of the public library per refresh. Off switches the page back to
+    #: the lazy behaviour: a language only appears after a meeting has dubbed into it.
+    voice_catalog_warm_enabled: bool = True
 
     # How many Cartesia websocket connections to hold open, ready for the next spoken sentence.
     #
