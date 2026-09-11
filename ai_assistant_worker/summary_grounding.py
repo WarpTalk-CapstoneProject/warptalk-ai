@@ -187,3 +187,35 @@ def ground_summary(summary: dict[str, Any], transcript: str) -> GroundedSummary:
         moments_dropped=tally.dropped,
         items_uncited=tally.uncited,
     )
+
+
+def strip_all_citations(summary: dict[str, Any]) -> dict[str, Any]:
+    """Every citation removed, for when the CHECK ITSELF broke.
+
+    There are two wrong answers when `ground_summary` raises, and this is neither of them.
+    Letting the exception stand reports a checker's crash as a generation failure, which throws
+    away a summary sitting right here — and because a failed rewrite has no path back to the
+    browser, throws it away in silence. Returning the summary with its citations untouched
+    publishes exactly the unverified numbers this module exists to catch. So the words survive
+    and every claim of provenance goes with the check that could not confirm it.
+
+    Deliberately dumber than the function it stands in for: no offsets, no arithmetic, no
+    promotion of a surviving moment, no tally. It writes constants. That is the point — a
+    fallback that shared the logic of the thing that just failed would fail the same way.
+    """
+    stripped: dict[str, Any] = {}
+    for key, value in summary.items():
+        if key == "citations":
+            # A citation entry is a link and nothing else. One that cannot be checked has no
+            # remainder worth keeping — see _ground_citations.
+            stripped[key] = []
+        elif key in UNCITED_KEYS or not isinstance(value, list):
+            stripped[key] = value
+        else:
+            stripped[key] = [
+                {**item, "atMs": None, "alsoAtMs": []}
+                if isinstance(item, dict) and ("atMs" in item or "alsoAtMs" in item)
+                else item
+                for item in value
+            ]
+    return stripped

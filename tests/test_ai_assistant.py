@@ -210,3 +210,46 @@ async def test_a_failed_translation_costs_the_minutes_nothing_else() -> None:
     assert result["summary"] == "Chốt công nợ quý ba."
     assert result["insufficientData"] is False
     assert "translations" not in result
+
+
+async def test_a_crash_in_the_grounding_pass_costs_the_citations_and_not_the_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The check is not the generation, and a broken check must not destroy what it checked.
+
+    `ground_summary` runs inside the same `try` that catches a malformed model response, so
+    anything it raises used to come out as `generationFailed` — which the worker publishes as a
+    failed rewrite, which the backend answers by leaving the OLD summary in place, which the
+    browser never hears about. A bug in the checker would have read, from every side, as a model
+    that could not write a summary.
+    """
+
+    def explode(_summary: object, _transcript: str) -> object:
+        raise RuntimeError("the checker itself is broken")
+
+    monkeypatch.setattr("ai_assistant_worker.assistant.ground_summary", explode)
+
+    assistant = _make_assistant_with_fake_client(
+        json.dumps(
+            {
+                "summary": "Nhóm chốt công nợ quý ba.",
+                "narrative": [{"text": "Nhóm chốt công nợ.", "atMs": 0, "alsoAtMs": [12_000]}],
+                "actionItems": [{"task": "Gửi hợp đồng.", "owner": "Ky", "atMs": 12_000}],
+            }
+        )
+    )
+
+    result = await assistant.generate_structured_summary(
+        "[t=0] [Nhi] chốt công nợ quý ba", template_key="traceable"
+    )
+
+    # The summary survives, whole and readable...
+    assert "generationFailed" not in result
+    assert result["insufficientData"] is False
+    assert result["summary"] == "Nhóm chốt công nợ quý ba."
+    assert result["narrative"][0]["text"] == "Nhóm chốt công nợ."
+    assert result["actionItems"][0]["owner"] == "Ky"
+    # ...and claims nothing it could not confirm.
+    assert result["narrative"][0]["atMs"] is None
+    assert result["narrative"][0]["alsoAtMs"] == []
+    assert result["actionItems"][0]["atMs"] is None

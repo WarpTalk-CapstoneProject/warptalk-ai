@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ai_assistant_worker.summary_grounding import ground_summary
+from ai_assistant_worker.summary_grounding import ground_summary, strip_all_citations
 from ai_assistant_worker.summary_templates import format_transcript_line
 
 # The moments this meeting actually has. Built through `format_transcript_line` so the tests
@@ -266,3 +266,57 @@ def test_every_moment_the_model_wrote_is_counted_once() -> None:
     assert grounded.moments_checked == 5
     assert grounded.moments_dropped == 2
     assert grounded.items_uncited == 1
+
+
+# --- When the CHECK is what breaks -------------------------------------------------------
+#
+# `ground_summary` used to run inside the same `try` that catches a malformed model response,
+# so an exception raised by the checker was reported as `generationFailed`: the summary thrown
+# away, the previous one left standing, and — because a failed rewrite has no path back to the
+# browser — nothing said to the person who asked. These pin the third answer.
+
+
+def test_stripping_keeps_every_word_and_removes_every_link() -> None:
+    payload = {
+        "narrative": [
+            {"text": "Một.", "atMs": 0, "alsoAtMs": [12_000]},
+            {"text": "Hai.", "atMs": 30_500, "alsoAtMs": []},
+        ],
+        "actionItems": [{"task": "Gửi hợp đồng.", "owner": "Ky", "atMs": 12_000}],
+        "citations": [{"key": "summary", "atMs": 0}],
+        "summary": "Nội dung.",
+        "templateKey": "traceable",
+        "insufficientData": False,
+    }
+
+    stripped = strip_all_citations(payload)
+
+    assert [item["text"] for item in stripped["narrative"]] == ["Một.", "Hai."]
+    assert all(item["atMs"] is None for item in stripped["narrative"])
+    assert all(item["alsoAtMs"] == [] for item in stripped["narrative"])
+    # The owner and the words of an action item are not provenance and must survive.
+    assert stripped["actionItems"][0] == {
+        "task": "Gửi hợp đồng.",
+        "owner": "Ky",
+        "atMs": None,
+        "alsoAtMs": [],
+    }
+    # A citation entry is a link and nothing else, so it has no remainder worth keeping.
+    assert stripped["citations"] == []
+    assert stripped["summary"] == "Nội dung."
+    assert stripped["templateKey"] == "traceable"
+
+
+def test_stripping_does_not_mutate_what_it_was_given() -> None:
+    payload = _narrative({"text": "Một.", "atMs": 0, "alsoAtMs": [12_000]})
+    before = dict(_first(payload))
+
+    strip_all_citations(payload)
+
+    assert _first(payload) == before
+
+
+def test_stripping_leaves_an_item_that_never_claimed_a_moment_alone() -> None:
+    payload = {"decisions": [{"text": "Không mốc."}], "templateKey": "general"}
+
+    assert strip_all_citations(payload)["decisions"] == [{"text": "Không mốc."}]
