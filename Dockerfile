@@ -26,8 +26,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/app/.venv/bin:$PATH \
     UV_HTTP_TIMEOUT=120
 
+# libpcre2-8-0 is named with its patched floor for CVE-2026-86145 (HIGH, fixed in
+# 10.42-1+deb12u1). The pinned base digest ships 10.42-1, and release v200 failed the Trivy gate
+# on all ten ai-* images for it.
+#
+# A bare `apt-get upgrade` would not have fixed that: the base is pinned and build-release.sh
+# builds with a registry BuildKit cache, so an unchanged RUN line is a cache hit and the upgrade
+# never runs. Changing this line changes the layer's cache key, and the dpkg check fails the build
+# loudly if the mirror still serves the vulnerable version instead of shipping it silently.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1 \
+    && apt-get install -y --no-install-recommends --only-upgrade libpcre2-8-0 \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libpcre2-8-0)" ge "10.42-1+deb12u1" \
     && rm -rf /var/lib/apt/lists/*
 
 # setuptools ships its own vendored copies of jaraco.context and wheel, and the versions
