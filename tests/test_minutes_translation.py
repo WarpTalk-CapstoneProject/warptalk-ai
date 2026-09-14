@@ -105,16 +105,19 @@ def test_a_section_the_model_ignored_is_dropped_not_faked() -> None:
     assert len(merged["decisions"]) == 2
 
 
-def test_an_empty_string_leaves_the_source_line_standing() -> None:
-    # A blank in one position is not a reason to lose the item: the lists must stay the same
-    # length or the pairing breaks, and the source words are more use than an empty bullet.
+def test_an_empty_translation_is_left_blank_not_filled_with_the_source() -> None:
+    # WT-685. The source words used to stand in, which printed a Vietnamese sentence under a
+    # [ja] tag. The slot stays (the list keeps its length and its moments) but says nothing, so
+    # the minutes treat the line as untranslated rather than as a translation.
     merged = merge_translation(
         _summary(),
         {"decisions": ["Budget approved", "   "], "actionItems": ["Send the report"]},
     )
 
     assert merged is not None
-    assert merged["decisions"][1]["text"] == "Hoãn tuyển dụng"
+    assert len(merged["decisions"]) == 2
+    assert merged["decisions"][1]["text"] == ""
+    assert merged["decisions"][1]["text"] != _summary()["decisions"][1]["text"]
 
 
 def test_nothing_usable_produces_nothing() -> None:

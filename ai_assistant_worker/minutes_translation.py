@@ -147,9 +147,12 @@ def _readable(item: Any) -> str:
 def _with_text(source_item: Any, replacement: Any) -> Any:
     """`source_item` with its readable string swapped, and everything else untouched."""
     if not isinstance(replacement, str) or not replacement.strip():
-        # Nothing usable came back for this one. The source string is more useful to a reader
-        # than a blank line, and leaves the two halves the same length.
-        return source_item
+        # Nothing usable came back for this one, so it is left BLANK rather than filled with the
+        # source words. Copying the source in printed a Vietnamese sentence under a [ja] tag — a
+        # line claiming to be Japanese that was never translated (WT-685). The list keeps its
+        # length, and a blank line is dropped when the minutes are drawn up, so the reader sees
+        # the section as untranslated instead of mislabelled.
+        return _blank(source_item)
 
     if isinstance(source_item, str):
         return replacement
@@ -162,5 +165,21 @@ def _with_text(source_item: Any, replacement: Any) -> Any:
                 return translated_item
         # An item with no readable field: keep it as it is rather than inventing one.
         return translated_item
+
+    return source_item
+
+
+def _blank(source_item: Any) -> Any:
+    """`source_item` with its readable string emptied — an untranslated slot, not a copy."""
+    if isinstance(source_item, str):
+        return ""
+
+    if isinstance(source_item, dict):
+        blank_item = dict(source_item)
+        for field in TRANSLATABLE_FIELDS:
+            if isinstance(source_item.get(field), str):
+                blank_item[field] = ""
+                return blank_item
+        return blank_item
 
     return source_item
