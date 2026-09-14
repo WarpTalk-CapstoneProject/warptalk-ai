@@ -34,7 +34,7 @@ import httpx
 from ai_assistant_worker.assistant import MeetingAssistant
 from ai_assistant_worker.summary_templates import format_transcript_line, resolve_template
 from shared.base_worker import BaseWorker
-from shared.config import AssistantSettings, resolve_openai_api_key
+from shared.config import AssistantSettings, ChatAssistantSettings, resolve_openai_api_key
 from shared.schemas import SummaryRequestMessage, SummaryResultMessage
 
 # One page is enough for any meeting this product records, and a bounded read means a
@@ -57,8 +57,21 @@ class SummaryTemplateWorker(BaseWorker):
     ) -> None:
         super().__init__(**kwargs)
         self.assistant_settings = assistant_settings or AssistantSettings()
-        self.transcript_base_url = transcript_base_url or getattr(
-            self.settings, "transcript_service_url", ""
+        # WT-684: every template switch answered "Could not read the transcript." in prod.
+        #
+        # This fell back to `self.settings.transcript_service_url`, and WorkerSettings has no such
+        # field — so __main__, which passes no URL, handed httpx an EMPTY base_url and every fetch
+        # raised UnsupportedProtocol before reaching the network. General kept working only
+        # because ArtifactsFinalizer sends the transcript with the request and never takes this
+        # path. The tests all pass a URL explicitly, which is how none of them saw it.
+        #
+        # The transcript service address is already configured in production for the chat
+        # worker in this same container (ASSISTANT_CHAT_TRANSCRIPT_SERVICE_URL), so it is read
+        # from there rather than inventing a second variable that would have to be deployed.
+        self.transcript_base_url = (
+            transcript_base_url
+            or getattr(self.settings, "transcript_service_url", "")
+            or ChatAssistantSettings().transcript_service_url
         )
         self.assistant: MeetingAssistant | None = None
         self._transcript_client: httpx.AsyncClient | None = None
