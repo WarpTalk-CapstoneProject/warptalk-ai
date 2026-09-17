@@ -6,7 +6,8 @@ every backfilled line and every post-correction retranslation was a model call n
 
 Pinned here: the stream is subscribed, the price is the live price (same charge type, same unit,
 same quantity rule), the workspace comes from the message rather than the room projection that
-has long expired, and duplicates of the same work are charged once.
+has long expired, duplicates of the same work are charged once, and the redo of a line whose
+transcript was corrected is not charged at all.
 """
 
 from __future__ import annotations
@@ -185,23 +186,52 @@ class TestIdempotency:
         live_key = f"TRANSLATION:{SEGMENT}-en-c0:en"
         assert self._key() != live_key
 
-    def test_each_correction_is_a_separate_charge(self) -> None:
-        first = self._key(is_retranslated=True, previous_translation_content_id=str(uuid.uuid4()))
-        second = self._key(is_retranslated=True, previous_translation_content_id=str(uuid.uuid4()))
-        assert first != second
-        assert first != self._key()
-
     def test_origin_is_recorded_for_reporting(self) -> None:
         worker = _worker()
-        asyncio.run(
-            worker._handle_backfill_translation(
-                _backfill(is_retranslated=True, previous_translation_content_id=str(uuid.uuid4()))
-            )
-        )
+        asyncio.run(worker._handle_backfill_translation(_backfill()))
         details = _charge(worker)["details"]
-        assert details["origin"] == "retranslation"
+        assert details["origin"] == "backfill"
         assert details["transcript_id"] == TRANSCRIPT
         assert details["is_external"] is False
+
+
+class TestACorrectionIsNotBilled:
+    """The redo exists because the platform heard the line wrong, over seconds already paid for.
+
+    Charging it billed the same audio twice for the platform's own error, against WT-344
+    (transcription is free) and the refund transcript_corrections.reversal_credit_transaction_id
+    was designed for.
+    """
+
+    @staticmethod
+    def _retranslation(**overrides) -> dict[str, str]:
+        return _backfill(
+            is_retranslated=True, previous_translation_content_id=str(uuid.uuid4()), **overrides
+        )
+
+    def test_a_retranslation_is_not_charged(self) -> None:
+        worker = _worker()
+        asyncio.run(worker._handle_backfill_translation(self._retranslation()))
+        worker.db.record_usage_and_charge.assert_not_awaited()
+
+    def test_it_does_not_even_look_up_the_subscription(self) -> None:
+        worker = _worker()
+        asyncio.run(worker._handle_backfill_translation(self._retranslation()))
+        worker.db.resolve_subscription.assert_not_awaited()
+
+    def test_the_absorbed_cost_is_still_logged(self) -> None:
+        worker = _worker()
+        asyncio.run(worker._handle_backfill_translation(self._retranslation()))
+        worker.logger.info.assert_called_once()
+        event, fields = worker.logger.info.call_args.args[0], worker.logger.info.call_args.kwargs
+        assert event == "retranslation_not_charged"
+        assert fields["seconds"] == 3.5
+        assert fields["workspace_id"] == WORKSPACE
+
+    def test_a_gap_fill_of_the_same_line_is_still_charged(self) -> None:
+        worker = _worker()
+        asyncio.run(worker._handle_backfill_translation(_backfill()))
+        worker.db.record_usage_and_charge.assert_awaited_once()
 
 
 def test_the_live_translation_message_carries_no_backfill_fields() -> None:
