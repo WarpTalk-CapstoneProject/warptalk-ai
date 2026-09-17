@@ -34,6 +34,12 @@ dependencies = [
     # LiveKit
     "livekit>=0.11",
     "livekit-api>=0.11",
+    # Japanese morphological analysis for the transcript disfluency prepass (WT-716,
+    # shared/disfluency). Japanese has no spaces, so "えーと" vs "ええ" and "その、その件" can only
+    # be told apart on morpheme boundaries. unidic-lite ships the dictionary inside the wheel
+    # (~50 MB) so no post-install download step is needed in the worker images.
+    "fugashi>=1.3",
+    "unidic-lite>=1.0.8",
 ]
 
 [project.optional-dependencies]
@@ -119,5 +125,5 @@ files = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["soundfile", "torch", "torchaudio", "TTS", "TTS.*"]
+module = ["soundfile", "torch", "torchaudio", "TTS", "TTS.*", "fugashi", "unidic_lite"]
 ignore_missing_imports = true
