@@ -30,6 +30,7 @@ from ai_assistant_worker.transcript_buffer import (
 from shared.base_worker import BaseWorker
 from shared.config import AssistantSettings, resolve_openai_api_key
 from shared.control_markers import is_control_marker
+from shared.languages import known_language_code
 from shared.schemas import STTResultMessage
 
 #: One accumulated STT segment: (speaker, text, timestamp_ms).
@@ -308,6 +309,17 @@ class AIAssistantWorker(BaseWorker):
                 )
         except Exception:
             self.logger.warning("failed_to_read_summary_language", meeting_id=meeting_id)
+
+        # WT-703: same guard as SummaryTemplateWorker. The key is written by another service,
+        # and whatever it holds would otherwise reach the prompt verbatim.
+        requested_summary_language = summary_language
+        summary_language = known_language_code(requested_summary_language)
+        if requested_summary_language.strip() and not summary_language:
+            self.logger.warning(
+                "summary_language_unrecognised",
+                meeting_id=meeting_id,
+                requested=repr(requested_summary_language[:16]),
+            )
 
         # Generate summary
         assistant = self._require_assistant()

@@ -237,10 +237,12 @@ class TestTheLanguageTheSummaryIsWrittenIn:
         # spelling happened to reach it.
         assert build_system_prompt(GENERAL, "vi-VN") == build_system_prompt(GENERAL, "vi")
 
-    def test_an_unknown_code_still_produces_an_instruction(self) -> None:
-        # Falling back to the code is a worse prompt; raising would be a missing summary.
+    def test_an_unknown_code_is_read_as_no_choice_not_echoed(self) -> None:
+        # WT-703: raising would be a missing summary, and echoing the code put whatever string
+        # arrived into the system prompt. Neither: the model follows the transcript.
         prompt = build_system_prompt(GENERAL, "xx")
-        assert "XX" in prompt
+        assert "Write in the language the meeting was held in." in prompt
+        assert "XX" not in prompt
 
     def test_the_rule_covers_every_string_not_only_the_prose(self) -> None:
         # The failure this guards against is a half-translated document: prose in Japanese,

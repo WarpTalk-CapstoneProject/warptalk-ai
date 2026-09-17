@@ -35,6 +35,7 @@ from ai_assistant_worker.assistant import MeetingAssistant
 from ai_assistant_worker.summary_templates import format_transcript_line, resolve_template
 from shared.base_worker import BaseWorker
 from shared.config import AssistantSettings, ChatAssistantSettings, resolve_openai_api_key
+from shared.languages import known_language_code
 from shared.schemas import SummaryRequestMessage, SummaryResultMessage
 
 # One page is enough for any meeting this product records, and a bounded read means a
@@ -113,11 +114,24 @@ class SummaryTemplateWorker(BaseWorker):
         except json.JSONDecodeError:
             target_languages = []
 
+        # WT-703: the backend only publishes languages the room allows, and this does not rely
+        # on it. The language is spliced into the summary prompt, into the minutes translation
+        # prompt and into the stored content, so a value the map cannot name is dropped here —
+        # the model follows the transcript — rather than trusted anywhere downstream.
+        summary_language = known_language_code(request.summary_language)
+        if request.summary_language.strip() and not summary_language:
+            self.logger.warning(
+                "summary_language_unrecognised",
+                room_id=request.room_id,
+                request_id=request.request_id,
+                requested=repr(request.summary_language[:16]),
+            )
+
         content = await self.assistant.generate_structured_summary(
             transcript,
             target_languages=target_languages,
             template_key=template.key,
-            summary_language=request.summary_language,
+            summary_language=summary_language,
         )
 
         # WT-530: a generation that failed is not a rewrite that succeeded.
@@ -154,7 +168,7 @@ class SummaryTemplateWorker(BaseWorker):
             "summary_regenerated",
             room_id=request.room_id,
             template=template.key,
-            language=request.summary_language or "as-spoken",
+            language=summary_language or "as-spoken",
         )
 
     async def _load_transcript(self, request: SummaryRequestMessage) -> str:
