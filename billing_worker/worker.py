@@ -41,6 +41,15 @@ BACKFILL TRANSLATION IS BILLED LIKE LIVE TRANSLATION.
     a line costs the same whether it was translated during the meeting or after it. Only where the
     workspace and the user come from differs; see _handle_backfill_translation.
 
+    A RETRANSLATION AFTER A TRANSCRIPT CORRECTION IS NOT BILLED. THIS IS DELIBERATE.
+    The same stream carries the redo of a line whose transcript somebody corrected. That work
+    exists only because the platform heard the line wrong, and the seconds it covers were already
+    paid for once, when the line was first translated live or by backfill. Charging again bills
+    the same audio twice for the platform's own mistake: the opposite of transcription being free
+    (WT-344), and of transcript_corrections.reversal_credit_transaction_id, which was designed to
+    REFUND a translation a human had to correct. Spend on it stays bounded by TranscriptService's
+    per-transcript backfill budget, which corrections draw from.
+
 Does not subclass shared.base_worker.BaseWorker: that class is built around one
 input_stream per instance plus a route-status pub/sub listener for the real-time
 pipeline. This worker needs two streams and has nothing to react to in real time —
@@ -568,16 +577,31 @@ class BillingSettlementWorker:
           which has expired for any transcript read back more than a day later.
         * USER: the requester, not the speaker. Nobody spoke this; somebody asked for it. The user
           is nullable on usage_records, so a message without one is still charged.
-        * IDEMPOTENCY: keyed on the bare segment id and language, plus the translation being
-          replaced for a post-correction redo. A duplicated backfill (two readers racing, a run
-          marker that expired mid-run) is charged once; each correction is its own charge,
-          because each one is a fresh model call.
+        * IDEMPOTENCY: keyed on the bare segment id and language. A duplicated backfill (two
+          readers racing, a run marker that expired mid-run) is charged once.
+
+        A retranslation after a correction (previous_translation_content_id set) is not charged
+        at all; see the module docstring.
 
         A message without a workspace is from a producer older than this contract. It is skipped,
         not retried: no number of redeliveries will add the field.
         """
         msg = TranslationResultMessage.from_redis(data)
         if not msg.translated_text.strip():
+            return
+
+        if msg.previous_translation_content_id:
+            # Logged, not silent: the model call still happened, and this is the only record of
+            # what the platform absorbed for its own transcription errors.
+            self.logger.info(
+                "retranslation_not_charged",
+                translation_room_id=msg.meeting_id,
+                workspace_id=msg.workspace_id,
+                transcript_id=msg.transcript_id,
+                segment_id=msg.segment_id,
+                target_lang=msg.target_lang,
+                seconds=_translation_quantity_seconds(msg),
+            )
             return
 
         segment_id = _extract_underlying_segment_id(msg.segment_id)
@@ -622,15 +646,7 @@ class BillingSettlementWorker:
                 requested_by = None
 
         target_lang = msg.target_lang
-        if msg.previous_translation_content_id:
-            origin = "retranslation"
-            idempotency_key = (
-                f"{TRANSLATION_CHARGE_TYPE}:retranslation:{segment_id}:{target_lang}:"
-                f"{msg.previous_translation_content_id}"
-            )
-        else:
-            origin = "backfill"
-            idempotency_key = f"{TRANSLATION_CHARGE_TYPE}:backfill:{segment_id}:{target_lang}"
+        idempotency_key = f"{TRANSLATION_CHARGE_TYPE}:backfill:{segment_id}:{target_lang}"
 
         await self.db.record_usage_and_charge(
             subscription_id=subscription_id,
@@ -651,7 +667,7 @@ class BillingSettlementWorker:
                 # A reporting dimension that fails towards internal (see _is_external_speaker);
                 # the requester already passed the transcript read check of the workspace.
                 "is_external": False,
-                "origin": origin,
+                "origin": "backfill",
                 "transcript_id": msg.transcript_id,
             },
         )
