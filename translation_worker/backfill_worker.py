@@ -83,6 +83,8 @@ class TranslationBackfillWorker(BaseWorker):
         target_lang = _bare(fields.get("target_lang", ""))
         status_key = fields.get("status_key", "")
         transcript_id = fields.get("transcript_id", "")
+        workspace_id = fields.get("workspace_id", "")
+        requested_by_user_id = fields.get("requested_by_user_id", "")
 
         try:
             segments = json.loads(fields.get("segments_json", "[]"))
@@ -109,7 +111,7 @@ class TranslationBackfillWorker(BaseWorker):
         # where a Vietnamese and a Japanese speaker alternate produces exactly that. translate_batch
         # takes a single source language, so the batch is split by the language it was spoken in
         # rather than being handed to the model as if it were all one.
-        by_source: dict[str, list[dict[str, str]]] = {}
+        by_source: dict[str, list[dict[str, Any]]] = {}
         for segment in segments:
             source_lang = _bare(str(segment.get("source_lang", "")))
             text = str(segment.get("text", "")).strip()
@@ -130,6 +132,8 @@ class TranslationBackfillWorker(BaseWorker):
                     "previous_translation_content_id": str(
                         segment.get("previous_translation_content_id") or ""
                     ),
+                    "start_ms": _as_ms(segment.get("start_ms")),
+                    "end_ms": _as_ms(segment.get("end_ms")),
                 }
             )
 
@@ -174,6 +178,14 @@ class TranslationBackfillWorker(BaseWorker):
                         previous_translation_content_id=(
                             item["previous_translation_content_id"] or None
                         ),
+                        # What billing_worker needs to charge this like a live translation: the
+                        # line's audio span (TRANSLATION is priced per second of source speech),
+                        # the workspace that owns the transcript, and who asked for the work.
+                        start_ms=item["start_ms"],
+                        end_ms=item["end_ms"],
+                        workspace_id=workspace_id or None,
+                        requested_by_user_id=requested_by_user_id or None,
+                        transcript_id=transcript_id or None,
                         # No latency_ms on purpose. One API call produced N sentences, so no
                         # sentence has a duration of its own; the schema treats an absent field
                         # as "not measured" and the column stores NULL.
@@ -221,6 +233,14 @@ class TranslationBackfillWorker(BaseWorker):
             await self.redis.set_with_ttl(status_key, "failed", STATUS_TTL_SECONDS)
         except Exception:  # pragma: no cover - the marker is a hint, not state anything reads back
             self.logger.warning("backfill_status_not_written", status_key=status_key)
+
+
+def _as_ms(value: Any) -> int:
+    """A millisecond offset from the request JSON; anything unreadable is 0 ("not stated")."""
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _bare(language: str) -> str:
