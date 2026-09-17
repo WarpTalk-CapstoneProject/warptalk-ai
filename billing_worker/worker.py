@@ -1,6 +1,7 @@
 """Billing settlement worker.
 
-Consumes the BILLABLE AI pipeline result streams (translate:results, tts:results)
+Consumes the BILLABLE AI pipeline result streams (translate:results, tts:results, and
+translate:backfill_results for translations produced after a meeting ended)
 *after the fact* — via its own consumer groups, alongside whatever else already reads
 those streams (e.g. TranscriptService's Redis consumer persists segment/translation
 content; this worker only settles credits, it does not duplicate that job) — and turns
@@ -30,6 +31,15 @@ WT-605 — SPEECH SAID WHILE THE TRANSCRIPT IS PAUSED IS STILL BILLED. THIS IS D
     The gates that DO belong to WT-605 sit where the written record is produced —
     ai_assistant_worker (summary) and suggestion_worker (badges). See
     shared/transcript_pause.py for the flag and the cross-repo contract behind it.
+
+BACKFILL TRANSLATION IS BILLED LIKE LIVE TRANSLATION.
+    translation_worker/backfill_worker.py translates a saved transcript's missing lines (and redoes
+    a corrected line's translations) with the same model, and publishes to
+    translate:backfill_results so that tts_worker does not dub a meeting that ended hours ago. That
+    separate stream is also why none of it was ever charged: this worker only read
+    translate:results. Same charge type, same rate card, same unit (seconds of source speech), so
+    a line costs the same whether it was translated during the meeting or after it. Only where the
+    workspace and the user come from differs; see _handle_backfill_translation.
 
 Does not subclass shared.base_worker.BaseWorker: that class is built around one
 input_stream per instance plus a route-status pub/sub listener for the real-time
@@ -70,6 +80,8 @@ from shared.schemas import (
 logger = get_logger("worker.billing")
 
 TRANSLATION_CHARGE_TYPE = "TRANSLATION"
+BACKFILL_RESULT_STREAM = "translate:backfill_results"
+BILLED_STREAMS = ("translate:results", BACKFILL_RESULT_STREAM, "tts:results")
 SettlementHandler = Callable[[Mapping[Any, Any]], Awaitable[None]]
 
 
@@ -97,6 +109,17 @@ def _extract_underlying_segment_id(raw_segment_id: str) -> str | None:
         return None
 
 
+def _translation_quantity_seconds(msg: TranslationResultMessage) -> float:
+    """Seconds of source speech a translation is priced on: one rule for live and backfill.
+
+    A message with no usable span (an older backfill producer, a segment stored without timing)
+    bills the same flat 1.0s the live path always has.
+    """
+    if msg.end_ms > msg.start_ms:
+        return max((msg.end_ms - msg.start_ms) / 1000.0, 0.1)
+    return 1.0
+
+
 class BillingSettlementWorker:
     max_delivery_attempts = 5
     heartbeat_interval_seconds = 10
@@ -118,6 +141,8 @@ class BillingSettlementWorker:
         self._last_progress_unix_ms = int(time.time() * 1000)
         # translation_room_id -> (subscription_id, workspace_id, cached_at_monotonic)
         self._subscription_cache: dict[str, tuple[uuid.UUID, uuid.UUID, float]] = {}
+        # workspace_id -> (subscription_id, workspace_id, cached_at_monotonic), for backfills
+        self._workspace_subscription_cache: dict[str, tuple[uuid.UUID, uuid.UUID, float]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -145,6 +170,11 @@ class BillingSettlementWorker:
                 self._heartbeat_loop(),
                 self._consume_loop(
                     "translate:results", "billing-translation-workers", self._handle_translation
+                ),
+                self._consume_loop(
+                    "translate:backfill_results",
+                    "billing-translation-backfill-workers",
+                    self._handle_backfill_translation,
                 ),
                 self._consume_loop("tts:results", "billing-tts-workers", self._handle_tts),
             )
@@ -274,10 +304,7 @@ class BillingSettlementWorker:
                 {
                     "worker": "billing",
                     "consumer": self._consumer_name,
-                    "streams": [
-                        "translate:results",
-                        "tts:results",
-                    ],
+                    "streams": list(BILLED_STREAMS),
                     "timestamp_unix_ms": now_unix_ms,
                     "last_progress_unix_ms": getattr(
                         self,
@@ -357,6 +384,29 @@ class BillingSettlementWorker:
         subscription_id, workspace_id = resolved
         self._subscription_cache[translation_room_id] = (subscription_id, workspace_id, now)
         return subscription_id, workspace_id
+
+    async def _resolve_workspace_subscription(
+        self,
+        workspace_id: str,
+    ) -> tuple[uuid.UUID, uuid.UUID] | None:
+        """The active subscription of a workspace named directly, for backfills.
+
+        Not the room projection: a backfill runs whenever somebody reads the transcript, which is
+        routinely days after `meeting:room:v2:` expired. TranscriptService names the workspace from
+        the transcript row itself.
+        """
+        cached = self._workspace_subscription_cache.get(workspace_id)
+        now = time.monotonic()
+        if cached and now - cached[2] < self.settings.subscription_cache_ttl_seconds:
+            return cached[0], cached[1]
+
+        resolved = await self.db.resolve_subscription(workspace_id)
+        if resolved is None:
+            return None
+
+        subscription_id, workspace_uuid = resolved
+        self._workspace_subscription_cache[workspace_id] = (subscription_id, workspace_uuid, now)
+        return subscription_id, workspace_uuid
 
     # ------------------------------------------------------------------
     # Per-stream handlers
@@ -478,9 +528,7 @@ class BillingSettlementWorker:
         if underlying_segment_id is None:
             self.logger.warning("segment_id_extraction_failed", raw_segment_id=msg.segment_id)
 
-        quantity_s = (
-            max((msg.end_ms - msg.start_ms) / 1000.0, 0.1) if msg.end_ms > msg.start_ms else 1.0
-        )
+        quantity_s = _translation_quantity_seconds(msg)
         await self.db.record_usage_and_charge(
             subscription_id=subscription_id,
             user_id=msg.speaker_id,
@@ -507,6 +555,104 @@ class BillingSettlementWorker:
             # touched to add a reporting dimension.
             details={
                 "is_external": await self._is_external_speaker(msg.meeting_id, msg.speaker_id),
+            },
+        )
+
+    async def _handle_backfill_translation(self, data: Mapping[Any, Any]) -> None:
+        """Charge a translation produced after the meeting, priced exactly like a live one.
+
+        Same charge type, rate card, unit and quantity rule as _handle_translation. Three inputs
+        cannot come from where the live path gets them:
+
+        * WORKSPACE: from the message (the owner of the transcript row), not the room projection,
+          which has expired for any transcript read back more than a day later.
+        * USER: the requester, not the speaker. Nobody spoke this; somebody asked for it. The user
+          is nullable on usage_records, so a message without one is still charged.
+        * IDEMPOTENCY: keyed on the bare segment id and language, plus the translation being
+          replaced for a post-correction redo. A duplicated backfill (two readers racing, a run
+          marker that expired mid-run) is charged once; each correction is its own charge,
+          because each one is a fresh model call.
+
+        A message without a workspace is from a producer older than this contract. It is skipped,
+        not retried: no number of redeliveries will add the field.
+        """
+        msg = TranslationResultMessage.from_redis(data)
+        if not msg.translated_text.strip():
+            return
+
+        segment_id = _extract_underlying_segment_id(msg.segment_id)
+        if segment_id is None:
+            self.logger.warning(
+                "backfill_settlement_skipped_bad_segment_id", raw_segment_id=msg.segment_id
+            )
+            return
+
+        if not msg.workspace_id:
+            self.logger.warning(
+                "backfill_settlement_skipped_no_workspace",
+                translation_room_id=msg.meeting_id,
+                segment_id=segment_id,
+            )
+            return
+        try:
+            uuid.UUID(msg.workspace_id)
+            uuid.UUID(msg.meeting_id)
+        except ValueError:
+            self.logger.warning(
+                "backfill_settlement_skipped_unparseable_ids",
+                workspace_id=msg.workspace_id,
+                translation_room_id=msg.meeting_id,
+            )
+            return
+
+        resolved = await self._resolve_workspace_subscription(msg.workspace_id)
+        if resolved is None:
+            self.logger.warning("no_subscription_for_workspace", workspace_id=msg.workspace_id)
+            return
+        subscription_id, workspace_id = resolved
+
+        requested_by = msg.requested_by_user_id
+        if requested_by:
+            try:
+                uuid.UUID(requested_by)
+            except ValueError:
+                self.logger.warning(
+                    "backfill_settlement_unparseable_requester", requested_by=requested_by
+                )
+                requested_by = None
+
+        target_lang = msg.target_lang
+        if msg.previous_translation_content_id:
+            origin = "retranslation"
+            idempotency_key = (
+                f"{TRANSLATION_CHARGE_TYPE}:retranslation:{segment_id}:{target_lang}:"
+                f"{msg.previous_translation_content_id}"
+            )
+        else:
+            origin = "backfill"
+            idempotency_key = f"{TRANSLATION_CHARGE_TYPE}:backfill:{segment_id}:{target_lang}"
+
+        await self.db.record_usage_and_charge(
+            subscription_id=subscription_id,
+            user_id=requested_by,
+            workspace_id=workspace_id,
+            translation_room_id=msg.meeting_id,
+            usage_type=TRANSLATION_CHARGE_TYPE,
+            charge_type=TRANSLATION_CHARGE_TYPE,
+            reference_id=segment_id,
+            reference_type="translation_content",
+            quantity=_translation_quantity_seconds(msg),
+            unit="second",
+            source_language_code=msg.source_lang,
+            target_language_code=target_lang,
+            transcript_segment_id=segment_id,
+            idempotency_key=idempotency_key,
+            details={
+                # A reporting dimension that fails towards internal (see _is_external_speaker);
+                # the requester already passed the transcript read check of the workspace.
+                "is_external": False,
+                "origin": origin,
+                "transcript_id": msg.transcript_id,
             },
         )
 

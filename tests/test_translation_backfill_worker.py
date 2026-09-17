@@ -290,3 +290,47 @@ async def test_an_ordinary_gap_fill_claims_no_predecessor() -> None:
     _, _, payload = worker.published[0]
     assert "is_retranslated" not in payload
     assert "previous_translation_content_id" not in payload
+
+
+@pytest.mark.asyncio
+async def test_carries_what_billing_needs_to_charge_the_line() -> None:
+    """billing_worker settles translate:backfill_results on the live TRANSLATION rate card.
+
+    It prices seconds of source speech and cannot use the room projection (24h TTL) or a speaker,
+    so each result must carry the span, the workspace and the requester from the request.
+    """
+    worker = _worker()
+    request = _request(
+        [
+            {
+                "segment_id": SEGMENT_A,
+                "text": "xin chao",
+                "source_lang": "vi",
+                "start_ms": 12000,
+                "end_ms": 15500,
+            }
+        ]
+    )
+    request[b"requested_by_user_id"] = b"u1"
+
+    await worker.process(b"1-0", request)
+
+    [(_, _, data)] = worker.published
+    assert data["start_ms"] == "12000"
+    assert data["end_ms"] == "15500"
+    assert data["workspace_id"] == "w1"
+    assert data["requested_by_user_id"] == "u1"
+    assert data["transcript_id"] == "t1"
+
+
+@pytest.mark.asyncio
+async def test_a_request_from_before_timing_existed_still_translates() -> None:
+    worker = _worker()
+
+    await worker.process(
+        b"1-0", _request([{"segment_id": SEGMENT_A, "text": "xin chao", "source_lang": "vi"}])
+    )
+
+    [(_, _, data)] = worker.published
+    assert data["start_ms"] == "0"
+    assert data["end_ms"] == "0"
