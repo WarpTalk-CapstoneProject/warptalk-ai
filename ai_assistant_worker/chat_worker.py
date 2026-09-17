@@ -48,6 +48,10 @@ from ai_assistant_worker.mcp_tools import (
 )
 from ai_assistant_worker.mcp_tools import normalize_mcp_tool_payload as _normalize_mcp_tool_payload
 from ai_assistant_worker.mcp_tools import (
+    parse_disabled_plugin_keys as _parse_disabled_plugin_keys,
+)
+from ai_assistant_worker.mcp_tools import read_mcp_always_allow as _read_mcp_always_allow
+from ai_assistant_worker.mcp_tools import (
     redact_mcp_tool_payload_for_model as _redact_mcp_tool_payload_for_model,
 )
 from ai_assistant_worker.mcp_tools import (
@@ -877,10 +881,17 @@ class ChatAssistantWorker(BaseWorker):
         if not isinstance(assistant_client, httpx.AsyncClient):
             return []
 
+        # WT-687: plugins switched off for this conversation are left out by AssistantService, so
+        # the model is never told they exist. Sent as a repeated query parameter.
+        params: dict[str, Any] = {"workspaceId": request.workspace_id}
+        disabled_plugin_keys = _parse_disabled_plugin_keys(request.disabled_plugin_keys_json)
+        if disabled_plugin_keys:
+            params["excludePluginKeys"] = disabled_plugin_keys
+
         try:
             response = await assistant_client.get(
                 "/api/v1/assistant/mcp/tools",
-                params={"workspaceId": request.workspace_id},
+                params=params,
                 headers={"Authorization": request.bearer_token} if request.bearer_token else {},
             )
         except Exception:
@@ -923,6 +934,7 @@ class ChatAssistantWorker(BaseWorker):
             label = str(item.get("label") or name)
             description = str(item.get("description") or label)[:_MCP_MAX_DESCRIPTION_CHARS]
             effect = str(item.get("effect") or "")
+            policy = str(item.get("policy") or "")
             tools.append(
                 ChatTool(
                     name=name,
@@ -930,6 +942,7 @@ class ChatAssistantWorker(BaseWorker):
                     parameters=_with_mcp_confirmation_parameter(
                         cast(dict[str, Any], parameters),
                         effect=effect,
+                        policy=policy,
                     ),
                     handler=self._build_mcp_tool_handler(plugin_key, name, request),
                 )
@@ -948,6 +961,7 @@ class ChatAssistantWorker(BaseWorker):
             if assistant_client is None:
                 return json.dumps({"error": "Plugin tools are not available right now."})
 
+            always_allow = _read_mcp_always_allow(arguments)
             tool_arguments, confirmation_token = _split_mcp_tool_arguments(arguments)
             response = await assistant_client.post(
                 "/api/v1/assistant/mcp/tools/execute",
@@ -959,6 +973,8 @@ class ChatAssistantWorker(BaseWorker):
                     "conversationId": request.conversation_id,
                     "assistantMessageId": None,
                     "confirmationToken": confirmation_token,
+                    # Honoured by AssistantService only alongside a token that validates.
+                    "alwaysAllow": always_allow and confirmation_token is not None,
                 },
                 headers={"Authorization": request.bearer_token} if request.bearer_token else {},
             )

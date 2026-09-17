@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from copy import deepcopy
 from typing import Any
@@ -17,12 +18,25 @@ MCP_MAX_DYNAMIC_TOOLS = 64
 MCP_MAX_DESCRIPTION_CHARS = 1024
 
 
+def mcp_tool_needs_confirmation(*, effect: str | None, policy: str | None = None) -> bool:
+    """Whether AssistantService will ask before running this tool.
+
+    WT-687: the user's per-tool ``policy`` decides when AssistantService sends one - a trusted
+    write tool runs straight away, a read tool the user wants to see coming asks. A service older
+    than the setting sends no policy, and then the old rule applies: writes ask.
+    """
+    if policy:
+        return policy == "approval"
+    return effect == "write"
+
+
 def with_mcp_confirmation_parameter(
     parameters: dict[str, Any],
     *,
     effect: str | None,
+    policy: str | None = None,
 ) -> dict[str, Any]:
-    if effect != "write":
+    if not mcp_tool_needs_confirmation(effect=effect, policy=policy):
         return parameters
 
     updated = deepcopy(parameters)
@@ -35,15 +49,45 @@ def with_mcp_confirmation_parameter(
                 "description": "Confirmation token from WarpBot's previous confirmation card.",
             },
         )
+        properties.setdefault(
+            "alwaysAllow",
+            {
+                "type": "boolean",
+                "description": (
+                    "True only when the user answered the confirmation card with Always allow."
+                ),
+            },
+        )
     return updated
 
 
 def split_mcp_tool_arguments(arguments: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     clean_arguments = dict(arguments)
+    # Ours, not the provider's: AssistantService reads it off the request, and a server handed an
+    # argument its schema never declared may refuse the call.
+    clean_arguments.pop("alwaysAllow", None)
     token = clean_arguments.pop("confirmationToken", None)
     if isinstance(token, str) and token.strip():
         return clean_arguments, token.strip()
     return clean_arguments, None
+
+
+def read_mcp_always_allow(arguments: dict[str, Any]) -> bool:
+    """WT-687: the user chose Always allow on the card. Only a real ``true`` counts."""
+    return arguments.get("alwaysAllow") is True
+
+
+def parse_disabled_plugin_keys(disabled_plugin_keys_json: str) -> list[str]:
+    """WT-687: the plugin keys switched off for this conversation, tolerating an absent field."""
+    if not disabled_plugin_keys_json:
+        return []
+    try:
+        raw = json.loads(disabled_plugin_keys_json)
+    except ValueError:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [key.strip() for key in raw if isinstance(key, str) and key.strip()]
 
 
 def normalize_mcp_tool_payload(payload: Any) -> dict[str, Any]:
@@ -256,6 +300,16 @@ def build_mcp_confirmation_questions(
                         "description": "Run this write action once.",
                         "value": (
                             f"Confirm the {tool_name} plugin action. confirmationToken: {token}"
+                        ),
+                    },
+                    {
+                        # WT-687. Runs this call and stops asking for this tool. The token still
+                        # has to validate before AssistantService records the choice.
+                        "label": "Always allow",
+                        "description": "Run it now and stop asking for this tool.",
+                        "value": (
+                            f"Confirm the {tool_name} plugin action and always allow it from now "
+                            f"on. confirmationToken: {token} alwaysAllow: true"
                         ),
                     },
                     {

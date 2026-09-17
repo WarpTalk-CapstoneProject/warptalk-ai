@@ -625,6 +625,9 @@ class ChatRequestMessage(BaseModel):
     # Renaming it would need both sides deployed in lockstep, and the shape inside it is what
     # actually changed.
     images_json: str = ""
+    # WT-687: plugin keys the user switched off for this conversation, as a JSON array, or "".
+    # "" is what an older AssistantService sends, and it means every installed plugin is offered.
+    disabled_plugin_keys_json: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -639,6 +642,7 @@ class ChatRequestMessage(BaseModel):
             "page_context_json": self.page_context_json,
             "mentions_json": self.mentions_json,
             "images_json": self.images_json,
+            "disabled_plugin_keys_json": self.disabled_plugin_keys_json,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -656,6 +660,7 @@ class ChatRequestMessage(BaseModel):
             page_context_json=d.get("page_context_json", ""),
             mentions_json=d.get("mentions_json", ""),
             images_json=d.get("images_json", ""),
+            disabled_plugin_keys_json=d.get("disabled_plugin_keys_json", ""),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 

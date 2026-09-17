@@ -5,6 +5,8 @@ from ai_assistant_worker.mcp_tools import (
     build_mcp_confirmation_questions,
     build_mcp_plugin_connection_action,
     normalize_mcp_tool_payload,
+    parse_disabled_plugin_keys,
+    read_mcp_always_allow,
     redact_mcp_tool_payload_for_model,
     select_mcp_tool_entries,
     split_mcp_tool_arguments,
@@ -134,6 +136,49 @@ def test_confirmation_question_carries_hidden_token_value() -> None:
     assert question["header"] == "Confirm plugin action"
     assert confirm["label"] == "Confirm"
     assert "token-1" in confirm["value"]
+
+
+def test_confirmation_question_offers_always_allow_with_the_token_and_the_flag() -> None:
+    question_payload = build_mcp_confirmation_questions(
+        {"message": "Confirm first.", "confirmationToken": "token-1"},
+        tool_name="linear_save_issue",
+    )
+
+    labels = [option["label"] for option in question_payload["questions"][0]["options"]]
+    always = question_payload["questions"][0]["options"][1]
+    assert labels == ["Confirm", "Always allow", "Cancel"]
+    assert "token-1" in always["value"]
+    assert "alwaysAllow: true" in always["value"]
+
+
+def test_policy_decides_whether_a_tool_asks_and_effect_is_the_fallback() -> None:
+    parameters = {"type": "object", "properties": {}}
+
+    trusted_write = with_mcp_confirmation_parameter(parameters, effect="write", policy="allow")
+    watched_read = with_mcp_confirmation_parameter(parameters, effect="read", policy="approval")
+    legacy_write = with_mcp_confirmation_parameter(parameters, effect="write", policy="")
+
+    assert "confirmationToken" not in trusted_write["properties"]
+    assert {"confirmationToken", "alwaysAllow"} <= set(watched_read["properties"])
+    assert "confirmationToken" in legacy_write["properties"]
+
+
+def test_always_allow_is_read_only_from_a_real_true_and_never_reaches_the_provider() -> None:
+    raw = {"title": "Bug", "confirmationToken": "t", "alwaysAllow": True}
+
+    arguments, token = split_mcp_tool_arguments(raw)
+
+    assert read_mcp_always_allow(raw) is True
+    assert read_mcp_always_allow({"alwaysAllow": "true"}) is False
+    assert arguments == {"title": "Bug"}
+    assert token == "t"
+
+
+def test_disabled_plugin_keys_tolerate_an_absent_or_malformed_field() -> None:
+    assert parse_disabled_plugin_keys("") == []
+    assert parse_disabled_plugin_keys("not json") == []
+    assert parse_disabled_plugin_keys('{"linear": true}') == []
+    assert parse_disabled_plugin_keys('[" linear ", 3, ""]') == ["linear"]
 
 
 def test_split_mcp_tool_arguments_removes_confirmation_token_from_provider_args() -> None:
