@@ -91,6 +91,8 @@ def _request(
     # `request.images_json` directly, so a stand-in that omits it passes here and would hide the
     # day the field stops being optional. ChatRequestMessage defaults it to "".
     images_json: str = "",
+    # WT-687. Same reasoning as images_json: the worker reads it directly.
+    disabled_plugin_keys_json: str = "",
 ) -> Any:
     return SimpleNamespace(
         request_id="req-1",
@@ -100,6 +102,7 @@ def _request(
         origin=origin,
         page_context_json=page_context_json,
         mentions_json=mentions_json,
+        disabled_plugin_keys_json=disabled_plugin_keys_json,
         images_json=images_json,
     )
 
@@ -183,6 +186,83 @@ class TestAgentLoop:
         assert tool_log[0]["status"] == "failed"
         assert "error" in json.loads(tool_log[0]["result"])
         assert any(p["type_"] == "tool_call_completed" for p in published)
+
+    async def test_dynamic_mcp_tools_honour_disabled_plugins_policy_and_always_allow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """WT-687: switched-off plugins are excluded, policy decides the confirmation parameter,
+        and Always allow travels outside the provider's arguments."""
+        monkeypatch.setattr(chat_worker_module, "TOOLS", [])
+        monkeypatch.setattr(chat_worker_module, "TOOLS_BY_NAME", {})
+
+        posted: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                assert request.url.params.get_list("excludePluginKeys") == ["notion", "linear"]
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "name": "save_issue",
+                            "pluginKey": "github",
+                            "label": "Save issue",
+                            "description": "Create an issue.",
+                            "effect": "write",
+                            "policy": "allow",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                        {
+                            "name": "list_issues",
+                            "pluginKey": "github",
+                            "label": "List issues",
+                            "description": "List issues.",
+                            "effect": "read",
+                            "policy": "approval",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    ],
+                )
+            posted.append(json.loads(request.content))
+            return httpx.Response(200, json={"isSuccess": True, "data": {}})
+
+        assistant_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://assistant-service",
+        )
+        worker, _ = _build_worker(
+            [
+                [
+                    _completed(
+                        _function_call(
+                            "list_issues",
+                            '{"confirmationToken":"token-1","alwaysAllow":true}',
+                        )
+                    )
+                ],
+                [_text_delta("Done."), _completed(_message_item())],
+            ]
+        )
+        worker.chat_settings.web_search_enabled = False
+
+        try:
+            await worker._run_agent_loop(
+                _request(disabled_plugin_keys_json='["notion", "linear"]'),
+                [],
+                SimpleNamespace(assistant_client=assistant_client, citations=None),
+            )
+        finally:
+            await assistant_client.aclose()
+
+        tools = {
+            tool["name"]: tool["parameters"]["properties"]
+            for tool in worker._openai.responses.create.await_args_list[0].kwargs["tools"]
+        }
+        assert "confirmationToken" not in tools["save_issue"]
+        assert {"confirmationToken", "alwaysAllow"} <= set(tools["list_issues"])
+        assert posted[0]["arguments"] == {}
+        assert posted[0]["confirmationToken"] == "token-1"
+        assert posted[0]["alwaysAllow"] is True
 
     async def test_dynamic_mcp_tool_is_discovered_and_executed(
         self, monkeypatch: pytest.MonkeyPatch
