@@ -253,6 +253,7 @@ class TestBillableSurface:
             for stream in (
                 "stt:results",
                 "translate:results",
+                "translate:backfill_results",
                 "tts:results",
                 "ai_assistant:results",
             )
@@ -260,7 +261,12 @@ class TestBillableSurface:
         }
 
     def test_only_translation_and_dubbing_are_billed(self) -> None:
-        assert self._subscribed_streams() == {"translate:results", "tts:results"}
+        # translate:backfill_results is translation too, produced after the meeting ended.
+        assert self._subscribed_streams() == {
+            "translate:results",
+            "translate:backfill_results",
+            "tts:results",
+        }
 
     def test_free_pipelines_have_no_settlement_handler_left_behind(self) -> None:
         # A handler with no subscription is dead code that reads as a live feature — the

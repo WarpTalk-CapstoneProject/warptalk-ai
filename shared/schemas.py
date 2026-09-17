@@ -440,6 +440,16 @@ class TranslationResultMessage(BaseModel):
     # The translation_contents row this one supersedes. Set together with is_retranslated; the
     # producer gets it from the current SegmentTranslationLink it is replacing.
     previous_translation_content_id: str | None = None
+    # Post-meeting backfill only (translate:backfill_results); None on every live translation.
+    #
+    # billing_worker charges a backfill from these rather than from the live path's inputs, both
+    # of which are gone by then: the `meeting:room:v2:` projection that maps a room to its
+    # workspace lives 24h, and a backfilled line has no speaker who spent anything. The workspace
+    # comes from the transcript row that owns the line, and the user is whoever asked for the
+    # work — the reader who picked the language, or the editor whose correction redid it.
+    workspace_id: str | None = None
+    requested_by_user_id: str | None = None
+    transcript_id: str | None = None
 
     def to_redis(self) -> dict[str, str]:
         payload = {
@@ -475,6 +485,13 @@ class TranslationResultMessage(BaseModel):
             payload["is_retranslated"] = "1"
         if self.previous_translation_content_id:
             payload["previous_translation_content_id"] = self.previous_translation_content_id
+        # Absent on live translations, so translate:results carries exactly what it did before.
+        if self.workspace_id:
+            payload["workspace_id"] = self.workspace_id
+        if self.requested_by_user_id:
+            payload["requested_by_user_id"] = self.requested_by_user_id
+        if self.transcript_id:
+            payload["transcript_id"] = self.transcript_id
         return payload
 
     @classmethod
@@ -506,6 +523,9 @@ class TranslationResultMessage(BaseModel):
             latency_ms=int(d["latency_ms"]) if d.get("latency_ms") else None,
             is_retranslated=d.get("is_retranslated") == "1",
             previous_translation_content_id=d.get("previous_translation_content_id") or None,
+            workspace_id=d.get("workspace_id") or None,
+            requested_by_user_id=d.get("requested_by_user_id") or None,
+            transcript_id=d.get("transcript_id") or None,
         )
 
 
