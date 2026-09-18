@@ -21,24 +21,46 @@ A1_FILLERS = _keys(
     "えーと", "えっと", "えーっと", "ええと", "えと", "えー", "あのー", "そのー", "んーと"
 )
 A2_FILLERS = _keys("うーん", "んー", "あー", "まー")
-B_MARKERS = _keys(
-    "あの", "その", "まあ", "なんか", "ちょっと", "やっぱり", "こう", "なんていうか"
-)
+B_MARKERS = _keys("あの", "その", "まあ", "なんか", "ちょっと", "やっぱり", "こう", "なんていうか")
 C_KEEP = _keys("はい", "ええ", "うん", "そう", "ああ", "いや", "いえ", "ううん")
 
 # 畳語 — reduplicated words. The tokenizer never splits a morpheme, so a word whose two halves
 # are equal stays whole; these keys additionally glue UniDic's split forms (はい|はい) back.
 PROTECTED_REDUPLICATIONS = _keys(
-    "時々", "人々", "色々", "いろいろ", "我々", "どんどん", "まだまだ", "そろそろ", "だんだん",
-    "ますます", "わくわく", "はいはい", "そうそう", "うんうん", "いえいえ", "もしもし",
-    "どうもどうも", "ねえねえ", "まあまあ", "まーまー",
+    "時々",
+    "人々",
+    "色々",
+    "いろいろ",
+    "我々",
+    "どんどん",
+    "まだまだ",
+    "そろそろ",
+    "だんだん",
+    "ますます",
+    "わくわく",
+    "はいはい",
+    "そうそう",
+    "うんうん",
+    "いえいえ",
+    "もしもし",
+    "どうもどうも",
+    "ねえねえ",
+    "まあまあ",
+    "まーまー",
 )
 
 # Correction markers. "赤じゃなくて青がいい" is a real contrast and "月曜、じゃなくて火曜" is a
 # repair; only meaning tells them apart, so both escalate and nothing is deleted.
 SELF_REPAIR_MARKERS = _keys(
-    "じゃなくて", "ではなくて", "じゃなく", "ではなく", "というか", "っていうか", "間違えた",
-    "失礼", "いや",
+    "じゃなくて",
+    "ではなくて",
+    "じゃなく",
+    "ではなく",
+    "というか",
+    "っていうか",
+    "間違えた",
+    "失礼",
+    "いや",
 )
 
 # Multi-morpheme surfaces the tokenizer glues back into one token (UniDic splits えー|と).

@@ -39,8 +39,22 @@ C_KEEP = frozenset(
 # ≥2 consecutive copies collapse to one: these are the words people restart on.
 STUTTER_FUNCTION_WORDS = frozenset(
     {
-        "i", "we", "you", "they", "it", "the", "a", "an", "and", "to", "of", "in", "my", "this",
-        "we're", "it's",
+        "i",
+        "we",
+        "you",
+        "they",
+        "it",
+        "the",
+        "a",
+        "an",
+        "and",
+        "to",
+        "of",
+        "in",
+        "my",
+        "this",
+        "we're",
+        "it's",
     }
 )
 # Any other word collapses only at this many copies or more.
@@ -50,8 +64,26 @@ CONTENT_REPEAT_MIN = 3
 # ("very very very" included). "had had", "that that", "is is" are grammatical English.
 PROTECTED_REPEAT_WORDS = frozenset(
     {
-        "very", "no", "yeah", "bye", "so", "well", "had", "that", "is", "do", "walla", "really",
-        "yes", "ha", "blah", "knock", "tick", "tock", "bang", "night",
+        "very",
+        "no",
+        "yeah",
+        "bye",
+        "so",
+        "well",
+        "had",
+        "that",
+        "is",
+        "do",
+        "walla",
+        "really",
+        "yes",
+        "ha",
+        "blah",
+        "knock",
+        "tick",
+        "tock",
+        "bang",
+        "night",
     }
 )
 
@@ -63,10 +95,40 @@ NEGATIONS = frozenset({"not", "no", "never"})
 
 NUMBER_WORDS = frozenset(
     {
-        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-        "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
-        "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
-        "eighty", "ninety", "hundred", "thousand", "million", "billion", "percent", "double",
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+        "twenty",
+        "thirty",
+        "forty",
+        "fifty",
+        "sixty",
+        "seventy",
+        "eighty",
+        "ninety",
+        "hundred",
+        "thousand",
+        "million",
+        "billion",
+        "percent",
+        "double",
         "triple",
     }
 )

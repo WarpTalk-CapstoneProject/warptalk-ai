@@ -37,19 +37,30 @@ _VI_RE = re.compile(
 # "hoà" compare equal. Safe as a blind substitution: with a final consonant ("hoàn") both styles
 # already agree, so the old-style sequence never occurs where it would mean something else.
 _VI_TONE_PAIRS = {
-    "òa": "oà", "óa": "oá", "ỏa": "oả", "õa": "oã", "ọa": "oạ",
-    "òe": "oè", "óe": "oé", "ỏe": "oẻ", "õe": "oẽ", "ọe": "oẹ",
-    "ùy": "uỳ", "úy": "uý", "ủy": "uỷ", "ũy": "uỹ", "ụy": "uỵ",
+    "òa": "oà",
+    "óa": "oá",
+    "ỏa": "oả",
+    "õa": "oã",
+    "ọa": "oạ",
+    "òe": "oè",
+    "óe": "oé",
+    "ỏe": "oẻ",
+    "õe": "oẽ",
+    "ọe": "oẹ",
+    "ùy": "uỳ",
+    "úy": "uý",
+    "ủy": "uỷ",
+    "ũy": "uỹ",
+    "ụy": "uỵ",
 }
 _VI_TONE_RE = re.compile("|".join(_VI_TONE_PAIRS))
 
 # Half-width katakana → full-width. Only kana and Japanese punctuation, deliberately NOT full
 # NFKC: NFKC would also rewrite full-width digits and ① style characters, which are text.
-_HALFWIDTH_KATA = (
-    "ｦｧｨｩｪｫｬｭｮｯｰｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ"
-)
+_HALFWIDTH_KATA = "ｦｧｨｩｪｫｬｭｮｯｰｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ"
 _FULLWIDTH_KATA = (
-    "ヲァィゥェォャュョッーアイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワン"
+    "ヲァィゥェォャュョッーアイウエオカキクケコサシスセソタチ"
+    "ツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワン"
 )
 _HALFWIDTH_PUNCT = {"｡": "。", "､": "、", "｢": "「", "｣": "」", "･": "・"}
 _DAKUTEN = "ﾞ"
