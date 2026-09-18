@@ -402,8 +402,9 @@ MEETING_KIND_RULES: tuple[str, ...] = (
     "Call the tool straight away - the user confirms on WarpBot's card.",
     "- If the Google Meet tool is not available to you, say the Google Meet plugin must be "
     "installed and connected. Do not create a WarpTalk room instead.",
-    "- After creating a Google Meet meeting, give its meetLink as a markdown link titled with the "
-    "meeting name and state the meetingCode. After creating a WarpTalk room, give its room_url.",
+    "- After creating either kind, say in one or two sentences what was created and whether it "
+    "is on Google Meet or in WarpTalk. WarpBot draws a card under your answer with the join "
+    "link, the meeting code and the time, so do not paste the link or the code yourself.",
     "- Google Meet AND live translation: create the Google Meet meeting first, then a WarpTalk "
     "room of type EXTERNAL_BRIDGE with external_provider GOOGLE_MEET and the returned link, and "
     "explain that the meeting happens on Google Meet while WarpTalk translates it.",

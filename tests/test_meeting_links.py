@@ -9,6 +9,7 @@ card says what it will create.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,6 +20,7 @@ from ai_assistant_worker import chat_worker as chat_worker_module
 from ai_assistant_worker.chat_templates import GENERAL, build_system_prompt
 from ai_assistant_worker.mcp_tools import build_mcp_confirmation_questions
 from ai_assistant_worker.meeting_links import (
+    MEETING_MARKER_PREFIX,
     MeetingLink,
     ensure_meeting_links,
     meet_code_from_url,
@@ -82,24 +84,64 @@ class TestMeetingLinkFromToolResult:
 
 
 class TestEnsureMeetingLinks:
-    link = MeetingLink(kind="google_meet", url=MEET_URL, title="Quick sync", code="abc-defg-hij")
+    link = MeetingLink(
+        kind="google_meet",
+        url=MEET_URL,
+        title="Quick sync",
+        code="abc-defg-hij",
+        start="2026-09-18T15:40:00+07:00",
+        end="2026-09-18T16:10:00+07:00",
+        calendar_url="https://www.google.com/calendar/event?eid=abc",
+    )
 
-    def test_a_missing_link_is_appended(self) -> None:
-        assert ensure_meeting_links("Đã tạo cuộc họp.", [self.link]) == (
-            f"Đã tạo cuộc họp.\n\n[Quick sync]({MEET_URL})"
+    def _marker(self, answer: str) -> dict[str, Any]:
+        line = next(line for line in answer.splitlines() if line.startswith(MEETING_MARKER_PREFIX))
+        return json.loads(line[len(MEETING_MARKER_PREFIX) : -len(" -->")])
+
+    def test_the_marker_is_appended_and_no_visible_link(self) -> None:
+        answer = ensure_meeting_links("Đã tạo cuộc họp.", [self.link])
+        assert answer.startswith(f"Đã tạo cuộc họp.\n\n{MEETING_MARKER_PREFIX}")
+        assert f"[Quick sync]({MEET_URL})" not in answer
+        assert self._marker(answer) == {
+            "kind": "google_meet",
+            "url": MEET_URL,
+            "title": "Quick sync",
+            "code": "abc-defg-hij",
+            "start": "2026-09-18T15:40:00+07:00",
+            "end": "2026-09-18T16:10:00+07:00",
+            "calendarUrl": "https://www.google.com/calendar/event?eid=abc",
+        }
+
+    def test_one_marker_per_meeting(self) -> None:
+        answer = ensure_meeting_links("ok", [self.link, self.link])
+        assert answer.count(MEETING_MARKER_PREFIX) == 1
+
+    def test_a_bridge_room_says_so(self) -> None:
+        link = meeting_link_from_tool_result(
+            json.dumps(
+                {
+                    "status": "created",
+                    "title": "Japan client",
+                    "room_url": "/rooms/r-1",
+                    "room_type": "EXTERNAL_BRIDGE",
+                }
+            )
         )
+        assert link is not None
+        assert self._marker(ensure_meeting_links("", [link]))["roomType"] == "EXTERNAL_BRIDGE"
 
-    def test_a_link_already_given_is_not_repeated(self) -> None:
-        answer = f"Link: {MEET_URL}"
-        assert ensure_meeting_links(answer, [self.link]) == answer
+    def test_a_title_cannot_close_the_comment_early(self) -> None:
+        link = MeetingLink(kind="warptalk_room", url="/rooms/r-1", title="a --> b")
+        answer = ensure_meeting_links("ok", [link])
+        marker_line = answer.splitlines()[-1]
+        assert marker_line.count("-->") == 1 and marker_line.endswith(" -->")
+        assert self._marker(answer)["title"] == "a --> b"
 
-    def test_a_link_without_its_scheme_counts(self) -> None:
-        answer = "Vào meet.google.com/abc-defg-hij nhé"
-        assert ensure_meeting_links(answer, [self.link]) == answer
-
-    def test_brackets_in_a_title_cannot_break_the_markdown(self) -> None:
-        link = MeetingLink(kind="warptalk_room", url="/rooms/r-1", title="[Q3] review")
-        assert ensure_meeting_links("", [link]) == "[(Q3) review](/rooms/r-1)"
+    def test_a_calendar_link_off_google_is_dropped(self) -> None:
+        link = meeting_link_from_tool_result(
+            _meet_result(calendarEventLink="https://evil.test/calendar")
+        )
+        assert link is not None and link.calendar_url is None
 
 
 def test_helpers() -> None:
@@ -109,6 +151,8 @@ def test_helpers() -> None:
 
 
 class TestGoogleMeetConfirmationCard:
+    NOW = datetime(2026, 9, 18, 8, 40, 27, tzinfo=UTC)  # 15:40:27 in Vietnam
+
     def _card(self, **arguments: Any) -> dict[str, Any]:
         payload = {"confirmationToken": "token-1", "message": "Confirm this action."}
         return build_mcp_confirmation_questions(
@@ -116,23 +160,33 @@ class TestGoogleMeetConfirmationCard:
             tool_name="google_calendar_create_meet_event",
             tool_label="Create Google Meet meeting",
             arguments=arguments,
+            now=self.NOW,
         )["questions"][0]
+
+    def _details(self, question: dict[str, Any]) -> dict[str, str]:
+        return {row["label"]: row["value"] for row in question["details"]}
 
     def test_it_says_what_it_will_create(self) -> None:
         question = self._card(
             summary="Roadmap",
-            start="2026-09-18T03:00:00Z",
-            end="2026-09-18T03:45:00Z",
+            start="2026-09-19T03:00:00Z",
+            end="2026-09-19T03:45:00Z",
             attendees=["a@example.test"],
         )
         assert question["header"] == "Google Meet"
-        assert "Title: Roadmap" in question["question"]
-        assert "10:00 - 10:45 (GMT+7)" in question["question"]
-        assert "Guests: a@example.test" in question["question"]
+        assert question["question"] == "Create a Google Meet meeting?"
+        assert self._details(question) == {
+            "Title": "Roadmap",
+            "When": "Tomorrow 10:00 – 10:45 (GMT+7)",
+            "Calendar": "Your primary Google Calendar",
+            "Guests": "a@example.test",
+        }
         assert question["options"][0]["label"] == "Create"
 
-    def test_no_time_means_now(self) -> None:
-        assert "Starts now, 30 minutes" in self._card()["question"]
+    def test_no_time_means_now_for_half_an_hour(self) -> None:
+        details = self._details(self._card())
+        assert details["When"] == "Today 15:40 – 16:10 (GMT+7)"
+        assert details["Title"] == "Google Meet meeting"
 
     def test_the_answer_leads_with_the_choice_and_keeps_the_token_for_the_model(self) -> None:
         value = self._card()["options"][0]["value"]
@@ -149,6 +203,7 @@ class TestGoogleMeetConfirmationCard:
         )["questions"][0]
         assert question["header"] == "Confirm plugin action"
         assert question["question"].startswith('Run "Save issue"?')
+        assert "details" not in question
 
 
 def test_the_prompt_separates_warptalk_rooms_from_google_meet() -> None:
@@ -201,7 +256,8 @@ class TestAgentLoopGuaranteesTheLink:
         finally:
             await assistant_client.aclose()
 
-        assert text == f"Đã tạo cuộc họp Google Meet.\n\n[Quick sync]({MEET_URL})"
+        assert text.startswith(f"Đã tạo cuộc họp Google Meet.\n\n{MEETING_MARKER_PREFIX}")
+        assert MEET_URL in text and "abc-defg-hij" in text
 
     async def test_the_confirmation_card_carries_the_meeting_details(
         self, monkeypatch: pytest.MonkeyPatch
@@ -262,4 +318,4 @@ class TestAgentLoopGuaranteesTheLink:
         assert len(questions) == 1
         card = json.loads(questions[0]["tool_calls_json"])["questions"][0]
         assert card["header"] == "Google Meet"
-        assert "Title: Standup" in card["question"]
+        assert {"label": "Title", "value": "Standup"} in card["details"]

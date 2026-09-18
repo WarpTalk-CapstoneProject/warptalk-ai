@@ -1514,6 +1514,7 @@ async def _create_meeting(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             "room_url": room_url(room_id) if isinstance(room_id, str) and room_id.strip() else None,
             "title": room.get("title"),
             "room_code": room.get("translationRoomCode"),
+            "room_type": room.get("translationRoomType") or draft.translation_room_type,
             "scheduled_at": room.get("scheduledAt"),
             "recurring": bool(created.get("series")),
             "invited_count": len(draft.invited_emails),
@@ -1852,9 +1853,9 @@ TOOLS: list[ChatTool] = [
         description=(
             "Create a WarpTalk room (a meeting hosted in WarpTalk itself - NOT a Google Meet "
             "meeting) in the current workspace. This is the default when the user asks for a "
-            "meeting and does not mention Google Meet. When it succeeds, give the user the "
-            "returned room_url as a markdown link titled with the meeting name, and call it a "
-            "WarpTalk room. Call this ONLY once you know "
+            "meeting and does not mention Google Meet. When it succeeds, call it a WarpTalk room; "
+            "WarpBot shows a card with the room's link under your answer, so do not paste the "
+            "link. Call this ONLY once you know "
             "the title, meeting type, source language and target languages — if any of those is "
             "missing, call ask_user first. Supports a one-off time (scheduled_at) OR a repeating "
             "rule (recurrence_*), never both. Invited people receive an email, so only pass "

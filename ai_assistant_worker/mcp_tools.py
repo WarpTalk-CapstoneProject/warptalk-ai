@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 #: What the Responses API accepts as a function name. An MCP server is free to call its tool
@@ -292,19 +292,23 @@ def build_mcp_confirmation_questions(
     tool_name: str,
     tool_label: str | None = None,
     arguments: dict[str, Any] | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """The confirmation card for a write the user's policy wants approved.
 
     Each option's ``value`` is what comes back as the user's next message. It is two paragraphs:
     the choice as a person would say it, then the machine line the model needs to act on it
     (tool name and token). The web shows the first and hides the second, so the bubble reads
-    "Google Meet: Create" instead of a token.
+    "Create" instead of a token.
+
+    ``details`` are label/value rows the card draws under the question (Title, When, Calendar),
+    so the user sees exactly what is about to be written to their calendar.
     """
     token = str(payload.get("confirmationToken") or "").strip()
 
     if tool_name == GOOGLE_MEET_CREATE_TOOL:
         header = "Google Meet"
-        question = _google_meet_confirmation_text(arguments or {})
+        question, details = _google_meet_confirmation(arguments or {}, now)
         confirm_label = "Create"
         confirm_description = "Create this Google Meet meeting once."
     else:
@@ -316,6 +320,7 @@ def build_mcp_confirmation_questions(
         )
         if label and label != tool_name:
             question = f'Run "{label}"?\n{question}'
+        details = []
         confirm_label = "Confirm"
         confirm_description = "Run this write action once."
 
@@ -324,6 +329,7 @@ def build_mcp_confirmation_questions(
             {
                 "header": header,
                 "question": question,
+                **({"details": details} if details else {}),
                 "options": [
                     {
                         "label": confirm_label,
@@ -354,30 +360,37 @@ def build_mcp_confirmation_questions(
     }
 
 
-def _google_meet_confirmation_text(arguments: dict[str, Any]) -> str:
+def _google_meet_confirmation(
+    arguments: dict[str, Any], now: datetime | None = None
+) -> tuple[str, list[dict[str, str]]]:
+    """The question and the rows under it: what will be created, when, and where it is written."""
     title = _argument_text(arguments, "summary") or "Google Meet meeting"
-    start = _parse_instant(_argument_text(arguments, "start"))
-    end = _parse_instant(_argument_text(arguments, "end"))
+    current = (now or datetime.now(UTC)).astimezone(_CARD_TIMEZONE)
+    # No start means the gateway starts it now, to the minute, for 30 minutes.
+    start = _parse_instant(_argument_text(arguments, "start")) or current.replace(
+        second=0, microsecond=0
+    )
+    end = _parse_instant(_argument_text(arguments, "end")) or start + timedelta(minutes=30)
+    local_start = start.astimezone(_CARD_TIMEZONE)
+    local_end = end.astimezone(_CARD_TIMEZONE)
 
-    if start is None:
-        when = "Starts now, 30 minutes"
+    days = (local_start.date() - current.date()).days
+    day = {0: "Today", 1: "Tomorrow"}.get(days) or f"{local_start:%a %d %b}"
+    if local_end.date() == local_start.date():
+        finish = f"{local_end:%H:%M}"
     else:
-        finish = end or start + timedelta(minutes=30)
-        local_start = start.astimezone(_CARD_TIMEZONE)
-        local_end = finish.astimezone(_CARD_TIMEZONE)
-        when = f"{local_start:%a %d %b, %H:%M} - {local_end:%H:%M} (GMT+7)"
-
-    lines = [
-        "Create a Google Meet meeting on your Google Calendar?",
-        f"Title: {title}",
-        f"When: {when}",
+        finish = f"{local_end:%a %d %b %H:%M}"
+    details = [
+        {"label": "Title", "value": title},
+        {"label": "When", "value": f"{day} {local_start:%H:%M} – {finish} (GMT+7)"},
+        {"label": "Calendar", "value": "Your primary Google Calendar"},
     ]
     attendees = arguments.get("attendees")
     if isinstance(attendees, list):
         emails = [a.strip() for a in attendees if isinstance(a, str) and a.strip()]
         if emails:
-            lines.append(f"Guests: {', '.join(emails)}")
-    return "\n".join(lines)
+            details.append({"label": "Guests", "value": ", ".join(emails)})
+    return "Create a Google Meet meeting?", details
 
 
 def _argument_text(arguments: dict[str, Any], key: str) -> str:
