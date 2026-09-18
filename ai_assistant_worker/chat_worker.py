@@ -61,6 +61,11 @@ from ai_assistant_worker.mcp_tools import split_mcp_tool_arguments as _split_mcp
 from ai_assistant_worker.mcp_tools import (
     with_mcp_confirmation_parameter as _with_mcp_confirmation_parameter,
 )
+from ai_assistant_worker.meeting_links import (
+    MeetingLink,
+    ensure_meeting_links,
+    meeting_link_from_tool_result,
+)
 from ai_assistant_worker.tool_targets import (
     describe_tool_target,
     describe_web_search_target,
@@ -648,6 +653,9 @@ class ChatAssistantWorker(BaseWorker):
         if self.chat_settings.web_search_enabled:
             tool_schemas.append({"type": "web_search"})
         tool_call_log: list[dict[str, Any]] = []
+        # Meetings a tool created this turn. Their links are appended to the answer if the model
+        # left them out - see meeting_links.
+        created_meetings: list[MeetingLink] = []
         final_text = ""
 
         for _ in range(self.chat_settings.max_tool_iterations):
@@ -831,6 +839,11 @@ class ChatAssistantWorker(BaseWorker):
                 # strand the turn with no way back. The card is fire-and-forget; the answer
                 # arrives as an ordinary message on the next turn, which is also why the user can
                 # ignore it and type something else entirely.
+                if status == "completed":
+                    created = meeting_link_from_tool_result(result_json)
+                    if created is not None:
+                        created_meetings.append(created)
+
                 if tool_name == "ask_user" and status == "completed":
                     await self._publish_result(
                         request,
@@ -870,7 +883,7 @@ class ChatAssistantWorker(BaseWorker):
                 or "I wasn't able to finish looking that up — please try rephrasing your question."
             )
 
-        return final_text, tool_call_log
+        return ensure_meeting_links(final_text, created_meetings), tool_call_log
 
     async def _load_dynamic_mcp_tools(
         self,
@@ -944,7 +957,7 @@ class ChatAssistantWorker(BaseWorker):
                         effect=effect,
                         policy=policy,
                     ),
-                    handler=self._build_mcp_tool_handler(plugin_key, name, request),
+                    handler=self._build_mcp_tool_handler(plugin_key, name, request, label),
                 )
             )
 
@@ -955,6 +968,7 @@ class ChatAssistantWorker(BaseWorker):
         plugin_key: str,
         tool_name: str,
         request: ChatRequestMessage,
+        tool_label: str | None = None,
     ) -> Callable[[ToolContext, dict[str, Any]], Awaitable[str]]:
         async def handler(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             assistant_client = ctx.assistant_client
@@ -1006,7 +1020,12 @@ class ChatAssistantWorker(BaseWorker):
                     type_="question",
                     tool_name=tool_name,
                     tool_calls_json=json.dumps(
-                        _build_mcp_confirmation_questions(normalized, tool_name=tool_name)
+                        _build_mcp_confirmation_questions(
+                            normalized,
+                            tool_name=tool_name,
+                            tool_label=tool_label,
+                            arguments=tool_arguments,
+                        )
                     ),
                 )
             elif (

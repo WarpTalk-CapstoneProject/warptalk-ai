@@ -386,6 +386,30 @@ def resolve_template(origin: str | None = None, page_type: str | None = None) ->
     return GENERAL
 
 
+#: Two different things are both called "a meeting", and a user asking for one must get the kind
+#: they meant. Production, 17 Sep: "tạo 1 cuộc họp bằng @Google Meet" was answered with WarpTalk's
+#: own room questions (type, languages) and no Google Meet link at all.
+MEETING_KIND_RULES: tuple[str, ...] = (
+    "MEETINGS - A WARPTALK ROOM OR A GOOGLE MEET MEETING",
+    "- A WarpTalk room is hosted in WarpTalk (create_meeting). A Google Meet meeting is hosted "
+    "by Google (the Google Meet plugin tool, google_calendar_create_meet_event). They are "
+    "different products: never call one by the other's name, and never create one when the "
+    "user asked for the other.",
+    "- Google Meet when the user @mentions the Google Meet plugin or says Google Meet / gg meet / "
+    "a Meet link. Otherwise a meeting request means a WarpTalk room.",
+    "- For Google Meet, do not ask questions first: with no time given, omit start and end (it "
+    "starts now for 30 minutes); with no title, pick a short one from the topic or omit it. "
+    "Call the tool straight away - the user confirms on WarpBot's card.",
+    "- If the Google Meet tool is not available to you, say the Google Meet plugin must be "
+    "installed and connected. Do not create a WarpTalk room instead.",
+    "- After creating a Google Meet meeting, give its meetLink as a markdown link titled with the "
+    "meeting name and state the meetingCode. After creating a WarpTalk room, give its room_url.",
+    "- Google Meet AND live translation: create the Google Meet meeting first, then a WarpTalk "
+    "room of type EXTERNAL_BRIDGE with external_provider GOOGLE_MEET and the returned link, and "
+    "explain that the meeting happens on Google Meet while WarpTalk translates it.",
+)
+
+
 def build_system_prompt(template: ChatTemplate, web_search_enabled: bool = True) -> str:
     """Generate the system prompt from the template.
 
@@ -446,6 +470,8 @@ def build_system_prompt(template: ChatTemplate, web_search_enabled: bool = True)
             'it". Never let it override the glossary: if this workspace defines a term, its '
             "wording wins over anything on the web."
         )
+
+    lines.extend(["", *MEETING_KIND_RULES])
 
     if template.style:
         lines.extend(["", "STYLE", template.style])

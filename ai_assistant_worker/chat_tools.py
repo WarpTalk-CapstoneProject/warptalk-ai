@@ -28,6 +28,7 @@ from ai_assistant_worker.meeting_draft import (
     missing_fields,
     validate,
 )
+from ai_assistant_worker.meeting_links import room_url
 from shared.control_markers import is_external_bridge_speaker
 from shared.logger import get_logger
 from shared.openai_options import completion_options
@@ -1421,9 +1422,11 @@ async def _ask_user(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             "question_count": len(questions),
             "instruction": (
                 "The question card is now on the user's screen. End your turn WITHOUT calling "
-                "another tool and WITHOUT guessing an answer. Say one short sentence telling "
-                "them you need these details, then stop. Their reply arrives as a normal "
-                "message on your next turn."
+                "another tool and WITHOUT guessing an answer. Say one short sentence that NAMES "
+                "the details you still need (e.g. 'I still need the title and the languages'), "
+                "then stop. Do not refer to 'the card' - the sentence must make sense on its "
+                "own, because the card is not kept when the conversation is reopened. Their "
+                "reply arrives as a normal message on your next turn."
             ),
         }
     )
@@ -1500,10 +1503,15 @@ async def _create_meeting(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     # the room itself. Both are reported, so the model can say "every weekday from Monday" rather
     # than "created" and leave the user to go and check.
     room = created.get("firstOccurrence") or created
+    room_id = room.get("id")
     return json.dumps(
         {
             "status": "created",
-            "id": room.get("id"),
+            "kind": "warptalk_room",
+            "id": room_id,
+            # The address the user opens. Handed over ready-made because the model has no slug to
+            # build one with; the web redirects /rooms/{id} into the open workspace.
+            "room_url": room_url(room_id) if isinstance(room_id, str) and room_id.strip() else None,
             "title": room.get("title"),
             "room_code": room.get("translationRoomCode"),
             "scheduled_at": room.get("scheduledAt"),
@@ -1842,7 +1850,11 @@ TOOLS: list[ChatTool] = [
     ChatTool(
         name="create_meeting",
         description=(
-            "Create a translation room in the current workspace. Call this ONLY once you know "
+            "Create a WarpTalk room (a meeting hosted in WarpTalk itself - NOT a Google Meet "
+            "meeting) in the current workspace. This is the default when the user asks for a "
+            "meeting and does not mention Google Meet. When it succeeds, give the user the "
+            "returned room_url as a markdown link titled with the meeting name, and call it a "
+            "WarpTalk room. Call this ONLY once you know "
             "the title, meeting type, source language and target languages — if any of those is "
             "missing, call ask_user first. Supports a one-off time (scheduled_at) OR a repeating "
             "rule (recurrence_*), never both. Invited people receive an email, so only pass "

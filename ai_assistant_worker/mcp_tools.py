@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 #: What the Responses API accepts as a function name. An MCP server is free to call its tool
@@ -278,28 +279,58 @@ def build_mcp_operator_setup_action(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+#: The one write tool whose card says what it will create rather than "a plugin action".
+GOOGLE_MEET_CREATE_TOOL = "google_calendar_create_meet_event"
+
+#: Meetings are booked by people in Vietnam; UTC+7 has no DST, so a fixed offset is exact.
+_CARD_TIMEZONE = timezone(timedelta(hours=7), "ICT")
+
+
 def build_mcp_confirmation_questions(
     payload: dict[str, Any],
     *,
     tool_name: str,
+    tool_label: str | None = None,
+    arguments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """The confirmation card for a write the user's policy wants approved.
+
+    Each option's ``value`` is what comes back as the user's next message. It is two paragraphs:
+    the choice as a person would say it, then the machine line the model needs to act on it
+    (tool name and token). The web shows the first and hides the second, so the bubble reads
+    "Google Meet: Create" instead of a token.
+    """
     token = str(payload.get("confirmationToken") or "").strip()
-    message = str(
-        payload.get("message")
-        or "WarpBot wants to change data in a connected app. Confirm before it continues."
-    )
+
+    if tool_name == GOOGLE_MEET_CREATE_TOOL:
+        header = "Google Meet"
+        question = _google_meet_confirmation_text(arguments or {})
+        confirm_label = "Create"
+        confirm_description = "Create this Google Meet meeting once."
+    else:
+        label = (tool_label or "").strip()
+        header = "Confirm plugin action"
+        question = str(
+            payload.get("message")
+            or "WarpBot wants to change data in a connected app. Confirm before it continues."
+        )
+        if label and label != tool_name:
+            question = f'Run "{label}"?\n{question}'
+        confirm_label = "Confirm"
+        confirm_description = "Run this write action once."
 
     return {
         "questions": [
             {
-                "header": "Confirm plugin action",
-                "question": message,
+                "header": header,
+                "question": question,
                 "options": [
                     {
-                        "label": "Confirm",
-                        "description": "Run this write action once.",
+                        "label": confirm_label,
+                        "description": confirm_description,
                         "value": (
-                            f"Confirm the {tool_name} plugin action. confirmationToken: {token}"
+                            f"{confirm_label}\n\nConfirm the {tool_name} plugin action. "
+                            f"confirmationToken: {token}"
                         ),
                     },
                     {
@@ -308,16 +339,58 @@ def build_mcp_confirmation_questions(
                         "label": "Always allow",
                         "description": "Run it now and stop asking for this tool.",
                         "value": (
-                            f"Confirm the {tool_name} plugin action and always allow it from now "
-                            f"on. confirmationToken: {token} alwaysAllow: true"
+                            f"Always allow\n\nConfirm the {tool_name} plugin action and always "
+                            f"allow it from now on. confirmationToken: {token} alwaysAllow: true"
                         ),
                     },
                     {
                         "label": "Cancel",
                         "description": "Do not run this action.",
-                        "value": f"Do not run the {tool_name} plugin action.",
+                        "value": f"Cancel\n\nDo not run the {tool_name} plugin action.",
                     },
                 ],
             }
         ]
     }
+
+
+def _google_meet_confirmation_text(arguments: dict[str, Any]) -> str:
+    title = _argument_text(arguments, "summary") or "Google Meet meeting"
+    start = _parse_instant(_argument_text(arguments, "start"))
+    end = _parse_instant(_argument_text(arguments, "end"))
+
+    if start is None:
+        when = "Starts now, 30 minutes"
+    else:
+        finish = end or start + timedelta(minutes=30)
+        local_start = start.astimezone(_CARD_TIMEZONE)
+        local_end = finish.astimezone(_CARD_TIMEZONE)
+        when = f"{local_start:%a %d %b, %H:%M} - {local_end:%H:%M} (GMT+7)"
+
+    lines = [
+        "Create a Google Meet meeting on your Google Calendar?",
+        f"Title: {title}",
+        f"When: {when}",
+    ]
+    attendees = arguments.get("attendees")
+    if isinstance(attendees, list):
+        emails = [a.strip() for a in attendees if isinstance(a, str) and a.strip()]
+        if emails:
+            lines.append(f"Guests: {', '.join(emails)}")
+    return "\n".join(lines)
+
+
+def _argument_text(arguments: dict[str, Any], key: str) -> str:
+    value = arguments.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _parse_instant(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    # A time with no offset is read the way the user meant it: Vietnam time.
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=_CARD_TIMEZONE)
