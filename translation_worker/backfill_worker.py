@@ -31,6 +31,7 @@ from typing import Any
 
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, WorkerSettings, resolve_openai_api_key
+from shared.languages import known_language_code
 from shared.logger import setup_logging
 from shared.schemas import TranslationResultMessage
 from translation_worker.translator import OpenAITranslator
@@ -85,6 +86,20 @@ class TranslationBackfillWorker(BaseWorker):
         transcript_id = fields.get("transcript_id", "")
         workspace_id = fields.get("workspace_id", "")
         requested_by_user_id = fields.get("requested_by_user_id", "")
+
+        if target_lang and not known_language_code(target_lang):
+            # WT-704. The target is named in the translation prompt, and language_name() falls
+            # back to its input for a code it does not know — so "klingon", or a sentence of
+            # instructions, would reach the model verbatim. TranscriptService refuses such a
+            # request, but this worker must not rely on that. The request can never succeed,
+            # so mark the run failed and let the message be acknowledged rather than retried.
+            self.logger.warning(
+                "backfill_target_language_unknown",
+                transcript_id=transcript_id,
+                target_lang=repr(fields.get("target_lang", ""))[:16],
+            )
+            await self._mark_failed(status_key)
+            return
 
         try:
             segments = json.loads(fields.get("segments_json", "[]"))
