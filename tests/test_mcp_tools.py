@@ -133,8 +133,8 @@ def test_confirmation_question_carries_hidden_token_value() -> None:
 
     question = question_payload["questions"][0]
     confirm = question["options"][0]
-    assert question["header"] == "Confirm plugin action"
-    assert confirm["label"] == "Confirm"
+    assert question["header"] == "Allow plugin action"
+    assert confirm["label"] == "Allow"
     assert "token-1" in confirm["value"]
 
 
@@ -146,7 +146,7 @@ def test_confirmation_question_offers_always_allow_with_the_token_and_the_flag()
 
     labels = [option["label"] for option in question_payload["questions"][0]["options"]]
     always = question_payload["questions"][0]["options"][1]
-    assert labels == ["Confirm", "Always allow", "Cancel"]
+    assert labels == ["Allow", "Always allow", "Cancel"]
     assert "token-1" in always["value"]
     assert "alwaysAllow: true" in always["value"]
 
