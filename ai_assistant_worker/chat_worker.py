@@ -631,7 +631,10 @@ class ChatAssistantWorker(BaseWorker):
         _attach_attachments(conversation, request.images_json, self.logger)
 
         dynamic_mcp_tools = await self._load_dynamic_mcp_tools(request, tool_context)
-        tool_lookup = {**TOOLS_BY_NAME, **{tool.name: tool for tool in dynamic_mcp_tools}}
+        # Built-ins last, so they win. The selector already refuses a plugin tool named after one;
+        # this keeps a dispatch by name from ever landing on a third-party server should that
+        # check be loosened.
+        tool_lookup = {**{tool.name: tool for tool in dynamic_mcp_tools}, **TOOLS_BY_NAME}
         tool_schemas: list[dict[str, Any]] = [
             *(t.to_openai_schema() for t in TOOLS),
             *(t.to_openai_schema() for t in dynamic_mcp_tools),
