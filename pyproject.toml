@@ -35,7 +35,7 @@ dependencies = [
     "livekit>=0.11",
     "livekit-api>=0.11",
     # Japanese morphological analysis for the transcript disfluency prepass (WT-716,
-    # shared/disfluency). Japanese has no spaces, so "えーと" vs "ええ" and "その、その件" can only
+    # shared/disfluency). Japanese has no spaces, so the filler "eeto" vs the answer "ee" can only
     # be told apart on morpheme boundaries. unidic-lite ships the dictionary inside the wheel
     # (~50 MB) so no post-install download step is needed in the worker images.
     "fugashi>=1.3",
