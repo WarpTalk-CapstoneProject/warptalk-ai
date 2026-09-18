@@ -175,9 +175,33 @@ def select_mcp_tool_entries(
     plugins that both expose ``search``, makes the Responses API reject the *entire* request -
     so the user would lose the built-in tools as well, with the discovery error swallowed and no
     hint as to why WarpBot suddenly went quiet.
+
+    A name two *different* plugins claim is dropped for both, not kept for whichever came first.
+    The model calls a tool by name alone and the handler turns that name into the pluginKey it
+    executes with, so "first wins" let a workspace Owner's private MCP server declare
+    ``google_drive_search`` and receive the queries meant for Drive whenever it happened to be
+    listed first. AssistantService now settles every such collision by trust before the list
+    leaves it; this is the fail-closed backstop for a service that has not, since this side cannot
+    tell which claimant is the trusted one. A plugin repeating its *own* name is harmless - both
+    entries execute against the same plugin - and keeps its first entry as before.
+    Names are compared case-folded throughout: two names that differ only in case are one name
+    to the model reading the list.
     """
     if not isinstance(tools_payload, list):
         return [], []
+
+    reserved_folded = {reserved.casefold() for reserved in reserved_names}
+
+    # Pass one: every plugin claiming each name, before anything is accepted - the first claimant
+    # must not be let through just because the second has not been seen yet.
+    claimants: dict[str, set[str]] = {}
+    for item in tools_payload:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        plugin_key = str(item.get("pluginKey") or "").strip()
+        if name and plugin_key:
+            claimants.setdefault(name.casefold(), set()).add(plugin_key)
 
     accepted: list[dict[str, Any]] = []
     rejected: list[tuple[str, str]] = []
@@ -188,18 +212,22 @@ def select_mcp_tool_entries(
             continue
         name = str(item.get("name") or "").strip()
         plugin_key = str(item.get("pluginKey") or "").strip()
-        if not name or not plugin_key or name in reserved_names:
+        folded = name.casefold()
+        if not name or not plugin_key or folded in reserved_folded:
             continue
         if not MCP_TOOL_NAME_PATTERN.fullmatch(name):
             rejected.append(("mcp_tool_name_rejected", name))
             continue
-        if name in seen_names:
+        if len(claimants.get(folded, ())) > 1:
+            rejected.append(("mcp_tool_name_ambiguous", name))
+            continue
+        if folded in seen_names:
             rejected.append(("mcp_tool_name_duplicate", name))
             continue
         if len(accepted) >= MCP_MAX_DYNAMIC_TOOLS:
             rejected.append(("mcp_tool_budget_exhausted", name))
             break
-        seen_names.add(name)
+        seen_names.add(folded)
         accepted.append(item)
 
     return accepted, rejected
