@@ -320,12 +320,14 @@ def build_mcp_confirmation_questions(
     return {
         "questions": [
             {
-                "header": "Confirm plugin action",
+                "header": "Allow plugin action",
                 "question": message,
                 "options": [
                     {
-                        "label": "Confirm",
-                        "description": "Run this write action once.",
+                        # Allow runs this one call; Always allow also stops the card for this tool.
+                        # The value text keeps saying "Confirm": it is what the model reads back.
+                        "label": "Allow",
+                        "description": "Run this action once.",
                         "value": (
                             f"Confirm the {tool_name} plugin action. confirmationToken: {token}"
                         ),
