@@ -463,6 +463,47 @@ class TestTranslationWorker:
             assert envelope.arousal == "high"
             assert envelope.pitch_lift == pytest.approx(1.3)
 
+    async def test_a_room_stopped_for_a_refused_charge_is_not_translated(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """WT-699 / TC3705 — translation did not stop when credits reached zero.
+
+        settle_usage_charge refused every charge and this stage kept making paid LLM calls (and
+        handing tts_worker paid dubs) for a workspace that could no longer pay. billing_worker now
+        flags the room when a charge is refused; this stage must honour the flag.
+        """
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
+
+        async def fake_get(key: str) -> bytes | None:
+            return b"true" if key == "translationRoom:m1:ai_service_suspended" else None
+
+        mock_redis_client._redis.get.side_effect = fake_get
+
+        await worker.process(b"msg-1", self._make_stt_msg(language="en").to_redis())
+
+        published = [
+            c
+            for c in mock_redis_client._redis.xadd.call_args_list
+            if "translate:results" in str(c.args[0])
+        ]
+        assert published == []
+        worker.translator.translate_with_valence.assert_not_awaited()
+        worker.translator.translate_batch.assert_not_awaited()
+
+    async def test_a_room_whose_flag_is_absent_is_translated(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
+
+        await worker.process(b"msg-1", self._make_stt_msg(language="en").to_redis())
+
+        assert any(
+            "translate:results" in str(c.args[0])
+            for c in mock_redis_client._redis.xadd.call_args_list
+        )
+
     async def test_same_language_listener_gets_nothing_published(
         self, mock_redis_client, worker_settings: WorkerSettings
     ) -> None:

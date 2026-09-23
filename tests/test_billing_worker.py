@@ -504,3 +504,136 @@ class TestSettlementGoesThroughTheDatabaseFunction:
 
         with pytest.raises(RuntimeError, match="No active usage rate card"):
             await _settle(repo)
+
+
+# ── WT-699 / TC3705: a refused charge stops the room's translation ─────────────────────────
+
+
+def _suspension_worker() -> BillingSettlementWorker:
+    worker = BillingSettlementWorker.__new__(BillingSettlementWorker)
+    worker.logger = MagicMock()
+    worker._suspended_rooms = {}
+    worker.redis = MagicMock()
+    worker.redis.set_if_absent = AsyncMock(return_value=True)
+    worker.redis.set_with_ttl = AsyncMock()
+    worker.redis.expire = AsyncMock()
+    worker.redis.redis = MagicMock()
+    worker.redis.redis.publish = AsyncMock()
+    worker.redis.redis.delete = AsyncMock(return_value=2)
+    worker.db = MagicMock()
+    return worker
+
+
+def _outcome(*, applied: bool, replayed: bool = False) -> billing_db.SettlementOutcome:
+    return billing_db.SettlementOutcome(
+        applied=applied,
+        replayed=replayed,
+        balance_after=0,
+        service_state="suspended" if not applied else "healthy",
+        suspended_reason="overage_cap" if not applied else None,
+        credits_consumed=3,
+    )
+
+
+class TestRefusedChargeStopsTranslation:
+    """Translation used to keep running at zero credits: the refusal was logged and ignored."""
+
+    async def test_a_refused_charge_flags_the_room_and_tells_the_room(self) -> None:
+        worker = _suspension_worker()
+        room_id = str(uuid.uuid4())
+        subscription_id, workspace_id = uuid.uuid4(), uuid.uuid4()
+
+        await worker._note_settlement(
+            room_id, subscription_id, workspace_id, _outcome(applied=False)
+        )
+
+        worker.redis.set_if_absent.assert_awaited_once_with(
+            f"translationRoom:{room_id}:ai_service_suspended", "true", 120
+        )
+        written = {call.args[0]: call.args[1] for call in worker.redis.set_with_ttl.await_args_list}
+        assert written[f"workspace:{workspace_id}:ai_service_suspended"] == "true"
+        state = json.loads(written[f"translationRoom:{room_id}:ai_service_state"])
+        assert state["suspendedReason"] == "overage_cap"
+        channel, message = worker.redis.redis.publish.await_args.args
+        assert channel == "warptalk:translation-room:commands"
+        assert json.loads(message) == {
+            "Command": "TranslationCreditsExhausted",
+            "RoomId": room_id,
+            "Reason": "overage_cap",
+        }
+        assert worker._suspended_rooms[room_id] == (subscription_id, workspace_id)
+
+    async def test_the_room_is_announced_once_however_many_charges_are_refused(self) -> None:
+        worker = _suspension_worker()
+        worker.redis.set_if_absent = AsyncMock(return_value=False)
+
+        await worker._note_settlement(
+            str(uuid.uuid4()), uuid.uuid4(), uuid.uuid4(), _outcome(applied=False)
+        )
+
+        worker.redis.redis.publish.assert_not_awaited()
+        worker.redis.expire.assert_awaited()
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [_outcome(applied=True), _outcome(applied=False, replayed=True), MagicMock()],
+    )
+    async def test_a_paid_or_replayed_charge_stops_nothing(self, outcome: object) -> None:
+        worker = _suspension_worker()
+
+        await worker._note_settlement(str(uuid.uuid4()), uuid.uuid4(), uuid.uuid4(), outcome)
+
+        worker.redis.set_if_absent.assert_not_awaited()
+        worker.redis.redis.publish.assert_not_awaited()
+
+    async def test_the_room_stays_stopped_while_the_subscription_is_suspended(self) -> None:
+        worker = _suspension_worker()
+        room_id = str(uuid.uuid4())
+        worker._suspended_rooms[room_id] = (uuid.uuid4(), uuid.uuid4())
+        worker.db.get_service_state = AsyncMock(return_value=("suspended", "overage_cap"))
+
+        await worker._recheck_suspended_rooms()
+
+        assert room_id in worker._suspended_rooms
+        worker.redis.redis.delete.assert_not_awaited()
+        refreshed = {call.args[0] for call in worker.redis.expire.await_args_list}
+        assert f"translationRoom:{room_id}:ai_service_suspended" in refreshed
+
+    async def test_the_room_translates_again_once_the_workspace_can_pay(self) -> None:
+        worker = _suspension_worker()
+        room_id = str(uuid.uuid4())
+        worker._suspended_rooms[room_id] = (uuid.uuid4(), uuid.uuid4())
+        worker.db.get_service_state = AsyncMock(return_value=("healthy", None))
+
+        await worker._recheck_suspended_rooms()
+
+        assert room_id not in worker._suspended_rooms
+        channel, message = worker.redis.redis.publish.await_args.args
+        assert json.loads(message) == {"Command": "TranslationCreditsRestored", "RoomId": room_id}
+
+    async def test_the_translation_handler_reports_its_settlement(self) -> None:
+        """The wiring, end to end through _handle_translation: a refusal there stops the room."""
+        worker = _suspension_worker()
+        worker._subscription_cache = {}
+        worker.settings = MagicMock()
+        worker.settings.subscription_cache_ttl_seconds = 300
+        room_id = str(uuid.uuid4())
+        subscription_id, workspace_id = uuid.uuid4(), uuid.uuid4()
+        worker._resolve_subscription = AsyncMock(return_value=(subscription_id, workspace_id))
+        worker._is_external_speaker = AsyncMock(return_value=False)
+        worker.db.record_usage_and_charge = AsyncMock(return_value=_outcome(applied=False))
+        worker.redis.redis.hget = AsyncMock(return_value=None)
+        msg = TranslationResultMessage(
+            segment_id=f"{uuid.uuid4()}-vi-c0",
+            meeting_id=room_id,
+            speaker_id=str(uuid.uuid4()),
+            original_text="hello",
+            translated_text="xin chao",
+            source_lang="en",
+            target_lang="vi",
+            is_final_chunk=True,
+        )
+
+        await worker._handle_translation(msg.to_redis())
+
+        assert worker._suspended_rooms[room_id] == (subscription_id, workspace_id)

@@ -439,6 +439,17 @@ class TranslationWorker(BaseWorker):
             )
             return
 
+        # WT-699 / TC3705: the workspace cannot pay for this. billing_worker sets the flag when
+        # settle_usage_charge refuses a charge for this room and keeps it set only while the
+        # subscription stays suspended, so this is the stage that stops spending — before the
+        # paid LLM call and before tts_worker renders a dub nobody will be billed for.
+        if await self._credits_suspended(stt_result.meeting_id):
+            self.logger.info(
+                "translation_skipped_credits_exhausted",
+                meeting_id=stt_result.meeting_id,
+            )
+            return
+
         current_timestamp_ms = int(time.time() * 1000)
         e2e_latency_ms = current_timestamp_ms - stt_result.timestamp_ms
         await self.redis.publish_telemetry(stt_result.meeting_id, self.worker_name, e2e_latency_ms)
@@ -498,6 +509,20 @@ class TranslationWorker(BaseWorker):
         )
         if any(publish_results) and stt_result.confidence >= self._CONTEXT_MIN_CONFIDENCE:
             self._remember_source_context(stt_result.meeting_id, stt_result.text)
+
+    async def _credits_suspended(self, room_id: str) -> bool:
+        """Whether billing_worker has stopped this room for a refused charge (WT-699 / TC3705).
+
+        Fails OPEN on a Redis error: the charge itself is still refused by the settlement
+        function, so a blip here costs a few unbilled sentences, never a paying room its meeting.
+        """
+        try:
+            raw = await self.redis.get(f"translationRoom:{room_id}:ai_service_suspended")
+        except Exception:
+            return False
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return raw == "true"
 
     async def _translate_and_publish(
         self,
