@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -87,6 +88,15 @@ class ToolContext:
     #: without one simply produces no citations rather than failing.
     citations: SourceRegistry | None = None
     assistant_client: httpx.AsyncClient | None = None
+    #: Where this turn was asked from: "meeting_chat" for @WarpBot in a meeting's chat, anything
+    #: else for the widget. Decides whether continue_in_widget is offered at all.
+    origin: str = "assistant"
+    #: The page the question was asked on, from page_context_json. The quick actions fall back to
+    #: it when the model leaves meeting_id empty — on a meeting page "add this as an action item"
+    #: means THIS meeting, and making the model restate an id it was already handed is how it ends
+    #: up inventing one.
+    page_type: str | None = None
+    page_entity_id: str | None = None
 
 
 @dataclass
@@ -1517,6 +1527,467 @@ async def _create_meeting(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     )
 
 
+#: Offered only on the meeting-chat surface (see tools_for_origin): in the widget there is nowhere
+#: to move to, and a tool the model can call to no effect is a tool it will call.
+CONTINUE_IN_WIDGET_TOOL = "continue_in_widget"
+
+#: Page types whose entity id IS a translation room. Kept in step with chat_templates'
+#: _PAGE_TEMPLATES entries that carry the meeting binding.
+MEETING_PAGE_TYPES = frozenset(
+    {"meeting_chat", "in_meeting", "room_detail", "external_meeting_widget"}
+)
+
+#: create_action_item's `owner` values. NONE is a real member, not an omission: the chat model
+#: fills every property it is given (see meeting_draft.draft_from_arguments), so an enum with no
+#: way to say "nobody" forces it to pick somebody.
+ACTION_ITEM_OWNERS = ("ME", "NAMED", "NONE")
+
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _text_arg(arguments: dict[str, Any] | None, key: str) -> str:
+    """One string argument, trimmed, with the model's filler ("", None, 0) read as absent."""
+    value = (arguments or {}).get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _meeting_id_for(ctx: ToolContext, arguments: dict[str, Any] | None) -> str:
+    """The meeting a quick action is about: the one named, else the one on screen, else ""."""
+    named = _text_arg(arguments, "meeting_id")
+    if named:
+        return named
+    if (ctx.page_type or "").strip().lower() in MEETING_PAGE_TYPES and ctx.page_entity_id:
+        return str(ctx.page_entity_id).strip()
+    return ""
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def _error_reason(response: Any) -> str:
+    """The service's own words for a refusal, whichever of its three shapes it answered in.
+
+    ApiErrorResponse ({"error"/"message"}), a bare JSON string (the glossary controller returns
+    NotFound(error)), or plain text. The reason is what lets the model tell the user something
+    they can act on; "the tool failed" is not.
+    """
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        return str(body.get("error") or body.get("message") or body.get("title") or "")
+    if isinstance(body, str):
+        return body
+    try:
+        return str(response.text or "")[:300]
+    except Exception:
+        return ""
+
+
+async def _workspace_slug(ctx: ToolContext) -> str | None:
+    """The workspace's URL slug, fetched once per turn with the caller's own token.
+
+    Every workspace page lives under /{slug}/…, and nothing on the chat request carries the slug,
+    so without this a created task could only be described, never linked. None when it cannot be
+    read — the caller then leaves the link out rather than printing /None/rooms/….
+    """
+    if ctx.workspace_slug:
+        return ctx.workspace_slug
+    try:
+        response = await ctx.workspace_client.get(
+            f"/api/v1/workspaces/{ctx.workspace_id}",
+            headers=_auth_headers(ctx),
+        )
+        if response.status_code != 200:
+            logger.warning("workspace_slug_lookup_failed", status=response.status_code)
+            return None
+        body = response.json()
+        slug = body.get("slug") if isinstance(body, dict) else None
+    except Exception:
+        logger.exception("workspace_slug_lookup_error")
+        return None
+    if isinstance(slug, str) and slug.strip():
+        ctx.workspace_slug = slug.strip()
+        return ctx.workspace_slug
+    return None
+
+
+async def _continue_in_widget(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Hand this meeting's WarpBot thread to the asker's WarpBot widget.
+
+    Nothing is moved here. The worker publishes a `handoff` event when this returns, the meeting
+    service relays it addressed to whoever asked, and THAT person's browser opens the widget on a
+    new conversation that starts with the thread. Everybody else in the room sees only the one
+    sentence the model writes next.
+    """
+    if (ctx.origin or "").strip().lower() != "meeting_chat":
+        return json.dumps(
+            {
+                "status": "not_applicable",
+                "instruction": (
+                    "You are already in the WarpBot widget, so there is nothing to move. "
+                    "Just carry on with the user's request."
+                ),
+            }
+        )
+    return json.dumps(
+        {
+            "status": "handoff_requested",
+            "instruction": (
+                "The asker's WarpBot widget is opening with this thread in it. Reply with ONE "
+                "short sentence, in the language they wrote in, saying the conversation continues "
+                "in the widget (bottom-right). Do not repeat or summarise the thread, and do not "
+                "call another tool."
+            ),
+        }
+    )
+
+
+async def _create_action_item(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Save a task to a meeting — for real, with a link, instead of acknowledging it in prose.
+
+    Written because WarpBot answered a dictated action item with "Đã ghi nhận" and a bullet list,
+    and when asked where it was saved admitted it was saved nowhere. The contract now is: a task
+    exists only once this has returned status "created", and the answer links to it.
+
+    Owner resolution is the SERVICE's job (ActionItemOwnerResolver, the same matcher approval
+    uses), not the model's: the model reports "me" or the name it heard, and a name that does not
+    match exactly one participant comes back refused so the model can ask who was meant.
+    """
+    task = _text_arg(arguments, "task")
+    if not task:
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": ["task"],
+                "instruction": "Ask the user what the action item is, then call this again.",
+            }
+        )
+
+    owner = _text_arg(arguments, "owner").upper() or "NONE"
+    if owner not in ACTION_ITEM_OWNERS:
+        owner = "NONE"
+    owner_name = _text_arg(arguments, "owner_name")
+    if owner == "NAMED" and not owner_name:
+        # NAMED with no name is the filler case; the honest reading is that nobody was named.
+        owner = "NONE"
+
+    due_date = _text_arg(arguments, "due_date")
+    if due_date and not _ISO_DATE.match(due_date):
+        return json.dumps(
+            {
+                "status": "invalid",
+                "problems": ["due_date must be yyyy-MM-dd, or empty when no deadline was given."],
+            }
+        )
+    if due_date:
+        try:
+            datetime.strptime(due_date, "%Y-%m-%d")
+        except ValueError:
+            return json.dumps(
+                {"status": "invalid", "problems": [f"{due_date} is not a real date."]}
+            )
+
+    meeting_id = _meeting_id_for(ctx, arguments)
+    if not meeting_id:
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": ["meeting"],
+                "instruction": (
+                    "An action item belongs to a meeting and none is open. Find it with "
+                    "list_recent_meetings, or ask the user which meeting with ask_user — do NOT "
+                    "tell the user it was saved."
+                ),
+            }
+        )
+    if not _is_uuid(meeting_id):
+        return json.dumps({"status": "invalid", "problems": ["meeting_id is not a meeting id."]})
+
+    payload: dict[str, Any] = {
+        "task": task,
+        "assignToSelf": owner == "ME",
+        "ownerName": owner_name if owner == "NAMED" else None,
+        "dueDate": due_date or None,
+    }
+
+    try:
+        response = await ctx.translation_room_client.post(
+            f"/api/v1/rooms/{meeting_id}/action-items",
+            json=payload,
+            headers=_auth_headers(ctx),
+        )
+    except Exception:
+        logger.exception("create_action_item_request_error")
+        return json.dumps(
+            {
+                "status": "failed",
+                "reason": "Could not reach the meeting service. Nothing was saved.",
+            }
+        )
+
+    if response.status_code not in (200, 201):
+        reason = _error_reason(response)
+        logger.warning("create_action_item_failed", status=response.status_code)
+        if response.status_code == 400 and owner == "NAMED":
+            return json.dumps(
+                {
+                    "status": "owner_not_found",
+                    "owner_name": owner_name,
+                    "reason": reason,
+                    "instruction": (
+                        "Nothing was saved. Ask the user who they meant (ask_user), or offer to "
+                        "assign it to them or leave it unassigned."
+                    ),
+                }
+            )
+        return json.dumps(
+            {
+                "status": "failed",
+                "http_status": response.status_code,
+                "reason": reason or "The meeting service refused the request. Nothing was saved.",
+            }
+        )
+
+    try:
+        created = response.json()
+    except Exception:
+        created = {}
+    if not isinstance(created, dict):
+        created = {}
+
+    slug = await _workspace_slug(ctx)
+    result: dict[str, Any] = {
+        "status": "created",
+        "id": created.get("id"),
+        "task": created.get("task") or task,
+        "owner": created.get("ownerName"),
+        "assigned_to_you": bool(created.get("assigneeUserId"))
+        and str(created.get("assigneeUserId")).lower() == (ctx.user_id or "").lower(),
+        "assigned": bool(created.get("assigneeUserId")),
+        "due_date": created.get("dueDate"),
+        "meeting_title": created.get("roomTitle"),
+        "instruction": (
+            "It is saved. Confirm in one or two lines — the task, the owner, the deadline or "
+            "'no deadline' — and give the link. Do not restate it as a list of notes."
+        ),
+    }
+    # The meeting's own page is where its action items are listed. There is no workspace-wide
+    # task page to link to (web#551 removed it), and a link that lands on home is a broken promise.
+    if slug:
+        result["meeting_link"] = f"/{slug}/rooms/{meeting_id}"
+    return json.dumps(result, ensure_ascii=False)
+
+
+async def _add_glossary_term(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Add a term to one of this workspace's glossaries — the one named, or the only one there is.
+
+    Glossaries are listed for ctx.workspace_id, which comes from the chat request, never from the
+    model, so a term can only ever land in this workspace.
+    """
+    source_term = _text_arg(arguments, "source_term")
+    target_term = _text_arg(arguments, "target_term")
+    missing = [
+        name
+        for name, value in (("source_term", source_term), ("target_term", target_term))
+        if not value
+    ]
+    if missing:
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": missing,
+                "instruction": "Ask the user for the term and its preferred translation.",
+            }
+        )
+
+    try:
+        listed = await ctx.transcript_client.get(
+            f"/api/v1/glossaries/workspace/{ctx.workspace_id}",
+            headers=_auth_headers(ctx),
+        )
+    except Exception:
+        logger.exception("add_glossary_term_list_error")
+        return json.dumps({"status": "failed", "reason": "Could not reach the glossary service."})
+    if listed.status_code != 200:
+        logger.warning("add_glossary_term_list_failed", status=listed.status_code)
+        return json.dumps(
+            {"status": "failed", "http_status": listed.status_code, "reason": _error_reason(listed)}
+        )
+
+    try:
+        glossaries = [
+            g for g in (listed.json() or []) if isinstance(g, dict) and g.get("isActive", True)
+        ]
+    except Exception:
+        glossaries = []
+
+    if not glossaries:
+        return json.dumps(
+            {
+                "status": "no_glossary",
+                "instruction": (
+                    "This workspace has no glossary yet, so nothing was saved. Tell the user to "
+                    "create one on the Glossary page first."
+                ),
+            }
+        )
+
+    wanted = _text_arg(arguments, "glossary_name").casefold()
+    chosen: list[dict[str, Any]]
+    if wanted:
+        chosen = [g for g in glossaries if str(g.get("name") or "").casefold() == wanted]
+        if not chosen:
+            chosen = [g for g in glossaries if wanted in str(g.get("name") or "").casefold()]
+    else:
+        chosen = glossaries
+
+    if len(chosen) != 1:
+        return json.dumps(
+            {
+                "status": "choose_glossary",
+                "glossaries": [
+                    {
+                        "name": g.get("name"),
+                        "source_language": g.get("sourceLanguage"),
+                        "target_language": g.get("targetLanguage"),
+                    }
+                    for g in glossaries
+                ],
+                "instruction": (
+                    "Nothing was saved. Ask the user which glossary with ask_user, then call "
+                    "this again with its exact name as glossary_name."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    glossary = chosen[0]
+    context = _text_arg(arguments, "context")
+    try:
+        response = await ctx.transcript_client.post(
+            f"/api/v1/glossaries/{glossary.get('id')}/terms",
+            json={
+                "sourceTerm": source_term[:200],
+                "targetTerm": target_term[:200],
+                "context": context[:1000] or None,
+                "domain": None,
+                "definition": None,
+                "usageNote": None,
+                "partOfSpeech": None,
+                "priority": 0,
+            },
+            headers=_auth_headers(ctx),
+        )
+    except Exception:
+        logger.exception("add_glossary_term_request_error")
+        return json.dumps({"status": "failed", "reason": "Could not reach the glossary service."})
+
+    if response.status_code == 409:
+        return json.dumps(
+            {
+                "status": "already_exists",
+                "glossary": glossary.get("name"),
+                "reason": _error_reason(response),
+                "instruction": "Tell the user the term is already in that glossary.",
+            },
+            ensure_ascii=False,
+        )
+    if response.status_code not in (200, 201):
+        logger.warning("add_glossary_term_failed", status=response.status_code)
+        return json.dumps(
+            {
+                "status": "failed",
+                "http_status": response.status_code,
+                "reason": _error_reason(response),
+            }
+        )
+
+    slug = await _workspace_slug(ctx)
+    result: dict[str, Any] = {
+        "status": "created",
+        "glossary": glossary.get("name"),
+        "source_term": source_term,
+        "target_term": target_term,
+    }
+    if slug:
+        result["glossary_link"] = f"/{slug}/glossary"
+    return json.dumps(result, ensure_ascii=False)
+
+
+async def _share_meeting_minutes(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Give an email address access to a meeting's minutes, and hand back the link to send.
+
+    WarpTalk sends no email for this — the grant makes the minutes readable by that address
+    through the share link — so the result says so, and the model must not claim it was "sent".
+    Only the meeting's host can share; the service's refusal is passed through in its own words.
+    """
+    email = _text_arg(arguments, "email")
+    if "@" not in email or " " in email:
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": ["email"],
+                "instruction": "Ask the user for the email address to share the minutes with.",
+            }
+        )
+    meeting_id = _meeting_id_for(ctx, arguments)
+    if not meeting_id or not _is_uuid(meeting_id):
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": ["meeting"],
+                "instruction": (
+                    "Find the meeting with list_recent_meetings or ask the user which one."
+                ),
+            }
+        )
+
+    try:
+        response = await ctx.translation_room_client.post(
+            f"/api/v1/rooms/{meeting_id}/minutes/share/people",
+            json={"email": email},
+            headers=_auth_headers(ctx),
+        )
+    except Exception:
+        logger.exception("share_meeting_minutes_request_error")
+        return json.dumps({"status": "failed", "reason": "Could not reach the meeting service."})
+
+    if response.status_code != 200:
+        logger.warning("share_meeting_minutes_failed", status=response.status_code)
+        return json.dumps(
+            {
+                "status": "failed",
+                "http_status": response.status_code,
+                "reason": _error_reason(response)
+                or "The meeting's minutes could not be shared. Only the host can share them.",
+            }
+        )
+
+    try:
+        body = response.json()
+    except Exception:
+        body = {}
+    return json.dumps(
+        {
+            "status": "shared",
+            "email": email,
+            "share_url": body.get("url") if isinstance(body, dict) else None,
+            "instruction": (
+                "Access is granted, but WarpTalk does not email anyone. Give the user the "
+                "share_url to send, and do not say the minutes were sent."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
 #: Reports get_platform_analytics can fetch, and which client serves each. Kept beside the tool
 #: declaration's enum so the two cannot drift into offering a report nothing can answer.
 PLATFORM_ANALYTICS_REPORTS = ("overview", "revenue", "feedback", "users", "health")
@@ -1842,11 +2313,12 @@ TOOLS: list[ChatTool] = [
     ChatTool(
         name="create_meeting",
         description=(
-            "Create a translation room in the current workspace. Call this ONLY once you know "
-            "the title, meeting type, source language and target languages — if any of those is "
-            "missing, call ask_user first. Supports a one-off time (scheduled_at) OR a repeating "
-            "rule (recurrence_*), never both. Invited people receive an email, so only pass "
-            "addresses the user actually gave you."
+            "Create a translation room in the current workspace — including a FOLLOW-UP to the "
+            "meeting in progress (reuse its languages, and title it after it). Call this ONLY "
+            "once you know the title, meeting type, source language and target languages — if "
+            "any of those is missing, call ask_user first. Supports a one-off time "
+            "(scheduled_at) OR a repeating rule (recurrence_*), never both. Invited people "
+            "receive an email, so only pass addresses the user actually gave you."
         ),
         parameters={
             "type": "object",
@@ -1968,6 +2440,114 @@ TOOLS: list[ChatTool] = [
             "required": ["title", "translation_room_type", "source_language", "target_languages"],
         },
         handler=_create_meeting,
+    ),
+    ChatTool(
+        name="create_action_item",
+        description=(
+            "SAVE an action item (a task) to a meeting. Call this whenever the user states a "
+            "task, commitment or to-do — 'Action: …', 'ghi lại việc này', 'add a task', "
+            "'người thực hiện: tôi', 'deadline: …' — instead of acknowledging it in your reply. "
+            "Writing 'noted' or a bullet list saves NOTHING: the task exists only once this "
+            "returns status 'created', and only then may you say it is saved, with the link it "
+            "returns. It is listed on the meeting's page with its owner and deadline."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The task itself, as one clear sentence in the user's language.",
+                },
+                "owner": {
+                    "type": "string",
+                    "enum": list(ACTION_ITEM_OWNERS),
+                    "description": (
+                        "ME when the user will do it themselves ('tôi', 'mình', 'em', 'me', "
+                        "'I'). NAMED when they named somebody else (put the name in "
+                        "owner_name). NONE when nobody was named."
+                    ),
+                },
+                "owner_name": {
+                    "type": "string",
+                    "description": (
+                        "Only for owner NAMED: the name as the user said it, e.g. 'chị Nhi'. "
+                        "Empty otherwise. It is matched against the meeting's participants."
+                    ),
+                },
+                "due_date": {
+                    "type": "string",
+                    "description": (
+                        "yyyy-MM-dd, resolved from what the user said against today's date. "
+                        "EMPTY when no deadline was given or it is 'not decided' — never "
+                        "invent one."
+                    ),
+                },
+                "meeting_id": {
+                    "type": "string",
+                    "description": (
+                        "The meeting the task belongs to. Leave EMPTY when you are in or on a "
+                        "meeting — the one on screen is used. Otherwise an id from "
+                        "list_recent_meetings; never invent one."
+                    ),
+                },
+            },
+            "required": ["task", "owner"],
+        },
+        handler=_create_action_item,
+    ),
+    ChatTool(
+        name="add_glossary_term",
+        description=(
+            "SAVE a term and its preferred translation to this workspace's glossary, so live "
+            "translation uses it from now on. Call this when the user asks to add, save or fix "
+            "how a term is translated — do not just promise to remember it."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "source_term": {"type": "string", "description": "The term as spoken."},
+                "target_term": {
+                    "type": "string",
+                    "description": "How it must be translated.",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional one-line note on meaning or usage. Empty if none.",
+                },
+                "glossary_name": {
+                    "type": "string",
+                    "description": (
+                        "Which glossary, when the workspace has several. Empty to use the only "
+                        "one; if there are several you will be told their names."
+                    ),
+                },
+            },
+            "required": ["source_term", "target_term"],
+        },
+        handler=_add_glossary_term,
+    ),
+    ChatTool(
+        name="share_meeting_minutes",
+        description=(
+            "Give someone access to a meeting's minutes (biên bản) by email and get the share "
+            "link. Host only. WarpTalk does not email them — hand the user the link to send, "
+            "and never say it was sent."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "email": {"type": "string", "description": "The address to grant access to."},
+                "meeting_id": {
+                    "type": "string",
+                    "description": (
+                        "Empty for the meeting on screen; otherwise an id from "
+                        "list_recent_meetings."
+                    ),
+                },
+            },
+            "required": ["email"],
+        },
+        handler=_share_meeting_minutes,
     ),
     ChatTool(
         name="search_workspace_members",
@@ -2281,6 +2861,40 @@ TOOLS: list[ChatTool] = [
         },
         handler=_get_platform_analytics,
     ),
+    ChatTool(
+        name=CONTINUE_IN_WIDGET_TOOL,
+        description=(
+            "Move this conversation to the asker's private WarpBot widget so they can keep "
+            "discussing there. Call it when the user asks to continue, move or switch the chat "
+            "to the widget or to a private chat — 'chuyển qua widget', 'bàn tiếp ở widget', "
+            "'move this to chat', 'continue in the widget'. Their widget opens with this thread "
+            "already in it."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": (
+                        "A few words on what they want to keep discussing. Empty if unclear."
+                    ),
+                },
+            },
+            "required": [],
+        },
+        handler=_continue_in_widget,
+    ),
 ]
 
 TOOLS_BY_NAME: dict[str, ChatTool] = {t.name: t for t in TOOLS}
+
+
+def offered_on(tool_name: str, origin: str | None) -> bool:
+    """Whether a built-in tool is offered to a turn asked from this surface.
+
+    Every tool everywhere, except the handoff, which means something only when the question came
+    from a meeting's chat.
+    """
+    if tool_name != CONTINUE_IN_WIDGET_TOOL:
+        return True
+    return (origin or "").strip().lower() == "meeting_chat"
