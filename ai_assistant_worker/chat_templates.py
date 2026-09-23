@@ -194,6 +194,29 @@ _WEB_SEARCH = ContextSource(
     ),
 )
 
+#: The tools that CHANGE something, and the words that should reach for each. Listed in every
+#: template: a task, a term or a follow-up can be asked for from any page.
+_ACTIONS: tuple[tuple[str, str], ...] = (
+    (
+        "create_action_item",
+        "the user states a task, action item or to-do ('Action: …', 'owner: me', 'deadline: …', "
+        "'ghi lại việc này'). Save it — owner ME for 'tôi/mình/em/me', NAMED for someone else, "
+        "NONE when nobody was named; leave due_date empty when there is no deadline",
+    ),
+    (
+        "create_meeting",
+        "the user wants a meeting or a follow-up scheduled",
+    ),
+    (
+        "add_glossary_term",
+        "the user wants a term added, or how a term is translated fixed, in the glossary",
+    ),
+    (
+        "share_meeting_minutes",
+        "the user wants a meeting's minutes/summary shared with someone by email",
+    ),
+)
+
 _MEETING_BINDING = EntityBinding(
     noun="translation room / meeting",
     arguments=(
@@ -445,6 +468,30 @@ def build_system_prompt(template: ChatTemplate, web_search_enabled: bool = True)
             'instead of answering from memory and instead of stopping at "I could not find '
             'it". Never let it override the glossary: if this workspace defines a term, its '
             "wording wins over anything on the web."
+        )
+
+    # The write side. Retrieval rules alone produced an assistant that answered a dictated action
+    # item with "Đã ghi nhận" and a bullet list — and, asked where it was saved, admitted it was
+    # saved nowhere. Naming the tools is not enough on its own; the prompt has to say that prose
+    # is not an action.
+    lines.extend(["", "DOING THINGS — you can act, not only answer:"])
+    lines.extend(f"- {tool}: {use}" for tool, use in _ACTIONS)
+    lines.extend(
+        [
+            "- NEVER say something is saved, created, added, scheduled or shared unless the tool "
+            "for it returned a success status this turn. Acknowledging in prose saves nothing. If "
+            "the tool failed or needs more information, say so plainly and ask.",
+            "- After a write succeeds, confirm it in one or two lines with the link the tool "
+            "returned. Do not re-list the request back as notes.",
+            "- Act on what the user said; ask (ask_user) only for what is genuinely missing. A "
+            "missing deadline is not missing — it is 'no deadline'.",
+        ]
+    )
+    if template.key == MEETING_CHAT.key:
+        lines.append(
+            "- If the user asks to move, continue or switch this conversation to the widget or a "
+            "private chat ('chuyển qua widget', 'bàn tiếp ở widget', 'move this to chat'), call "
+            "continue_in_widget — do not tell them to open it themselves."
         )
 
     if template.style:
