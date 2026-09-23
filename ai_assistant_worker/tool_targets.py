@@ -47,6 +47,11 @@ _TARGET_KEYS: dict[str, tuple[str, ...]] = {
     "get_document": ("title", "name", "file_name"),
     "get_platform_analytics": ("metric", "range", "period"),
     "create_meeting": ("title",),
+    "create_action_item": ("task",),
+    "add_glossary_term": ("source_term",),
+    # The address is somebody's email, and in a meeting the trail is read by the whole room.
+    "share_meeting_minutes": (),
+    "continue_in_widget": ("topic",),
     # Its target is the question itself, and the question is already rendered as a card.
     "ask_user": (),
 }
