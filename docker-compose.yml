@@ -33,6 +33,20 @@ services:
       - warptalk-infrastructure_warptalk-net
     restart: unless-stopped
 
+  # ---- Transcript Clean Worker ----
+  # Post-hoc, never in the live path: it consumes stt:results under its own consumer group and
+  # publishes one clean SENTENCE per line to transcript:clean for the stored transcript.
+  transcript-clean:
+    build:
+      context: .
+      target: transcript-clean
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+    networks:
+      - warptalk-infrastructure_warptalk-net
+    restart: unless-stopped
+
   # ---- TTS Worker ----
   tts:
     build:
