@@ -27,15 +27,29 @@ HOW THAT IS ENFORCED, WITHOUT A DICTIONARY
     "you know", a stutter, anything — while an inserted or altered word is rejected by
     construction rather than by a similarity score that a good paraphrase might slip past.
     The model is told what it may do; this is what makes it true.
+
+WHY THE CHECK MOVED ONTO shared.disfluency (WT-716)
+    The rule was right and its TOKENIZER was wrong for one of the three languages this product
+    ships in. Splitting on whitespace makes a Japanese sentence exactly one token, so
+
+        明日えーとリリースします  →  明日リリースします
+
+    was not a subsequence of anything: the whole line changed, by the only measure available,
+    and every legitimate Japanese clean-up was refused. Deleting the filler was impossible
+    unless the recogniser happened to put spaces around it, which Japanese does not.
+
+    `shared.disfluency.tokenize` segments Japanese into morphemes (fugashi/unidic-lite) and
+    keeps the regex path for en/vi, and `check_invariants` states the whole rule — I1 is the
+    subsequence rule above, and I2 adds what a subsequence check cannot see: a polish that
+    deletes a "not", a number, or the particle that made the line a question is a subsequence
+    and is still a different sentence. Those three failures are the ones a reader cannot spot,
+    so the guardian now refuses them too. The ≤50% cap is unchanged.
 """
 
 from __future__ import annotations
 
-import re
-import unicodedata
-
-_PUNCTUATION_RE = re.compile(r"[^\w\s]", re.UNICODE)
-_WHITESPACE_RE = re.compile(r"\s+")
+from shared.disfluency import check_invariants, normalize_key, tokenize
+from shared.disfluency.normalize import resolve_language
 
 # How much of an utterance may be dropped as filler. Generous enough for a hesitant sentence
 # that is half "ừm à thì", tight enough that a model summarising instead of formatting fails —
@@ -65,43 +79,43 @@ def guardian_instruction(language: str) -> str:
     )
 
 
-def _tokens(text: str) -> list[str]:
+def _tokens(text: str, language: str) -> list[str]:
     """The words, stripped of everything the guardian is allowed to change.
 
     Case, punctuation and spacing go, because those are exactly what it MAY edit. Diacritics
     stay: in Vietnamese they are the difference between words, not decoration, and folding them
-    away would let a model quietly strip the tone marks off an entire meeting.
+    away would let a model quietly strip the tone marks off an entire meeting — `normalize_key`
+    keeps them for exactly that reason (it folds elongation and tone-mark PLACEMENT, not tone).
     """
-    normalized = unicodedata.normalize("NFC", text).casefold()
-    stripped = _WHITESPACE_RE.sub(" ", _PUNCTUATION_RE.sub(" ", normalized))
-    return [token for token in stripped.split(" ") if token]
+    return [normalize_key(token, language) for token in tokenize(text, language)]
 
 
-def _is_subsequence(candidate: list[str], source: list[str]) -> bool:
-    """Whether every token of `candidate` appears in `source`, in order."""
-    iterator = iter(source)
-    return all(token in iterator for token in candidate)
+def _language_of(text: str, language: str) -> str:
+    """The base language tag to tokenize and check with; script heuristic when unstated.
+
+    `language` used to be accepted and ignored. It is read now because the tokenizer depends on
+    it, and it stays optional because `stt_worker.second_pass` calls this without one — an
+    unstated language is resolved from the text's script, and falls back to the Latin path.
+    """
+    return resolve_language(language, text) or "en"
 
 
 def is_faithful(original: str, polished: str, language: str = "") -> bool:
-    """Whether `polished` is `original` with only formatting changed.
-
-    `language` is accepted and unused: the rule is structural, so it holds in every language,
-    and the parameter stays so callers do not have to change if that ever stops being true.
-    """
+    """Whether `polished` is `original` with only formatting changed."""
     if not polished.strip():
         return False
 
-    original_tokens = _tokens(original)
-    polished_tokens = _tokens(polished)
+    lang = _language_of(original, language)
+    original_tokens = _tokens(original, lang)
     if not original_tokens:
         return False
 
-    # Nothing may be added, changed or moved — only dropped.
-    if not _is_subsequence(polished_tokens, original_tokens):
+    # Nothing may be added, changed or moved — only dropped (I1) — and what is dropped may not
+    # be a negation, a number or the question marker (I2).
+    if check_invariants(original, polished, lang):
         return False
 
-    deleted = len(original_tokens) - len(polished_tokens)
+    deleted = len(original_tokens) - len(_tokens(polished, lang))
     return deleted <= len(original_tokens) * _MAX_DELETED_FRACTION
 
 
