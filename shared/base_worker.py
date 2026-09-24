@@ -24,6 +24,7 @@ from redis.asyncio.client import PubSub
 from shared.config import RedisSettings, WorkerSettings
 from shared.health_probe import heartbeat_key
 from shared.logger import get_logger
+from shared.provider_calls import bind_provider_calls
 from shared.redis_client import RedisStreamClient
 from shared.transcript_pause import is_transcript_paused as _read_transcript_paused
 
@@ -142,6 +143,9 @@ class BaseWorker(ABC):
             # 1. Connect to Redis
             await self.redis.connect()
             self.logger.info("redis_connected")
+            # Provider calls (OpenAI over httpx, Cartesia/OpenAI websockets) are counted on this
+            # connection from here on; see shared/provider_calls.
+            bind_provider_calls(self.redis)
             await self._publish_heartbeat()
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 

@@ -33,6 +33,7 @@ from openai import AsyncOpenAI, BadRequestError
 
 from retranscribe_worker.merge import SpeakerSegment
 from shared.logger import get_logger
+from shared.provider_calls import observed_openai_http_client
 
 logger = get_logger(__name__)
 
@@ -70,7 +71,9 @@ class BatchTranscriber:
     """One call per audio file, returning segments on the file's own clock."""
 
     def __init__(self, api_key: str, model: str) -> None:
-        self._client = AsyncOpenAI(api_key=api_key)
+        self._client = AsyncOpenAI(
+            api_key=api_key, http_client=observed_openai_http_client("retranscribe")
+        )
         self._model = model
 
     async def transcribe(

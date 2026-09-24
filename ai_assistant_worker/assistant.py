@@ -26,6 +26,7 @@ from shared.config import AssistantSettings
 from shared.languages import language_name, normalize_language_code
 from shared.logger import get_logger
 from shared.openai_options import completion_options
+from shared.provider_calls import observed_openai_http_client
 
 logger = get_logger(__name__)
 
@@ -76,7 +77,9 @@ When extracting action items:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required for WarpBot assistant")
 
-        self._client = AsyncOpenAI(api_key=self.api_key)
+        self._client = AsyncOpenAI(
+            api_key=self.api_key, http_client=observed_openai_http_client("assistant")
+        )
         logger.info("openai_client_initialized", model=self.model)
 
     async def summarize(self, transcript: str, context_snapshot: str = "") -> str:
