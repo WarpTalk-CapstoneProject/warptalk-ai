@@ -67,6 +67,17 @@ class TranscriptCleanSettings(BaseSettings):
     # tier is given a sentence the prepass has already had a pass at.
     max_delete_ratio: float = 0.4
 
+    # The same cap for a VERIFIED self-repair, which is allowed to delete more because that is
+    # the shape of the thing ("họp thứ hai, à không, thứ ba" throws away four of seven words).
+    #
+    # It is a separate knob, and an env var, because it is the only setting that can make this
+    # stage publish a line the speaker did not say: everything a repair is permitted to remove —
+    # the reparandum, its marker, the number or negation inside it — is removed on the strength
+    # of a classification the model made. Lowering this towards max_delete_ratio buys back
+    # faithfulness at the cost of leaving more repairs uncleaned, which is the direction this
+    # ticket says to fail in, and nobody should have to ship code to move in that direction.
+    self_repair_max_delete_ratio: float = 0.7
+
     # Bound on concurrent LLM calls in flight for this worker. The calls are independent and
     # nothing waits on them, so this is a spend/rate-limit bound rather than an ordering one.
     llm_concurrency: int = 4
