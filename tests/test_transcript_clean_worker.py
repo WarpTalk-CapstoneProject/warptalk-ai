@@ -293,6 +293,24 @@ class TestThePrepassTier:
 
         assert len(clean_messages(redis)) == 1
 
+    async def test_a_meeting_that_goes_silent_is_eventually_forgotten(self):
+        # The backstop for a meeting that ends without its sentinel or a terminal room status
+        # reaching this replica: a long-lived worker must not keep one segmenter per meeting it
+        # has ever seen.
+        worker, _, _ = build_worker()
+        await worker.process(b"1-0", stt("We should ship it today."))
+        await worker._flush_meeting(MEETING_ID, reason="meeting_end")
+        assert MEETING_ID in worker._segmenters
+
+        worker._last_seen_ms[MEETING_ID] -= worker._FORGET_AFTER_MS + 1
+        worker._IDLE_TICK_SECONDS = 0  # type: ignore[misc]
+        task = asyncio.create_task(worker._idle_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+
+        assert MEETING_ID not in worker._segmenters
+        assert MEETING_ID not in worker._last_line
+
     async def test_a_backchannel_does_not_cut_the_speakers_sentence(self):
         worker, redis, _ = build_worker()
         other = "33333333-3333-3333-3333-333333333333"

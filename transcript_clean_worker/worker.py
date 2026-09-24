@@ -69,6 +69,14 @@ class TranscriptCleanWorker(BaseWorker):
 
     _IDLE_TICK_SECONDS = 1.0
 
+    # How long a meeting may say nothing before this worker forgets it. The room's terminal
+    # status and the `__MEETING_END__` sentinel are the normal way state is dropped; this is the
+    # backstop for the meeting that ends without either reaching this replica, which would
+    # otherwise keep a (now empty) segmenter and its last line for the life of the process.
+    # Rebuilding the state costs nothing — the next segment creates it — and a meeting silent for
+    # fifteen minutes has no question for the next turn to be answering anyway.
+    _FORGET_AFTER_MS = 15 * 60 * 1000
+
     def __init__(
         self,
         clean_settings: TranscriptCleanSettings | None = None,
@@ -83,6 +91,7 @@ class TranscriptCleanWorker(BaseWorker):
         # keeps a turn-initial "hmm"/"ừ"/"うん" when the previous turn was a question, and the LLM
         # is shown one line of it for the same reason.
         self._last_line: dict[str, str] = {}
+        self._last_seen_ms: dict[str, int] = {}
         self._refine_tasks: set[asyncio.Task[None]] = set()
         self._idle_task: asyncio.Task[None] | None = None
 
@@ -131,7 +140,7 @@ class TranscriptCleanWorker(BaseWorker):
             await self.cleaner.close()
 
     async def _idle_loop(self) -> None:
-        """Close sentences whose speaker simply stopped talking."""
+        """Close sentences whose speaker simply stopped talking, and forget dead meetings."""
         while not self._shutdown_event.is_set():
             await asyncio.sleep(self._IDLE_TICK_SECONDS)
             try:
@@ -139,6 +148,9 @@ class TranscriptCleanWorker(BaseWorker):
                 for meeting_id, segmenter in list(self._segmenters.items()):
                     for sentence in segmenter.flush_idle(now_ms):
                         await self._publish(meeting_id, sentence)
+                    silent_for = now_ms - self._last_seen_ms.get(meeting_id, now_ms)
+                    if segmenter.is_empty and silent_for >= self._FORGET_AFTER_MS:
+                        self._forget(meeting_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -186,6 +198,7 @@ class TranscriptCleanWorker(BaseWorker):
                 idle_flush_ms=self.clean_settings.idle_flush_ms,
             )
             self._segmenters[meeting_id] = segmenter
+        self._last_seen_ms[meeting_id] = self._now_ms()
 
         for sentence in segmenter.add(self._to_segment(stt_result)):
             await self._publish(meeting_id, sentence)
@@ -368,6 +381,7 @@ class TranscriptCleanWorker(BaseWorker):
     def _forget(self, meeting_id: str) -> None:
         self._segmenters.pop(meeting_id, None)
         self._last_line.pop(meeting_id, None)
+        self._last_seen_ms.pop(meeting_id, None)
 
     async def _on_route_status_changed(self, room_id: str, new_status: str) -> None:
         if new_status in TERMINAL_ROOM_STATUSES:
