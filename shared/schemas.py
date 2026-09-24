@@ -829,6 +829,16 @@ class SummaryRequestMessage(BaseModel):
     #: Pre-read transcript, already formatted with `format_transcript_line`. Empty for a
     #: user-initiated rewrite, which fetches instead.
     transcript_text: str = ""
+    #: HOW to answer. "generate" (and an absent field — every request published before this
+    #: existed) writes a summary from the transcript. "translate" writes the summary in
+    #: `source_content_json` in `summary_language`: same sections, same items, same cited
+    #: moments, only the words change. The backend asks for it when a reader switches only the
+    #: LANGUAGE of the published summary, so what they read is the meeting's summary in their
+    #: language rather than a second summary that happens to be in it — and so a biên bản's
+    #: sections still line up with it. Mirrors SummaryRequestMode in translation-room.
+    mode: str = "generate"
+    #: The published summary to translate, when `mode` is "translate". Empty otherwise.
+    source_content_json: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -842,6 +852,8 @@ class SummaryRequestMessage(BaseModel):
             "summary_language": self.summary_language,
             "delivery": self.delivery,
             "transcript_text": self.transcript_text,
+            "mode": self.mode,
+            "source_content_json": self.source_content_json,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -863,6 +875,8 @@ class SummaryRequestMessage(BaseModel):
             # Absent on every message the backend published before this field existed, which is
             # exactly the user-initiated shape — so an old request keeps fetching.
             transcript_text=d.get("transcript_text", ""),
+            mode=d.get("mode") or "generate",
+            source_content_json=d.get("source_content_json", ""),
             timestamp_ms=int(d.get("timestamp_ms", 0) or 0),
         )
 
@@ -883,6 +897,13 @@ class SummaryResultMessage(BaseModel):
     delivery: str = "canonical"
     content_json: str = ""
     error: str = ""
+    #: The (template, language) the REQUEST asked for, echoed so the backend can tell a rendering
+    #: filed under the pair it was asked for from one that would be filed somewhere nobody looks.
+    #: `template_key` above is what the template RESOLVED to, which differs for an unknown key;
+    #: this is the key as requested (trimmed, lower-cased). `summary_language` is the requested
+    #: language normalised to its bare code, "" for as-spoken. WT-701.
+    requested_template_key: str = ""
+    summary_language: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -894,6 +915,8 @@ class SummaryResultMessage(BaseModel):
             "delivery": self.delivery,
             "content_json": self.content_json,
             "error": self.error,
+            "requested_template_key": self.requested_template_key,
+            "summary_language": self.summary_language,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -908,6 +931,8 @@ class SummaryResultMessage(BaseModel):
             delivery=d.get("delivery") or "canonical",
             content_json=d.get("content_json", ""),
             error=d.get("error", ""),
+            requested_template_key=d.get("requested_template_key", ""),
+            summary_language=d.get("summary_language", ""),
             timestamp_ms=int(d.get("timestamp_ms", 0) or 0),
         )
 

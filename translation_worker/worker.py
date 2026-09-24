@@ -21,6 +21,7 @@ from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
 from shared.control_markers import is_control_marker, is_system_speaker
 from shared.lang import is_same_language
+from shared.languages import known_language_code
 from shared.schemas import (
     ProsodyEnvelope,
     STTResultMessage,
@@ -160,6 +161,8 @@ class TranslationWorker(BaseWorker):
         ] = {}
         self._speculative_semaphore = asyncio.Semaphore(1)
         self._speculative_listener_task: asyncio.Task[None] | None = None
+        # (meeting_id, raw value) pairs already warned about by _get_target_languages.
+        self._warned_unknown_targets: set[tuple[str, str]] = set()
 
     async def load_model(self) -> None:
         """Initialize OpenAI translation client."""
@@ -439,6 +442,17 @@ class TranslationWorker(BaseWorker):
             )
             return
 
+        # WT-699 / TC3705: the workspace cannot pay for this. billing_worker sets the flag when
+        # settle_usage_charge refuses a charge for this room and keeps it set only while the
+        # subscription stays suspended, so this is the stage that stops spending — before the
+        # paid LLM call and before tts_worker renders a dub nobody will be billed for.
+        if await self._credits_suspended(stt_result.meeting_id):
+            self.logger.info(
+                "translation_skipped_credits_exhausted",
+                meeting_id=stt_result.meeting_id,
+            )
+            return
+
         current_timestamp_ms = int(time.time() * 1000)
         e2e_latency_ms = current_timestamp_ms - stt_result.timestamp_ms
         await self.redis.publish_telemetry(stt_result.meeting_id, self.worker_name, e2e_latency_ms)
@@ -531,6 +545,20 @@ class TranslationWorker(BaseWorker):
             # back to the model as "what has been said in this meeting", and a history of
             # "um, so, uh" teaches it nothing except to expect more of them.
             self._remember_source_context(stt_result.meeting_id, mt_source)
+
+    async def _credits_suspended(self, room_id: str) -> bool:
+        """Whether billing_worker has stopped this room for a refused charge (WT-699 / TC3705).
+
+        Fails OPEN on a Redis error: the charge itself is still refused by the settlement
+        function, so a blip here costs a few unbilled sentences, never a paying room its meeting.
+        """
+        try:
+            raw = await self.redis.get(f"translationRoom:{room_id}:ai_service_suspended")
+        except Exception:
+            return False
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return raw == "true"
 
     async def _translate_and_publish(
         self,
@@ -808,8 +836,19 @@ class TranslationWorker(BaseWorker):
             if user_id == speaker_id:
                 continue
             lang = raw_lang.decode() if isinstance(raw_lang, bytes) else raw_lang
-            if lang:
-                targets.add(lang)
+            if not lang:
+                continue
+            # WT-704. The hash is written by TranslationRoomHub from the client's own
+            # SignalR arguments, only lowercased and cut at '-', and when the workspace has
+            # no language whitelist nothing else filters it. translator._lang_name falls
+            # back to its input for an unknown code, so whatever a participant sent here
+            # went into the translation prompt verbatim — and was paid for once per
+            # utterance. A value this worker cannot name is not a translation target.
+            known = known_language_code(lang)
+            if not known:
+                self._warn_unknown_target_once(meeting_id, lang)
+                continue
+            targets.add(known)
 
         # No other participant registered yet — avoid assuming Vietnamese for all users.
         targets = targets or {"en"}
@@ -846,6 +885,33 @@ class TranslationWorker(BaseWorker):
                 targets -= echoes
 
         return targets
+
+    # Bounds _warned_unknown_targets: a worker lives for many meetings, and the values being
+    # remembered are attacker-chosen, so the set must not grow without limit.
+    _MAX_WARNED_UNKNOWN_TARGETS = 1024
+
+    def _warn_unknown_target_once(self, meeting_id: str, raw_lang: str) -> None:
+        """Log a dropped listen-language once per (room, value), not once per utterance.
+
+        _get_target_languages runs for every STT result and every speculative prefetch, so
+        an unconditional warning would repeat for as long as the listener stays in the room.
+        """
+        warned: set[tuple[str, str]] | None = getattr(self, "_warned_unknown_targets", None)
+        if warned is None:
+            warned = set()
+            self._warned_unknown_targets = warned
+        key = (meeting_id, raw_lang)
+        if key in warned:
+            return
+        if len(warned) >= self._MAX_WARNED_UNKNOWN_TARGETS:
+            warned.clear()
+        warned.add(key)
+        self.logger.warning(
+            "unknown_target_language_dropped",
+            meeting_id=meeting_id,
+            # Truncated and repr'd: the value is untrusted client input.
+            target_lang=repr(raw_lang[:64]),
+        )
 
     async def _get_mt_glossary(self, meeting_id: str) -> list[dict[str, str]]:
         """This meeting's workspace glossary, as [{"source": ..., "target": ...}, ...] —

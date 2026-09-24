@@ -88,6 +88,29 @@ class BillingRepository:
 
             return subscription_id, workspace_uuid
 
+    async def get_service_state(
+        self, subscription_id: uuid.UUID
+    ) -> tuple[str | None, str | None] | None:
+        """(service_state, suspended_reason) of one subscription, or None when it is gone.
+
+        WT-699 / TC3705: read by the suspension watch to learn when a workspace that was refused a
+        charge can pay again — a resume, a renewal, a contract change — so the room it stopped can
+        translate again without anybody restarting it.
+        """
+        assert self._pool is not None, "call connect() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT service_state, suspended_reason
+                FROM subscription.subscriptions
+                WHERE id = $1
+                """,
+                subscription_id,
+            )
+        if row is None:
+            return None
+        return row["service_state"], row["suspended_reason"]
+
     async def record_usage_and_charge(
         self,
         *,

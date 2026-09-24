@@ -26,7 +26,14 @@ import httpx
 from openai import AsyncOpenAI
 
 from ai_assistant_worker.chat_templates import PERSONA, build_system_prompt, resolve_template
-from ai_assistant_worker.chat_tools import TOOLS, TOOLS_BY_NAME, ChatTool, ToolContext
+from ai_assistant_worker.chat_tools import (
+    CONTINUE_IN_WIDGET_TOOL,
+    TOOLS,
+    TOOLS_BY_NAME,
+    ChatTool,
+    ToolContext,
+    offered_on,
+)
 from ai_assistant_worker.citations import (
     SourceRegistry,
     strip_markers,
@@ -107,6 +114,23 @@ def _page_type(page_context_json: str) -> str | None:
         return None
     page_type = context.get("pageType")
     return page_type if isinstance(page_type, str) and page_type else None
+
+
+def _result_status(result_json: str) -> str:
+    """The `status` a built-in tool reported, or "" for anything that is not such an object."""
+    try:
+        parsed = json.loads(result_json)
+    except (TypeError, ValueError):
+        return ""
+    return str(parsed.get("status") or "") if isinstance(parsed, dict) else ""
+
+
+def _page_entity_id(page_context_json: str) -> str | None:
+    context = _parse_page_context(page_context_json)
+    if context is None:
+        return None
+    entity_id = context.get("entityId")
+    return str(entity_id).strip() if entity_id else None
 
 
 def _format_page_context(page_context_json: str) -> str | None:
@@ -545,6 +569,9 @@ class ChatAssistantWorker(BaseWorker):
             model=self.chat_settings.model,
             redis=self.redis,
             citations=citations,
+            origin=request.origin,
+            page_type=_page_type(request.page_context_json),
+            page_entity_id=_page_entity_id(request.page_context_json),
         )
 
         try:
@@ -631,9 +658,12 @@ class ChatAssistantWorker(BaseWorker):
         _attach_attachments(conversation, request.images_json, self.logger)
 
         dynamic_mcp_tools = await self._load_dynamic_mcp_tools(request, tool_context)
-        tool_lookup = {**TOOLS_BY_NAME, **{tool.name: tool for tool in dynamic_mcp_tools}}
+        # Built-ins last, so they win. The selector already refuses a plugin tool named after one;
+        # this keeps a dispatch by name from ever landing on a third-party server should that
+        # check be loosened.
+        tool_lookup = {**{tool.name: tool for tool in dynamic_mcp_tools}, **TOOLS_BY_NAME}
         tool_schemas: list[dict[str, Any]] = [
-            *(t.to_openai_schema() for t in TOOLS),
+            *(t.to_openai_schema() for t in TOOLS if offered_on(t.name, request.origin)),
             *(t.to_openai_schema() for t in dynamic_mcp_tools),
         ]
 
@@ -837,6 +867,27 @@ class ChatAssistantWorker(BaseWorker):
                         type_="question",
                         tool_name=tool_name,
                         tool_calls_json=raw_arguments,
+                    )
+                # "Move this to the widget." Like the question card, the tool's real output is a UI
+                # — the asker's widget opening on this thread — so it gets its own event, which the
+                # meeting service relays addressed to the person who asked. Only when the handler
+                # actually agreed: on any other surface it answers not_applicable and nothing opens.
+                if (
+                    tool_name == CONTINUE_IN_WIDGET_TOOL
+                    and status == "completed"
+                    and _result_status(result_json) == "handoff_requested"
+                ):
+                    await self._publish_result(
+                        request,
+                        type_="handoff",
+                        tool_name=tool_name,
+                        tool_calls_json=json.dumps(
+                            {
+                                "target": "widget",
+                                "topic": str((arguments or {}).get("topic") or "")[:200],
+                            },
+                            ensure_ascii=False,
+                        ),
                     )
                 # The call and its result are fed back as a pair of typed input items —
                 # the Responses equivalent of the assistant/tool message pair.

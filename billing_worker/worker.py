@@ -41,6 +41,15 @@ BACKFILL TRANSLATION IS BILLED LIKE LIVE TRANSLATION.
     a line costs the same whether it was translated during the meeting or after it. Only where the
     workspace and the user come from differs; see _handle_backfill_translation.
 
+    A RETRANSLATION AFTER A TRANSCRIPT CORRECTION IS NOT BILLED. THIS IS DELIBERATE.
+    The same stream carries the redo of a line whose transcript somebody corrected. That work
+    exists only because the platform heard the line wrong, and the seconds it covers were already
+    paid for once, when the line was first translated live or by backfill. Charging again bills
+    the same audio twice for the platform's own mistake: the opposite of transcription being free
+    (WT-344), and of transcript_corrections.reversal_credit_transaction_id, which was designed to
+    REFUND a translation a human had to correct. Spend on it stays bounded by TranscriptService's
+    per-transcript backfill budget, which corrections draw from.
+
 Does not subclass shared.base_worker.BaseWorker: that class is built around one
 input_stream per instance plus a route-status pub/sub listener for the real-time
 pipeline. This worker needs two streams and has nothing to react to in real time —
@@ -66,7 +75,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
-from billing_worker.db import BillingRepository
+from billing_worker.db import BillingRepository, SettlementOutcome
 from shared.config import BillingSettings, RedisSettings, WorkerSettings
 from shared.control_markers import is_system_speaker
 from shared.health_probe import heartbeat_key
@@ -83,6 +92,31 @@ TRANSLATION_CHARGE_TYPE = "TRANSLATION"
 BACKFILL_RESULT_STREAM = "translate:backfill_results"
 BILLED_STREAMS = ("translate:results", BACKFILL_RESULT_STREAM, "tts:results")
 SettlementHandler = Callable[[Mapping[Any, Any]], Awaitable[None]]
+
+# WT-699 / TC3705 — WHEN A CHARGE IS REFUSED, TRANSLATION STOPS.
+#
+# settle_usage_charge refuses a charge (applied=False, not a replay) when the subscription is
+# suspended or the charge would cross the overage cap — which, with overage off, is the moment
+# the workspace runs out of credits. This worker used to log that and move on, and the meeting
+# went on translating and dubbing for free with nothing on screen saying anything was wrong.
+#
+# Now a refusal marks the ROOM (and the workspace) suspended in Redis. translation_worker reads the
+# room key and stops translating; TranslationRoomService reads both and refuses Start
+# Translation, saying why; the Gateway relays the command below so everybody in the room is told.
+#
+# The keys are the ones BillingService already writes for its own suspensions
+# (RedisConstants.Keys.*AiService*), in the same shape, so every reader has one contract.
+# They carry a short TTL that the watch loop keeps refreshing for as long as the subscription is
+# still suspended, and deletes the moment it is not — so a top-up followed by a resume brings the
+# room back on its own, and a crashed worker cannot leave a room stopped forever.
+ROOM_SUSPENDED_KEY = "translationRoom:{room_id}:ai_service_suspended"
+ROOM_STATE_KEY = "translationRoom:{room_id}:ai_service_state"
+WORKSPACE_SUSPENDED_KEY = "workspace:{workspace_id}:ai_service_suspended"
+WORKSPACE_STATE_KEY = "workspace:{workspace_id}:ai_service_state"
+GATEWAY_COMMANDS_CHANNEL = "warptalk:translation-room:commands"
+SUSPENDED_SERVICE_STATE = "suspended"
+SUSPENSION_TTL_SECONDS = 120
+SUSPENSION_RECHECK_SECONDS = 30
 
 
 def _extract_underlying_segment_id(raw_segment_id: str) -> str | None:
@@ -143,6 +177,9 @@ class BillingSettlementWorker:
         self._subscription_cache: dict[str, tuple[uuid.UUID, uuid.UUID, float]] = {}
         # workspace_id -> (subscription_id, workspace_id, cached_at_monotonic), for backfills
         self._workspace_subscription_cache: dict[str, tuple[uuid.UUID, uuid.UUID, float]] = {}
+        # WT-699 / TC3705: rooms this replica stopped because a charge was refused.
+        # translation_room_id -> (subscription_id, workspace_id)
+        self._suspended_rooms: dict[str, tuple[uuid.UUID, uuid.UUID]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -168,6 +205,7 @@ class BillingSettlementWorker:
             # free, and translation and dubbing are what it pays for.
             await asyncio.gather(
                 self._heartbeat_loop(),
+                self._suspension_watch_loop(),
                 self._consume_loop(
                     "translate:results", "billing-translation-workers", self._handle_translation
                 ),
@@ -325,6 +363,146 @@ class BillingSettlementWorker:
                 raise
             except Exception:
                 self.logger.exception("billing_heartbeat_failed")
+
+    # ------------------------------------------------------------------
+    # WT-699 / TC3705: a refused charge stops the room's translation
+    # ------------------------------------------------------------------
+
+    async def _note_settlement(
+        self,
+        translation_room_id: str,
+        subscription_id: uuid.UUID,
+        workspace_id: uuid.UUID,
+        outcome: object,
+    ) -> None:
+        """Stop the room if the workspace could not pay for what it just used.
+
+        A replay carries its original transaction and is not a refusal. Anything that is not a
+        SettlementOutcome (an older repository, a test double) is left alone rather than guessed at.
+        """
+        if not isinstance(outcome, SettlementOutcome):
+            return
+        if outcome.applied or outcome.replayed:
+            return
+        try:
+            await self._suspend_room(
+                translation_room_id,
+                subscription_id,
+                workspace_id,
+                outcome.service_state,
+                outcome.suspended_reason,
+            )
+        except Exception:
+            # The charge was already refused; failing the message here would only get it
+            # redelivered and refused again. The next refusal retries the marking.
+            self.logger.exception(
+                "credit_suspension_mark_failed", translation_room_id=translation_room_id
+            )
+
+    async def _suspend_room(
+        self,
+        translation_room_id: str,
+        subscription_id: uuid.UUID,
+        workspace_id: uuid.UUID,
+        service_state: str | None,
+        suspended_reason: str | None,
+    ) -> None:
+        self._suspended_rooms[translation_room_id] = (subscription_id, workspace_id)
+        state = json.dumps(
+            {
+                "translationRoomId": translation_room_id,
+                "workspaceId": str(workspace_id),
+                "serviceState": service_state or SUSPENDED_SERVICE_STATE,
+                "suspendedReason": suspended_reason,
+                "updatedAt": int(time.time() * 1000),
+            }
+        )
+        room_key = ROOM_SUSPENDED_KEY.format(room_id=translation_room_id)
+        # SET NX decides who announces it: one refusal per room reaches the UI, however many
+        # replicas and however many refused segments follow it.
+        newly_suspended = await self.redis.set_if_absent(room_key, "true", SUSPENSION_TTL_SECONDS)
+        if not newly_suspended:
+            await self.redis.expire(room_key, SUSPENSION_TTL_SECONDS)
+        await self.redis.set_with_ttl(
+            ROOM_STATE_KEY.format(room_id=translation_room_id), state, SUSPENSION_TTL_SECONDS
+        )
+        await self.redis.set_with_ttl(
+            WORKSPACE_SUSPENDED_KEY.format(workspace_id=workspace_id),
+            "true",
+            SUSPENSION_TTL_SECONDS,
+        )
+        await self.redis.set_with_ttl(
+            WORKSPACE_STATE_KEY.format(workspace_id=workspace_id), state, SUSPENSION_TTL_SECONDS
+        )
+
+        if newly_suspended:
+            self.logger.warning(
+                "translation_suspended_charge_refused",
+                translation_room_id=translation_room_id,
+                workspace_id=str(workspace_id),
+                service_state=service_state,
+                suspended_reason=suspended_reason,
+            )
+            await self._publish_gateway_command(
+                {
+                    "Command": "TranslationCreditsExhausted",
+                    "RoomId": translation_room_id,
+                    "Reason": suspended_reason or "",
+                }
+            )
+
+    async def _suspension_watch_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(SUSPENSION_RECHECK_SECONDS)
+            try:
+                await self._recheck_suspended_rooms()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.exception("credit_suspension_recheck_failed")
+
+    async def _recheck_suspended_rooms(self) -> None:
+        """Keep a stopped room stopped while it cannot pay; let it go the moment it can."""
+        for room_id, (subscription_id, workspace_id) in list(self._suspended_rooms.items()):
+            state = await self.db.get_service_state(subscription_id)
+            if state is not None and state[0] == SUSPENDED_SERVICE_STATE:
+                for key in (
+                    ROOM_SUSPENDED_KEY.format(room_id=room_id),
+                    ROOM_STATE_KEY.format(room_id=room_id),
+                    WORKSPACE_SUSPENDED_KEY.format(workspace_id=workspace_id),
+                    WORKSPACE_STATE_KEY.format(workspace_id=workspace_id),
+                ):
+                    await self.redis.expire(key, SUSPENSION_TTL_SECONDS)
+                continue
+
+            self._suspended_rooms.pop(room_id, None)
+            # Only the replica that actually removed the room key announces the resume.
+            removed = await self.redis.redis.delete(
+                ROOM_SUSPENDED_KEY.format(room_id=room_id),
+                ROOM_STATE_KEY.format(room_id=room_id),
+            )
+            await self.redis.redis.delete(
+                WORKSPACE_SUSPENDED_KEY.format(workspace_id=workspace_id),
+                WORKSPACE_STATE_KEY.format(workspace_id=workspace_id),
+            )
+            if removed:
+                self.logger.info(
+                    "translation_resumed_service_restored",
+                    translation_room_id=room_id,
+                    service_state=state[0] if state else None,
+                )
+                await self._publish_gateway_command(
+                    {"Command": "TranslationCreditsRestored", "RoomId": room_id}
+                )
+
+    async def _publish_gateway_command(self, payload: dict[str, str]) -> None:
+        # PascalCase on purpose: the Gateway deserializes TranslationRoomCommandMessage with the
+        # default (case-sensitive) options, the same envelope every other publisher here uses.
+        try:
+            await self.redis.redis.publish(GATEWAY_COMMANDS_CHANNEL, json.dumps(payload))
+        except Exception:
+            # Pub/sub is a courtesy to the UI; the Redis flags above are what stop translation.
+            self.logger.exception("gateway_command_publish_failed", command=payload.get("Command"))
 
     # ------------------------------------------------------------------
     # Subscription resolution (cached per translation_room_id)
@@ -529,7 +707,7 @@ class BillingSettlementWorker:
             self.logger.warning("segment_id_extraction_failed", raw_segment_id=msg.segment_id)
 
         quantity_s = _translation_quantity_seconds(msg)
-        await self.db.record_usage_and_charge(
+        outcome = await self.db.record_usage_and_charge(
             subscription_id=subscription_id,
             user_id=msg.speaker_id,
             workspace_id=workspace_id,
@@ -557,6 +735,7 @@ class BillingSettlementWorker:
                 "is_external": await self._is_external_speaker(msg.meeting_id, msg.speaker_id),
             },
         )
+        await self._note_settlement(msg.meeting_id, subscription_id, workspace_id, outcome)
 
     async def _handle_backfill_translation(self, data: Mapping[Any, Any]) -> None:
         """Charge a translation produced after the meeting, priced exactly like a live one.
@@ -568,16 +747,31 @@ class BillingSettlementWorker:
           which has expired for any transcript read back more than a day later.
         * USER: the requester, not the speaker. Nobody spoke this; somebody asked for it. The user
           is nullable on usage_records, so a message without one is still charged.
-        * IDEMPOTENCY: keyed on the bare segment id and language, plus the translation being
-          replaced for a post-correction redo. A duplicated backfill (two readers racing, a run
-          marker that expired mid-run) is charged once; each correction is its own charge,
-          because each one is a fresh model call.
+        * IDEMPOTENCY: keyed on the bare segment id and language. A duplicated backfill (two
+          readers racing, a run marker that expired mid-run) is charged once.
+
+        A retranslation after a correction (previous_translation_content_id set) is not charged
+        at all; see the module docstring.
 
         A message without a workspace is from a producer older than this contract. It is skipped,
         not retried: no number of redeliveries will add the field.
         """
         msg = TranslationResultMessage.from_redis(data)
         if not msg.translated_text.strip():
+            return
+
+        if msg.previous_translation_content_id:
+            # Logged, not silent: the model call still happened, and this is the only record of
+            # what the platform absorbed for its own transcription errors.
+            self.logger.info(
+                "retranslation_not_charged",
+                translation_room_id=msg.meeting_id,
+                workspace_id=msg.workspace_id,
+                transcript_id=msg.transcript_id,
+                segment_id=msg.segment_id,
+                target_lang=msg.target_lang,
+                seconds=_translation_quantity_seconds(msg),
+            )
             return
 
         segment_id = _extract_underlying_segment_id(msg.segment_id)
@@ -622,15 +816,7 @@ class BillingSettlementWorker:
                 requested_by = None
 
         target_lang = msg.target_lang
-        if msg.previous_translation_content_id:
-            origin = "retranslation"
-            idempotency_key = (
-                f"{TRANSLATION_CHARGE_TYPE}:retranslation:{segment_id}:{target_lang}:"
-                f"{msg.previous_translation_content_id}"
-            )
-        else:
-            origin = "backfill"
-            idempotency_key = f"{TRANSLATION_CHARGE_TYPE}:backfill:{segment_id}:{target_lang}"
+        idempotency_key = f"{TRANSLATION_CHARGE_TYPE}:backfill:{segment_id}:{target_lang}"
 
         await self.db.record_usage_and_charge(
             subscription_id=subscription_id,
@@ -651,7 +837,7 @@ class BillingSettlementWorker:
                 # A reporting dimension that fails towards internal (see _is_external_speaker);
                 # the requester already passed the transcript read check of the workspace.
                 "is_external": False,
-                "origin": origin,
+                "origin": "backfill",
                 "transcript_id": msg.transcript_id,
             },
         )
@@ -682,7 +868,7 @@ class BillingSettlementWorker:
             self.logger.warning("segment_id_extraction_failed", raw_segment_id=msg.segment_id)
 
         quantity_s = max(msg.duration_ms / 1000.0, 0.1)
-        await self.db.record_usage_and_charge(
+        outcome = await self.db.record_usage_and_charge(
             subscription_id=subscription_id,
             user_id=msg.speaker_id,
             workspace_id=workspace_id,
@@ -703,6 +889,7 @@ class BillingSettlementWorker:
                 "is_external": await self._is_external_speaker(msg.meeting_id, msg.speaker_id),
             },
         )
+        await self._note_settlement(msg.meeting_id, subscription_id, workspace_id, outcome)
 
     def _register_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()

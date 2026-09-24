@@ -155,6 +155,78 @@ def _preview_failure(exc: BaseException) -> tuple[str, str]:
     return "UNKNOWN", str(exc)[:200]
 
 
+#: The upload clone's answer when the recording was gone before the worker reached it.
+CLONE_SAMPLE_EXPIRED = "SAMPLE_EXPIRED"
+
+
+def _provider_error_body(exc: BaseException) -> tuple[str, str]:
+    """(error_code, message) from a Cartesia API error body, or ("", "") when there is none.
+
+    Read by attribute rather than by importing the SDK's exception types: the CI environment does
+    not install the `tts` extra, and the classifier has to be testable there.
+    """
+    body = getattr(exc, "body", None)
+    if not isinstance(body, Mapping):
+        return "", ""
+    code = body.get("error_code")
+    message = body.get("message")
+    return (
+        code if isinstance(code, str) else "",
+        message if isinstance(message, str) else "",
+    )
+
+
+def _clone_failure(exc: BaseException) -> tuple[str, str]:
+    """An upload-clone failure as (code, message), from whatever the provider SDK threw.
+
+    WHY THIS IS NOT `_preview_failure`
+        Cartesia answers a clone on the Free plan with HTTP 402 `plan_upgrade_required`. There is
+        no SDK subclass for 402, so it arrives as the bare `APIStatusError` — which
+        `_preview_failure` files under PROVIDER_UNAVAILABLE, "the voice provider returned an
+        error". That sentence is exactly what hid the 2026-09-18 outage: every upload from the
+        day the account dropped to Free failed at the vendor in four seconds, and the only record
+        of why was a log line that the next deploy deleted. The status code is the diagnosis, so
+        it is read first; the class name is only the fallback.
+
+    The CODE is what AuthService stores and the page translates. The MESSAGE is stored beside it
+    as the detail, so it must never carry a request id or a Python repr — for a sample the
+    provider refused, it is the provider's own one-line reason ("clip too short"), which is the
+    one thing that tells the person what to change in the next take.
+    """
+    status = getattr(exc, "status_code", None)
+    provider_code, provider_message = _provider_error_body(exc)
+
+    if status == 402:
+        if provider_code == "plan_upgrade_required":
+            return (
+                "PROVIDER_PLAN_REQUIRED",
+                "the voice provider account's plan does not include voice cloning",
+            )
+        return "PROVIDER_QUOTA_EXCEEDED", "the voice provider account is out of credits"
+    if status in (400, 413, 415, 422):
+        detail = provider_message.strip()[:160]
+        return (
+            "SAMPLE_REJECTED",
+            f"the voice provider could not use this recording: {detail}"
+            if detail
+            else "the voice provider could not use this recording",
+        )
+    if status in (401, 403):
+        return "PROVIDER_REJECTED", "the voice provider rejected our credentials"
+    if status == 429:
+        return "PROVIDER_BUSY", "the voice provider is rate limiting us"
+    if isinstance(status, int) and status >= 500:
+        return "PROVIDER_UNAVAILABLE", "the voice provider returned an error"
+
+    code, message = _preview_failure(exc)
+    if code == "VOICE_NOT_RENDERABLE":
+        # A 400-family error the SDK typed but whose status was not readable above.
+        return "SAMPLE_REJECTED", "the voice provider could not use this recording"
+    if code == "VOICE_NOT_FOUND":
+        return "UNKNOWN", message
+    return code, message
+
+
 # WT-B — a clone that outlives the meeting it was made in.
 #
 # WHY THE HAND-OFF EXISTS AT ALL
@@ -1482,13 +1554,23 @@ class TTSWorker(BaseWorker):
         sample_key = f"{_CLONE_SAMPLE_PREFIX}{profile_id}"
         result_key = f"{_CLONE_RESULT_PREFIX}{profile_id}"
 
-        async def answer(voice_id: str | None, error: str | None) -> None:
+        async def answer(
+            voice_id: str | None, error: str | None, error_code: str | None = None
+        ) -> None:
             # Seven days, because somebody may upload and not open the page for a while, and
             # losing the id would mean paying Cartesia again for a voice we already made.
+            #
+            # errorCode travels beside the message so AuthService can STORE why, not just that:
+            # the reason used to exist only in two log lines, and a deploy took both.
+            payload: dict[str, str | None] = {
+                "voiceId": voice_id,
+                "provider": "cartesia",
+                "error": error,
+            }
+            if error_code is not None:
+                payload["errorCode"] = error_code
             await self.redis.set_with_ttl(
-                result_key,
-                json.dumps({"voiceId": voice_id, "provider": "cartesia", "error": error}),
-                _CLONE_RESULT_TTL_SECONDS,
+                result_key, json.dumps(payload), _CLONE_RESULT_TTL_SECONDS
             )
 
         try:
@@ -1496,7 +1578,11 @@ class TTSWorker(BaseWorker):
             if not sample:
                 # The audio outlived by its TTL, or the request was replayed after the sample was
                 # collected. Said plainly rather than left pending forever.
-                await answer(None, "the uploaded recording was no longer available to clone")
+                await answer(
+                    None,
+                    "the uploaded recording was no longer available to clone",
+                    CLONE_SAMPLE_EXPIRED,
+                )
                 return
 
             audio = sample.encode("utf-8") if isinstance(sample, str) else sample
@@ -1511,8 +1597,11 @@ class TTSWorker(BaseWorker):
                 "uploaded_voice_cloned", profile_id=profile_id, bytes=len(audio), language=language
             )
         except Exception as exc:
-            self.logger.exception("uploaded_voice_clone_failed", profile_id=profile_id)
-            await answer(None, str(exc)[:200])
+            code, message = _clone_failure(exc)
+            self.logger.exception(
+                "uploaded_voice_clone_failed", profile_id=profile_id, error_code=code
+            )
+            await answer(None, message, code)
         finally:
             # The bytes are biometric data and there is no reason to keep them once we are done
             # with them, whichever way it went. The TTL is the backstop, not the plan.
