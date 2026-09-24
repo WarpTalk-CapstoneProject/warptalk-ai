@@ -21,6 +21,7 @@ from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
 from shared.control_markers import is_control_marker, is_system_speaker
 from shared.lang import is_same_language
+from shared.languages import known_language_code
 from shared.schemas import (
     ProsodyEnvelope,
     STTResultMessage,
@@ -160,6 +161,8 @@ class TranslationWorker(BaseWorker):
         ] = {}
         self._speculative_semaphore = asyncio.Semaphore(1)
         self._speculative_listener_task: asyncio.Task[None] | None = None
+        # (meeting_id, raw value) pairs already warned about by _get_target_languages.
+        self._warned_unknown_targets: set[tuple[str, str]] = set()
 
     async def load_model(self) -> None:
         """Initialize OpenAI translation client."""
@@ -800,8 +803,19 @@ class TranslationWorker(BaseWorker):
             if user_id == speaker_id:
                 continue
             lang = raw_lang.decode() if isinstance(raw_lang, bytes) else raw_lang
-            if lang:
-                targets.add(lang)
+            if not lang:
+                continue
+            # WT-704. The hash is written by TranslationRoomHub from the client's own
+            # SignalR arguments, only lowercased and cut at '-', and when the workspace has
+            # no language whitelist nothing else filters it. translator._lang_name falls
+            # back to its input for an unknown code, so whatever a participant sent here
+            # went into the translation prompt verbatim — and was paid for once per
+            # utterance. A value this worker cannot name is not a translation target.
+            known = known_language_code(lang)
+            if not known:
+                self._warn_unknown_target_once(meeting_id, lang)
+                continue
+            targets.add(known)
 
         # No other participant registered yet — avoid assuming Vietnamese for all users.
         targets = targets or {"en"}
@@ -838,6 +852,33 @@ class TranslationWorker(BaseWorker):
                 targets -= echoes
 
         return targets
+
+    # Bounds _warned_unknown_targets: a worker lives for many meetings, and the values being
+    # remembered are attacker-chosen, so the set must not grow without limit.
+    _MAX_WARNED_UNKNOWN_TARGETS = 1024
+
+    def _warn_unknown_target_once(self, meeting_id: str, raw_lang: str) -> None:
+        """Log a dropped listen-language once per (room, value), not once per utterance.
+
+        _get_target_languages runs for every STT result and every speculative prefetch, so
+        an unconditional warning would repeat for as long as the listener stays in the room.
+        """
+        warned: set[tuple[str, str]] | None = getattr(self, "_warned_unknown_targets", None)
+        if warned is None:
+            warned = set()
+            self._warned_unknown_targets = warned
+        key = (meeting_id, raw_lang)
+        if key in warned:
+            return
+        if len(warned) >= self._MAX_WARNED_UNKNOWN_TARGETS:
+            warned.clear()
+        warned.add(key)
+        self.logger.warning(
+            "unknown_target_language_dropped",
+            meeting_id=meeting_id,
+            # Truncated and repr'd: the value is untrusted client input.
+            target_lang=repr(raw_lang[:64]),
+        )
 
     async def _get_mt_glossary(self, meeting_id: str) -> list[dict[str, str]]:
         """This meeting's workspace glossary, as [{"source": ..., "target": ...}, ...] —
