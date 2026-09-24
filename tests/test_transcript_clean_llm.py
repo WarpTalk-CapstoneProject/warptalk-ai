@@ -39,9 +39,7 @@ class FakeCompletions:
             await asyncio.sleep(self.delay_s)
         payload = self.payloads.pop(0)
         content = payload if isinstance(payload, str) else json.dumps(payload)
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
-        )
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
 
 class FakeClient:
@@ -131,9 +129,7 @@ class TestRefusedAnswers:
         assert subject.rejections == {REJECT_BAD_JSON: 1}
 
     async def test_a_timeout_leaves_revision_zero_standing(self):
-        subject = cleaner(
-            [{"delete": [0], "self_repair": False}], delay_s=0.2, timeout_s=0.01
-        )
+        subject = cleaner([{"delete": [0], "self_repair": False}], delay_s=0.2, timeout_s=0.01)
         assert await subject.clean("um so we should ship it", "en") is None
         assert subject.rejections == {REJECT_TIMEOUT: 1}
 
@@ -214,9 +210,7 @@ class TestPureHelpers:
         assert apply_deletions("um, so we should ship it", "en", [0]) == "So we should ship it."
 
     def test_a_comma_between_two_surviving_words_is_the_speakers(self):
-        assert apply_deletions("um, we ship, then we test", "en", [0]) == (
-            "We ship, then we test."
-        )
+        assert apply_deletions("um, we ship, then we test", "en", [0]) == ("We ship, then we test.")
 
     def test_japanese_rebuilds_without_spaces(self):
         assert apply_deletions("えーと、明日リリースします", "ja", [0]) == "明日リリースします。"

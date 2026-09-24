@@ -144,9 +144,7 @@ class TestContinuationMarkersPerLanguage:
         segmenter = make()
         segmenter.add(segment("Mình deploy chiều nay để", language="vi", start_ms=0, end_ms=900))
         assert (
-            segmenter.add(
-                segment("kịp demo ngày mai.", language="vi", start_ms=1300, end_ms=2500)
-            )
+            segmenter.add(segment("kịp demo ngày mai.", language="vi", start_ms=1300, end_ms=2500))
             == []
         )
         [sentence] = segmenter.flush()

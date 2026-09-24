@@ -111,18 +111,83 @@ _BACKCHANNEL_MAX_TOKENS = 3
 _JOIN_LOWERCASE = {
     "en": frozenset(
         {
-            "a", "an", "and", "are", "as", "at", "be", "because", "but", "can", "for", "he",
-            "her", "his", "if", "in", "is", "it", "its", "of", "on", "or", "our", "she", "so",
-            "that", "the", "their", "then", "there", "they", "this", "to", "we", "were", "what",
-            "when", "which", "will", "with", "would", "you", "your",
+            "a",
+            "an",
+            "and",
+            "are",
+            "as",
+            "at",
+            "be",
+            "because",
+            "but",
+            "can",
+            "for",
+            "he",
+            "her",
+            "his",
+            "if",
+            "in",
+            "is",
+            "it",
+            "its",
+            "of",
+            "on",
+            "or",
+            "our",
+            "she",
+            "so",
+            "that",
+            "the",
+            "their",
+            "then",
+            "there",
+            "they",
+            "this",
+            "to",
+            "we",
+            "were",
+            "what",
+            "when",
+            "which",
+            "will",
+            "with",
+            "would",
+            "you",
+            "your",
         }
     ),
     "vi": frozenset(
         normalize_key(w, "vi")
         for w in (
-            "thì", "là", "mà", "và", "nhưng", "vì", "để", "với", "của", "cái", "này", "đó",
-            "sẽ", "đã", "đang", "có", "không", "rồi", "cho", "tôi", "mình", "chúng", "nó",
-            "khi", "nếu", "nên", "trong", "trên", "ở",
+            "thì",
+            "là",
+            "mà",
+            "và",
+            "nhưng",
+            "vì",
+            "để",
+            "với",
+            "của",
+            "cái",
+            "này",
+            "đó",
+            "sẽ",
+            "đã",
+            "đang",
+            "có",
+            "không",
+            "rồi",
+            "cho",
+            "tôi",
+            "mình",
+            "chúng",
+            "nó",
+            "khi",
+            "nếu",
+            "nên",
+            "trong",
+            "trên",
+            "ở",
         )
     ),
 }
@@ -280,9 +345,7 @@ def _decapitalize(text: str, language: str, original: str | None = None) -> str:
     return text[:1].lower() + text[1:]
 
 
-def join_texts(
-    pieces: list[str], language: str, originals: list[str] | None = None
-) -> str:
+def join_texts(pieces: list[str], language: str, originals: list[str] | None = None) -> str:
     """Join the pieces of one sentence back together, punctuation-only.
 
     Adds and removes PUNCTUATION and case, never a word, so the result stays a deletion of the

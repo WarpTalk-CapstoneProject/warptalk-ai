@@ -134,15 +134,17 @@ async def settle() -> None:
 class TestTheWireContract:
     async def test_revision_zero_then_revision_one(self):
         cleaner = FakeCleaner(
-            [CleanedSentence(text="We should ship it today.", self_repair=False, deleted_indices=(0,))]
+            [
+                CleanedSentence(
+                    text="We should ship it today.", self_repair=False, deleted_indices=(0,)
+                )
+            ]
         )
         worker, redis, _ = build_worker(cleaner)
         first, second = str(uuid.uuid4()), str(uuid.uuid4())
 
         await worker.process(b"1-0", stt("um we should ship it", segment_id=first, end_ms=1000))
-        await worker.process(
-            b"1-1", stt("today.", segment_id=second, start_ms=1200, end_ms=2000)
-        )
+        await worker.process(b"1-1", stt("today.", segment_id=second, start_ms=1200, end_ms=2000))
         await worker._flush_meeting(MEETING_ID, reason="meeting_end")
         await settle()
 
@@ -295,11 +297,11 @@ class TestThePrepassTier:
         worker, redis, _ = build_worker()
         other = "33333333-3333-3333-3333-333333333333"
         await worker.process(b"1-0", stt("I think that", end_ms=1000))
-        await worker.process(
-            b"1-1", stt("Yeah.", speaker_id=other, start_ms=1100, end_ms=1300)
-        )
+        await worker.process(b"1-1", stt("Yeah.", speaker_id=other, start_ms=1100, end_ms=1300))
         await worker.process(b"1-2", stt("we should ship it.", start_ms=1400, end_ms=2400))
         await worker._flush_meeting(MEETING_ID, reason="meeting_end")
 
-        texts = [(message["speaker_id"], message["clean_text"]) for message in clean_messages(redis)]
+        texts = [
+            (message["speaker_id"], message["clean_text"]) for message in clean_messages(redis)
+        ]
         assert texts == [(other, "Yeah."), (SPEAKER, "I think that we should ship it.")]
