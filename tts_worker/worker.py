@@ -1277,6 +1277,9 @@ class TTSWorker(BaseWorker):
                 generation_config=generation_config,
             )
         except Exception as e:
+            # Swallowed so the next sentence still plays; counted so a Cartesia outage (402 quota,
+            # 5xx) shows as a TTS success rate falling rather than as silence.
+            self.note_attempt_outcome("vendor_error")
             # Carried the error and the voice and nothing else, so a failure could not be tied
             # to the sentence that failed: the one question worth asking of this line — WHICH
             # line went silent — was the one it could not answer.
