@@ -43,6 +43,9 @@ MEETING_MARKER_PREFIX = "<!-- warpbot:meeting "
 #: ">" written as a JSON escape, so a title containing "-->" cannot close the comment early.
 _ESCAPED_GT = "\\u003e"
 
+#: A marker on its own line, with the newline that carried it.
+_MARKER_LINE = re.compile(r"[ \t]*<!-- warpbot:meeting .*?-->[ \t]*\n?")
+
 MeetingKind = Literal["google_meet", "warptalk_room"]
 
 
@@ -155,6 +158,18 @@ def ensure_meeting_links(answer: str, links: list[MeetingLink]) -> str:
         return answer
     joined = "\n".join(markers)
     return f"{answer.rstrip()}\n\n{joined}" if answer.strip() else joined
+
+
+def strip_meeting_markers(text: str) -> str:
+    """The answer without its markers — what history hands back to the model.
+
+    A model that sees markers in its own past answers writes them, and a marker it wrote is a
+    card, with a join link and a code, under an answer that only talks about a meeting.
+    """
+    if not text or MEETING_MARKER_PREFIX not in text:
+        return text
+    without = _MARKER_LINE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", without).strip()
 
 
 def _text(value: Any) -> str:

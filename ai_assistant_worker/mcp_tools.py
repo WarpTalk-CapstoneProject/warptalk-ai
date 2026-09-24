@@ -366,23 +366,26 @@ def _google_meet_confirmation(
     """The question and the rows under it: what will be created, when, and where it is written."""
     title = _argument_text(arguments, "summary") or "Google Meet meeting"
     current = (now or datetime.now(UTC)).astimezone(_CARD_TIMEZONE)
-    # No start means the gateway starts it now, to the minute, for 30 minutes.
-    start = _parse_instant(_argument_text(arguments, "start")) or current.replace(
-        second=0, microsecond=0
-    )
-    end = _parse_instant(_argument_text(arguments, "end")) or start + timedelta(minutes=30)
-    local_start = start.astimezone(_CARD_TIMEZONE)
-    local_end = end.astimezone(_CARD_TIMEZONE)
-
-    days = (local_start.date() - current.date()).days
-    day = {0: "Today", 1: "Tomorrow"}.get(days) or f"{local_start:%a %d %b}"
-    if local_end.date() == local_start.date():
-        finish = f"{local_end:%H:%M}"
+    start = _parse_instant(_argument_text(arguments, "start"))
+    if start is None:
+        # The gateway stamps the start when the call actually runs, which is after the user reads
+        # this card. Printing a clock time here would be wrong by however long they took.
+        when = "Starts when you confirm, 30 minutes"
     else:
-        finish = f"{local_end:%a %d %b %H:%M}"
+        end = _parse_instant(_argument_text(arguments, "end")) or start + timedelta(minutes=30)
+        local_start = start.astimezone(_CARD_TIMEZONE)
+        local_end = end.astimezone(_CARD_TIMEZONE)
+        days = (local_start.date() - current.date()).days
+        day = {0: "Today", 1: "Tomorrow"}.get(days) or f"{local_start:%a %d %b}"
+        if local_end.date() == local_start.date():
+            finish = f"{local_end:%H:%M}"
+        else:
+            finish = f"{local_end:%a %d %b %H:%M}"
+        when = f"{day} {local_start:%H:%M} – {finish} (GMT+7)"
+
     details = [
         {"label": "Title", "value": title},
-        {"label": "When", "value": f"{day} {local_start:%H:%M} – {finish} (GMT+7)"},
+        {"label": "When", "value": when},
         {"label": "Calendar", "value": "Your primary Google Calendar"},
     ]
     attendees = arguments.get("attendees")

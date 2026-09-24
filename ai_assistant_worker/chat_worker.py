@@ -65,6 +65,7 @@ from ai_assistant_worker.meeting_links import (
     MeetingLink,
     ensure_meeting_links,
     meeting_link_from_tool_result,
+    strip_meeting_markers,
 )
 from ai_assistant_worker.tool_targets import (
     describe_tool_target,
@@ -630,8 +631,16 @@ class ChatAssistantWorker(BaseWorker):
         instructions_parts.append(citation_instruction())
         instructions = "\n\n".join(instructions_parts)
 
+        # Markers are stripped on the way back in. They are stored with the message, so an
+        # unfiltered history teaches the model to write them — and a marker it wrote itself would
+        # put a card, with a link and a code, under an answer that merely TALKS about a meeting.
+        # The card is a record of what a tool did; only the worker may write one.
         conversation: list[dict[str, Any]] = [
-            {"role": turn.get("role"), "content": turn.get("content")} for turn in history
+            {
+                "role": turn.get("role"),
+                "content": strip_meeting_markers(turn.get("content") or ""),
+            }
+            for turn in history
         ]
         _attach_attachments(conversation, request.images_json, self.logger)
 

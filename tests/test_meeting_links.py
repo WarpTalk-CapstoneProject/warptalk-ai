@@ -26,6 +26,7 @@ from ai_assistant_worker.meeting_links import (
     meet_code_from_url,
     meeting_link_from_tool_result,
     room_url,
+    strip_meeting_markers,
 )
 from tests.test_chat_agent_loop import (
     _build_worker,
@@ -183,9 +184,11 @@ class TestGoogleMeetConfirmationCard:
         }
         assert question["options"][0]["label"] == "Create"
 
-    def test_no_time_means_now_for_half_an_hour(self) -> None:
+    def test_no_time_promises_no_clock_time(self) -> None:
+        # The gateway stamps the start when the call runs, so a clock time on the card would be
+        # wrong by however long the user took to press Create.
         details = self._details(self._card())
-        assert details["When"] == "Today 15:40 – 16:10 (GMT+7)"
+        assert details["When"] == "Starts when you confirm, 30 minutes"
         assert details["Title"] == "Google Meet meeting"
 
     def test_the_answer_leads_with_the_choice_and_keeps_the_token_for_the_model(self) -> None:
@@ -210,6 +213,18 @@ def test_the_prompt_separates_warptalk_rooms_from_google_meet() -> None:
     prompt = build_system_prompt(GENERAL)
     assert "A WARPTALK ROOM OR A GOOGLE MEET MEETING" in prompt
     assert "Do not create a WarpTalk room instead." in prompt
+    # The marker is the worker's to write, never the model's.
+    assert "Never" in prompt and "HTML comment of your own" in prompt
+    # And the confirmation round-trip has to come back with the same arguments.
+    assert "EXACTLY the arguments you sent the first time" in prompt
+
+
+def test_the_history_the_model_sees_carries_no_markers() -> None:
+    link = MeetingLink(kind="google_meet", url=MEET_URL, title="Quick sync", code="abc-defg-hij")
+    answer = ensure_meeting_links("Đã tạo cuộc họp.", [link])
+    assert MEETING_MARKER_PREFIX in answer
+    assert strip_meeting_markers(answer) == "Đã tạo cuộc họp."
+    assert strip_meeting_markers("plain answer") == "plain answer"
 
 
 class TestAgentLoopGuaranteesTheLink:

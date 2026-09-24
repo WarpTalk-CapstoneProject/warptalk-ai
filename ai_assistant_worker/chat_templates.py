@@ -398,16 +398,26 @@ MEETING_KIND_RULES: tuple[str, ...] = (
     "- Google Meet when the user @mentions the Google Meet plugin or says Google Meet / gg meet / "
     "a Meet link. Otherwise a meeting request means a WarpTalk room.",
     "- For Google Meet, do not ask questions first: with no time given, omit start and end (it "
-    "starts now for 30 minutes); with no title, pick a short one from the topic or omit it. "
+    "starts now for 30 minutes), and with no title given, omit summary too - the server names it. "
     "Call the tool straight away - the user confirms on WarpBot's card.",
+    "- When the tool answers confirmation_required, STOP: say in one sentence what you are "
+    "waiting for and end your turn. The user's answer arrives as their next message; then call "
+    "the tool again with EXACTLY the arguments you sent the first time plus the confirmationToken "
+    "from that message. Different arguments mean a different action, and the token will not "
+    "cover it.",
     "- If the Google Meet tool is not available to you, say the Google Meet plugin must be "
-    "installed and connected. Do not create a WarpTalk room instead.",
+    "installed and connected, or switched back on for this conversation. Do not create a "
+    "WarpTalk room instead.",
     "- After creating either kind, say in one or two sentences what was created and whether it "
     "is on Google Meet or in WarpTalk. WarpBot draws a card under your answer with the join "
-    "link, the meeting code and the time, so do not paste the link or the code yourself.",
-    "- Google Meet AND live translation: create the Google Meet meeting first, then a WarpTalk "
-    "room of type EXTERNAL_BRIDGE with external_provider GOOGLE_MEET and the returned link, and "
-    "explain that the meeting happens on Google Meet while WarpTalk translates it.",
+    "link, the meeting code and the time, so do not paste the link or the code yourself. Never "
+    "write an HTML comment of your own - the card comes from the tool's result, not from you.",
+    "- If a Google Meet meeting comes back with no link yet (meetLinkStatus 'pending'), say "
+    "Google is still creating it and point at the calendar event; do not invent a link.",
+    "- Google Meet AND live translation: create the Google Meet meeting first and wait until it "
+    "has a link, then create a WarpTalk room of type EXTERNAL_BRIDGE with external_provider "
+    "GOOGLE_MEET and that exact link, and explain that the meeting happens on Google Meet while "
+    "WarpTalk translates it.",
 )
 
 

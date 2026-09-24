@@ -1792,8 +1792,10 @@ TOOLS: list[ChatTool] = [
         name="ask_user",
         description=(
             "Ask the user one or more multiple-choice questions and STOP. Use this the moment "
-            "you need a detail you do not have — never guess a meeting's title, languages, type "
-            "or time. The questions appear as a card the user picks from; their answer arrives "
+            "you need a detail you do not have — never guess a WarpTalk room's title, languages "
+            "or type. (A Google Meet meeting is the exception: it needs no questions, see the "
+            "meetings rules.) The questions appear as a card the user picks from; their answer "
+            "arrives "
             "as a normal message on your next turn. Ask everything you need in ONE call: three "
             "questions in one card is a form, three cards in a row is an interrogation."
         ),
