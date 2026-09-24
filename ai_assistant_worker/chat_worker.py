@@ -68,6 +68,11 @@ from ai_assistant_worker.mcp_tools import split_mcp_tool_arguments as _split_mcp
 from ai_assistant_worker.mcp_tools import (
     with_mcp_confirmation_parameter as _with_mcp_confirmation_parameter,
 )
+from ai_assistant_worker.platform_tools import (
+    PLATFORM_TOOLS,
+    PLATFORM_TOOLS_BY_NAME,
+    build_platform_system_prompt,
+)
 from ai_assistant_worker.tool_targets import (
     describe_tool_target,
     describe_web_search_target,
@@ -425,6 +430,15 @@ def _now_message(now: datetime | None = None) -> str:
     )
 
 
+def _is_platform_turn(request: Any) -> bool:
+    """Whether this turn belongs to a system admin's platform-scope conversation.
+
+    Read with getattr so a stand-in request without the field is a workspace turn — which is what
+    every request from an AssistantService that predates the field is.
+    """
+    return (str(getattr(request, "scope", "") or "")).strip().lower() == "platform"
+
+
 def _web_citations(output_items: list[Any]) -> list[tuple[str, str, int]]:
     """(title, url, position) for every url_citation OpenAI's hosted search anchored in the answer.
 
@@ -555,8 +569,12 @@ class ChatAssistantWorker(BaseWorker):
         # this mechanism exists to prevent.
         citations = SourceRegistry()
 
+        platform_turn = _is_platform_turn(request)
         tool_context = ToolContext(
-            workspace_id=request.workspace_id,
+            # A platform turn has no workspace, whatever the stream says: no tool it is offered
+            # takes one, and forcing "" here means a stray id could not scope anything if one
+            # ever were.
+            workspace_id="" if platform_turn else request.workspace_id,
             user_id=request.user_id,
             bearer_token=request.bearer_token,
             workspace_client=self._workspace_client,
@@ -626,6 +644,21 @@ class ChatAssistantWorker(BaseWorker):
 
         # Responses carries the system prompt as `instructions` rather than as a leading
         # message, so the three system-role messages are joined into one.
+        if _is_platform_turn(request):
+            return await self._run_tool_loop(
+                request,
+                history,
+                tool_context,
+                instructions="\n\n".join(
+                    [build_platform_system_prompt(), _now_message(), citation_instruction()]
+                ),
+                # THE SCOPE BOUNDARY. A platform turn is offered the read-only admin tools and
+                # nothing else: no workspace tool, no retrieval, no plugin (MCP discovery is
+                # workspace-scoped and never called), no hosted web search.
+                tool_lookup=dict(PLATFORM_TOOLS_BY_NAME),
+                tool_schemas=[tool.to_openai_schema() for tool in PLATFORM_TOOLS],
+            )
+
         template = resolve_template(
             origin=request.origin,
             page_type=_page_type(request.page_context_json),
@@ -677,6 +710,33 @@ class ChatAssistantWorker(BaseWorker):
         # ENABLED=false turns it off without a rebuild.
         if self.chat_settings.web_search_enabled:
             tool_schemas.append({"type": "web_search"})
+
+        return await self._run_tool_loop(
+            request,
+            history,
+            tool_context,
+            instructions=instructions,
+            tool_lookup=tool_lookup,
+            tool_schemas=tool_schemas,
+            conversation=conversation,
+        )
+
+    async def _run_tool_loop(
+        self,
+        request: ChatRequestMessage,
+        history: list[dict[str, str]],
+        tool_context: ToolContext,
+        *,
+        instructions: str,
+        tool_lookup: dict[str, ChatTool],
+        tool_schemas: list[dict[str, Any]],
+        conversation: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """The Responses-API tool loop, over whichever tool set the scope was given."""
+        if conversation is None:
+            conversation = [
+                {"role": turn.get("role"), "content": turn.get("content")} for turn in history
+            ]
         tool_call_log: list[dict[str, Any]] = []
         final_text = ""
 
@@ -1110,5 +1170,6 @@ class ChatAssistantWorker(BaseWorker):
             tool_detail=tool_detail,
             tool_calls_json=tool_calls_json,
             sources_json=sources_json,
+            scope="platform" if _is_platform_turn(request) else "workspace",
         )
         await self.publish("assistant:chat_results", request.conversation_id, result.to_redis())
