@@ -115,6 +115,7 @@ files = [
     "shared",
     "stt_worker",
     "translation_worker",
+    "transcript_clean_worker",
     "tts_worker",
     "ai_assistant_worker",
     "embedding_worker",
