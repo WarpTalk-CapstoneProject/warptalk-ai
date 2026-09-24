@@ -26,15 +26,18 @@ WHAT IT IS FOR THAT THE PREPASS CANNOT DO
 
 WHEN THE ANSWER IS DISCARDED
     Invariant violation, a deletion ratio over the cap, an index that is not a token, an empty
-    result, a timeout, malformed JSON. In every case revision 0 — the prepass line, already
-    published — stands. The clean tier is a polish on a line the reader already has, so the
-    right failure mode is "no second revision", never "no line".
+    result, a timeout, malformed JSON — and, for a claimed self-repair, a negation deleted
+    outside the repair marker or a number deleted with nothing of its kind put back. In every
+    case revision 0 — the prepass line, already published — stands. The clean tier is a polish
+    on a line the reader already has, so the right failure mode is "no second revision", never
+    "no line".
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +56,7 @@ from shared.disfluency.normalize import resolve_language
 from shared.disfluency.tokenize import COMMAS, Token, tokenize_spans
 from shared.logger import get_logger
 from shared.openai_options import completion_options
+from transcript_clean_worker.config import TranscriptCleanSettings
 
 logger = get_logger(__name__)
 
@@ -64,14 +68,23 @@ REJECT_RATIO = "delete_ratio"
 REJECT_TIMEOUT = "timeout"
 REJECT_CALL_FAILED = "call_failed"
 REJECT_NO_CHANGE = "no_change"
+REJECT_NEGATION_OUTSIDE_MARKER = "negation_outside_marker"
+REJECT_NUMBER_WITHOUT_REPLACEMENT = "number_without_replacement"
 
 # A VERIFIED self-repair is allowed to delete more than an ordinary clean-up, because that is
-# the shape of the thing: "Monday, I mean Tuesday" is three of its four words, and "họp thứ hai,
-# à không, thứ ba" is four of seven. The ordinary cap exists to catch a model that is
+# the shape of the thing: "họp thứ hai, à không, thứ ba" is four of seven words, and "We ship on
+# Monday, I mean Tuesday" is three of seven. The ordinary cap exists to catch a model that is
 # summarising; a repair whose marker ("I mean", "à không", "じゃなくて") is inside one contiguous
 # deleted span is not summarising. Without this, the cap would reject exactly the case this tier
 # was added for. What still holds for a repair: I1 (nothing invented) and the question marker.
-_SELF_REPAIR_MAX_DELETE_RATIO = 0.8
+#
+# 0.7 and not the 0.8 this started at. The number is a guess either way, so it is set at the
+# smallest value that still covers the repairs we have actually seen — a whole SENTENCE that is
+# four fifths reparandum is more likely a model summarising than a speaker correcting themselves,
+# and when the two readings are that close the ruling on this ticket says to keep the messier,
+# truer line. `TranscriptCleanSettings.self_repair_max_delete_ratio` makes it an env var, so this
+# can be tightened further in production without shipping code.
+_SELF_REPAIR_MAX_DELETE_RATIO = 0.7
 
 _OPENING = frozenset('([{“‘「『"')
 _CLOSING = frozenset(",.?!;:)]}…”’、。？！」』%")
@@ -88,6 +101,182 @@ _SELF_REPAIR_MARKERS: dict[str, tuple[str, ...]] = {
     "vi": tuple(" ".join(phrase) for phrase in lexicon_vi.SELF_REPAIR_MARKERS),
     "ja": tuple(lexicon_ja.SELF_REPAIR_MARKERS),
 }
+
+
+def _marker_phrases(lang: str) -> tuple[tuple[str, ...], ...]:
+    """The markers as comparison keys, longest first.
+
+    Longest first because the marker span is what licenses a deleted negation below, and the
+    long markers are the ones that CONTAIN the negation: matching "à không" before "à", or
+    "không phải" before "à không", is the difference between "the negation is part of the
+    marker" and "the model quietly deleted a không".
+    """
+    phrases = [
+        (normalize_key(marker, lang),)
+        if lang == "ja"
+        else tuple(normalize_key(word, lang) for word in marker.split())
+        for marker in _SELF_REPAIR_MARKERS.get(lang, ())
+    ]
+    phrases.sort(key=lambda phrase: -sum(len(key) for key in phrase))
+    return tuple(phrases)
+
+
+_MARKER_PHRASES: dict[str, tuple[tuple[str, ...], ...]] = {
+    lang: _marker_phrases(lang) for lang in ("en", "vi", "ja")
+}
+
+# Mirrors `shared.disfluency.invariants._JA_NEGATION_RE`, which is private and owned by another
+# task on this ticket — so it is restated rather than imported or edited. The one difference: the
+# shared pattern anchors a bare "ず" on the punctuation that follows it in the SENTENCE, and this
+# one is matched against a single token key, where end-of-token is the same evidence.
+_JA_NEGATION_RE = re.compile(r"ない|ません|なかっ|ず$")
+
+# WHAT COUNTS AS "A NUMBER" FOR THE REPLACEMENT RULE, AND WHY IT IS LOCAL.
+#
+# `shared.disfluency` counts digits and number words (en NUMBER_WORDS, vi NUMBER_SYLLABLES, ja
+# NUMERAL_CHARS) and nothing else — "Monday" and "May" are ordinary words to it. But the repair
+# this tier exists for is precisely "Monday, I mean Tuesday": a weekday swapped for a weekday. To
+# tell a REPLACEMENT repair from a plain loss of fact, this stage has to know that those two
+# words are the same kind of thing, so the calendar vocabulary lives here, beside the rule that
+# needs it, instead of in shared/** (owned elsewhere on this ticket).
+#
+# Vietnamese weekdays and months are built out of number syllables ("thứ hai", "tháng ba") that
+# shared already counts, so only "chủ nhật" needs an entry — handled positionally below.
+_KIND_NUMBER = "number"
+_KIND_WEEKDAY = "weekday"
+_KIND_MONTH = "month"
+
+_EN_WEEKDAYS = frozenset(
+    {
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "mon",
+        "tue",
+        "tues",
+        "wed",
+        "thu",
+        "thur",
+        "thurs",
+        "fri",
+        "sat",
+        "sun",
+    }
+)
+# "may" and "march" are also an ordinary verb and an ordinary noun. They stay in: mistaking a
+# modal for a month can only make this stage REFUSE a deletion, which is the cheap direction.
+_EN_MONTHS = frozenset(
+    {
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+        "jan",
+        "feb",
+        "mar",
+        "apr",
+        "jun",
+        "jul",
+        "aug",
+        "sep",
+        "sept",
+        "oct",
+        "nov",
+        "dec",
+    }
+)
+# Ordinals are how a date or a position is said out loud ("the third, sorry, the fourth"), and
+# shared's NUMBER_WORDS has only the cardinals.
+_EN_ORDINALS = frozenset(
+    {
+        "first",
+        "second",
+        "third",
+        "fourth",
+        "fifth",
+        "sixth",
+        "seventh",
+        "eighth",
+        "ninth",
+        "tenth",
+        "eleventh",
+        "twelfth",
+    }
+)
+_JA_WEEKDAYS = frozenset(
+    normalize_key(word, "ja")
+    for word in (
+        "月曜",
+        "火曜",
+        "水曜",
+        "木曜",
+        "金曜",
+        "土曜",
+        "日曜",
+        "月曜日",
+        "火曜日",
+        "水曜日",
+        "木曜日",
+        "金曜日",
+        "土曜日",
+        "日曜日",
+    )
+)
+_VI_SUNDAY = (normalize_key("chủ", "vi"), normalize_key("nhật", "vi"))
+
+
+def _quantity_kind(tokens: list[Token], index: int, lang: str) -> str | None:
+    """Which KIND of fact this token carries — a number, a weekday, a month — or None.
+
+    "Kind" is the whole point: a repair replaces a fact with another fact of the same kind, and
+    a deletion that removes the only weekday in the line is not a repair, it is a fact going
+    missing. The classes are deliberately coarse; a digit and a number word are one kind, because
+    "three, I mean 4" is the same repair written two ways.
+    """
+    key = tokens[index].key
+    if lang == "ja":
+        if any(char in lexicon_ja.NUMERAL_CHARS for char in key):
+            return _KIND_NUMBER
+        return _KIND_WEEKDAY if key in _JA_WEEKDAYS else None
+    if any(char.isdigit() for char in key):
+        return _KIND_NUMBER
+    if lang == "vi":
+        if key in lexicon_vi.NUMBER_SYLLABLES:
+            return _KIND_NUMBER
+        # "chủ nhật" is the one Vietnamese weekday with no number syllable in it; "nhật" on its
+        # own is a language ("tiếng Nhật"), so it only counts next to its "chủ".
+        neighbours = (
+            key == _VI_SUNDAY[0]
+            and index + 1 < len(tokens)
+            and tokens[index + 1].key == _VI_SUNDAY[1]
+        ) or (key == _VI_SUNDAY[1] and index > 0 and tokens[index - 1].key == _VI_SUNDAY[0])
+        return _KIND_WEEKDAY if neighbours else None
+    if key in lexicon_en.NUMBER_WORDS or key in _EN_ORDINALS:
+        return _KIND_NUMBER
+    if key in _EN_WEEKDAYS:
+        return _KIND_WEEKDAY
+    return _KIND_MONTH if key in _EN_MONTHS else None
+
+
+def _is_negation(token: Token, lang: str) -> bool:
+    if lang == "en":
+        return token.key in lexicon_en.NEGATIONS or token.key.endswith("n't")
+    if lang == "vi":
+        return token.key in lexicon_vi.NEGATIONS
+    return bool(_JA_NEGATION_RE.search(token.key))
+
 
 _SYSTEM_PROMPT = """You clean one line of a live meeting transcript. You may ONLY DELETE tokens.
 
@@ -109,15 +298,25 @@ NEVER DELETE:
 - a contrast, which is not a self-correction: "赤じゃなくて青がいい" ("not red, blue") keeps
   every token, and so does "not Monday but Tuesday"
 
-If nothing should be deleted, answer {"delete": [], "self_repair": false}. Never invent an
-index. Deleting too little is always better than deleting too much."""
+WHEN UNSURE, DELETE LESS. This is the rule that outranks every other rule here. A line that
+still has a filler in it is untidy; a line that lost a word the speaker said is a record of a
+meeting that did not happen, and it will be translated and read out in another language. If you
+cannot tell whether a span is an abandoned false start or something the speaker meant, LEAVE IT
+IN. If you cannot tell whether two halves are a correction or a contrast, LEAVE THEM BOTH IN.
+Never delete a word only because the sentence would read better without it.
 
-# Three, and no more. Measured behaviour on this task: the more deletions a model is shown, the
-# more it finds — a longer example list reliably pushed it into removing meaningful words.
+If nothing should be deleted, answer {"delete": [], "self_repair": false}. That is a correct
+and common answer, not a failure to do the job. Never invent an index."""
+
+# Four, and no more. Measured behaviour on this task: the more deletions a model is shown, the
+# more it finds — a longer example list reliably pushed it into removing meaningful words. Two of
+# the four delete nothing, on purpose: the empty answer has to look as normal as the other two.
 _FEW_SHOT = """Examples (tokens are shown as index:token):
 1. 0:um 1:so 2:we 3:we 4:should 5:ship 6:it -> {"delete": [0, 3], "self_repair": false}
 2. 0:họp 1:thứ 2:hai 3:à 4:không 5:thứ 6:ba -> {"delete": [1, 2, 3, 4], "self_repair": true}
-3. 0:赤 1:じゃなくて 2:青 3:が 4:いい -> {"delete": [], "self_repair": false}"""
+3. 0:赤 1:じゃなくて 2:青 3:が 4:いい -> {"delete": [], "self_repair": false}
+4. 0:not 1:monday 2:but 3:tuesday -> {"delete": [], "self_repair": false}
+   (a contrast, not a correction — when it could be either, delete nothing)"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,33 +414,95 @@ def apply_deletions(raw: str, language: str, indices: list[int]) -> str:
     return normalize_terminal_punctuation(text, lang)
 
 
-def deleted_surface(raw: str, language: str, indices: list[int]) -> str:
-    """The normalised keys of the deleted tokens, as one string, for marker matching."""
-    lang = _language_of(raw, language)
-    tokens = lexical_tokens(raw, lang)
-    keys = [tokens[i].key for i in sorted(indices) if 0 <= i < len(tokens)]
-    return "".join(keys) if lang == "ja" else " " + " ".join(keys) + " "
+def self_repair_marker_span(raw: str, language: str, indices: list[int]) -> tuple[int, ...]:
+    """The token indices the correction marker itself occupies, or () when none was deleted.
 
+    Which tokens, not just whether — because the marker span is what licenses the narrow
+    exceptions below. "à không" and "no wait" ARE partly a negation, so a repair cannot be
+    verified without allowing that one negation to disappear; every other negation in the
+    deleted span is a word the speaker said and is not covered by anything.
 
-def has_self_repair_marker(raw: str, language: str, indices: list[int]) -> bool:
-    """Whether what was deleted contains a correction marker ("I mean", "à không", "じゃなくて").
-
-    The contiguity of the deletion is not checked separately: a marker inside the deleted span
-    IS the evidence that the span was a reparandum, and the lexicons here are the same ones the
+    The contiguity of the deletion is checked by the caller: a marker inside the deleted span IS
+    the evidence that the span was a reparandum, and the lexicons here are the same ones the
     prepass escalates on, so the two tiers cannot disagree about what a repair looks like.
     """
     lang = _language_of(raw, language)
-    surface = deleted_surface(raw, lang, indices)
-    for marker in _SELF_REPAIR_MARKERS.get(lang, ()):
-        key = normalize_key(marker, lang)
-        if lang == "ja":
-            if key in surface:
-                return True
-        else:
-            phrase = " ".join(normalize_key(word, lang) for word in marker.split())
-            if f" {phrase} " in surface:
-                return True
-    return False
+    tokens = lexical_tokens(raw, lang)
+    ordered = [index for index in sorted(set(indices)) if 0 <= index < len(tokens)]
+    keys = [tokens[index].key for index in ordered]
+
+    if lang == "ja":
+        # No spaces to align on, so the match is over the concatenated keys and the span is every
+        # token the matched character range touches.
+        bounds: list[tuple[int, int]] = []
+        cursor = 0
+        for key in keys:
+            bounds.append((cursor, cursor + len(key)))
+            cursor += len(key)
+        surface = "".join(keys)
+        for phrase in _MARKER_PHRASES["ja"]:
+            start = surface.find(phrase[0])
+            if start < 0:
+                continue
+            end = start + len(phrase[0])
+            return tuple(
+                ordered[position]
+                for position, (low, high) in enumerate(bounds)
+                if low < end and high > start
+            )
+        return ()
+
+    for phrase in _MARKER_PHRASES.get(lang, ()):
+        width = len(phrase)
+        for start in range(len(keys) - width + 1):
+            if tuple(keys[start : start + width]) == phrase:
+                return tuple(ordered[start : start + width])
+    return ()
+
+
+def has_self_repair_marker(raw: str, language: str, indices: list[int]) -> bool:
+    """Whether what was deleted contains a correction marker ("I mean", "à không", "じゃなくて")."""
+    return bool(self_repair_marker_span(raw, language, indices))
+
+
+def negations_deleted_outside_marker(
+    tokens: list[Token], lang: str, indices: list[int], marker_span: tuple[int, ...]
+) -> list[str]:
+    """The negations this deletion removes that are NOT part of the correction marker.
+
+    Empty is the only acceptable answer. A negation inside "à không" / "không phải" / "no wait"
+    / "じゃなくて" goes because the marker goes, and that is a word the speaker used to CANCEL a
+    statement, not to make one. A negation anywhere else in the span is the statement itself.
+    """
+    inside = set(marker_span)
+    return [
+        tokens[index].text
+        for index in indices
+        if index not in inside and _is_negation(tokens[index], lang)
+    ]
+
+
+def quantity_without_replacement(tokens: list[Token], lang: str, indices: list[int]) -> str | None:
+    """The kind of fact this deletion removes without putting another of that kind back.
+
+    A repair REPLACES: "thứ hai, à không, thứ ba" still has a number in it afterwards, and
+    "Monday, I mean Tuesday" still has a weekday. That surviving token is the evidence that the
+    speaker was correcting a fact rather than dropping one, so it is required — and required
+    AFTER the deleted span, because that is where the repairing half of a repair lives. A
+    deletion that leaves no number where there was one is a number going missing, whatever the
+    model called it.
+    """
+    last = indices[-1]
+    deleted_kinds: set[str] = set()
+    for index in indices:
+        kind = _quantity_kind(tokens, index, lang)
+        if kind is not None:
+            deleted_kinds.add(kind)
+    if not deleted_kinds:
+        return None
+    for index in range(last + 1, len(tokens)):
+        deleted_kinds.discard(_quantity_kind(tokens, index, lang) or "")
+    return sorted(deleted_kinds)[0] if deleted_kinds else None
 
 
 class LLMCleaner:
@@ -254,6 +515,7 @@ class LLMCleaner:
         model: str,
         timeout_s: float = 8.0,
         max_delete_ratio: float = 0.4,
+        self_repair_max_delete_ratio: float | None = None,
         concurrency: int = 4,
         temperature: float = 0.0,
     ) -> None:
@@ -261,6 +523,15 @@ class LLMCleaner:
         self.model = model
         self.timeout_s = timeout_s
         self.max_delete_ratio = max_delete_ratio
+        # Resolved from the settings object when the caller does not pass one, so
+        # TRANSCRIPT_CLEAN_SELF_REPAIR_MAX_DELETE_RATIO is live in production today: the worker's
+        # construction site (worker.load_model) belongs to another task on this ticket and is not
+        # touched here. An explicit argument always wins, which is how the tests pin it.
+        self.self_repair_max_delete_ratio = (
+            TranscriptCleanSettings().self_repair_max_delete_ratio
+            if self_repair_max_delete_ratio is None
+            else self_repair_max_delete_ratio
+        )
         self.temperature = temperature
         self._client: AsyncOpenAI | None = None
         self._semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -340,6 +611,38 @@ class LLMCleaner:
     def _verify(
         self, raw: str, lang: str, tokens: list[Token], response: Any
     ) -> CleanedSentence | None:
+        """The model's answer, or None — and None is the cheap answer, by design.
+
+        THE RULING THIS FUNCTION IMPLEMENTS (WT-716)
+            Faithfulness to what the speaker actually said outranks tidiness. Deleting too little
+            is better than deleting too much, and deleting too little is also better than
+            refusing to publish: a rejection here is not a missing line, it is the tier-1 wording
+            standing as revision 0, which the reader already has. So every doubt in this function
+            resolves the same way — refuse the polish, keep the line.
+
+        WHY THAT MAKES THE SELF-REPAIR EXCEPTION THE DANGEROUS PART
+            A verified self-repair is the one path that RELAXES a check, and the checks it used
+            to relax wholesale were exactly the two that stop the transcript saying something the
+            speaker did not: the negation count and the number count. A sentence wrongly
+            classified as a repair could therefore lose a "không"/"not"/"ない" or a figure and
+            come out meaning the opposite, in the transcript, in its translation, and in the
+            minutes built on top of it. "Cleaned but wrong" is the one outcome this stage must
+            never produce, and it is strictly worse than "not cleaned".
+
+            So the exception is narrowed to the two shapes that make a repair a repair, and
+            nothing else is forgiven:
+
+            - a deleted negation is allowed ONLY when it is part of the correction marker itself
+              ("à không", "không phải", "no wait", "じゃなくて"). The marker is how the speaker
+              cancelled a statement; any other negation in the span is the statement.
+            - a deleted number, weekday or month is allowed ONLY when the kept text still has one
+              of the same kind after the span — a REPLACEMENT ("thứ hai, à không, thứ ba" keeps
+              "thứ ba"). A fact that is removed and not replaced is a fact going missing.
+
+            Anything outside those two shapes is rejected outright rather than downgraded to an
+            ordinary clean-up, because a model that claimed a repair here was wrong about the
+            sentence, not merely over-eager on one token.
+        """
         try:
             payload = json.loads(response.choices[0].message.content or "{}")
             raw_indices = payload["delete"] if isinstance(payload, dict) else None
@@ -363,13 +666,13 @@ class LLMCleaner:
 
         # Contiguity is part of what makes a claimed repair believable: a reparandum plus its
         # marker is one run of tokens. It is required here because the flag also unlocks the
-        # count-invariant exception below.
-        self_repair = (
-            claims_repair
-            and indices[-1] - indices[0] + 1 == len(indices)
-            and has_self_repair_marker(raw, lang, indices)
+        # count-invariant exceptions below.
+        contiguous = indices[-1] - indices[0] + 1 == len(indices)
+        marker_span = (
+            self_repair_marker_span(raw, lang, indices) if claims_repair and contiguous else ()
         )
-        cap = _SELF_REPAIR_MAX_DELETE_RATIO if self_repair else self.max_delete_ratio
+        self_repair = bool(marker_span)
+        cap = self.self_repair_max_delete_ratio if self_repair else self.max_delete_ratio
         if len(indices) > len(tokens) * cap:
             self._reject(
                 REJECT_RATIO,
@@ -396,11 +699,21 @@ class LLMCleaner:
             # rules, which exist to catch a model quietly dropping a "not", call every correctly
             # resolved repair a violation, and the ticket's own example would be rejected.
             #
-            # The exception is bought with three conditions, all checked above: the model said
-            # this was a repair, a repair MARKER from the prepass lexicons is inside what it
-            # deleted, and the deletion is one contiguous span (a reparandum is; a model
-            # harvesting numbers from around the sentence is not). I1 still holds absolutely —
-            # nothing may be invented — and a question marker still may not be lost.
+            # The exception is bought with the conditions checked above — the model said this was
+            # a repair, a repair MARKER from the prepass lexicons is inside what it deleted, and
+            # the deletion is one contiguous span — AND with the two narrow tests below, which
+            # are what keep a misclassified sentence from flipping meaning. I1 still holds
+            # absolutely, and a question marker still may not be lost.
+            stray = negations_deleted_outside_marker(tokens, lang, indices, marker_span)
+            if stray:
+                self._reject(REJECT_NEGATION_OUTSIDE_MARKER, raw=raw, clean=text, negations=stray)
+                return None
+            missing_kind = quantity_without_replacement(tokens, lang, indices)
+            if missing_kind is not None:
+                self._reject(
+                    REJECT_NUMBER_WITHOUT_REPLACEMENT, raw=raw, clean=text, kind=missing_kind
+                )
+                return None
             violations = [
                 violation
                 for violation in violations
@@ -441,7 +754,9 @@ __all__ = [
     "REJECT_BAD_JSON",
     "REJECT_CALL_FAILED",
     "REJECT_EMPTY",
+    "REJECT_NEGATION_OUTSIDE_MARKER",
     "REJECT_NO_CHANGE",
+    "REJECT_NUMBER_WITHOUT_REPLACEMENT",
     "REJECT_RATIO",
     "REJECT_TIMEOUT",
     "CleanedSentence",
@@ -449,5 +764,8 @@ __all__ = [
     "apply_deletions",
     "has_self_repair_marker",
     "lexical_tokens",
+    "negations_deleted_outside_marker",
     "prepass_deletion_indices",
+    "quantity_without_replacement",
+    "self_repair_marker_span",
 ]
