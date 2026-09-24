@@ -256,6 +256,15 @@ class SummaryTemplateWorker(BaseWorker):
         # anyone inventing a privileged HTTP path into the transcript service.
         #
         # Checked BEFORE the client assert on purpose: this path makes no HTTP call at all.
+        #
+        # WT-716 — THIS TEXT IS RAW, AND IT IS USED AS SENT. `ArtifactsFinalizer` formats the
+        # segments it already holds with `CitedTranscriptFormatter` over `FinalizedSegment.Text`,
+        # which is the raw wording; the clean column travels on the segment rows, not on this
+        # pre-rendered blob. There is no clean version to prefer here, and manufacturing one —
+        # by re-fetching the segments the publisher just read, with no requester and no token —
+        # is exactly the privileged read this worker refuses to invent (see the class docstring).
+        # So the finalizer's fallback summary reads the raw wording, the fetching path below
+        # reads the clean one, and both cite the same moments.
         if request.transcript_text.strip():
             self.logger.info(
                 "summary_transcript_supplied",
@@ -309,10 +318,10 @@ class SummaryTemplateWorker(BaseWorker):
             format_transcript_line(
                 int(segment.get("startTimeMs") or 0),
                 str(segment.get("speakerName") or "Unknown speaker"),
-                str(segment.get("originalText") or "").strip(),
+                spoken,
             )
             for segment in segments
-            if str(segment.get("originalText") or "").strip()
+            if (spoken := _segment_text(segment))
         ]
         return "\n".join(lines)
 
@@ -344,6 +353,35 @@ class SummaryTemplateWorker(BaseWorker):
         if self._transcript_client is not None:
             await self._transcript_client.aclose()
             self._transcript_client = None
+
+
+def _segment_text(segment: dict[str, Any]) -> str:
+    """The wording to summarise: the clean line when the transcript has one, raw otherwise.
+
+    WT-716. The stored segment carries both — `originalText` is the raw record billing,
+    retranscribe and corrections work from, and `cleanText` is that line with its fillers and
+    stutters deleted. The three states the backend distinguishes (TranscriptSegmentDto) are all
+    meaningful and all answered here:
+
+        null   NOT CLEANED — an older row, an older producer, or a line a human has corrected
+               since. The raw wording is the only wording there is, exactly as before WT-716.
+        ""     FILLER ONLY. The Clean view hides the line, and so does this: there is nothing in
+               it for a summary to rest on, and a transcript of "Ummm" lines reads to a model
+               like a meeting where people said nothing.
+        text   The clean line.
+
+    NO ANCHOR MOVES. A citation is the `startTimeMs` this row was stored with, printed by
+    `format_transcript_line` and checked back by `summary_grounding` — read from the row, never
+    recomputed from the text, so changing WHICH of a row's two texts is shown cannot move it. A
+    skipped filler-only line simply takes its own moment out of the set the model may cite,
+    which is the point: it was never shown that line.
+
+    `.strip()` for the same reason the raw read always did — whitespace is not content.
+    """
+    clean = segment.get("cleanText")
+    if isinstance(clean, str):
+        return clean.strip()
+    return str(segment.get("originalText") or "").strip()
 
 
 def _requested_template(request: SummaryRequestMessage) -> str:

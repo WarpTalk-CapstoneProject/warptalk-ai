@@ -78,9 +78,11 @@ class TestTheWorkerUsesIt:
 
         worker = AIAssistantWorker.__new__(AIAssistantWorker)
         worker._transcripts = {"m1": list(in_memory)} if in_memory else {}
-        # Bypassing __init__ means bypassing every field it sets. WT-605 added these two.
+        # Bypassing __init__ means bypassing every field it sets. WT-605 added the first two,
+        # WT-716 the third.
         worker._pause_gaps = {}
         worker._gap_open = set()
+        worker._filler_only_ms = {}
 
         async def _lrange(key: str, start: int = 0, stop: int = -1):
             return [encode_segment(s).encode() for s in buffered]
@@ -190,6 +192,7 @@ class TestTheWriteSide:
         worker._transcripts = {}
         worker._pause_gaps = {}
         worker._gap_open = set()
+        worker._filler_only_ms = {}
         worker.redis = SimpleNamespace(
             rpush_capped=AsyncMock(),
             # WT-605: process() now asks whether recording is paused. None = not paused.

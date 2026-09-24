@@ -122,6 +122,7 @@ def _live_worker(stored_language: str | None) -> tuple[Any, dict[str, Any], Magi
     # Bypassing __init__ means bypassing every field it sets.
     worker._pause_gaps = {}
     worker._gap_open = set()
+    worker._filler_only_ms = {}
 
     async def _get(key: str) -> bytes | None:
         if key.endswith(":summary_language") and stored_language is not None:
