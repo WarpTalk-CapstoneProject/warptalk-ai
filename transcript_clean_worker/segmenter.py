@@ -258,11 +258,20 @@ def _strip_soft_terminal(text: str, language: str) -> str:
     return stripped
 
 
-def _decapitalize(text: str, language: str) -> str:
-    """Lower a sentence-initial capital that a merge has moved into mid-sentence."""
-    lowercase = _JOIN_LOWERCASE.get(language)
-    if not lowercase or not text[:1].isupper():
+def _decapitalize(text: str, language: str, original: str | None = None) -> str:
+    """Lower a sentence-initial capital that a merge has moved into mid-sentence.
+
+    `original` is the RAW text this piece was cleaned from, and it settles the question
+    outright when it exists: the prepass capitalises the first word of every segment it cleans
+    (it has no way to know the segment was mid-sentence), so a piece whose raw form began in
+    lower case is a piece whose capital this pipeline invented and may take back. Without it —
+    joining raw texts, where the capital is the recogniser's — the word list decides.
+    """
+    if language not in _JOIN_LOWERCASE or not text[:1].isupper():
         return text
+    if original is not None and original.strip()[:1].islower():
+        return text[:1].lower() + text[1:]
+    lowercase = _JOIN_LOWERCASE[language]
     head = text.split(" ", 1)[0].strip(",.?!;:")
     if head.isupper():  # an acronym, not a sentence start
         return text
@@ -271,7 +280,9 @@ def _decapitalize(text: str, language: str) -> str:
     return text[:1].lower() + text[1:]
 
 
-def join_texts(pieces: list[str], language: str) -> str:
+def join_texts(
+    pieces: list[str], language: str, originals: list[str] | None = None
+) -> str:
     """Join the pieces of one sentence back together, punctuation-only.
 
     Adds and removes PUNCTUATION and case, never a word, so the result stays a deletion of the
@@ -279,13 +290,17 @@ def join_texts(pieces: list[str], language: str) -> str:
     place the speaker did not stop is dropped, and Japanese gets a "、" where the first piece
     ended on a conjunctive particle — "来週の会議ですが" + "火曜日に..." reads as one sentence
     only with the comma, and reads as two with a 。.
+
+    `originals` are the raw texts the pieces were cleaned from, positionally. They only decide
+    capitalisation — see `_decapitalize`.
     """
     lang = resolve_language(language, " ".join(pieces)) or language
     out = ""
-    for piece in pieces:
+    for index, piece in enumerate(pieces):
         text = piece.strip()
         if not text:
             continue
+        original = originals[index] if originals and index < len(originals) else None
         if not out:
             out = text
             continue
@@ -300,7 +315,7 @@ def join_texts(pieces: list[str], language: str) -> str:
         # Only a piece that really was mid-sentence gets its capital lowered. A "?" or "!"
         # survives the join (see `_SOFT_TERMINALS`), and what follows one is a new sentence
         # whose capital is correct where it stands.
-        joined = text if head[-1:] in TERMINALS else _decapitalize(text, lang)
+        joined = text if head[-1:] in TERMINALS else _decapitalize(text, lang, original)
         out = head + separator + joined
     return out
 
@@ -429,7 +444,11 @@ class SentenceSegmenter:
             language=language,
             segments=tuple(segments),
             raw_text=join_texts([s.raw_text for s in segments], language),
-            prepass_text=join_texts([s.clean_text for s in segments], language),
+            prepass_text=join_texts(
+                [s.clean_text for s in segments],
+                language,
+                [s.raw_text for s in segments],
+            ),
             reason=reason,
             flags=frozenset(flags),
         )
