@@ -28,7 +28,9 @@ from transcript_clean_worker.llm_cleaner import (
     REJECT_NEGATION_OUTSIDE_MARKER,
     REJECT_NO_CHANGE,
     REJECT_NUMBER_WITHOUT_REPLACEMENT,
+    REJECT_PROTECTED_TOKEN,
     REJECT_RATIO,
+    REJECT_REPARANDUM_LONGER_THAN_REPAIR,
     REJECT_TIMEOUT,
     LLMCleaner,
     apply_deletions,
@@ -335,6 +337,94 @@ class TestARejectionNeverCostsTheLine:
         assert messages[0]["source"] == "prepass"
         assert "mình không đồng ý" in messages[0]["clean_text"]
         assert subject.rejections == {REJECT_NEGATION_OUTSIDE_MARKER: 1}
+
+
+class TestMeasuredFailuresAgainstRealModels:
+    """Regression tests for the five failure shapes found running gpt-4.1-mini/gpt-4.1 on hard
+    sentences (WT-716, ai-t6). Each test drives the cleaner with the EXACT indices the real model
+    returned; the assertion is either the corrected text (revision 1 published, now right) or
+    `None` with the reason revision 0 stands instead — never the wrong text the model produced.
+    """
+
+    async def test_protected_vietnamese_reduplication_survives_a_bad_deletion(self):
+        # gpt-4.1-mini published "Mình cứ từ làm, không vội." — one half of "từ từ" (slowly)
+        # deleted as if it were a stutter. Fixed by REJECTION: "từ từ" is in
+        # protected_indices, so the whole answer is refused and tier 1's own wording — which
+        # never touched the reduplication — stands as revision 0.
+        subject = cleaner([{"delete": [3], "self_repair": False}])
+        assert await subject.clean("mình cứ từ từ làm, không vội", "vi") is None
+        assert subject.rejections == {REJECT_PROTECTED_TOKEN: 1}
+
+    async def test_protected_english_intensifier_repeat_survives_a_bad_deletion(self):
+        # gpt-4.1-mini published "It was very expensive." — "very very" is intensification, not
+        # a stutter. Fixed by REJECTION.
+        subject = cleaner([{"delete": [2], "self_repair": False}])
+        assert await subject.clean("it was very very expensive", "en") is None
+        assert subject.rejections == {REJECT_PROTECTED_TOKEN: 1}
+
+    async def test_protected_japanese_demonstrative_survives_a_bad_deletion(self):
+        # gpt-4.1-mini published "資料はもう送りました。" — "あの" here means "that [document]", not
+        # the elongated filler "あのー". Fixed by REJECTION.
+        subject = cleaner([{"delete": [0], "self_repair": False}])
+        assert await subject.clean("あの資料はもう送りました。", "ja") is None
+        assert subject.rejections == {REJECT_PROTECTED_TOKEN: 1}
+
+    async def test_a_model_that_cleans_fillers_but_not_tier_1s_own_stutter_fix_is_not_worse(self):
+        # gpt-4.1-mini published "So we we need to finalize the budget." — it deleted "um" and
+        # "uh" but not the "we we" stutter tier 1 had ALREADY fixed in revision 0, so revision 1
+        # would have been WORSE than revision 0 had it replaced it outright. Fixed by
+        # CORRECTION: the published text is the union of tier 1's stutter deletion (index 4, "we")
+        # and the model's filler deletions (0, "um"; 3, "uh"), never a replacement.
+        raw = "um so we uh we need to finalize the budget"
+        prepass_text = "So we need to finalize the budget."
+        subject = cleaner([{"delete": [0, 3], "self_repair": False}])
+        result = await subject.clean(raw, "en", prepass_text=prepass_text)
+        assert result is not None
+        assert result.text == "So we need to finalize the budget."
+        assert result.deleted_indices == (0, 3, 4)
+
+    async def test_a_reparandum_longer_than_its_repair_is_refused(self):
+        # gpt-4.1-mini published "Anh Nam Anh." — it deleted "gửi cho anh Nam" (4 tokens) as the
+        # reparandum for a correction whose repair, "anh Nam Anh", is only 3: the deletion
+        # swallowed "gửi cho", which was never part of what got corrected. Fixed by REJECTION.
+        subject = cleaner([{"delete": [0, 1, 2, 3, 4, 5], "self_repair": True}])
+        assert await subject.clean("gửi cho anh Nam, à nhầm, anh Nam Anh", "vi") is None
+        assert subject.rejections == {REJECT_REPARANDUM_LONGER_THAN_REPAIR: 1}
+
+    async def test_a_reparandum_no_longer_than_its_repair_is_accepted(self):
+        # The real repair this ticket's few-shot example is built on: "thứ hai" (2 tokens)
+        # replaced by "thứ ba" (2 tokens) is one-for-one, not a case rule 3 should ever catch.
+        subject = cleaner([{"delete": [1, 2, 3, 4], "self_repair": True}])
+        result = await subject.clean("họp thứ hai, à không, thứ ba", "vi")
+        assert result is not None
+        assert result.text == "Họp thứ ba."
+
+
+class TestUnionNotReplace:
+    """Rule 2 (WT-716, ai-t6): the published deletion set is tier 1's own deletions UNIONED with
+    whatever the model additionally deletes — never the model's answer replacing tier 1's.
+    """
+
+    async def test_a_deletion_the_model_omits_is_still_published(self):
+        # Tier 1 already resolved "we we" as a stutter (index 3) in revision 0. The model is
+        # shown that suggestion but answers with only the filler "um" (index 0) — a model that
+        # relitigated nothing about the stutter, not one that decided to keep it. The published
+        # text still has the stutter fix, because tier 2 can only ADD deletions.
+        raw = "um so we we should ship it"
+        prepass_text = "So we should ship it."
+        subject = cleaner([{"delete": [0], "self_repair": False}])
+        result = await subject.clean(raw, "en", prepass_text=prepass_text)
+        assert result is not None
+        assert result.text == "So we should ship it."
+        assert result.deleted_indices == (0, 3)
+
+    async def test_without_a_prepass_text_the_model_answer_is_used_as_is(self):
+        # No prepass_text means no suggestion to union with (existing behaviour, unchanged): the
+        # model's own accepted indices are exactly what gets published.
+        subject = cleaner([{"delete": [0], "self_repair": False}])
+        result = await subject.clean("um so we should ship it", "en")
+        assert result is not None
+        assert result.deleted_indices == (0,)
 
 
 class TestTheRequest:

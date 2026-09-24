@@ -2,7 +2,8 @@
 
 Public API:
     prepass(text, language, *, prev_turn_is_question=False, standalone_turn=None)
-        -> PrepassResult(clean_text, flags, removed_spans, escalate_reasons)
+        -> PrepassResult(clean_text, flags, removed_spans, escalate_reasons, protected_spans)
+    protected_indices(text, language) -> frozenset[int]
     tokenize(text, language) -> list[str]
     normalize_key(token, language) -> str
     check_invariants(raw, clean, language) -> list[str]
@@ -28,6 +29,7 @@ from shared.disfluency.prepass import (
     FLAG_STUTTER_REMOVED,
     PrepassResult,
     prepass,
+    protected_indices,
 )
 from shared.disfluency.punctuation import detect_question, normalize_terminal_punctuation
 from shared.disfluency.tokenize import tokenize
@@ -43,5 +45,6 @@ __all__ = [
     "normalize_key",
     "normalize_terminal_punctuation",
     "prepass",
+    "protected_indices",
     "tokenize",
 ]

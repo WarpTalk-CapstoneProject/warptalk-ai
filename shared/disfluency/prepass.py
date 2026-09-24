@@ -57,12 +57,23 @@ class PrepassResult:
 
     `clean_text` is "" (never None) for a filler-only turn. `removed_spans` are (start, end)
     offsets into the text that was passed in. `escalate_reasons` explains every `escalate`.
+
+    `protected_spans` are (start, end) offsets — same coordinate system as `removed_spans` — of
+    tokens this run refused to delete ON PRINCIPLE and would refuse again no matter who asked:
+    protected reduplication ("từ từ", "very very", "まだまだ"), a tier-C look-alike ("uh-huh",
+    "あの" as a demonstrative), and a Vietnamese vocative "à". This is a NARROWER set than
+    `Token.protected` (see `_Run.protect_for_llm`) — a self-repair's own marker is `.protected`
+    so THIS run's filler/stutter passes leave it alone, but it is deliberately absent here,
+    because resolving the repair by deleting the marker is the LLM tier's whole job on this
+    ticket. `protected_indices` below is the public entry point that turns this into token
+    positions for a caller that only has raw text, not this dataclass.
     """
 
     clean_text: str
     flags: frozenset[str] = frozenset()
     removed_spans: list[tuple[int, int]] = field(default_factory=list)
     escalate_reasons: list[str] = field(default_factory=list)
+    protected_spans: list[tuple[int, int]] = field(default_factory=list)
 
 
 class _Run:
@@ -74,6 +85,7 @@ class _Run:
         self.reasons: list[str] = []
         self.fillers_removed = False
         self.stutter_removed = False
+        self.tier2_protected: set[int] = set()
 
     # -- navigation ----------------------------------------------------------------------
 
@@ -125,6 +137,18 @@ class _Run:
     def protect(self, indices: Iterable[int]) -> None:
         for i in indices:
             self.toks[i].protected = True
+
+    def protect_for_llm(self, indices: Iterable[int]) -> None:
+        """Mark tokens the LLM tier (WT-716 tier 2) may never delete either.
+
+        Narrower than `protect`: that one only has to survive THIS run's own later passes, and
+        is also set on a self-repair's marker for that reason — but the marker is exactly what
+        tier 2 deletes to resolve the repair it was escalated for, so it is never added here.
+        Call this ONLY for reduplication/畳語 the lexicon recognises as a real word and for a
+        tier-C look-alike; a filler, a stutter this run chose not to collapse, or an ordinary
+        escalation ("I mean", "kiểu") belongs to tier 2 to decide, not to this set.
+        """
+        self.tier2_protected.update(indices)
 
     def escalate(self, reason: str) -> None:
         if reason not in self.reasons:
@@ -229,18 +253,24 @@ def _starts_sentence(toks: list[Token], prev: int | None, gap_deleted: bool) -> 
     return gap_deleted and toks[prev].punct and toks[prev].text in TERMINALS
 
 
-def _removed_spans(toks: list[Token], origin: list[int] | None) -> list[tuple[int, int]]:
-    """Deleted tokens as (start, end) offsets into the caller's text, adjacent runs merged."""
+def _spans_for(
+    toks: list[Token], indices: Iterable[int], origin: list[int] | None
+) -> list[tuple[int, int]]:
+    """The given token indices as (start, end) offsets into the caller's text, runs merged."""
     spans: list[tuple[int, int]] = []
-    for t in toks:
-        if not t.deleted:
-            continue
+    for i in sorted(indices):
+        t = toks[i]
         start, end = (origin[t.start], origin[t.end]) if origin else (t.start, t.end)
         if spans and start - spans[-1][1] <= 1:
             spans[-1] = (spans[-1][0], end)
         else:
             spans.append((start, end))
     return spans
+
+
+def _removed_spans(toks: list[Token], origin: list[int] | None) -> list[tuple[int, int]]:
+    """Deleted tokens as (start, end) offsets into the caller's text, adjacent runs merged."""
+    return _spans_for(toks, (i for i, t in enumerate(toks) if t.deleted), origin)
 
 
 # --- English ----------------------------------------------------------------------------------
@@ -259,12 +289,14 @@ def _en(run: _Run, prev_q: bool, standalone: bool | None) -> None:
                 toks[i + 1].protected = True  # a unit after a number: "5 mm"
         if t.key in lexicon_en.C_KEEP:
             t.protected = True
+            run.protect_for_llm((i,))  # "uh-huh" is a backchannel, never a hesitation
         if len(t.text) >= 2 and t.text.isupper():
             t.protected = True  # an acronym ("ER"), not a hesitation
 
     def protect_idiom(group: list[int]) -> None:
         if toks[group[0]].key in lexicon_en.PROTECTED_REPEAT_WORDS:
             run.protect(group)
+            run.protect_for_llm(group)  # "very very" is intensification, not a stutter
 
     _collapse_runs(run, protect_idiom)
 
@@ -392,10 +424,14 @@ def _vi(run: _Run, prev_q: bool, standalone: bool | None) -> None:
     # P1 protect.
     for i in lex:
         t = toks[i]
-        if any(c.isdigit() for c in t.key) or t.key in lexicon_vi.C_KEEP:
+        if any(c.isdigit() for c in t.key):
             t.protected = True
+        if t.key in lexicon_vi.C_KEEP:
+            t.protected = True
+            run.protect_for_llm((i,))  # "dạ"/"vâng" are answers, never fillers
     for _, span, _ in run.match_phrases(lexicon_vi.PROTECTED_REDUPLICATIONS):
         run.protect(span)
+        run.protect_for_llm(span)  # "từ từ", "ba ba" are words, not a restart
     for pos, i in enumerate(lex):
         t = toks[i]
         if t.key != "à":
@@ -403,9 +439,13 @@ def _vi(run: _Run, prev_q: bool, standalone: bool | None) -> None:
         prev = lex[pos - 1] if pos > 0 else None
         if prev is not None and prev == i - 1 and toks[prev].key in lexicon_vi.KINSHIP_TERMS:
             t.protected = True  # "Chị à" — a vocative
+            run.protect_for_llm((i,))
     for _, span, _ in run.match_phrases(lexicon_vi.SELF_REPAIR_MARKERS):
         run.protect(span)
         run.escalate("self_repair")
+        # NOT protect_for_llm: "à không"/"à nhầm" is exactly what tier 2 deletes to resolve the
+        # repair it was just escalated for. Protecting it here would make that resolution
+        # impossible and defeat the escalation.
 
     # P2 fillers.
     def tier(t: Token) -> str:
@@ -492,17 +532,23 @@ def _ja(run: _Run, prev_q: bool, standalone: bool | None) -> None:
     # P1 protect.
     for i in lex:
         t = toks[i]
+        if t.pos2 == "数詞" or any(c in lexicon_ja.NUMERAL_CHARS for c in t.key):
+            t.protected = True
         if (
-            t.pos2 == "数詞"
-            or any(c in lexicon_ja.NUMERAL_CHARS for c in t.key)
-            or t.key in lexicon_ja.PROTECTED_REDUPLICATIONS
+            t.key in lexicon_ja.PROTECTED_REDUPLICATIONS
             or t.key in lexicon_ja.C_KEEP
             or t.key in lexicon_ja.B_MARKERS
         ):
             t.protected = True
+            # 畳語 (まだまだ), a backchannel (はい/ええ), or あの/その used as a demonstrative
+            # ("あの資料" = "that document") rather than the elongated filler form (あのー) — none
+            # of these is ever a hesitation, so tier 2 does not get to delete them either.
+            run.protect_for_llm((i,))
         if t.key in lexicon_ja.SELF_REPAIR_MARKERS:
             t.protected = True
             run.escalate("self_repair")
+            # NOT protect_for_llm: "じゃなくて"/"いや" is what tier 2 deletes to resolve the
+            # repair it was just escalated for.
 
     # P2 fillers.
     def tier(t: Token) -> str:
@@ -617,18 +663,54 @@ def prepass(
     if run.stutter_removed:
         flags.add(FLAG_STUTTER_REMOVED)
 
+    protected = _spans_for(toks, run.tier2_protected, origin)
+
     if not run.kept_lex():
         flags.add(FLAG_FILLER_ONLY)
         if run.reasons:
             flags.add(FLAG_ESCALATE)
-        return PrepassResult("", frozenset(flags), _removed_spans(toks, origin), run.reasons)
+        return PrepassResult(
+            "", frozenset(flags), _removed_spans(toks, origin), run.reasons, protected
+        )
 
     clean = _render(run, capitalize=lang in ("en", "vi"))
     clean = normalize_terminal_punctuation(clean, lang)
 
     violations = check_invariants(text, clean, lang)
     if violations:
-        return PrepassResult(text, frozenset({FLAG_ESCALATE}), [], [*run.reasons, *violations])
+        return PrepassResult(
+            text, frozenset({FLAG_ESCALATE}), [], [*run.reasons, *violations], protected
+        )
     if run.reasons:
         flags.add(FLAG_ESCALATE)
-    return PrepassResult(clean, frozenset(flags), _removed_spans(toks, origin), run.reasons)
+    return PrepassResult(
+        clean, frozenset(flags), _removed_spans(toks, origin), run.reasons, protected
+    )
+
+
+def protected_indices(text: str, language: str) -> frozenset[int]:
+    """Lexical token positions the deterministic tier protects from ANY deletion, tier 2 included.
+
+    Positions index into `tokenize(text, language)` (equivalently `lexical_tokens` in
+    `transcript_clean_worker/llm_cleaner.py` — both drop punctuation the same way), so a caller
+    holding only the raw text and the numbered-token protocol can look an index up directly.
+
+    WHY CHARACTER SPANS IN BETWEEN, RATHER THAN HANDING BACK TOKEN INDICES DIRECTLY. The prepass
+    tokenizes ja text after `_ja_prepare` (width normalisation, ASCII punctuation folded to
+    Japanese), so its own token list is not guaranteed to line up 1:1 with tokenizing the RAW
+    string the caller has — a half-width kana pair can even merge into one character. Rather than
+    assume the two tokenizations agree, this re-tokenizes `text` exactly as `lexical_tokens` does
+    and maps `PrepassResult.protected_spans` onto it by character overlap, which is correct
+    whether or not the two token counts match. en/vi have no such normalisation step, so the
+    mapping is exact there.
+    """
+    result = prepass(text, language)
+    if not result.protected_spans:
+        return frozenset()
+    lang = resolve_language(language, text) or "en"
+    lexical = [t for t in tokenize_spans(text, lang) if not t.punct]
+    return frozenset(
+        index
+        for index, tok in enumerate(lexical)
+        if any(tok.start < end and tok.end > start for start, end in result.protected_spans)
+    )

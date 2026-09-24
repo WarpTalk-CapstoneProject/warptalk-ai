@@ -50,6 +50,7 @@ from shared.disfluency import (
     lexicon_vi,
     normalize_key,
     normalize_terminal_punctuation,
+    protected_indices,
 )
 from shared.disfluency.invariants import I2_NEGATION_COUNT, I2_NUMBER_COUNT
 from shared.disfluency.normalize import resolve_language
@@ -70,6 +71,8 @@ REJECT_CALL_FAILED = "call_failed"
 REJECT_NO_CHANGE = "no_change"
 REJECT_NEGATION_OUTSIDE_MARKER = "negation_outside_marker"
 REJECT_NUMBER_WITHOUT_REPLACEMENT = "number_without_replacement"
+REJECT_PROTECTED_TOKEN = "protected_token_deleted"
+REJECT_REPARANDUM_LONGER_THAN_REPAIR = "reparandum_longer_than_repair"
 
 # A VERIFIED self-repair is allowed to delete more than an ordinary clean-up, because that is
 # the shape of the thing: "họp thứ hai, à không, thứ ba" is four of seven words, and "We ship on
@@ -606,10 +609,15 @@ class LLMCleaner:
             self._reject(REJECT_CALL_FAILED, error=repr(exc))
             return None
 
-        return self._verify(raw, lang, tokens, response)
+        return self._verify(raw, lang, tokens, response, suggestion)
 
     def _verify(
-        self, raw: str, lang: str, tokens: list[Token], response: Any
+        self,
+        raw: str,
+        lang: str,
+        tokens: list[Token],
+        response: Any,
+        prepass_deleted: list[int],
     ) -> CleanedSentence | None:
         """The model's answer, or None — and None is the cheap answer, by design.
 
@@ -642,6 +650,34 @@ class LLMCleaner:
             Anything outside those two shapes is rejected outright rather than downgraded to an
             ordinary clean-up, because a model that claimed a repair here was wrong about the
             sentence, not merely over-eager on one token.
+
+        TWO MORE RULINGS FROM THE SAME "FAITHFULNESS FIRST" PRINCIPLE, MEASURED AGAINST THE REAL
+        MODELS (WT-716, ai-t6)
+            Running this stage against gpt-4.1-mini and gpt-4.1 on hard sentences found the same
+            failure shape every time: the model deletes what the deterministic tier deliberately
+            protected ("very very", "từ từ", "あの資料"), or resolves a self-repair by deleting
+            more of the sentence than the repair ever needed to lose. Two checks close those:
+
+            - `protected_indices` names the tokens tier 1 protects ON PRINCIPLE — reduplication,
+              畳語, a tier-C look-alike. If the model's answer deletes ANY of them, the whole
+              answer is rejected: a model that got a protected token wrong was not reasoning about
+              this sentence correctly, so nothing else it said can be trusted either.
+            - For a verified repair, the reparandum (what is deleted before the marker) may not
+              outnumber the repair (what survives after it). "gửi cho anh Nam, à nhầm, anh Nam
+              Anh" deleting "gửi cho anh Nam" (4) to keep "anh Nam Anh" (3) swallows words that
+              were never part of the correction; "họp thứ hai, à không, thứ ba" deleting "thứ hai"
+              (2) to keep "thứ ba" (2) is the repair working as intended.
+
+            And once an answer clears every check above, the published deletion set is the UNION
+            of this model's accepted indices and whatever the deterministic tier already deleted
+            in revision 0 (`prepass_deleted`) — never a replacement. Revision 1 can only add to
+            revision 0's deletions, so it can never come out MESSIER than the line the reader
+            already has ("So we we need to finalize the budget" — the model cleaned the fillers
+            but not tier 1's own stutter fix — is impossible once the two are unioned instead of
+            one replacing the other). This union is safe without re-running the checks above: tier
+            1 never deletes a number, a negation or anything protected, so adding its deletions to
+            an already-verified answer cannot newly violate I1 (deletion-only, trivially) or I2
+            (tier 1 touches neither the negations nor the numbers I2 counts).
         """
         try:
             payload = json.loads(response.choices[0].message.content or "{}")
@@ -662,6 +698,15 @@ class LLMCleaner:
         indices = sorted(set(indices))
         if not indices:
             self._reject(REJECT_NO_CHANGE)
+            return None
+
+        # RULE 1 (WT-716, ai-t6): tier 2 may never delete what tier 1 protected on principle.
+        # A model that deleted a reduplication or a tier-C look-alike was wrong about the
+        # sentence, not merely over-eager on that one token — so the whole answer is refused,
+        # the same way a hallucinated index refuses the whole answer above.
+        touched = protected_indices(raw, lang).intersection(indices)
+        if touched:
+            self._reject(REJECT_PROTECTED_TOKEN, indices=sorted(touched))
             return None
 
         # Contiguity is part of what makes a claimed repair believable: a reparandum plus its
@@ -714,6 +759,25 @@ class LLMCleaner:
                     REJECT_NUMBER_WITHOUT_REPLACEMENT, raw=raw, clean=text, kind=missing_kind
                 )
                 return None
+            # RULE 3 (WT-716, ai-t6): the reparandum may not outnumber the repair. Counted in
+            # tokens, excluding the marker itself from both sides — the reparandum is what is
+            # deleted BEFORE the marker, the repair is what SURVIVES after it. A repair that
+            # replaces "thứ hai" with "thứ ba" is one-for-one; "gửi cho anh Nam, à nhầm, anh Nam
+            # Anh" deleting the whole "gửi cho anh Nam" to keep "anh Nam Anh" deletes a clause
+            # that was never part of the correction, and the length alone gives it away.
+            reparandum = sum(1 for index in indices if index < marker_span[0])
+            repair = sum(
+                1 for index in range(marker_span[-1] + 1, len(tokens)) if index not in indices
+            )
+            if reparandum > repair:
+                self._reject(
+                    REJECT_REPARANDUM_LONGER_THAN_REPAIR,
+                    raw=raw,
+                    clean=text,
+                    reparandum=reparandum,
+                    repair=repair,
+                )
+                return None
             violations = [
                 violation
                 for violation in violations
@@ -723,10 +787,18 @@ class LLMCleaner:
             self._reject(",".join(violations), raw=raw, clean=text)
             return None
 
+        # RULE 2 (WT-716, ai-t6): tier 2 may only ADD to tier 1's deletions, never undo them.
+        # See the docstring above for why this union needs no re-verification: tier 1 never
+        # deletes a number, a negation, or anything `protected_indices` names, so it cannot
+        # newly trip I1 or I2 on top of an already-accepted answer.
+        final_indices = sorted(set(indices) | {i for i in prepass_deleted if 0 <= i < len(tokens)})
+        if final_indices != indices:
+            text = apply_deletions(raw, lang, final_indices)
+
         return CleanedSentence(
             text=text,
             self_repair=self_repair,
-            deleted_indices=tuple(indices),
+            deleted_indices=tuple(final_indices),
         )
 
 
@@ -757,7 +829,9 @@ __all__ = [
     "REJECT_NEGATION_OUTSIDE_MARKER",
     "REJECT_NO_CHANGE",
     "REJECT_NUMBER_WITHOUT_REPLACEMENT",
+    "REJECT_PROTECTED_TOKEN",
     "REJECT_RATIO",
+    "REJECT_REPARANDUM_LONGER_THAN_REPAIR",
     "REJECT_TIMEOUT",
     "CleanedSentence",
     "LLMCleaner",
