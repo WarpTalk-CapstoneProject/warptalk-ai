@@ -478,6 +478,22 @@ class RedisStreamClient:
         except Exception:
             logger.debug("outcome_record_failed", stage=stage, outcome=outcome, exc_info=True)
 
+    async def record_provider_call_fields(
+        self, key: str, fields: list[tuple[str, int]], ttl_seconds: int
+    ) -> None:
+        """Apply one provider call's increments to its day's hash (see shared/provider_calls).
+
+        One pipeline, no transaction, TTL refreshed on write; best effort like record_outcome.
+        """
+        try:
+            pipeline = self.redis.pipeline(transaction=False)
+            for field, increment in fields:
+                pipeline.hincrby(key, field, increment)
+            pipeline.expire(key, ttl_seconds)
+            await pipeline.execute()
+        except Exception:
+            logger.debug("provider_call_record_failed", key=key, exc_info=True)
+
     async def publish_system_event(
         self, room_id: str, event_type: str, payload: dict[str, Any]
     ) -> bytes | str:

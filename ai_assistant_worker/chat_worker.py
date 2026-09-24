@@ -81,6 +81,7 @@ from ai_assistant_worker.tool_targets import (
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
 from shared.openai_options import reasoning_summary_options, responses_options
+from shared.provider_calls import observed_openai_http_client
 from shared.schemas import ChatRequestMessage, ChatResultMessage
 
 SIBLING_SERVICE_TIMEOUT_SECONDS = 15.0
@@ -497,7 +498,9 @@ class ChatAssistantWorker(BaseWorker):
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is required for ChatAssistantWorker")
 
-        self._openai = AsyncOpenAI(api_key=api_key)
+        self._openai = AsyncOpenAI(
+            api_key=api_key, http_client=observed_openai_http_client("assistant-chat")
+        )
         self._workspace_client = httpx.AsyncClient(
             base_url=self.chat_settings.workspace_service_url,
             timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,

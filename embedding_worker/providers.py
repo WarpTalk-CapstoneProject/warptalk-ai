@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from shared.config import EmbeddingSettings, resolve_openai_api_key
+from shared.provider_calls import observed_openai_http_client
 
 
 class EmbeddingProvider(ABC):
@@ -39,7 +40,9 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         if self._client is None:
             from openai import AsyncOpenAI
 
-            self._client = AsyncOpenAI(api_key=api_key)
+            self._client = AsyncOpenAI(
+                api_key=api_key, http_client=observed_openai_http_client("embedding")
+            )
         return self._client
 
     async def embed_texts(self, texts: list[str]) -> list[list[float]]:
