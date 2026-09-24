@@ -10,11 +10,13 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import signal
 import socket
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 from redis.asyncio.client import PubSub
@@ -37,6 +39,21 @@ from shared.transcript_pause import is_transcript_paused as _read_transcript_pau
 # was missing here, so an expired room's bot was never released; "TIMEOUT" is not a status
 # the backend has ever published, so that entry never matched anything.
 TERMINAL_ROOM_STATUSES = frozenset({"FAILED", "ENDED", "CANCELLED", "EXPIRED"})
+
+
+@dataclass
+class _AttemptOutcome:
+    """What `process()` reported about the attempt it is running, beyond returning or raising."""
+
+    outcome: str | None = None
+
+
+# The attempt currently being processed in this task. A mutable holder rather than a plain value
+# so a note made inside `asyncio.wait_for` — which on 3.11 runs the coroutine in a child task with
+# a COPY of the context — still reaches the caller that records it.
+_current_attempt: contextvars.ContextVar[_AttemptOutcome | None] = contextvars.ContextVar(
+    "warptalk_current_attempt", default=None
+)
 
 
 class BaseWorker(ABC):
@@ -731,6 +748,7 @@ class BaseWorker(ABC):
                         self.consumer_group,
                         message_id,
                     )
+                    await self._record_outcome("dead_letter")
                     self.logger.error(
                         "message_dead_lettered",
                         message_id=message_id,
@@ -746,13 +764,45 @@ class BaseWorker(ABC):
                 message_id,
             )
 
+    def note_attempt_outcome(self, outcome: str) -> None:
+        """Mark the message being processed as failed even though `process()` will return.
+
+        For the failures a worker deliberately swallows so the meeting keeps going — the STT
+        vendor refusing a chunk, Cartesia refusing a sentence. Those paths return normally, so
+        without this they would be counted as successes and the stage success rate would stay at
+        100% through a total vendor outage. No-op outside a `_process_and_log_errors` call.
+        """
+        attempt = _current_attempt.get()
+        if attempt is not None:
+            attempt.outcome = outcome
+
+    async def _record_outcome(self, outcome: str) -> None:
+        # record_outcome is already best effort; this also covers a client that is not a real
+        # RedisStreamClient (a test double), because nothing here may turn into a message error.
+        try:
+            await self.redis.record_outcome(self.worker_name, outcome)
+        except Exception:
+            self.logger.debug("outcome_record_skipped", outcome=outcome, exc_info=True)
+
     async def _process_and_log_errors(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        attempt = _AttemptOutcome()
+        token = _current_attempt.set(attempt)
+        outcome = "error"
         try:
             await asyncio.wait_for(
                 self.process(message_id, data),
                 timeout=self.processing_timeout_seconds,
             )
             self._last_progress_unix_ms = int(time.time() * 1000)
+            outcome = attempt.outcome or "ok"
+        except TimeoutError:
+            outcome = "timeout"
+            self.logger.exception(
+                "process_error",
+                message_id=message_id,
+                stream=self.input_stream,
+            )
+            raise
         except Exception:
             self.logger.exception(
                 "process_error",
@@ -762,6 +812,11 @@ class BaseWorker(ABC):
             # Propagate so the Redis consumer does not XACK the message. It remains
             # pending and can be reclaimed/retried by this or another worker.
             raise
+        finally:
+            _current_attempt.reset(token)
+            # Every attempt, retries included: the rate is "attempts that worked", and a message
+            # that fails three times before succeeding was three failures a listener waited on.
+            await self._record_outcome(outcome)
 
     # ------------------------------------------------------------------
     # Signal handling

@@ -38,6 +38,12 @@ LATENCY_KEY_PREFIX = "warptalk:latency:"
 # Refreshed on every observation. Long enough to survive a quiet weekend, bounded so this can
 # never become the next thing that fills Redis.
 LATENCY_KEY_TTL_SECONDS = 7 * 24 * 60 * 60
+# Per-stage attempt outcomes, one hash per stage: field = outcome, value = count. Read back by
+# metrics_exporter as warptalk_stage_messages_total{stage, outcome}. Same TTL rule as latency.
+OUTCOME_KEY_PREFIX = "warptalk:outcome:"
+# The outcomes a stage attempt can have. "ok" and the three failure kinds partition every attempt;
+# "dead_letter" is counted on top, once, when a message is parked after its retries are spent.
+STAGE_OUTCOMES = ("ok", "error", "timeout", "vendor_error", "dead_letter")
 
 
 def is_per_room_stream(stream: str) -> bool:
@@ -448,6 +454,29 @@ class RedisStreamClient:
             await pipeline.execute()
         except Exception:
             logger.debug("latency_record_failed", stage=stage, exc_info=True)
+
+    async def record_outcome(self, stage: str, outcome: str) -> None:
+        """Count one attempt's outcome for a stage — the success-rate half of `record_latency`.
+
+        Latency alone could not say whether the pipeline WORKED: a stage that fails every call
+        fast has a beautiful p95. The admin System Health screen and the Meetings dashboard need
+        "of the attempts this hour, how many succeeded", per stage, and until this every failure
+        was a log line nobody aggregated.
+
+        Same shape and the same rules as `record_latency`: a hash the stateless exporter reads,
+        a TTL refreshed on write (a reset is something `increase()` handles), and best effort —
+        a metric must never be able to fail the pipeline it measures.
+        """
+        if outcome not in STAGE_OUTCOMES:
+            outcome = "error"
+        key = f"{OUTCOME_KEY_PREFIX}{stage}"
+        try:
+            pipeline = self.redis.pipeline(transaction=False)
+            pipeline.hincrby(key, outcome, 1)
+            pipeline.expire(key, LATENCY_KEY_TTL_SECONDS)
+            await pipeline.execute()
+        except Exception:
+            logger.debug("outcome_record_failed", stage=stage, outcome=outcome, exc_info=True)
 
     async def publish_system_event(
         self, room_id: str, event_type: str, payload: dict[str, Any]

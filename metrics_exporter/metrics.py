@@ -40,7 +40,12 @@ from typing import Any, Protocol
 from redis.exceptions import ResponseError
 
 from shared.config import MetricsSettings
-from shared.redis_client import LATENCY_BUCKETS_MS, LATENCY_KEY_PREFIX
+from shared.redis_client import (
+    LATENCY_BUCKETS_MS,
+    LATENCY_KEY_PREFIX,
+    OUTCOME_KEY_PREFIX,
+    STAGE_OUTCOMES,
+)
 
 # The three hops of the live pipeline. These are reported even when the stream is absent, so the
 # spine of the system always has a series; everything else is discovered.
@@ -247,6 +252,7 @@ async def collect_metrics(
     )
 
     lines.extend(await _latency_histograms(redis))
+    lines.extend(await _stage_outcomes(redis))
 
     return "\n".join(lines) + "\n"
 
@@ -292,4 +298,30 @@ async def _latency_histograms(redis: RedisMetricsClient) -> list[str]:
         # _count must equal the +Inf bucket. Reading it from its own field rather than reusing
         # `running` would let the two disagree if a write landed between the increments.
         lines.append(f'warptalk_stage_latency_ms_count{{stage="{_label(stage)}"}} {running}')
+    return lines
+
+
+async def _stage_outcomes(redis: RedisMetricsClient) -> list[str]:
+    """Per-stage attempt outcomes, as a counter: warptalk_stage_messages_total{stage, outcome}.
+
+    The workers HINCRBY `warptalk:outcome:{stage}` once per attempt (BaseWorker) — ok, error,
+    timeout, or vendor_error for a failure the worker swallowed to keep the meeting going — and
+    once more with dead_letter when a message is parked. Success rate is ok over the first four;
+    dead_letter is on top of the errors that led to it, not instead of them.
+
+    Every known outcome is emitted for every stage that has a hash, zero included, so a rate over
+    `outcome="vendor_error"` has a series to evaluate before the first failure rather than none.
+    """
+    lines = [
+        "# HELP warptalk_stage_messages_total Pipeline stage attempts, by outcome.",
+        "# TYPE warptalk_stage_messages_total counter",
+    ]
+    async for key in redis.scan_iter(match=f"{OUTCOME_KEY_PREFIX}*", count=100):
+        stage = _decode(key).removeprefix(OUTCOME_KEY_PREFIX)
+        raw = await redis.hgetall(key)
+        fields = {_decode(k): _decode(v) for k, v in raw.items()}
+        for outcome in STAGE_OUTCOMES:
+            value = int(fields.get(outcome, 0) or 0)
+            labels = f'stage="{_label(stage)}",outcome="{outcome}"'
+            lines.append(f"warptalk_stage_messages_total{{{labels}}} {value}")
     return lines
