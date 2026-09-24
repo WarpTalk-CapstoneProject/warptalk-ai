@@ -944,9 +944,48 @@ async def _get_system_health(ctx: ToolContext, _arguments: dict[str, Any]) -> st
                     if isinstance(d, dict) and d.get("length")
                 ],
                 "stage_latency_p95_ms": health.get("stageLatencies"),
+                # STT / translation / TTS attempt outcomes over the last hour. A stage with
+                # failures or parked (dead-lettered) attempts is the direct answer to "is a
+                # pipeline stage failing"; success_rate null means no attempts, not 0%.
+                "pipeline_stage_outcomes_last_hour": [
+                    {
+                        "stage": o.get("stage"),
+                        "ok": o.get("ok"),
+                        "failed": o.get("failed"),
+                        "dead_lettered": o.get("deadLettered"),
+                        "success_rate": o.get("successRate"),
+                    }
+                    for o in (health.get("stageOutcomes") or [])
+                    if isinstance(o, dict)
+                ],
+                "outbox_dead_letters": health.get("outboxDeadLetters"),
                 "warnings": health.get("warnings"),
             },
         )
+        # The headline of the System health page: did meetings work? Absent on a backend that
+        # predates it, and null when the counters have no series yet — neither is zero.
+        outcomes = health.get("meetings")
+        if isinstance(outcomes, dict):
+            payload["meeting_success"] = _cited(
+                ctx,
+                "System health · Meetings",
+                "/admin/health",
+                {
+                    "window": outcomes.get("window"),
+                    "success_rate": outcomes.get("successRate"),
+                    "started": outcomes.get("started"),
+                    "ended": outcomes.get("ended"),
+                    "reached_live": outcomes.get("reachedLive"),
+                    "ended_normally": outcomes.get("endedNormally"),
+                    "ended_abandoned_after_live": outcomes.get("endedAbandoned"),
+                    "failed": outcomes.get("failed"),
+                    "live_rooms": outcomes.get("liveRooms"),
+                    "note": (
+                        "success_rate = reached live (two people joined AND a caption was "
+                        "delivered) / ended, 0..1. null means nothing ended in the window."
+                    ),
+                },
+            )
 
     counts, counts_error = counts_result
     meetings, meetings_error = meetings_result
@@ -957,10 +996,6 @@ async def _get_system_health(ctx: ToolContext, _arguments: dict[str, Any]) -> st
     if isinstance(meetings, dict):
         meeting_facts["today_vs_yesterday"] = _metrics(meetings)
     if meeting_facts:
-        meeting_facts["note"] = (
-            "The platform records meetings held, not a per-meeting success flag. Judge pipeline "
-            "failures from firing alerts, backed-up stages and dead letters above."
-        )
         payload["meetings"] = _cited(ctx, "Insights · Today", today["link"], meeting_facts)
     else:
         payload["meetings"] = counts_error or meetings_error or {"error": "unavailable"}
@@ -1266,10 +1301,11 @@ PLATFORM_TOOLS: list[ChatTool] = [
     ChatTool(
         name="get_system_health",
         description=(
-            "System health right now: firing alerts, services down, workers at zero replicas, "
-            "pipeline stages (Redis stream groups) that are backed up, dead-letter streams, stage "
-            "latency, and meetings live / held today. Use for 'is anything broken', 'failing "
-            "pipeline stages', outage questions."
+            "System health right now: the meeting success rate (last 24h), STT / translation / "
+            "TTS stage outcomes (last hour), firing alerts, services down, workers at zero "
+            "replicas, backed-up stream groups, dead-letter streams, stage latency, and meetings "
+            "live / held today. Use for 'is anything broken', 'failing pipeline stages', meeting "
+            "success and outage questions."
         ),
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         handler=_get_system_health,

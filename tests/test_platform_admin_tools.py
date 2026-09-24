@@ -283,6 +283,46 @@ async def test_an_ambiguous_workspace_name_is_asked_about_not_guessed() -> None:
     assert not any("/api/v1/subscriptions" in r.url.path for r in recorder.requests)
 
 
+async def test_system_health_reports_meeting_success_and_failing_stages() -> None:
+    recorder = _Recorder()
+    health = {
+        "monitoringAvailable": True,
+        "alerts": [{"name": "SttErrors", "severity": "critical", "state": "firing"}],
+        "stageOutcomes": [
+            {"stage": "stt", "ok": 90, "failed": 10, "deadLettered": 2, "successRate": 0.9},
+        ],
+        "meetings": {"window": "24h", "successRate": 0.8, "ended": 10, "reachedLive": 8},
+    }
+    ctx = _ctx(
+        recorder,
+        workspace={"/api/v1/admin/platform-health": _json(health)},
+        room={"/": _json({})},
+    )
+
+    payload = json.loads(await PLATFORM_TOOLS_BY_NAME["get_system_health"].handler(ctx, {}))
+
+    assert payload["meeting_success"]["success_rate"] == 0.8
+    assert payload["meeting_success"]["admin_link"] == "/admin/health"
+    stage = payload["monitoring"]["pipeline_stage_outcomes_last_hour"][0]
+    assert (stage["stage"], stage["failed"], stage["dead_lettered"]) == ("stt", 10, 2)
+    assert payload["monitoring"]["firing_alerts"][0]["name"] == "SttErrors"
+
+
+async def test_unreadable_monitoring_is_not_an_outage() -> None:
+    recorder = _Recorder()
+    ctx = _ctx(
+        recorder,
+        workspace={"/api/v1/admin/platform-health": _json({"monitoringAvailable": False})},
+        room={"/": _json({})},
+    )
+
+    payload = json.loads(await PLATFORM_TOOLS_BY_NAME["get_system_health"].handler(ctx, {}))
+
+    assert payload["monitoring"]["monitoring_available"] is False
+    assert "NOTHING" in payload["monitoring"]["note"]
+    assert "meeting_success" not in payload
+
+
 # ── periods ───────────────────────────────────────────────────────────────────────────────────
 
 _NOW = datetime(2026, 9, 24, 3, 0, tzinfo=UTC)  # 10:00 in Ho Chi Minh City
