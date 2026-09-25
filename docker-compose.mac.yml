@@ -3,6 +3,8 @@ services:
     platform: linux/amd64
   translation:
     platform: linux/amd64
+  transcript-clean:
+    platform: linux/amd64
   tts:
     platform: linux/amd64
   assistant:

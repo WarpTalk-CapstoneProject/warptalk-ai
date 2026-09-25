@@ -59,6 +59,7 @@ COPY pyproject.toml uv.lock ./
 COPY shared/ shared/
 COPY stt_worker/ stt_worker/
 COPY translation_worker/ translation_worker/
+COPY transcript_clean_worker/ transcript_clean_worker/
 COPY tts_worker/ tts_worker/
 COPY ai_assistant_worker/ ai_assistant_worker/
 COPY suggestion_worker/ suggestion_worker/
@@ -88,6 +89,17 @@ USER worker
 
 ENV PYTHONPATH=/app
 CMD ["python", "-m", "translation_worker"]
+
+# ---- Transcript Clean Worker ----
+# Reads stt:results in its own consumer group and writes transcript:clean. Same image as the
+# other text workers: no model weights, no audio, one OpenAI dependency.
+FROM builder AS transcript-clean
+
+RUN groupadd -r worker && useradd -r -g worker -d /app worker
+USER worker
+
+ENV PYTHONPATH=/app
+CMD ["python", "-m", "transcript_clean_worker"]
 
 # ---- TTS Worker ----
 FROM builder AS tts

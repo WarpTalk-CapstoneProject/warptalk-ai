@@ -128,6 +128,28 @@ class WorkerSettings(BaseSettings):
     # consumes them), so it lives on the shared settings rather than on either one.
     stt_streaming_enabled: bool = True
 
+    # Clean transcript, tier 1 (WT-716): run the deterministic disfluency prepass
+    # (shared.disfluency.prepass) on every final STT segment right before it is published, and
+    # carry the result as `clean_text`/`clean_flags` beside the untouched raw `text`.
+    #
+    # WHY IT IS ON THE LIVE PATH AT ALL
+    #   "um so we uh we need to finalize the budget" is what STT hears and what a subtitle,
+    #   a dub and a translation should NOT say. The prepass is pure CPU, rule-based and
+    #   sub-millisecond on a sentence, so it can sit in front of translation without costing
+    #   the meeting any latency — which the LLM tier (transcript_clean_worker) cannot.
+    #
+    # WHY A KILL SWITCH
+    #   The rules delete words. A rule that is wrong for some real room deletes the wrong
+    #   words in every subtitle and every dub of that room, live, with no way to take it back.
+    #   Off means the STT worker simply does not set the fields: every consumer then reads
+    #   `display_text` == raw `text`, i.e. exactly what the pipeline did before WT-716 — no
+    #   deploy of any other worker needed to get back there.
+    #
+    # Env TRANSCRIPT_CLEAN_ENABLED. Read by the STT worker only (the producer); consumers key
+    # off the presence of the fields, never off this flag, so replicas that disagree during a
+    # rollout cannot produce a message that means two things.
+    transcript_clean_enabled: bool = True
+
     # Max only for uninterrupted speech; ordinary short turns still flush on VAD silence.
     # Six seconds gives the model enough lexical context for natural Vietnamese sentences
     # containing English technical terms without adding delay after an ordinary pause.
