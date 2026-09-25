@@ -80,7 +80,7 @@ from shared.config import BillingSettings, RedisSettings, WorkerSettings
 from shared.control_markers import is_system_speaker
 from shared.health_probe import heartbeat_key
 from shared.logger import get_logger
-from shared.redis_client import RedisStreamClient
+from shared.redis_client import BILLING_UNBILLED_KEY, BILLING_UNBILLED_REASONS, RedisStreamClient
 from shared.schemas import (
     TranslationResultMessage,
     TTSResultMessage,
@@ -117,6 +117,40 @@ GATEWAY_COMMANDS_CHANNEL = "warptalk:translation-room:commands"
 SUSPENDED_SERVICE_STATE = "suspended"
 SUSPENSION_TTL_SECONDS = 120
 SUSPENSION_RECHECK_SECONDS = 30
+
+# THE LEAK THIS CLOSES (2026-09-24). A room whose workspace had NO active subscription — it expired
+# the day before — translated and dubbed a 14-minute meeting for free. `resolve_subscription` asks
+# for `is_active`, found nothing, and the handlers logged `no_subscription_for_room` and RETURNED:
+# no charge, so no refusal, so the WT-699 stop path above never ran. "Nobody to bill" is now the
+# same event as "the bill was refused": the room is stopped, the room is told why, and it is
+# counted. This is the reason that travels with it — BillingService's
+# SubscriptionConstants.SuspendedReasons.SubscriptionExpired, and what settle_usage_charge returns
+# for an inactive row, so every reader has one word for it.
+SUBSCRIPTION_EXPIRED_REASON = "subscription_expired"
+
+# Billable work that was NOT billed, by reason — a hash the stateless metrics_exporter turns into
+# warptalk_billing_unbilled_events_total{reason, charge_type}. A log line was the only trace of the
+# leak, and nobody aggregates log lines; this is the number an alert can watch.
+UNBILLED_METRIC_KEY = BILLING_UNBILLED_KEY
+UNBILLED_METRIC_TTL_SECONDS = 7 * 24 * 60 * 60
+UNBILLED_NO_SUBSCRIPTION, UNBILLED_CHARGE_REFUSED = BILLING_UNBILLED_REASONS
+
+
+class NoActiveSubscription:
+    """A room's workspace, resolved, that has no active subscription to bill.
+
+    Returned instead of None so the caller still knows WHICH workspace cannot pay — the stop path
+    marks the workspace as well as the room, and the watch loop asks the workspace, not a
+    subscription that does not exist, whether it can pay again.
+    """
+
+    __slots__ = ("workspace_id",)
+
+    def __init__(self, workspace_id: uuid.UUID) -> None:
+        self.workspace_id = workspace_id
+
+    def __repr__(self) -> str:
+        return f"NoActiveSubscription(workspace_id={self.workspace_id})"
 
 
 def _extract_underlying_segment_id(raw_segment_id: str) -> str | None:
@@ -177,9 +211,10 @@ class BillingSettlementWorker:
         self._subscription_cache: dict[str, tuple[uuid.UUID, uuid.UUID, float]] = {}
         # workspace_id -> (subscription_id, workspace_id, cached_at_monotonic), for backfills
         self._workspace_subscription_cache: dict[str, tuple[uuid.UUID, uuid.UUID, float]] = {}
-        # WT-699 / TC3705: rooms this replica stopped because a charge was refused.
-        # translation_room_id -> (subscription_id, workspace_id)
-        self._suspended_rooms: dict[str, tuple[uuid.UUID, uuid.UUID]] = {}
+        # WT-699 / TC3705: rooms this replica stopped because a charge was refused, or because
+        # the workspace had no subscription to charge (subscription_id None).
+        # translation_room_id -> (subscription_id | None, workspace_id)
+        self._suspended_rooms: dict[str, tuple[uuid.UUID | None, uuid.UUID]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -374,6 +409,7 @@ class BillingSettlementWorker:
         subscription_id: uuid.UUID,
         workspace_id: uuid.UUID,
         outcome: object,
+        charge_type: str = TRANSLATION_CHARGE_TYPE,
     ) -> None:
         """Stop the room if the workspace could not pay for what it just used.
 
@@ -384,6 +420,11 @@ class BillingSettlementWorker:
             return
         if outcome.applied or outcome.replayed:
             return
+        await self._count_unbilled(UNBILLED_CHARGE_REFUSED, charge_type)
+        if outcome.suspended_reason == SUBSCRIPTION_EXPIRED_REASON:
+            # The cached subscription id is a plan that has ended. Forget it, so the next event
+            # resolves afresh and finds the renewal the moment there is one.
+            self._subscription_cache.pop(translation_room_id, None)
         try:
             await self._suspend_room(
                 translation_room_id,
@@ -402,7 +443,7 @@ class BillingSettlementWorker:
     async def _suspend_room(
         self,
         translation_room_id: str,
-        subscription_id: uuid.UUID,
+        subscription_id: uuid.UUID | None,
         workspace_id: uuid.UUID,
         service_state: str | None,
         suspended_reason: str | None,
@@ -451,6 +492,50 @@ class BillingSettlementWorker:
                 }
             )
 
+    async def _stop_unpaid_room(
+        self,
+        translation_room_id: str,
+        unpaid: NoActiveSubscription,
+        charge_type: str,
+    ) -> None:
+        """Billable output for a room whose workspace has no subscription: treat it as refused.
+
+        Warning, counted, and the room is stopped through the same keys and the same Gateway
+        command as a refused charge — with its own reason, so the room is told "the subscription
+        expired", not "you ran out of credits". Never raises: the message is acknowledged either
+        way, because redelivering it cannot conjure a subscription.
+        """
+        self.logger.warning(
+            "no_subscription_for_room",
+            translation_room_id=translation_room_id,
+            workspace_id=str(unpaid.workspace_id),
+            charge_type=charge_type,
+            action="translation_suspended",
+        )
+        await self._count_unbilled(UNBILLED_NO_SUBSCRIPTION, charge_type)
+        try:
+            await self._suspend_room(
+                translation_room_id,
+                None,
+                unpaid.workspace_id,
+                SUSPENDED_SERVICE_STATE,
+                SUBSCRIPTION_EXPIRED_REASON,
+            )
+        except Exception:
+            self.logger.exception(
+                "credit_suspension_mark_failed", translation_room_id=translation_room_id
+            )
+
+    async def _count_unbilled(self, reason: str, charge_type: str) -> None:
+        """Best effort, like every metric here: it must never fail the settlement it describes."""
+        try:
+            pipeline = self.redis.redis.pipeline(transaction=False)
+            pipeline.hincrby(UNBILLED_METRIC_KEY, f"{reason}:{charge_type}", 1)
+            pipeline.expire(UNBILLED_METRIC_KEY, UNBILLED_METRIC_TTL_SECONDS)
+            await pipeline.execute()
+        except Exception:
+            self.logger.debug("unbilled_metric_failed", reason=reason, exc_info=True)
+
     async def _suspension_watch_loop(self) -> None:
         while not self._shutdown_event.is_set():
             await asyncio.sleep(SUSPENSION_RECHECK_SECONDS)
@@ -461,11 +546,25 @@ class BillingSettlementWorker:
             except Exception:
                 self.logger.exception("credit_suspension_recheck_failed")
 
+    async def _workspace_payment_state(
+        self, workspace_id: uuid.UUID
+    ) -> tuple[str | None, str | None] | None:
+        """(service_state, suspended_reason) of the workspace's ACTIVE subscription, or None.
+
+        Asked of the workspace, not of the subscription the room was stopped on: a renewal after
+        expiry creates a NEW subscription row, so the old one stays inactive forever and asking it
+        would keep the room stopped after the customer has paid.
+        """
+        resolved = await self.db.resolve_subscription(str(workspace_id))
+        if resolved is None:
+            return None
+        return await self.db.get_service_state(resolved[0])
+
     async def _recheck_suspended_rooms(self) -> None:
         """Keep a stopped room stopped while it cannot pay; let it go the moment it can."""
-        for room_id, (subscription_id, workspace_id) in list(self._suspended_rooms.items()):
-            state = await self.db.get_service_state(subscription_id)
-            if state is not None and state[0] == SUSPENDED_SERVICE_STATE:
+        for room_id, (_subscription_id, workspace_id) in list(self._suspended_rooms.items()):
+            state = await self._workspace_payment_state(workspace_id)
+            if state is None or state[0] == SUSPENDED_SERVICE_STATE:
                 for key in (
                     ROOM_SUSPENDED_KEY.format(room_id=room_id),
                     ROOM_STATE_KEY.format(room_id=room_id),
@@ -476,6 +575,9 @@ class BillingSettlementWorker:
                 continue
 
             self._suspended_rooms.pop(room_id, None)
+            # A cached id may be the subscription that ended; the room bills its renewal now.
+            self._subscription_cache.pop(room_id, None)
+            self._workspace_subscription_cache.pop(str(workspace_id), None)
             # Only the replica that actually removed the room key announces the resume.
             removed = await self.redis.redis.delete(
                 ROOM_SUSPENDED_KEY.format(room_id=room_id),
@@ -511,7 +613,7 @@ class BillingSettlementWorker:
     async def _resolve_subscription(
         self,
         translation_room_id: str,
-    ) -> tuple[uuid.UUID, uuid.UUID] | None:
+    ) -> tuple[uuid.UUID, uuid.UUID] | NoActiveSubscription:
         cached = self._subscription_cache.get(translation_room_id)
         now = time.monotonic()
         if cached and now - cached[2] < self.settings.subscription_cache_ttl_seconds:
@@ -557,7 +659,8 @@ class BillingSettlementWorker:
 
         resolved = await self.db.resolve_subscription(workspace_id)
         if resolved is None:
-            return None
+            # Not cached: a renewal must be seen on the very next event.
+            return NoActiveSubscription(uuid.UUID(str(workspace_id)))
 
         subscription_id, workspace_id = resolved
         self._subscription_cache[translation_room_id] = (subscription_id, workspace_id, now)
@@ -692,8 +795,8 @@ class BillingSettlementWorker:
             return
 
         resolved = await self._resolve_subscription(msg.meeting_id)
-        if resolved is None:
-            self.logger.warning("no_subscription_for_room", translation_room_id=msg.meeting_id)
+        if isinstance(resolved, NoActiveSubscription):
+            await self._stop_unpaid_room(msg.meeting_id, resolved, TRANSLATION_CHARGE_TYPE)
             return
         subscription_id, workspace_id = resolved
 
@@ -801,7 +904,15 @@ class BillingSettlementWorker:
 
         resolved = await self._resolve_workspace_subscription(msg.workspace_id)
         if resolved is None:
-            self.logger.warning("no_subscription_for_workspace", workspace_id=msg.workspace_id)
+            # No room to stop — a backfill runs after the meeting — but never silent: it is
+            # counted, so a lapsed workspace reading back its transcripts shows up as unbilled work.
+            self.logger.warning(
+                "no_subscription_for_workspace",
+                workspace_id=msg.workspace_id,
+                translation_room_id=msg.meeting_id,
+                charge_type=TRANSLATION_CHARGE_TYPE,
+            )
+            await self._count_unbilled(UNBILLED_NO_SUBSCRIPTION, TRANSLATION_CHARGE_TYPE)
             return
         subscription_id, workspace_id = resolved
 
@@ -818,7 +929,7 @@ class BillingSettlementWorker:
         target_lang = msg.target_lang
         idempotency_key = f"{TRANSLATION_CHARGE_TYPE}:backfill:{segment_id}:{target_lang}"
 
-        await self.db.record_usage_and_charge(
+        outcome = await self.db.record_usage_and_charge(
             subscription_id=subscription_id,
             user_id=requested_by,
             workspace_id=workspace_id,
@@ -841,6 +952,8 @@ class BillingSettlementWorker:
                 "transcript_id": msg.transcript_id,
             },
         )
+        if isinstance(outcome, SettlementOutcome) and not (outcome.applied or outcome.replayed):
+            await self._count_unbilled(UNBILLED_CHARGE_REFUSED, TRANSLATION_CHARGE_TYPE)
 
     async def _handle_tts(self, data: Mapping[Any, Any]) -> None:
         msg = TTSResultMessage.from_redis(data)
@@ -851,15 +964,15 @@ class BillingSettlementWorker:
         if self._is_unbillable(msg.speaker_id, msg.meeting_id):
             return
 
-        resolved = await self._resolve_subscription(msg.meeting_id)
-        if resolved is None:
-            self.logger.warning("no_subscription_for_room", translation_room_id=msg.meeting_id)
-            return
-        subscription_id, workspace_id = resolved
-
         charge_type = (
             "AUDIO_DUBBING_VOICE_CLONE" if msg.voice_type == "cloned" else "AUDIO_DUBBING_STANDARD"
         )
+
+        resolved = await self._resolve_subscription(msg.meeting_id)
+        if isinstance(resolved, NoActiveSubscription):
+            await self._stop_unpaid_room(msg.meeting_id, resolved, charge_type)
+            return
+        subscription_id, workspace_id = resolved
 
         # Same composite-segment-id situation as _handle_translation above — extract the
         # real TranscriptSegment.Id before using it as a UUID column value.
@@ -889,7 +1002,9 @@ class BillingSettlementWorker:
                 "is_external": await self._is_external_speaker(msg.meeting_id, msg.speaker_id),
             },
         )
-        await self._note_settlement(msg.meeting_id, subscription_id, workspace_id, outcome)
+        await self._note_settlement(
+            msg.meeting_id, subscription_id, workspace_id, outcome, charge_type
+        )
 
     def _register_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()

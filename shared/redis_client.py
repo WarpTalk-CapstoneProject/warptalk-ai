@@ -44,6 +44,12 @@ OUTCOME_KEY_PREFIX = "warptalk:outcome:"
 # The outcomes a stage attempt can have. "ok" and the three failure kinds partition every attempt;
 # "dead_letter" is counted on top, once, when a message is parked after its retries are spent.
 STAGE_OUTCOMES = ("ok", "error", "timeout", "vendor_error", "dead_letter")
+# Billable work the billing worker did NOT bill, one hash: field = "{reason}:{charge_type}",
+# value = count. Read back by metrics_exporter as warptalk_billing_unbilled_events_total. Written by
+# billing_worker when a room's workspace has no subscription, or when a charge is refused.
+BILLING_UNBILLED_KEY = "warptalk:billing:unbilled"
+BILLING_UNBILLED_REASONS = ("no_active_subscription", "charge_refused")
+BILLING_CHARGE_TYPES = ("TRANSLATION", "AUDIO_DUBBING_STANDARD", "AUDIO_DUBBING_VOICE_CLONE")
 
 
 def is_per_room_stream(stream: str) -> bool:
