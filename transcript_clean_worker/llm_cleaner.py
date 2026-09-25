@@ -57,6 +57,7 @@ from shared.disfluency.normalize import resolve_language
 from shared.disfluency.tokenize import COMMAS, Token, tokenize_spans
 from shared.logger import get_logger
 from shared.openai_options import completion_options
+from shared.provider_calls import observed_openai_http_client
 from transcript_clean_worker.config import TranscriptCleanSettings
 
 logger = get_logger(__name__)
@@ -552,7 +553,9 @@ class LLMCleaner:
             # Not fatal: the prepass tier still cleans every line. See config.api_key.
             logger.warning("transcript_clean_llm_disabled", reason="no_api_key")
             return
-        self._client = AsyncOpenAI(api_key=self.api_key)
+        self._client = AsyncOpenAI(
+            api_key=self.api_key, http_client=observed_openai_http_client("transcript-clean")
+        )
         logger.info("transcript_clean_llm_loaded", model=self.model)
 
     async def close(self) -> None:
