@@ -278,6 +278,18 @@ class TranscriptCleanWorker(BaseWorker):
                 segment_ids=sentence.segment_ids,
             )
 
+        if not segment_ids:
+            # Every id in this sentence failed the GUID check above. Publishing anyway would
+            # send segment_ids: [] — the transcript service rejects that, and after its retries
+            # dead-letters the message, which is worse than saying nothing here: there is no
+            # segment left to attach a clean line to, so there is nothing faithful to publish.
+            self.logger.warning(
+                "transcript_clean_no_valid_segment_ids",
+                meeting_id=meeting_id,
+                raw_segment_ids=sentence.segment_ids,
+            )
+            return
+
         text = normalize_terminal_punctuation(sentence.prepass_text, sentence.language)
         message = CleanSentenceMessage(
             meeting_id=meeting_id,
