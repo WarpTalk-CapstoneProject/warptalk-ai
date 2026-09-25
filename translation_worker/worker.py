@@ -20,6 +20,7 @@ from typing import Any, cast
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
 from shared.control_markers import is_control_marker, is_system_speaker
+from shared.integration_status import OPENAI, IntegrationReport, credential_report
 from shared.lang import is_same_language
 from shared.languages import known_language_code
 from shared.schemas import (
@@ -163,6 +164,15 @@ class TranslationWorker(BaseWorker):
         self._speculative_listener_task: asyncio.Task[None] | None = None
         # (meeting_id, raw value) pairs already warned about by _get_target_languages.
         self._warned_unknown_targets: set[tuple[str, str]] = set()
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        s = self.translation_settings
+        return {
+            OPENAI: credential_report(
+                resolve_openai_api_key(s.api_key),
+                f"translation model {s.model}, realtime model {s.realtime_model}",
+            )
+        }
 
     async def load_model(self) -> None:
         """Initialize OpenAI translation client."""

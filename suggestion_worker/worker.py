@@ -20,10 +20,20 @@ import json
 import time
 from collections import deque
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from shared.base_worker import BaseWorker
-from shared.config import SuggestionSettings
+from shared.config import SuggestionSettings, resolve_openai_api_key
+from shared.integration_status import OPENAI, IntegrationReport, credential_report
+from shared.platform_settings import (
+    FLAG_AI_SUGGEST,
+    SUGGEST_COOLDOWN_SECONDS,
+    SUGGEST_MAX_PER_MEETING,
+    SUGGEST_MIN_CONFIDENCE,
+    SUGGEST_MIN_STT_CONFIDENCE,
+    SUGGEST_MIN_WORDS,
+)
 from shared.schemas import (
     STT_UNKNOWN_CONFIDENCE,
     STTResultMessage,
@@ -132,6 +142,32 @@ def _sources_json(names: Sequence[str]) -> str:
     )
 
 
+@dataclass(frozen=True)
+class SuggestionLimits:
+    """The five operator-tunable thresholds, as they stand for ONE segment.
+
+    Read once per segment from the platform settings (meetings.ai_suggest.*), each falling back
+    to its SUGGESTION_* env value, so a console change applies to the next segment without a
+    restart and a key nobody set changes nothing.
+    """
+
+    min_words: int
+    min_confidence: float
+    cooldown_seconds: int
+    max_per_meeting: int
+    min_stt_confidence: float
+
+    @classmethod
+    def from_settings(cls, settings: SuggestionSettings) -> SuggestionLimits:
+        return cls(
+            min_words=settings.min_words,
+            min_confidence=settings.min_confidence,
+            cooldown_seconds=settings.cooldown_seconds,
+            max_per_meeting=settings.max_per_meeting,
+            min_stt_confidence=settings.min_stt_confidence,
+        )
+
+
 class SuggestionWorker(BaseWorker):
     """Inline transcript suggestions — non-blocking, budget-capped, silent by default."""
 
@@ -170,7 +206,46 @@ class SuggestionWorker(BaseWorker):
         self._windows.pop(room_id, None)
         self._policies.pop(room_id, None)
 
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        settings = self.suggestion_settings
+        return {
+            OPENAI: credential_report(
+                resolve_openai_api_key(settings.api_key),
+                f"decide model {settings.decide_model}, generate model {settings.generate_model}",
+            )
+        }
+
+    async def _limits(self) -> SuggestionLimits:
+        """This segment's thresholds: platform settings live, env values as the fallback."""
+        env = self.suggestion_settings
+        reader = self.platform_settings()
+        return SuggestionLimits(
+            min_words=await reader.get_int(SUGGEST_MIN_WORDS, env.min_words),
+            min_confidence=await reader.get_float(SUGGEST_MIN_CONFIDENCE, env.min_confidence),
+            cooldown_seconds=await reader.get_int(SUGGEST_COOLDOWN_SECONDS, env.cooldown_seconds),
+            max_per_meeting=await reader.get_int(SUGGEST_MAX_PER_MEETING, env.max_per_meeting),
+            min_stt_confidence=await reader.get_float(
+                SUGGEST_MIN_STT_CONFIDENCE, env.min_stt_confidence
+            ),
+        )
+
+    async def _flag_allows(self, room_id: str) -> bool:
+        """`flags.ai_suggest` for this room's workspace. It can only NARROW SUGGESTION_ENABLED.
+
+        The workspace comes from MeetingService's room projection, and is looked up only when
+        the flag's value could depend on it (a partial rollout or a deny list) — a plainly on or
+        plainly off flag costs no lookup.
+        """
+        reader = self.platform_settings()
+
+        async def workspace() -> str | None:
+            return await reader.room_workspace_id(room_id)
+
+        return await reader.is_enabled(FLAG_AI_SUGGEST, resolve_workspace=workspace)
+
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        # The deploy switch stays the ceiling: SUGGESTION_ENABLED=false means off whatever the
+        # platform flag says.
         if not self.suggestion_settings.enabled:
             return
 
@@ -184,6 +259,12 @@ class SuggestionWorker(BaseWorker):
 
         if not self._is_room_active(room_id):
             return
+
+        if not await self._flag_allows(room_id):
+            self.logger.debug("suggestion_flag_off", meeting_id=room_id)
+            return
+
+        limits = await self._limits()
 
         # WT-605 — A BADGE NEEDS A TRANSCRIPT LINE TO SIT ON.
         #
@@ -220,7 +301,7 @@ class SuggestionWorker(BaseWorker):
         if turn.text:
             window.append(turn)
 
-        if not self._passes_local_heuristics(turn, stt_result.confidence):
+        if not self._passes_local_heuristics(turn, stt_result.confidence, limits):
             # Stage 0 spends no tokens, so until now it wrote nothing at all — and it is the
             # gate that rejects roughly half of everything spoken. That is precisely why the
             # feature could look dead rather than starved: every other stage leaves a trace,
@@ -232,6 +313,11 @@ class SuggestionWorker(BaseWorker):
                 question=_looks_like_question(turn.text),
                 stt_confidence=stt_result.confidence,
             )
+            return
+
+        # A per-meeting cap of 0 is the console's "no suggestions": nothing may reach the model.
+        if limits.max_per_meeting <= 0:
+            self.logger.debug("suggestion_cap_is_zero", meeting_id=room_id)
             return
 
         # Consent gate, before any transcript text leaves this process.
@@ -261,7 +347,7 @@ class SuggestionWorker(BaseWorker):
                 reason=decision.reason,
             )
             return
-        if decision.confidence < self.suggestion_settings.min_confidence:
+        if decision.confidence < limits.min_confidence:
             self.logger.debug(
                 "suggestion_below_confidence_gate",
                 meeting_id=room_id,
@@ -291,7 +377,7 @@ class SuggestionWorker(BaseWorker):
             )
             return
 
-        if not await self._claim_slot(room_id):
+        if not await self._claim_slot(room_id, limits):
             return
 
         suggestion = await self.suggester.generate(
@@ -314,7 +400,12 @@ class SuggestionWorker(BaseWorker):
             return False
         return self._route_states.get(room_id, "") not in _INACTIVE_ROUTE_STATES
 
-    def _passes_local_heuristics(self, turn: TranscriptTurn, confidence: float) -> bool:
+    def _passes_local_heuristics(
+        self,
+        turn: TranscriptTurn,
+        confidence: float,
+        limits: SuggestionLimits | None = None,
+    ) -> bool:
         """Reject before spending a token.
 
         Note what is NOT checked here: `is_final_chunk`. On this stream that flag marks
@@ -329,12 +420,14 @@ class SuggestionWorker(BaseWorker):
         did so silently, because stage 0 spends no tokens and therefore logs nothing, which
         is why the badge looked dead rather than starved.
         """
+        if limits is None:
+            limits = SuggestionLimits.from_settings(self.suggestion_settings)
         if not turn.text:
             return False
         floor = (
             self.suggestion_settings.min_question_words
             if _looks_like_question(turn.text)
-            else self.suggestion_settings.min_words
+            else limits.min_words
         )
         if len(turn.text.split()) < floor:
             return False
@@ -356,10 +449,7 @@ class SuggestionWorker(BaseWorker):
         # floor there): test the sentinel for equality first, and let unknown through. The decide
         # model is the real gate; this one exists to skip the obviously worthless, and "we do not
         # know how confident the recogniser was" is not evidence of worthlessness.
-        if (
-            confidence != STT_UNKNOWN_CONFIDENCE
-            and confidence < self.suggestion_settings.min_stt_confidence
-        ):
+        if confidence != STT_UNKNOWN_CONFIDENCE and confidence < limits.min_stt_confidence:
             return False
         return True
 
@@ -414,7 +504,7 @@ class SuggestionWorker(BaseWorker):
     async def _cooldown_active(self, room_id: str) -> bool:
         return await self.redis.get(self._cooldown_key(room_id)) is not None
 
-    async def _claim_slot(self, room_id: str) -> bool:
+    async def _claim_slot(self, room_id: str, limits: SuggestionLimits | None = None) -> bool:
         """Atomically take this room's next suggestion slot. False means don't suggest.
 
         Both limits live in Redis rather than worker memory because the production chart
@@ -422,10 +512,17 @@ class SuggestionWorker(BaseWorker):
         segments to whichever replica is free — per-process counters would multiply the
         real budget by the replica count and make the cooldown ineffective.
         """
+        if limits is None:
+            limits = SuggestionLimits.from_settings(self.suggestion_settings)
+        if limits.max_per_meeting <= 0:
+            return False
+        # A cooldown of 0 means "no cooldown". Redis refuses SET with EX 0, so the slot is still
+        # taken (it is what keeps two replicas from double-publishing) for the shortest TTL it
+        # accepts.
         claimed = await self.redis.set_if_absent(
             self._cooldown_key(room_id),
             "1",
-            self.suggestion_settings.cooldown_seconds,
+            max(1, limits.cooldown_seconds),
         )
         if not claimed:
             return False
@@ -434,7 +531,7 @@ class SuggestionWorker(BaseWorker):
             self._budget_key(room_id),
             self.suggestion_settings.state_ttl_seconds,
         )
-        if used > self.suggestion_settings.max_per_meeting:
+        if used > limits.max_per_meeting:
             self.logger.info("suggestion_budget_exhausted", meeting_id=room_id, used=used)
             return False
         return True

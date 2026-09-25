@@ -27,7 +27,19 @@ from typing import Any, cast
 from shared import isochrony
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
+from shared.integration_status import (
+    CARTESIA,
+    LIVEKIT,
+    IntegrationReport,
+    credential_report,
+    livekit_report,
+)
 from shared.lang import base_language, is_same_language
+from shared.platform_settings import (
+    FLAG_VOICE_CLONE,
+    VOICE_CLONE_MIN_SECONDS,
+    VOICE_CLONE_UPGRADE_MARGIN,
+)
 from shared.prosody import SPEED_MAX, Arousal, Delivery, Valence, to_generation_config
 from shared.provider_calls import classify_exception, record_provider_call
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
@@ -508,6 +520,47 @@ class TTSWorker(BaseWorker):
         if self.tts_settings.voice_catalog_warm_enabled:
             asyncio.create_task(self._warm_voice_catalogs())
         self.logger.info("tts_worker_ready", model=self.tts_settings.model)
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        reports = {
+            CARTESIA: credential_report(
+                self.tts_settings.api_key, f"tts model {self.tts_settings.model}"
+            )
+        }
+        if self.tts_settings.stream_to_livekit:
+            reports[LIVEKIT] = livekit_report(self.settings.livekit, "dub tracks")
+        return reports
+
+    # ------------------------------------------------------------------
+    # Platform settings (read live; the TTS_* env value is the fallback)
+    # ------------------------------------------------------------------
+
+    async def _clone_min_seconds(self) -> float:
+        """`meetings.voice_clone.min_sample_seconds`; falls back to the TTS_ env value."""
+        return await self.platform_settings().get_float(
+            VOICE_CLONE_MIN_SECONDS, float(self.tts_settings.voice_clone_min_seconds)
+        )
+
+    async def _clone_upgrade_margin(self) -> float:
+        """`meetings.voice_clone.upgrade_margin`, falling back to TTS_VOICE_CLONE_UPGRADE_MARGIN."""
+        return await self.platform_settings().get_float(
+            VOICE_CLONE_UPGRADE_MARGIN, float(self.tts_settings.voice_clone_upgrade_margin)
+        )
+
+    async def _voice_clone_allowed(self, meeting_id: str) -> bool:
+        """`flags.voice_clone` for this room's workspace — the platform's kill switch for cloning.
+
+        Off means no NEW in-meeting clone is started and no cloned voice is used to synthesize;
+        dubs go out in the standard voice. On leaves the consent and entitlement gates exactly
+        as they were: this can only narrow them. The workspace comes from MeetingService's room
+        projection and is looked up only when the flag's value could depend on it.
+        """
+        reader = self.platform_settings()
+
+        async def workspace() -> str | None:
+            return await reader.room_workspace_id(meeting_id)
+
+        return await reader.is_enabled(FLAG_VOICE_CLONE, resolve_workspace=workspace)
 
     async def _consume_loop(self) -> None:
         """Dispatch process() concurrently across DIFFERENT (speaker, target_lang)
@@ -1487,6 +1540,10 @@ class TTSWorker(BaseWorker):
         """
         if not self.is_voice_clone_consented(meeting_id, speaker_id):
             return None
+        # The platform kill switch, checked on every call for the same reason consent is: turned
+        # off mid-meeting, the very next dub goes out in the standard voice.
+        if not await self._voice_clone_allowed(meeting_id):
+            return None
         cached = await self.redis.hget(f"voice:{meeting_id}:{speaker_id}", "voice_id")
         if cached:
             return cached.decode() if isinstance(cached, bytes) else cached
@@ -1872,6 +1929,24 @@ class TTSWorker(BaseWorker):
                             carried_seen.discard(key)
                             continue
 
+                        # The platform kill switch (flags.voice_clone). Off: no new clone is
+                        # started, and nothing is buffered for one — the audio is biometric, and
+                        # holding it for a clone that cannot happen is holding it for nothing.
+                        # Said out loud like every other exit here, so a switched-off platform
+                        # does not read as broken cloning.
+                        if not await self._voice_clone_allowed(chunk.meeting_id):
+                            await self._note_clone_state(key, "disabled_by_platform")
+                            buffers.pop(key, None)
+                            buffer_seconds.pop(key, None)
+                            buffer_lang.pop(key, None)
+                            carried_seen.discard(key)
+                            continue
+
+                        # Read per chunk, not once per process: an operator's change in the
+                        # settings console applies to the next chunk without a restart.
+                        min_seconds = await self._clone_min_seconds()
+                        upgrade_margin = await self._clone_upgrade_margin()
+
                         # WT-B: adopt the bar a previous meeting's clone set, once per speaker.
                         #
                         # Without this the carried voice is used but never measured against, so
@@ -1989,8 +2064,7 @@ class TTSWorker(BaseWorker):
                         if (
                             not language_is_stale
                             and best_so_far is not None
-                            and best_so_far + self.tts_settings.voice_clone_upgrade_margin
-                            > MAX_SAMPLE_SCORE
+                            and best_so_far + upgrade_margin > MAX_SAMPLE_SCORE
                         ):
                             await self._note_clone_state(
                                 key, "cloned_best_possible", score=best_so_far
@@ -2013,10 +2087,10 @@ class TTSWorker(BaseWorker):
                             key,
                             "capturing",
                             seconds=buffer_seconds[key],
-                            required_seconds=float(self.tts_settings.voice_clone_min_seconds),
+                            required_seconds=float(min_seconds),
                         )
 
-                        if buffer_seconds[key] >= self.tts_settings.voice_clone_min_seconds:
+                        if buffer_seconds[key] >= min_seconds:
                             # NOT UNDER A GUESS ABOUT THE LANGUAGE.
                             #
                             # `_resolve_clone_language` returns None while the speaker's language
@@ -2080,10 +2154,7 @@ class TTSWorker(BaseWorker):
                                 # a Vietnamese speaker.
                                 worth_cloning = True
                             else:
-                                worth_cloning = (
-                                    assessment.score
-                                    >= previous_score + self.tts_settings.voice_clone_upgrade_margin
-                                )
+                                worth_cloning = assessment.score >= previous_score + upgrade_margin
                             if worth_cloning:
                                 audio_snapshot = bytes(buffers.pop(key))
                                 del buffer_seconds[key]
@@ -2100,8 +2171,7 @@ class TTSWorker(BaseWorker):
                                     "voice_clone_sample_accepted",
                                     speaker_id=chunk.speaker_id,
                                     seconds=round(
-                                        buffer_seconds.get(key, 0.0)
-                                        or self.tts_settings.voice_clone_min_seconds,
+                                        buffer_seconds.get(key, 0.0) or min_seconds,
                                         1,
                                     ),
                                     active_speech_ratio=round(assessment.active_speech_ratio, 3),

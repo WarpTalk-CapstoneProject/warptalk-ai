@@ -6,6 +6,7 @@ from openai import AsyncOpenAI
 from security_worker.scanners import OpenAISecurityScanner
 from shared.base_worker import BaseWorker
 from shared.config import SecuritySettings, resolve_openai_api_key
+from shared.integration_status import OPENAI, IntegrationReport, credential_report
 from shared.provider_calls import observed_openai_http_client
 
 RESULT_TTL_SECONDS = 300
@@ -57,6 +58,12 @@ class SecurityWorker(BaseWorker):
         self.security_settings = security_settings or SecuritySettings()
         self.openai_client: AsyncOpenAI | None = None
         self.openai_scanner: OpenAISecurityScanner | None = None
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        s = self.security_settings
+        return {
+            OPENAI: credential_report(resolve_openai_api_key(s.api_key), f"scan model {s.model}")
+        }
 
     async def load_model(self) -> None:
         api_key = resolve_openai_api_key(self.security_settings.api_key)
