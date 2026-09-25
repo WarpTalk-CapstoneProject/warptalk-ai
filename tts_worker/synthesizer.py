@@ -17,6 +17,7 @@ from cartesia import AsyncCartesia
 
 from shared.lang import base_language
 from shared.logger import get_logger
+from shared.provider_calls import observed_cartesia_http_client
 from tts_worker.prosody_context import SENTENCE_TIMEOUT_SECONDS, ProsodyContext
 
 logger = get_logger(__name__)
@@ -67,7 +68,9 @@ class CartesiaSynthesizer:
         self._warm_refill_task: asyncio.Task[None] | None = None
 
     async def load(self) -> None:
-        self._client = AsyncCartesia(api_key=self.api_key)
+        self._client = AsyncCartesia(
+            api_key=self.api_key, http_client=observed_cartesia_http_client("api")
+        )
         logger.info("cartesia_ready", model=self.model, sample_rate=self.sample_rate)
 
     async def _open_warm_connection(self) -> tuple[Any, float]:

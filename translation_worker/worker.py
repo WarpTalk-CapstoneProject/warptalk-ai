@@ -469,8 +469,38 @@ class TranslationWorker(BaseWorker):
         # always retains it even after several accepted utterances have accumulated.
         meeting_context = recent_context[-3:] + static_context
 
+        # WHAT GETS TRANSLATED IS THE CLEAN LINE, NOT THE RAW ONE (WT-716).
+        #
+        # `display_text` is `clean_text` when the STT worker's deterministic prepass produced
+        # one and the raw `text` otherwise, so a deployment with TRANSCRIPT_CLEAN_ENABLED off —
+        # or a message from a replica that predates the field — translates exactly what it
+        # always did. Nothing here reads the flag: the presence of the field is the contract.
+        #
+        # WHY THE CLEAN SIDE IS THE RIGHT INPUT. "um so we uh we need to finalize the budget"
+        # spends tokens on the fillers, invites the model to render them as words in the target
+        # language ("ええと、そのー"), and then hands tts_worker a sentence to SPEAK with the
+        # hesitations of a different language's speaker baked in. The raw line is still the
+        # record — it travels untouched on `stt:results` and is what corrections and billing
+        # work from — but it is not what a listener should hear.
+        mt_source = stt_result.display_text
+
+        # Filler-only ("Ummm", "えーと"): the prepass says there is no sentence here at all.
+        # Debug, not info, because on a live meeting this fires often and means nothing went
+        # wrong. Note what is NOT skipped: a filler-only segment that also closes the turn still
+        # falls into the `not sentences` branch below and publishes the empty final-chunk
+        # marker, because that marker is the turn boundary every downstream consumer waits for
+        # and losing it would strand the turn, not tidy it.
+        if stt_result.clean_text == "":
+            self.logger.debug(
+                "filler_only_segment_not_translated",
+                meeting_id=stt_result.meeting_id,
+                speaker_id=stt_result.speaker_id,
+                segment_id=stt_result.segment_id,
+                original=stt_result.text[:60],
+            )
+
         # Split long STT results into smaller sentences (streaming mechanism)
-        sentences = split_into_sentences(stt_result.text)
+        sentences = split_into_sentences(mt_source)
 
         if not sentences:
             if stt_result.is_final_chunk:
@@ -511,7 +541,10 @@ class TranslationWorker(BaseWorker):
             )
         )
         if any(publish_results) and stt_result.confidence >= self._CONTEXT_MIN_CONFIDENCE:
-            self._remember_source_context(stt_result.meeting_id, stt_result.text)
+            # The clean line, for the same reason it is what was translated: this context is fed
+            # back to the model as "what has been said in this meeting", and a history of
+            # "um, so, uh" teaches it nothing except to expect more of them.
+            self._remember_source_context(stt_result.meeting_id, mt_source)
 
     async def _credits_suspended(self, room_id: str) -> bool:
         """Whether billing_worker has stopped this room for a refused charge (WT-699 / TC3705).

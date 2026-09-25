@@ -29,6 +29,7 @@ from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
 from shared.lang import base_language, is_same_language
 from shared.prosody import SPEED_MAX, Arousal, Delivery, Valence, to_generation_config
+from shared.provider_calls import classify_exception, record_provider_call
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
 from tts_worker.clone_sample_quality import MAX_SAMPLE_SCORE, assess_clone_sample
 from tts_worker.livekit_publisher import LiveKitTTSPublisher, TrackStream
@@ -1280,6 +1281,13 @@ class TTSWorker(BaseWorker):
             # Swallowed so the next sentence still plays; counted so a Cartesia outage (402 quota,
             # 5xx) shows as a TTS success rate falling rather than as silence.
             self.note_attempt_outcome("vendor_error")
+            await record_provider_call(
+                "cartesia",
+                "tts",
+                classify_exception(e),
+                int((time.monotonic() - t0) * 1000),
+                self.tts_settings.model,
+            )
             # Carried the error and the voice and nothing else, so a failure could not be tied
             # to the sentence that failed: the one question worth asking of this line — WHICH
             # line went silent — was the one it could not answer.
@@ -1317,6 +1325,17 @@ class TTSWorker(BaseWorker):
         # rise. It is still the right measure of "how long the worker was busy with this
         # sentence"; it is no longer a measure of how long anyone waited to hear it.
         await self.redis.record_latency("tts_synthesis", synthesis_latency_ms)
+        # Cartesia's latency is its time to first audio; with streaming on, the whole synthesis
+        # time also contains playback (see above) and would make the vendor look 5x slower.
+        await record_provider_call(
+            "cartesia",
+            "tts",
+            "ok",
+            int((sentence.first_audio_at - t0) * 1000)
+            if sentence.first_audio_at is not None
+            else synthesis_latency_ms,
+            self.tts_settings.model,
+        )
         if sentence.first_audio_at is not None:
             # What the listener actually experiences, and the only number that answers the
             # complaint this work came from. Same t0 as above, so the two are comparable.

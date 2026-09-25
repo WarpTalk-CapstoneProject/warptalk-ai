@@ -46,6 +46,16 @@ _TARGET_KEYS: dict[str, tuple[str, ...]] = {
     "get_transcript": ("title", "room_code"),
     "get_document": ("title", "name", "file_name"),
     "get_platform_analytics": ("metric", "range", "period"),
+    # The platform-scope tools (platform_tools.py). Only free-text keys and the period: an enum
+    # left at "none" is not a subject.
+    "get_platform_insights": ("period",),
+    "search_workspaces": ("query",),
+    "search_accounts": ("query",),
+    "get_workspace_summary": ("workspace",),
+    "lookup_billing": ("workspace", "view"),
+    "get_system_health": (),
+    "search_audit_log": ("workspace", "entity_type", "action"),
+    "lookup_plugins": ("plugin_key", "query"),
     "create_meeting": ("title",),
     "create_action_item": ("task",),
     "add_glossary_term": ("source_term",),

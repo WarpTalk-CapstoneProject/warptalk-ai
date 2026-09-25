@@ -98,6 +98,58 @@ class TestRewritingIsRefused:
         assert not is_faithful(original, polished, "vi")
 
 
+class TestJapanese:
+    """Japanese has no spaces, so until WT-716 this module could not clean it at all.
+
+    Splitting on whitespace made a whole sentence one token: deleting a filler from the middle
+    of it changed that one token, the subsequence rule saw an entirely different word, and the
+    polish was refused every time. The tokenizer is morphemes now (shared.disfluency.tokenize).
+    """
+
+    def test_a_filler_inside_a_phrase_may_be_dropped(self):
+        assert is_faithful("明日えーとリリースします", "明日リリースします。", "ja")
+
+    def test_a_leading_filler_and_punctuation_may_be_dropped(self):
+        assert is_faithful("えーと、あのー、来週の会議ですが", "来週の会議ですが", "ja")
+
+    def test_a_repeated_restart_may_be_collapsed(self):
+        assert is_faithful("その、その件は明日話します", "その件は明日話します。", "ja")
+
+    def test_a_rewrite_is_still_refused(self):
+        assert not is_faithful("明日リリースします", "明日デプロイします。", "ja")
+
+    def test_deleting_the_negation_is_refused(self):
+        # A subsequence, and the opposite statement: "we will not release tomorrow" becoming
+        # "we will release tomorrow" is the failure a reader cannot see.
+        assert not is_faithful("明日はリリースしません", "明日はリリースします。", "ja")
+
+    def test_deleting_a_number_is_refused(self):
+        assert not is_faithful("三時に始めます", "始めます。", "ja")
+
+    def test_dropping_the_question_particle_is_refused(self):
+        assert not is_faithful("明日リリースしますか", "明日リリースします。", "ja")
+
+    def test_an_already_clean_line_passes(self):
+        assert is_faithful("明日リリースします。", "明日リリースします。", "ja")
+
+
+class TestMeaningIsNotFormatting:
+    """I2: a deletion can be a perfect subsequence and still change what was said."""
+
+    def test_dropping_an_english_negation_is_refused(self):
+        assert not is_faithful("we should not ship it today", "We should ship it today.", "en")
+
+    def test_dropping_a_vietnamese_negation_is_refused(self):
+        assert not is_faithful("mình không deploy chiều nay", "Mình deploy chiều nay.", "vi")
+
+    def test_dropping_a_number_is_refused(self):
+        assert not is_faithful("we ship on the 15th", "We ship.", "en")
+
+    def test_a_question_may_gain_its_mark_but_not_lose_it(self):
+        assert is_faithful("anh gửi báo cáo chưa", "Anh gửi báo cáo chưa?", "vi")
+        assert not is_faithful("anh gửi báo cáo chưa?", "Anh gửi báo cáo.", "vi")
+
+
 class TestDiacriticsAreWords:
     def test_stripping_vietnamese_tone_marks_is_a_rewrite(self):
         # "được" and "duoc" are not the same word, and normalising them together would let a

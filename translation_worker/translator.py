@@ -19,6 +19,7 @@ from shared.config import TranslationSettings
 from shared.languages import language_name
 from shared.logger import get_logger
 from shared.openai_options import completion_options, realtime_session_expired
+from shared.provider_calls import observed_openai_http_client
 from translation_worker import valence as valence_mod
 from translation_worker.transcript_guardian import guardian_instruction
 
@@ -362,7 +363,9 @@ class OpenAITranslator:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required for OpenAI translation")
 
-        self._client = AsyncOpenAI(api_key=self.api_key)
+        self._client = AsyncOpenAI(
+            api_key=self.api_key, http_client=observed_openai_http_client("translation")
+        )
         logger.info(
             "openai_translator_loaded",
             model=self.model,

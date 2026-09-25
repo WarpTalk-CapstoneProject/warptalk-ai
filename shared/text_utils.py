@@ -7,7 +7,12 @@ import re
 # Regex for sentence boundaries (split on '.', '!', '?', or newline).
 # Looks for punctuation followed by space or end of string.
 # Also handles Vietnamese and general Latin scripts well.
-SENTENCE_SPLIT_REGEX = re.compile(r"(?<=[.!?])\s+|[\n\r]+")
+#
+# WT-716: Japanese (and Chinese) full-width 。！？ end a sentence with NO following space —
+# the language does not put one there — so they split on their own, whitespace optional. Not
+# inside a run of terminators ("！？") and not before a closing bracket/quote (「はい。」と言った
+# keeps its quote together). The Latin branch is unchanged: "3.5" and "e.g.x" do not split.
+SENTENCE_SPLIT_REGEX = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])(?![。！？」』）】”’])\s*|[\n\r]+")
 
 
 def split_into_sentences(text: str, max_length: int = 150) -> list[str]:

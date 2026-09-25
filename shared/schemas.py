@@ -309,6 +309,23 @@ class STTResultMessage(BaseModel):
     # of — the only point in the pipeline where the audio still exists. None when nothing could
     # be measured; see ProsodyEnvelope.
     prosody: ProsodyEnvelope | None = None
+    # WT-716 clean transcript: `text` with fillers and stutters removed by the deterministic
+    # prepass (shared.disfluency.prepass). `text` itself is NEVER rewritten — it stays the raw
+    # record that billing, retranscribe and corrections work from.
+    #
+    # None means "no clean version was computed" (an older producer, or a language the prepass
+    # does not handle) and is NOT the same as "": an empty string means the segment was
+    # nothing but fillers ("Ummm") and a clean view should show nothing for it. Consumers that
+    # just want the best line to show use `display_text`.
+    clean_text: str | None = None
+    # shared.disfluency flags for `clean_text`: filler_only, fillers_removed, stutter_removed,
+    # escalate. Empty when nothing was flagged.
+    clean_flags: tuple[str, ...] = ()
+
+    @property
+    def display_text(self) -> str:
+        """The clean line when one was computed, otherwise the raw STT text."""
+        return self.clean_text if self.clean_text is not None else self.text
 
     def to_redis(self) -> dict[str, str]:
         payload = {
@@ -333,6 +350,12 @@ class STTResultMessage(BaseModel):
         # ordinary" are different instructions to the synthesizer.
         if self.prosody is not None:
             payload["prosody"] = self.prosody.to_wire()
+        # Both omitted when unset so a message without a clean version is byte-for-byte what it
+        # was before WT-716. "" IS sent: it is the filler-only answer, not an absence.
+        if self.clean_text is not None:
+            payload["clean_text"] = self.clean_text
+        if self.clean_flags:
+            payload["clean_flags"] = ",".join(self.clean_flags)
         return payload
 
     @classmethod
@@ -357,6 +380,84 @@ class STTResultMessage(BaseModel):
             is_early=d.get("is_early") == "1",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
             prosody=ProsodyEnvelope.from_wire(d.get("prosody")),
+            # Absent on everything published before WT-716: no clean version was computed.
+            clean_text=d.get("clean_text"),
+            clean_flags=_split_flags(d.get("clean_flags")),
+        )
+
+
+# Where CleanSentenceMessage travels. Published through BaseWorker.publish like every result
+# stream, so it lands on the global `transcript:clean` AND on `transcript:clean:{meeting_id}`
+# — the per-meeting key is the one the backend reads.
+TRANSCRIPT_CLEAN_STREAM = "transcript:clean"
+
+
+class CleanSentenceMessage(BaseModel):
+    """Transcript clean worker → backend: one clean, complete sentence (WT-716).
+
+    A clean transcript line is a SENTENCE, not an STT segment: STT cuts on pauses, so one
+    sentence can span several segments and one segment can hold several sentences.
+    `segment_ids` are the raw STTResultMessage.segment_id values the sentence was built from,
+    in order — the link back to the raw record, which is kept and never edited.
+
+    `revision` starts at 0 and increases each time the same `sentence_id` is republished (the
+    prepass line first, then the LLM line that replaces it); a consumer keeps the highest
+    revision it has seen and ignores older ones arriving late.
+
+    `flags` vocabulary: self_repair (the speaker corrected themselves and the LLM decided which
+    half to keep), fallback_raw (the LLM answer failed the invariants; the text is the prepass
+    or raw line), escalate (the prepass was unsure). `source` is "prepass" or "llm".
+    """
+
+    __slots__ = ()
+
+    meeting_id: str
+    sentence_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    revision: int = 0
+    speaker_id: str
+    segment_ids: list[str] = Field(default_factory=list)
+    clean_text: str
+    language: str
+    flags: list[str] = Field(default_factory=list)
+    source: str = "prepass"  # "prepass" | "llm"
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_redis(self) -> dict[str, str]:
+        return {
+            "meeting_id": self.meeting_id,
+            "sentence_id": self.sentence_id,
+            "revision": str(self.revision),
+            "speaker_id": self.speaker_id,
+            # A JSON array rather than a comma list: segment ids are opaque strings and the
+            # backend deserialises this field straight into a list.
+            "segment_ids": json.dumps(self.segment_ids),
+            "clean_text": self.clean_text,
+            "language": self.language,
+            "flags": ",".join(self.flags),
+            "source": self.source,
+            "timestamp_ms": str(self.timestamp_ms),
+        }
+
+    @classmethod
+    def from_redis(cls, data: Mapping[Any, Any]) -> CleanSentenceMessage:
+        d = _decode_dict(data)
+        raw_ids = d.get("segment_ids") or "[]"
+        try:
+            parsed = json.loads(raw_ids)
+        except ValueError:
+            parsed = []
+        segment_ids = [str(x) for x in parsed] if isinstance(parsed, list) else []
+        return cls(
+            meeting_id=d["meeting_id"],
+            sentence_id=d.get("sentence_id") or str(uuid.uuid4()),
+            revision=int(d.get("revision", 0) or 0),
+            speaker_id=d.get("speaker_id", ""),
+            segment_ids=segment_ids,
+            clean_text=d.get("clean_text", ""),
+            language=d.get("language", ""),
+            flags=list(_split_flags(d.get("flags"))),
+            source=d.get("source") or "prepass",
+            timestamp_ms=int(d.get("timestamp_ms", 0) or 0),
         )
 
 
@@ -648,7 +749,17 @@ class ChatRequestMessage(BaseModel):
     # WT-687: plugin keys the user switched off for this conversation, as a JSON array, or "".
     # "" is what an older AssistantService sends, and it means every installed plugin is offered.
     disabled_plugin_keys_json: str = ""
+    #: Which conversation store the turn belongs to: "workspace" (every conversation until now)
+    #: or "platform" (a system admin's WarpBot in the admin portal). A platform turn carries NO
+    #: workspace_id and is offered only the read-only platform admin tools — never retrieval,
+    #: plugins or workspace tools — so nothing from one scope can reach the other's answer.
+    #: "" / missing is "workspace": an older AssistantService never sends the field.
+    scope: str = "workspace"
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    @property
+    def is_platform(self) -> bool:
+        return (self.scope or "").strip().lower() == "platform"
 
     def to_redis(self) -> dict[str, str]:
         return {
@@ -663,6 +774,7 @@ class ChatRequestMessage(BaseModel):
             "mentions_json": self.mentions_json,
             "images_json": self.images_json,
             "disabled_plugin_keys_json": self.disabled_plugin_keys_json,
+            "scope": self.scope,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -672,7 +784,9 @@ class ChatRequestMessage(BaseModel):
         return cls(
             request_id=d["request_id"],
             conversation_id=d["conversation_id"],
-            workspace_id=d["workspace_id"],
+            # A platform turn has no workspace; AssistantService sends "" rather than omitting it,
+            # and a missing key is read the same way instead of failing the whole turn.
+            workspace_id=d.get("workspace_id", ""),
             user_id=d["user_id"],
             origin=d.get("origin", "assistant"),
             bearer_token=d.get("bearer_token", ""),
@@ -681,6 +795,7 @@ class ChatRequestMessage(BaseModel):
             mentions_json=d.get("mentions_json", ""),
             images_json=d.get("images_json", ""),
             disabled_plugin_keys_json=d.get("disabled_plugin_keys_json", ""),
+            scope=d.get("scope", "") or "workspace",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 
@@ -863,6 +978,9 @@ class ChatResultMessage(BaseModel):
     #: for a reply drawn from the conversation rather than from a tool result — see
     #: ai_assistant_worker/citations.py for why this is not simply "the tools that ran".
     sources_json: str = ""
+    #: Echo of the request's scope, so AssistantService finalizes the answer in the store the
+    #: question came from (assistant_messages vs platform_messages) without guessing by id.
+    scope: str = "workspace"
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -877,6 +995,7 @@ class ChatResultMessage(BaseModel):
             "tool_detail": self.tool_detail,
             "tool_calls_json": self.tool_calls_json,
             "sources_json": self.sources_json,
+            "scope": self.scope,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -897,6 +1016,7 @@ class ChatResultMessage(BaseModel):
             # field is read rather than rejected — the same rolling-deploy rule the rest of this
             # schema follows.
             sources_json=d.get("sources_json", ""),
+            scope=d.get("scope", "") or "workspace",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 
@@ -1080,6 +1200,13 @@ def _decode_dict(data: Mapping[Any, Any]) -> dict[str, str]:
         (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
         for k, v in data.items()
     }
+
+
+def _split_flags(raw: str | None) -> tuple[str, ...]:
+    """A comma-joined flag field back into a tuple; absent or blank is no flags."""
+    if not raw:
+        return ()
+    return tuple(flag.strip() for flag in raw.split(",") if flag.strip())
 
 
 def _bool_to_redis(value: bool) -> str:
