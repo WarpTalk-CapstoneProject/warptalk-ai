@@ -380,3 +380,36 @@ def test_uuid_segments_are_the_ones_the_pipeline_actually_mints() -> None:
     # uuid7 both parse, so a future id version does not silently start growing labels.
     assert is_room_scoped_stream(f"stt:results:{uuid.uuid4()}")
     assert is_room_scoped_stream("stt:results:01a00547-367f-7deb-88c0-c097396e3a62")
+
+
+class UnbilledRedis(FakeRedis):
+    async def hgetall(self, key: Any) -> dict[Any, Any]:
+        if key == "warptalk:billing:unbilled":
+            return {
+                b"no_active_subscription:TRANSLATION": b"8",
+                b"charge_refused:TRANSLATION": b"2",
+            }
+        return {}
+
+
+async def test_unbilled_ai_work_is_a_counter_an_alert_can_watch() -> None:
+    """The 2026-09-24 leak left one warning line per segment and no number anywhere."""
+    output = await collect_metrics(UnbilledRedis(), DEFAULT_SETTINGS)
+
+    assert (
+        'warptalk_billing_unbilled_events_total{reason="no_active_subscription",'
+        'charge_type="TRANSLATION"} 8' in output
+    )
+    assert (
+        'warptalk_billing_unbilled_events_total{reason="charge_refused",'
+        'charge_type="TRANSLATION"} 2' in output
+    )
+
+
+async def test_unbilled_series_exist_at_zero_before_the_first_event() -> None:
+    output = await collect_metrics(FakeRedis(), DEFAULT_SETTINGS)
+
+    assert (
+        'warptalk_billing_unbilled_events_total{reason="no_active_subscription",'
+        'charge_type="AUDIO_DUBBING_STANDARD"} 0' in output
+    )

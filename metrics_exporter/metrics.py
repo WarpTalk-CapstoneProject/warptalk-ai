@@ -41,6 +41,9 @@ from redis.exceptions import ResponseError
 
 from shared.config import MetricsSettings
 from shared.redis_client import (
+    BILLING_CHARGE_TYPES,
+    BILLING_UNBILLED_KEY,
+    BILLING_UNBILLED_REASONS,
     LATENCY_BUCKETS_MS,
     LATENCY_KEY_PREFIX,
     OUTCOME_KEY_PREFIX,
@@ -253,6 +256,7 @@ async def collect_metrics(
 
     lines.extend(await _latency_histograms(redis))
     lines.extend(await _stage_outcomes(redis))
+    lines.extend(await _billing_unbilled(redis))
 
     return "\n".join(lines) + "\n"
 
@@ -324,4 +328,39 @@ async def _stage_outcomes(redis: RedisMetricsClient) -> list[str]:
             value = int(fields.get(outcome, 0) or 0)
             labels = f'stage="{_label(stage)}",outcome="{outcome}"'
             lines.append(f"warptalk_stage_messages_total{{{labels}}} {value}")
+    return lines
+
+
+async def _billing_unbilled(redis: RedisMetricsClient) -> list[str]:
+    """Billable AI work the billing worker did not bill, as a counter.
+
+    warptalk_billing_unbilled_events_total{reason, charge_type}. `no_active_subscription` is the
+    2026-09-24 leak — a workspace whose subscription had expired translated a meeting for free, and
+    the only trace was a warning line nobody aggregated. `charge_refused` is the WT-699 case (out of
+    credits, suspended). Both stop the room; this is how anyone finds out it happened.
+
+    Every known (reason, charge type) pair is emitted, zero included, so an alert on the rate has a
+    series before the first event. One HGETALL, no scan: the key is fixed and its fields bounded.
+    """
+    lines = [
+        "# HELP warptalk_billing_unbilled_events_total Billable AI events not billed, by reason.",
+        "# TYPE warptalk_billing_unbilled_events_total counter",
+    ]
+    try:
+        raw = await redis.hgetall(BILLING_UNBILLED_KEY)
+    except Exception:
+        # One missing counter must not cost the whole scrape — the stream lag above matters more.
+        raw = {}
+    counts = {_decode(k): int(_decode(v) or 0) for k, v in (raw or {}).items()}
+    pairs = [
+        (reason, charge) for reason in BILLING_UNBILLED_REASONS for charge in BILLING_CHARGE_TYPES
+    ]
+    for field in sorted(counts):
+        reason, _, charge = field.partition(":")
+        if (reason, charge) not in pairs:
+            pairs.append((reason, charge))
+    for reason, charge in pairs:
+        value = counts.get(f"{reason}:{charge}", 0)
+        labels = f'reason="{_label(reason)}",charge_type="{_label(charge)}"'
+        lines.append(f"warptalk_billing_unbilled_events_total{{{labels}}} {value}")
     return lines

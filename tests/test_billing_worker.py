@@ -11,7 +11,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from billing_worker import db as billing_db
-from billing_worker.worker import BillingSettlementWorker, _extract_underlying_segment_id
+from billing_worker.worker import (
+    BillingSettlementWorker,
+    NoActiveSubscription,
+    _extract_underlying_segment_id,
+)
 from shared.health_probe import check_worker
 from shared.schemas import TranslationResultMessage
 
@@ -520,7 +524,10 @@ def _suspension_worker() -> BillingSettlementWorker:
     worker.redis.redis = MagicMock()
     worker.redis.redis.publish = AsyncMock()
     worker.redis.redis.delete = AsyncMock(return_value=2)
+    worker.redis.redis.pipeline = MagicMock(return_value=MagicMock(execute=AsyncMock()))
     worker.db = MagicMock()
+    worker._subscription_cache = {}
+    worker._workspace_subscription_cache = {}
     return worker
 
 
@@ -590,6 +597,7 @@ class TestRefusedChargeStopsTranslation:
         worker = _suspension_worker()
         room_id = str(uuid.uuid4())
         worker._suspended_rooms[room_id] = (uuid.uuid4(), uuid.uuid4())
+        worker.db.resolve_subscription = AsyncMock(return_value=(uuid.uuid4(), uuid.uuid4()))
         worker.db.get_service_state = AsyncMock(return_value=("suspended", "overage_cap"))
 
         await worker._recheck_suspended_rooms()
@@ -603,6 +611,7 @@ class TestRefusedChargeStopsTranslation:
         worker = _suspension_worker()
         room_id = str(uuid.uuid4())
         worker._suspended_rooms[room_id] = (uuid.uuid4(), uuid.uuid4())
+        worker.db.resolve_subscription = AsyncMock(return_value=(uuid.uuid4(), uuid.uuid4()))
         worker.db.get_service_state = AsyncMock(return_value=("healthy", None))
 
         await worker._recheck_suspended_rooms()
@@ -637,3 +646,168 @@ class TestRefusedChargeStopsTranslation:
         await worker._handle_translation(msg.to_redis())
 
         assert worker._suspended_rooms[room_id] == (subscription_id, workspace_id)
+
+
+# ── The expired-subscription leak: nobody to bill is a refusal, not a shrug ────────────────
+
+
+def _unpaid_worker(workspace_id: uuid.UUID) -> BillingSettlementWorker:
+    worker = _suspension_worker()
+    worker.settings = MagicMock()
+    worker.settings.subscription_cache_ttl_seconds = 300
+    worker.redis.get = AsyncMock(
+        return_value=(f'{{"WorkspaceId":"{workspace_id}","Status":"IN_PROGRESS"}}').encode()
+    )
+    worker.db.resolve_subscription = AsyncMock(return_value=None)
+    worker.db.record_usage_and_charge = AsyncMock()
+    return worker
+
+
+def _translation(room_id: str) -> TranslationResultMessage:
+    return TranslationResultMessage(
+        segment_id=f"{uuid.uuid4()}-vi-c0",
+        meeting_id=room_id,
+        speaker_id=str(uuid.uuid4()),
+        original_text="hello",
+        translated_text="xin chao",
+        source_lang="en",
+        target_lang="vi",
+        is_final_chunk=True,
+    )
+
+
+class TestNoSubscriptionStopsTranslation:
+    """2026-09-24: an expired workspace translated a 14-minute meeting free.
+
+    `resolve_subscription` found no active row, the handler logged `no_subscription_for_room` and
+    returned — no charge, so no refusal, so nothing ever stopped the room.
+    """
+
+    async def test_resolution_names_the_workspace_that_cannot_pay(self) -> None:
+        workspace_id = uuid.uuid4()
+        worker = _unpaid_worker(workspace_id)
+
+        resolved = await worker._resolve_subscription(str(uuid.uuid4()))
+
+        assert isinstance(resolved, NoActiveSubscription)
+        assert resolved.workspace_id == workspace_id
+        assert worker._subscription_cache == {}, "a renewal must be seen on the very next event"
+
+    async def test_a_translation_with_no_subscription_stops_the_room_and_says_why(self) -> None:
+        workspace_id = uuid.uuid4()
+        worker = _unpaid_worker(workspace_id)
+        room_id = str(uuid.uuid4())
+
+        await worker._handle_translation(_translation(room_id).to_redis())
+
+        worker.db.record_usage_and_charge.assert_not_awaited()
+        worker.redis.set_if_absent.assert_awaited_once_with(
+            f"translationRoom:{room_id}:ai_service_suspended", "true", 120
+        )
+        written = {call.args[0]: call.args[1] for call in worker.redis.set_with_ttl.await_args_list}
+        assert written[f"workspace:{workspace_id}:ai_service_suspended"] == "true"
+        state = json.loads(written[f"translationRoom:{room_id}:ai_service_state"])
+        assert state["suspendedReason"] == "subscription_expired"
+        channel, message = worker.redis.redis.publish.await_args.args
+        assert channel == "warptalk:translation-room:commands"
+        assert json.loads(message) == {
+            "Command": "TranslationCreditsExhausted",
+            "RoomId": room_id,
+            "Reason": "subscription_expired",
+        }
+        assert worker._suspended_rooms[room_id] == (None, workspace_id)
+
+    async def test_it_is_logged_as_a_warning_and_counted_never_silent(self) -> None:
+        workspace_id = uuid.uuid4()
+        worker = _unpaid_worker(workspace_id)
+        room_id = str(uuid.uuid4())
+        pipeline = MagicMock(execute=AsyncMock())
+        worker.redis.redis.pipeline = MagicMock(return_value=pipeline)
+
+        await worker._handle_translation(_translation(room_id).to_redis())
+
+        warned = [call.args[0] for call in worker.logger.warning.call_args_list]
+        assert "no_subscription_for_room" in warned
+        pipeline.hincrby.assert_called_once_with(
+            "warptalk:billing:unbilled", "no_active_subscription:TRANSLATION", 1
+        )
+
+    async def test_a_dub_with_no_subscription_stops_the_room_too(self) -> None:
+        workspace_id = uuid.uuid4()
+        worker = _unpaid_worker(workspace_id)
+        room_id = str(uuid.uuid4())
+        msg = MagicMock(
+            cache_hit=False,
+            audio_data=b"pcm",
+            speaker_id=str(uuid.uuid4()),
+            meeting_id=room_id,
+            voice_type="standard",
+        )
+
+        with patch("billing_worker.worker.TTSResultMessage.from_redis", return_value=msg):
+            await worker._handle_tts({})
+
+        worker.db.record_usage_and_charge.assert_not_awaited()
+        assert worker._suspended_rooms[room_id] == (None, workspace_id)
+
+    async def test_a_room_stopped_mid_meeting_when_the_subscription_expires(self) -> None:
+        """In flight: the room's subscription id is cached, and the plan ends under it.
+
+        settle_usage_charge refuses an inactive row with 'subscription_expired'. The room stops,
+        and the cached id is forgotten so a renewal is billed on the next event instead of the
+        ended plan being refused again.
+        """
+        worker = _suspension_worker()
+        room_id = str(uuid.uuid4())
+        subscription_id, workspace_id = uuid.uuid4(), uuid.uuid4()
+        worker._subscription_cache[room_id] = (subscription_id, workspace_id, 0.0)
+        refused = billing_db.SettlementOutcome(
+            applied=False,
+            replayed=False,
+            balance_after=500,
+            service_state="suspended",
+            suspended_reason="subscription_expired",
+            credits_consumed=3,
+        )
+
+        await worker._note_settlement(room_id, subscription_id, workspace_id, refused)
+
+        assert room_id not in worker._subscription_cache
+        assert worker._suspended_rooms[room_id] == (subscription_id, workspace_id)
+        _, message = worker.redis.redis.publish.await_args.args
+        assert json.loads(message)["Reason"] == "subscription_expired"
+
+    async def test_the_room_stays_stopped_until_the_workspace_has_a_subscription_again(
+        self,
+    ) -> None:
+        worker = _suspension_worker()
+        room_id = str(uuid.uuid4())
+        workspace_id = uuid.uuid4()
+        worker._suspended_rooms[room_id] = (None, workspace_id)
+        worker.db.resolve_subscription = AsyncMock(return_value=None)
+        worker.db.get_service_state = AsyncMock()
+
+        await worker._recheck_suspended_rooms()
+
+        assert room_id in worker._suspended_rooms
+        worker.redis.redis.delete.assert_not_awaited()
+        worker.db.resolve_subscription.assert_awaited_once_with(str(workspace_id))
+
+    async def test_renewal_re_enables_the_room(self) -> None:
+        """A renewal after expiry is a NEW subscription row; the room is released on it."""
+        worker = _suspension_worker()
+        room_id = str(uuid.uuid4())
+        ended_subscription, workspace_id = uuid.uuid4(), uuid.uuid4()
+        renewed = uuid.uuid4()
+        worker._suspended_rooms[room_id] = (ended_subscription, workspace_id)
+        worker._subscription_cache[room_id] = (ended_subscription, workspace_id, 0.0)
+        worker.db.resolve_subscription = AsyncMock(return_value=(renewed, workspace_id))
+        worker.db.get_service_state = AsyncMock(return_value=("healthy", None))
+
+        await worker._recheck_suspended_rooms()
+
+        worker.db.get_service_state.assert_awaited_once_with(renewed)
+        assert room_id not in worker._suspended_rooms
+        assert room_id not in worker._subscription_cache
+        _, message = worker.redis.redis.publish.await_args.args
+        assert json.loads(message) == {"Command": "TranslationCreditsRestored", "RoomId": room_id}
