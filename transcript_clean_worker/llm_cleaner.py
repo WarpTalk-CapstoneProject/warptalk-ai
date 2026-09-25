@@ -553,8 +553,15 @@ class LLMCleaner:
             # Not fatal: the prepass tier still cleans every line. See config.api_key.
             logger.warning("transcript_clean_llm_disabled", reason="no_api_key")
             return
+        # max_retries=0: revision 0 (tier-1 wording) is already published by the time this call
+        # runs, so a 429 or 5xx here only spends the 8s timeout on a second attempt at the SAME
+        # rate limit instead of returning promptly and leaving revision 0 as the final answer.
+        # This worker is not the place to buy a retry with a delayed revision 1 -- the caller
+        # already has something faithful on the wire.
         self._client = AsyncOpenAI(
-            api_key=self.api_key, http_client=observed_openai_http_client("transcript-clean")
+            api_key=self.api_key,
+            http_client=observed_openai_http_client("transcript-clean"),
+            max_retries=0,
         )
         logger.info("transcript_clean_llm_loaded", model=self.model)
 
