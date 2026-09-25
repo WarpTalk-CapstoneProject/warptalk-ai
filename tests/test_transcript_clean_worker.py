@@ -186,9 +186,7 @@ class TestTheWireContract:
         worker, redis, _ = build_worker()
         valid = str(uuid.uuid4())
         await worker.process(b"1-0", stt("We should ship it", segment_id="not-a-guid", end_ms=500))
-        await worker.process(
-            b"1-1", stt("today.", segment_id=valid, start_ms=500, end_ms=1000)
-        )
+        await worker.process(b"1-1", stt("today.", segment_id=valid, start_ms=500, end_ms=1000))
         await worker._flush_meeting(MEETING_ID, reason="meeting_end")
 
         assert json.loads(clean_messages(redis)[0]["segment_ids"]) == [valid]
