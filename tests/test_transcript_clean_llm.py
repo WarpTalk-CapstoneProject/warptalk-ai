@@ -94,6 +94,20 @@ class FakeRedis:
         return b"1-0"
 
 
+class TestClientConstruction:
+    async def test_load_disables_sdk_retries(self):
+        # Revision 0 (tier-1 wording) is already published by the time this client makes a
+        # call, so a 429/5xx retried by the SDK itself only spends the 8s window on a second
+        # attempt instead of returning promptly. See llm_cleaner.load().
+        instance = LLMCleaner(api_key="test-key", model="gpt-4.1-mini")
+        await instance.load()
+        try:
+            assert instance._client is not None
+            assert instance._client.max_retries == 0
+        finally:
+            await instance.close()
+
+
 class TestAcceptedAnswers:
     async def test_a_valid_deletion_is_applied(self):
         subject = cleaner([{"delete": [0, 3], "self_repair": False}])
