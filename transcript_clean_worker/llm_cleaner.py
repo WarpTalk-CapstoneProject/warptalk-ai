@@ -74,6 +74,8 @@ REJECT_NEGATION_OUTSIDE_MARKER = "negation_outside_marker"
 REJECT_NUMBER_WITHOUT_REPLACEMENT = "number_without_replacement"
 REJECT_PROTECTED_TOKEN = "protected_token_deleted"
 REJECT_REPARANDUM_LONGER_THAN_REPAIR = "reparandum_longer_than_repair"
+# Not a bad answer — no answer was attempted. See `clean`'s semaphore check.
+REJECT_REFINE_SKIPPED_BUSY = "refine_skipped_busy"
 
 # A VERIFIED self-repair is allowed to delete more than an ordinary clean-up, because that is
 # the shape of the thing: "họp thứ hai, à không, thứ ba" is four of seven words, and "We ship on
@@ -588,6 +590,17 @@ class LLMCleaner:
         if client is None or not raw.strip():
             return None
 
+        # Refine tasks are created one per sentence, uncapped, while only `concurrency` calls
+        # run at a time -- so under backlog they would queue behind the semaphore instead of
+        # running it, and revision 1 for an early sentence would arrive after several more had
+        # already closed. Revision 0 (tier-1 wording) is already published, so a queued call
+        # buys a fresher answer for a sentence the reader has moved past, at the cost of
+        # delaying every answer behind it. Dropping the refine here is strictly better: it costs
+        # this one sentence its polish and nothing else.
+        if self._semaphore.locked():
+            self._reject(REJECT_REFINE_SKIPPED_BUSY)
+            return None
+
         lang = _language_of(raw, language)
         tokens = lexical_tokens(raw, lang)
         if not tokens:
@@ -841,6 +854,7 @@ __all__ = [
     "REJECT_NUMBER_WITHOUT_REPLACEMENT",
     "REJECT_PROTECTED_TOKEN",
     "REJECT_RATIO",
+    "REJECT_REFINE_SKIPPED_BUSY",
     "REJECT_REPARANDUM_LONGER_THAN_REPAIR",
     "REJECT_TIMEOUT",
     "CleanedSentence",

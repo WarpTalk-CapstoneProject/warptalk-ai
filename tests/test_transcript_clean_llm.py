@@ -30,6 +30,7 @@ from transcript_clean_worker.llm_cleaner import (
     REJECT_NUMBER_WITHOUT_REPLACEMENT,
     REJECT_PROTECTED_TOKEN,
     REJECT_RATIO,
+    REJECT_REFINE_SKIPPED_BUSY,
     REJECT_REPARANDUM_LONGER_THAN_REPAIR,
     REJECT_TIMEOUT,
     LLMCleaner,
@@ -72,6 +73,7 @@ def cleaner(payloads: list[object], *, delay_s: float = 0.0, **kwargs) -> LLMCle
         timeout_s=float(kwargs.pop("timeout_s", 8.0)),
         max_delete_ratio=float(kwargs.pop("max_delete_ratio", 0.4)),
         self_repair_max_delete_ratio=float(kwargs.pop("self_repair_max_delete_ratio", 0.7)),
+        concurrency=int(kwargs.pop("concurrency", 4)),
     )
     instance._client = FakeClient(payloads, delay_s)  # type: ignore[assignment]
     return instance
@@ -167,6 +169,22 @@ class TestRefusedAnswers:
         subject = cleaner([])  # popping from an empty list raises inside create()
         assert await subject.clean("um so we should ship it", "en") is None
         assert "call_failed" in subject.rejections
+
+    async def test_a_saturated_semaphore_skips_the_call_instead_of_queuing(self):
+        # Refine tasks are created one per sentence, uncapped, while only `concurrency` calls
+        # run at a time. Queuing behind the semaphore under backlog is what makes revision 1
+        # arrive late; skipping instead costs only this sentence its polish.
+        subject = cleaner([{"delete": [0], "self_repair": False}], concurrency=1)
+        await subject._semaphore.acquire()  # every permit already in use
+        try:
+            result = await subject.clean("um so we should ship it", "en")
+        finally:
+            subject._semaphore.release()
+
+        assert result is None
+        assert subject.rejections == {REJECT_REFINE_SKIPPED_BUSY: 1}
+        # Never even reached the API call -- the payload popped above is still queued.
+        assert subject._client.completions.calls == []
 
     async def test_without_a_client_nothing_is_attempted(self):
         subject = LLMCleaner(api_key="", model="gpt-4.1-mini")
