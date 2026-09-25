@@ -15,7 +15,8 @@ from embedding_worker.providers import (
 from embedding_worker.schemas import EmbeddingIndexRequest, EmbeddingIndexResult
 from embedding_worker.vector_store import VectorStore, create_vector_store
 from shared.base_worker import BaseWorker
-from shared.config import EmbeddingSettings, VectorDbSettings
+from shared.config import EmbeddingSettings, VectorDbSettings, resolve_openai_api_key
+from shared.integration_status import OPENAI, IntegrationReport, credential_report
 
 T = TypeVar("T")
 
@@ -46,6 +47,16 @@ class EmbeddingWorker(BaseWorker):
         # request/chunks/vectors/payloads are locals); self.provider/self.vector_store are
         # async clients designed for concurrent use.
         self.concurrency = self.embedding_settings.concurrency
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        s = self.embedding_settings
+        if s.provider != "openai":
+            return {}
+        return {
+            OPENAI: credential_report(
+                resolve_openai_api_key(s.api_key), f"embedding model {s.model}"
+            )
+        }
 
     async def load_model(self) -> None:
         if self.provider is None:

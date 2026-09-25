@@ -20,6 +20,7 @@ from shared.base_worker import TERMINAL_ROOM_STATUSES, BaseWorker
 from shared.config import STTSettings, resolve_openai_api_key
 from shared.disfluency import detect_question, prepass
 from shared.disfluency.normalize import resolve_language
+from shared.integration_status import OPENAI, IntegrationReport, credential_report
 from shared.prosody import (
     SpeakerBaseline,
     measure,
@@ -218,6 +219,12 @@ class STTWorker(BaseWorker):
         self._clean_error_logged_at = 0.0
         self._clean_errors_suppressed = 0
         self._prewarm_listener_task: asyncio.Task[None] | None = None
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        s = self.stt_settings
+        return {
+            OPENAI: credential_report(resolve_openai_api_key(s.api_key), f"stt model {s.model}")
+        }
 
     async def load_model(self) -> None:
         self.model = OpenAISTT(

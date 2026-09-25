@@ -80,7 +80,9 @@ from ai_assistant_worker.tool_targets import (
 )
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
+from shared.integration_status import OPENAI, IntegrationReport, credential_report
 from shared.openai_options import reasoning_summary_options, responses_options
+from shared.platform_settings import FLAG_WARPBOT_WEB_SEARCH
 from shared.provider_calls import observed_openai_http_client
 from shared.schemas import ChatRequestMessage, ChatResultMessage
 
@@ -527,6 +529,14 @@ class ChatAssistantWorker(BaseWorker):
         )
         self.logger.info("chat_assistant_ready", model=self.chat_settings.model)
 
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        return {
+            OPENAI: credential_report(
+                resolve_openai_api_key(self.chat_settings.api_key),
+                f"chat model {self.chat_settings.model}",
+            )
+        }
+
     async def _cleanup(self) -> None:
         for client in (
             self._workspace_client,
@@ -629,6 +639,20 @@ class ChatAssistantWorker(BaseWorker):
                 content=str(exc) or "The assistant could not generate a reply.",
             )
 
+    async def _web_search_enabled(self, request: ChatRequestMessage) -> bool:
+        """Whether this turn is offered OpenAI's hosted web_search.
+
+        Both switches must agree. ASSISTANT_CHAT_WEB_SEARCH_ENABLED is the deploy ceiling; the
+        platform flag `flags.warpbot_web_search`, read live for the request's workspace, can only
+        narrow it. One answer feeds both the tool list and the prompt, so the model is never told
+        about a tool it was not given.
+        """
+        if not self.chat_settings.web_search_enabled:
+            return False
+        return await self.platform_settings().is_enabled(
+            FLAG_WARPBOT_WEB_SEARCH, workspace_id=request.workspace_id or None
+        )
+
     async def _run_agent_loop(
         self,
         request: ChatRequestMessage,
@@ -675,8 +699,9 @@ class ChatAssistantWorker(BaseWorker):
         # The same flag that decides whether the tool is in the schema below decides whether
         # the prompt names it. A prompt that offers a tool the model was not given is a plan
         # it cannot carry out.
+        web_search = await self._web_search_enabled(request)
         instructions_parts = [
-            build_system_prompt(template, web_search_enabled=self.chat_settings.web_search_enabled),
+            build_system_prompt(template, web_search_enabled=web_search),
             _now_message(),
         ]
         page_context_message = _format_page_context(request.page_context_json)
@@ -710,8 +735,9 @@ class ChatAssistantWorker(BaseWorker):
         # needs nothing else.
         #
         # It bills per call, which is the only reason it is a switch: ASSISTANT_CHAT_WEB_SEARCH_
-        # ENABLED=false turns it off without a rebuild.
-        if self.chat_settings.web_search_enabled:
+        # ENABLED=false turns it off without a rebuild, and `flags.warpbot_web_search` turns it
+        # off (platform-wide or per workspace) without even a restart. See _web_search_enabled.
+        if web_search:
             tool_schemas.append({"type": "web_search"})
 
         return await self._run_tool_loop(

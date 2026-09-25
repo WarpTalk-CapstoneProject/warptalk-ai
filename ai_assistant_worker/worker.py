@@ -30,6 +30,7 @@ from ai_assistant_worker.transcript_buffer import (
 from shared.base_worker import BaseWorker
 from shared.config import AssistantSettings, resolve_openai_api_key
 from shared.control_markers import is_control_marker
+from shared.integration_status import OPENAI, IntegrationReport, credential_report
 from shared.languages import known_language_code
 from shared.schemas import STTResultMessage
 
@@ -101,6 +102,12 @@ class AIAssistantWorker(BaseWorker):
         # fillers, per meeting — the one thing a skipped line still owes the summary. See
         # `_note_filler_only`.
         self._filler_only_ms: dict[str, int] = {}
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        s = self.assistant_settings
+        return {
+            OPENAI: credential_report(resolve_openai_api_key(s.api_key), f"summary model {s.model}")
+        }
 
     async def load_model(self) -> None:
         """Initialize OpenAI client."""

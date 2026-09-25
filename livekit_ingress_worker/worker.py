@@ -24,7 +24,9 @@ from livekit_ingress_worker.audio_archive import MeetingAudioArchive, describe
 from livekit_ingress_worker.near_field_gate import NearFieldGate
 from shared.base_worker import BaseWorker
 from shared.control_markers import is_external_bridge_speaker
+from shared.integration_status import LIVEKIT, IntegrationReport, livekit_report
 from shared.object_storage import ObjectStorage, ObjectStorageSettings
+from shared.platform_settings import CHUNK_DURATION_MS, FLASH_MODE_DEFAULT
 from shared.schemas import (
     STT_FRAME_STREAM,
     STT_FRAME_STREAM_MAXLEN,
@@ -419,7 +421,9 @@ class LiveKitIngressWorker(BaseWorker):
         has started anyway — and swallowing here is also what keeps a Redis blip from taking
         down the heartbeat that calls it.
         """
-        value = "on" if self.settings.stt_streaming_enabled else "off"
+        # The EFFECTIVE default — the platform setting when an operator has set one — because
+        # this key exists to make the host's switch describe what the room will really do.
+        value = "on" if await self._flash_mode_default() else "off"
         try:
             await self.redis.set_with_ttl(
                 _FLASH_MODE_DEFAULT_KEY, value, _FLASH_MODE_DEFAULT_TTL_SECONDS
@@ -427,6 +431,9 @@ class LiveKitIngressWorker(BaseWorker):
             self.logger.info("flash_mode_default_published", default=value)
         except Exception:
             self.logger.warning("flash_mode_default_publish_failed", default=value, exc_info=True)
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        return {LIVEKIT: livekit_report(self.settings.livekit, "ingress bot joins rooms")}
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Not used, we override _consume_loop for Pub/Sub."""
@@ -1689,6 +1696,11 @@ class LiveKitIngressWorker(BaseWorker):
                             speech_buffer = bytearray()
                             speech_samples = 0
                             streaming = await self._flash_mode_enabled(room_name)
+                            # Re-read per onset, like flash mode: a console change to the chunk cap
+                            # applies to the next utterance, not to the next track that opens.
+                            max_chunk_samples = int(
+                                sample_rate * (await self._max_chunk_ms() / 1000.0)
+                            )
                             if streaming:
                                 turn_id = uuid.uuid4().hex
                                 frame_seq = 0
@@ -1974,26 +1986,49 @@ class LiveKitIngressWorker(BaseWorker):
         if cached is not None and now - cached[0] < _FLASH_MODE_CACHE_SECONDS:
             return cached[1]
 
-        value = self.settings.stt_streaming_enabled
+        override: bool | None = None
         try:
             raw = await self.redis.get(f"translationRoom:{room_name}:flash_mode")
             if raw:
                 decoded = (raw.decode() if isinstance(raw, bytes) else raw).strip().lower()
                 if decoded in _FLASH_MODE_ON:
-                    value = True
+                    override = True
                 elif decoded in _FLASH_MODE_OFF:
-                    value = False
+                    override = False
                 else:
                     self.logger.warning(
                         "flash_mode_unrecognised", room_name=room_name, value=decoded
                     )
         except Exception:
-            # A room that cannot be read falls back to the deployment default. Never let a
-            # settings lookup stop audio from being processed.
+            # A room that cannot be read falls back to the default. Never let a settings lookup
+            # stop audio from being processed.
             self.logger.warning("flash_mode_unavailable", room_name=room_name)
 
+        # The host's per-room choice wins; otherwise the PLATFORM default an operator set in the
+        # settings console, and only then the deployment's STT_STREAMING_ENABLED.
+        value = override if override is not None else await self._flash_mode_default()
         cache[room_name] = (now, value)
         return value
+
+    async def _flash_mode_default(self) -> bool:
+        """What a room with no per-room override does: `meetings.flash_mode_default`, live.
+
+        Falls back to STT_STREAMING_ENABLED, so a platform that never set the key behaves exactly
+        as it did before the key existed. Never raises (see shared/platform_settings.py).
+        """
+        return await self.platform_settings().get_bool(
+            FLASH_MODE_DEFAULT, self.settings.stt_streaming_enabled
+        )
+
+    async def _max_chunk_ms(self) -> int:
+        """The hard cap on one speech chunk: `meetings.chunk_duration_ms`, live.
+
+        Falls back to CHUNK_DURATION_MS. Read at each speech onset (see process_audio_track), so
+        a change applies to the next thing anyone says rather than to the next track that opens.
+        """
+        return await self.platform_settings().get_int(
+            CHUNK_DURATION_MS, self.settings.chunk_duration_ms
+        )
 
     async def _publish_speech_frame(
         self,

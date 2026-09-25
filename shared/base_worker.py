@@ -23,7 +23,13 @@ from redis.asyncio.client import PubSub
 
 from shared.config import RedisSettings, WorkerSettings
 from shared.health_probe import heartbeat_key
+from shared.integration_status import (
+    REPORT_INTERVAL_SECONDS,
+    IntegrationReport,
+    publish_integration_status,
+)
 from shared.logger import get_logger
+from shared.platform_settings import PlatformSettings, reader_for
 from shared.provider_calls import bind_provider_calls
 from shared.redis_client import RedisStreamClient
 from shared.transcript_pause import is_transcript_paused as _read_transcript_paused
@@ -210,6 +216,46 @@ class BaseWorker(ABC):
             ),
             self.heartbeat_ttl_seconds,
         )
+        await self._report_integrations()
+
+    # ------------------------------------------------------------------
+    # Platform settings and integration status
+    # ------------------------------------------------------------------
+
+    def platform_settings(self) -> PlatformSettings:
+        """Operator-chosen settings, read live over this worker's Redis client.
+
+        Read at the moment a value is used, never once at startup: a change made in the console
+        reaches a running worker within the reader's cache TTL, without a restart. Every getter
+        takes the worker's own env/pydantic value as its fallback, so a key nobody has set
+        changes nothing. See shared/platform_settings.py.
+        """
+        return reader_for(self)
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        """The integrations this worker uses and whether each is configured. None by default.
+
+        Overridden by workers that call a vendor. Model names only in `detail` — never a key, a
+        secret or a URL (see shared/integration_status.py).
+        """
+        return {}
+
+    async def _report_integrations(self) -> None:
+        """Rides the heartbeat, throttled to REPORT_INTERVAL_SECONDS. Never raises."""
+        try:
+            now = time.monotonic()
+            last: float | None = getattr(self, "_integrations_reported_at", None)
+            if last is not None and now - last < REPORT_INTERVAL_SECONDS:
+                return
+            reports = self.integration_reports()
+            if not reports:
+                return
+            if await publish_integration_status(self.redis, self.worker_name, reports):
+                self._integrations_reported_at = now
+        except Exception:
+            log = getattr(self, "logger", None)
+            if log is not None:
+                log.warning("integration_status_report_failed", exc_info=True)
 
     async def _heartbeat_loop(self) -> None:
         while not self._shutdown_event.is_set():
