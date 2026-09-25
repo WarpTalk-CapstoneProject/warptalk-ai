@@ -321,3 +321,30 @@ def test_selector_caps_how_many_tools_one_turn_will_carry() -> None:
 
 def test_selector_tolerates_a_catalog_that_is_not_a_list() -> None:
     assert select_mcp_tool_entries({"tools": []}, reserved_names=set()) == ([], [])
+
+
+def test_always_allow_tells_the_model_the_card_is_gone_for_this_tool() -> None:
+    """The one answer that changes something beyond this call has to reach the user.
+
+    Pressing Always allow turns the confirmation card off for this tool. Nothing else on the way
+    back says so, so a user who pressed it once finds out the next time WarpBot acts without
+    asking - which is exactly the moment it should not be a surprise.
+    """
+    payload = normalize_mcp_tool_payload(
+        {
+            "isSuccess": True,
+            "appliedToolPolicy": "allow",
+            "data": {"provider": "google_meet"},
+        }
+    )
+
+    assert "Always allow" in payload["instruction"]
+    assert "not ask again" in payload["instruction"]
+    # The result itself is untouched.
+    assert payload["data"] == {"provider": "google_meet"}
+
+
+def test_an_ordinary_result_carries_no_instruction() -> None:
+    payload = normalize_mcp_tool_payload({"isSuccess": True, "data": {"files": []}})
+
+    assert "instruction" not in payload

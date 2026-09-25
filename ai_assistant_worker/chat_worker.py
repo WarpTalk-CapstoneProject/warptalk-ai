@@ -68,6 +68,12 @@ from ai_assistant_worker.mcp_tools import split_mcp_tool_arguments as _split_mcp
 from ai_assistant_worker.mcp_tools import (
     with_mcp_confirmation_parameter as _with_mcp_confirmation_parameter,
 )
+from ai_assistant_worker.meeting_links import (
+    MeetingLink,
+    ensure_meeting_links,
+    meeting_link_from_tool_result,
+    strip_meeting_markers,
+)
 from ai_assistant_worker.platform_tools import (
     PLATFORM_TOOLS,
     PLATFORM_TOOLS_BY_NAME,
@@ -713,8 +719,16 @@ class ChatAssistantWorker(BaseWorker):
         instructions_parts.append(citation_instruction())
         instructions = "\n\n".join(instructions_parts)
 
+        # Markers are stripped on the way back in. They are stored with the message, so an
+        # unfiltered history teaches the model to write them — and a marker it wrote itself would
+        # put a card, with a link and a code, under an answer that merely TALKS about a meeting.
+        # The card is a record of what a tool did; only the worker may write one.
         conversation: list[dict[str, Any]] = [
-            {"role": turn.get("role"), "content": turn.get("content")} for turn in history
+            {
+                "role": turn.get("role"),
+                "content": strip_meeting_markers(turn.get("content") or ""),
+            }
+            for turn in history
         ]
         _attach_attachments(conversation, request.images_json, self.logger)
 
@@ -767,6 +781,9 @@ class ChatAssistantWorker(BaseWorker):
                 {"role": turn.get("role"), "content": turn.get("content")} for turn in history
             ]
         tool_call_log: list[dict[str, Any]] = []
+        # Meetings a tool created this turn. Their links are appended to the answer if the model
+        # left them out - see meeting_links.
+        created_meetings: list[MeetingLink] = []
         final_text = ""
 
         for _ in range(self.chat_settings.max_tool_iterations):
@@ -950,6 +967,11 @@ class ChatAssistantWorker(BaseWorker):
                 # strand the turn with no way back. The card is fire-and-forget; the answer
                 # arrives as an ordinary message on the next turn, which is also why the user can
                 # ignore it and type something else entirely.
+                if status == "completed":
+                    created = meeting_link_from_tool_result(result_json)
+                    if created is not None:
+                        created_meetings.append(created)
+
                 if tool_name == "ask_user" and status == "completed":
                     await self._publish_result(
                         request,
@@ -1010,7 +1032,7 @@ class ChatAssistantWorker(BaseWorker):
                 or "I wasn't able to finish looking that up — please try rephrasing your question."
             )
 
-        return final_text, tool_call_log
+        return ensure_meeting_links(final_text, created_meetings), tool_call_log
 
     async def _load_dynamic_mcp_tools(
         self,
@@ -1084,7 +1106,7 @@ class ChatAssistantWorker(BaseWorker):
                         effect=effect,
                         policy=policy,
                     ),
-                    handler=self._build_mcp_tool_handler(plugin_key, name, request),
+                    handler=self._build_mcp_tool_handler(plugin_key, name, request, label),
                 )
             )
 
@@ -1095,6 +1117,7 @@ class ChatAssistantWorker(BaseWorker):
         plugin_key: str,
         tool_name: str,
         request: ChatRequestMessage,
+        tool_label: str | None = None,
     ) -> Callable[[ToolContext, dict[str, Any]], Awaitable[str]]:
         async def handler(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             assistant_client = ctx.assistant_client
@@ -1146,7 +1169,12 @@ class ChatAssistantWorker(BaseWorker):
                     type_="question",
                     tool_name=tool_name,
                     tool_calls_json=json.dumps(
-                        _build_mcp_confirmation_questions(normalized, tool_name=tool_name)
+                        _build_mcp_confirmation_questions(
+                            normalized,
+                            tool_name=tool_name,
+                            tool_label=tool_label,
+                            arguments=tool_arguments,
+                        )
                     ),
                 )
             elif (

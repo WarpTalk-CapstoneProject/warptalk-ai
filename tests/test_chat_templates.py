@@ -144,7 +144,9 @@ class TestExternalMeetingWidget:
         """The in_meeting page is still MEETING — the web app's meeting page is not a Meet call."""
         assert resolve_template(page_type="in_meeting") is MEETING
         prompt = build_system_prompt(MEETING)
-        assert "Google Meet" not in prompt
+        # The surface note, not the words: every prompt now carries MEETING_KIND_RULES, which
+        # name Google Meet as a product the user can ask for.
+        assert "Google Meet, not in WarpTalk" not in prompt
         assert "460px" not in prompt
 
     def test_it_is_a_registered_template(self) -> None:
