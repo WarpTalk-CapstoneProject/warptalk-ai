@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -76,6 +77,13 @@ REJECT_PROTECTED_TOKEN = "protected_token_deleted"
 REJECT_REPARANDUM_LONGER_THAN_REPAIR = "reparandum_longer_than_repair"
 # Not a bad answer — no answer was attempted. See `clean`'s semaphore check.
 REJECT_REFINE_SKIPPED_BUSY = "refine_skipped_busy"
+# Neither of these is a bad answer either — no call was ever placed, so no tokens were spent.
+# They are counted through the same dict as everything above (see `record_skipped_call`) because
+# the worker's shutdown log (`transcript_clean_llm_rejections`) is the one place this stage's
+# spend decisions are already visible, and "how often did we decide NOT to ask" belongs beside
+# "how often did we ask and get refused" (WT-830).
+REJECT_SKIPPED_CREDITS_SUSPENDED = "skipped_credits_suspended"
+REJECT_SKIPPED_CONFIDENT = "skipped_confident"
 
 # A VERIFIED self-repair is allowed to delete more than an ordinary clean-up, because that is
 # the shape of the thing: "họp thứ hai, à không, thứ ba" is four of seven words, and "We ship on
@@ -334,6 +342,10 @@ class CleanedSentence:
     deleted_indices: tuple[int, ...]
 
 
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
 def _language_of(raw: str, language: str) -> str:
     return resolve_language(language, raw) or "en"
 
@@ -577,6 +589,73 @@ class LLMCleaner:
         self.rejections[reason] = self.rejections.get(reason, 0) + 1
         logger.info("transcript_clean_llm_rejected", reason=reason, **fields)
 
+    def record_skipped_call(self, reason: str) -> None:
+        """Count a call the worker decided not to make at all (WT-830).
+
+        Called from `transcript_clean_worker.worker` — a credits-suspended room or a confidently
+        clean sentence (see `TranscriptCleanSettings.llm_only_when_uncertain`) never reaches
+        `clean()`, so `_reject` (which counts an ATTEMPTED call the verifier refused) is the wrong
+        counter for it. Same dict, same shutdown log, a reason that says "never asked" instead of
+        "asked and refused" — the distinction the review that opened WT-830 asked for.
+        """
+        self.rejections[reason] = self.rejections.get(reason, 0) + 1
+        logger.debug("transcript_clean_llm_call_skipped", reason=reason)
+
+    def _record_usage(
+        self,
+        *,
+        meeting_id: str,
+        outcome: str,
+        latency_ms: int,
+        usage: Any,
+        self_repair: bool | None = None,
+    ) -> None:
+        """One structured line per LLM call ATTEMPT, whatever happened to the answer (WT-830).
+
+        WHY A LOG LINE AND NOT A ROW IN `subscription.usage_records`
+            That table (see billing_worker/db.py's `settle_usage_charge`) only knows the
+            charge_types its rate card prices — TRANSLATION and TTS today. Billing this stage for
+            real needs a new charge_type, a rate-card row priced per token, and a settlement call
+            keyed on something that survives a retry without double-charging — all backend/schema
+            decisions, and billing_worker/** and shared/** belong to other tasks on this ticket.
+            Guessing at that shape here would be worse than not billing it: a wrong idempotency
+            key or a charge_type the rate card has no row for is a worker that crashes or silently
+            eats the charge, not a worker that under-bills.
+
+            What IS this worker's to give a later billing pass is the raw material it would need:
+            which meeting, which model, how many tokens in and out, how long the call took, and
+            whether the answer was even used — precisely what the WT-716 review found nowhere.
+            That is what this line carries.
+
+        WHY NOT `shared.provider_calls.record_provider_call`
+            Every call through this class's client already lands there automatically —
+            `load()` builds the client with `observed_openai_http_client("transcript-clean")`,
+            which times and classifies every HTTP request the SDK makes. Calling
+            `record_provider_call` again here would double-count the exact same call in
+            `warptalk:provider_calls:*`, and that schema (see shared/provider_calls.py) has no
+            token or meeting dimension to add one to without changing a contract the
+            billing-service sync job parses field by field — which is shared/** and out of scope
+            here. This line is additional, not a replacement: outcome/latency/model for every
+            call already exists; meeting_id and token counts did not.
+
+        Best effort, like every metrics path in this repo: a logging failure must not be able to
+        take down a call whose answer has already been decided.
+        """
+        try:
+            logger.info(
+                "transcript_clean_llm_usage",
+                meeting_id=meeting_id,
+                model=self.model,
+                prompt_tokens=getattr(usage, "prompt_tokens", None),
+                completion_tokens=getattr(usage, "completion_tokens", None),
+                total_tokens=getattr(usage, "total_tokens", None),
+                latency_ms=latency_ms,
+                outcome=outcome,
+                self_repair=self_repair,
+            )
+        except Exception:
+            logger.debug("transcript_clean_llm_usage_record_failed", exc_info=True)
+
     async def clean(
         self,
         raw: str,
@@ -584,6 +663,7 @@ class LLMCleaner:
         *,
         prepass_text: str | None = None,
         previous_line: str = "",
+        meeting_id: str = "",
     ) -> CleanedSentence | None:
         """The model's cleaned version of `raw`, or None when there is nothing safe to publish."""
         client = self._client
@@ -611,6 +691,7 @@ class LLMCleaner:
         )
         user_message = _render_request(raw, lang, tokens, suggestion, previous_line)
 
+        started = time.monotonic()
         try:
             async with self._semaphore:
                 response = await asyncio.wait_for(
@@ -626,13 +707,59 @@ class LLMCleaner:
                     timeout=self.timeout_s,
                 )
         except TimeoutError:
+            # No response ever arrived, so there is no `usage` to read the token counts from --
+            # but the prompt was already sent and OpenAI billed the tokens it read before this
+            # side gave up waiting, so the attempt is still recorded, with the counts it is
+            # honest about not knowing (WT-830: "the tokens were spent" either way).
+            self._record_usage(
+                meeting_id=meeting_id,
+                outcome=REJECT_TIMEOUT,
+                latency_ms=_elapsed_ms(started),
+                usage=None,
+            )
             self._reject(REJECT_TIMEOUT, model=self.model)
             return None
         except Exception as exc:
+            self._record_usage(
+                meeting_id=meeting_id,
+                outcome=REJECT_CALL_FAILED,
+                latency_ms=_elapsed_ms(started),
+                usage=None,
+            )
             self._reject(REJECT_CALL_FAILED, error=repr(exc))
             return None
 
-        return self._verify(raw, lang, tokens, response, suggestion)
+        # A response DID come back, whatever `_verify` makes of it, so its `usage` is the true
+        # cost of this call -- recorded before verification's own accept/reject decision so a
+        # rejected answer (a bad index, a ratio over cap, a claimed repair that fails the count
+        # invariants) is billed for exactly as an accepted one is. The tokens do not become
+        # cheaper because the answer was unusable.
+        rejections_before = dict(self.rejections)
+        result = self._verify(raw, lang, tokens, response, suggestion)
+        if result is not None:
+            outcome = "accepted"
+        else:
+            # `_verify` returns None having called `_reject` exactly once on every path, so the
+            # one key that grew against the snapshot above names what happened. Reading it back
+            # rather than threading an outcome string through every `return None` in `_verify`
+            # keeps that function's contract (a `CleanedSentence` or nothing) exactly as every
+            # existing caller and test already expects.
+            outcome = next(
+                (
+                    reason
+                    for reason, count in self.rejections.items()
+                    if count != rejections_before.get(reason, 0)
+                ),
+                "rejected",
+            )
+        self._record_usage(
+            meeting_id=meeting_id,
+            outcome=outcome,
+            latency_ms=_elapsed_ms(started),
+            usage=getattr(response, "usage", None),
+            self_repair=result.self_repair if result is not None else None,
+        )
+        return result
 
     def _verify(
         self,
@@ -856,6 +983,8 @@ __all__ = [
     "REJECT_RATIO",
     "REJECT_REFINE_SKIPPED_BUSY",
     "REJECT_REPARANDUM_LONGER_THAN_REPAIR",
+    "REJECT_SKIPPED_CONFIDENT",
+    "REJECT_SKIPPED_CREDITS_SUSPENDED",
     "REJECT_TIMEOUT",
     "CleanedSentence",
     "LLMCleaner",
