@@ -95,6 +95,17 @@ def normalize_mcp_tool_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {"isSuccess": False, "error": "Plugin tool returned an invalid response."}
 
+    # "Always allow" is the one answer that changes something beyond this call: the card is gone
+    # for this tool from now on. Nothing else on the way back says so, and a setting that changed
+    # in silence is one the user finds out about the day WarpBot acts without asking.
+    if payload.get("appliedToolPolicy") == "allow":
+        payload = dict(payload)
+        payload["instruction"] = (
+            "The user chose Always allow, so this tool now runs without a confirmation card. "
+            "Tell them in one short clause that you will not ask again for this action, and "
+            "that they can change it in the plugin's settings."
+        )
+
     error_code = payload.get("errorCode")
     if payload.get("isSuccess") is not False or not isinstance(error_code, str):
         return payload
@@ -395,8 +406,8 @@ def build_mcp_confirmation_questions(
 def _google_meet_confirmation(
     arguments: dict[str, Any], now: datetime | None = None
 ) -> tuple[str, list[dict[str, str]]]:
-    """The question and the rows under it: what will be created, when, and where it is written."""
-    title = _argument_text(arguments, "summary") or "Google Meet meeting"
+    """The question and the rows under it — only the things somebody actually chose."""
+    title = _argument_text(arguments, "summary")
     current = (now or datetime.now(UTC)).astimezone(_CARD_TIMEZONE)
     start = _parse_instant(_argument_text(arguments, "start"))
     if start is None:
@@ -415,11 +426,15 @@ def _google_meet_confirmation(
             finish = f"{local_end:%a %d %b %H:%M}"
         when = f"{day} {local_start:%H:%M} – {finish} (GMT+7)"
 
-    details = [
-        {"label": "Title", "value": title},
-        {"label": "When", "value": when},
-        {"label": "Calendar", "value": "Your primary Google Calendar"},
-    ]
+    # Only what somebody actually decided. A title nobody gave, and a calendar nobody chose,
+    # read as facts about this meeting when they are neither: the title would be the server's
+    # default and the calendar is always the user's primary one. A card of invented rows is
+    # worse than a short card - it asks the reader to check things that were never in question.
+    details = []
+    if title:
+        details.append({"label": "Title", "value": title})
+    details.append({"label": "When", "value": when})
+
     attendees = arguments.get("attendees")
     if isinstance(attendees, list):
         emails = [a.strip() for a in attendees if isinstance(a, str) and a.strip()]

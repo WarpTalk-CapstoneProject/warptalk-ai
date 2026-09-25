@@ -179,17 +179,18 @@ class TestGoogleMeetConfirmationCard:
         assert self._details(question) == {
             "Title": "Roadmap",
             "When": "Tomorrow 10:00 – 10:45 (GMT+7)",
-            "Calendar": "Your primary Google Calendar",
             "Guests": "a@example.test",
         }
         assert question["options"][0]["label"] == "Create"
 
-    def test_no_time_promises_no_clock_time(self) -> None:
-        # The gateway stamps the start when the call runs, so a clock time on the card would be
-        # wrong by however long the user took to press Create.
+    def test_it_invents_nothing_the_user_did_not_choose(self) -> None:
+        # No title given means no Title row: the one that would appear is the server's default,
+        # not a decision. The calendar is never a choice either - it is always the user's own.
         details = self._details(self._card())
+        assert list(details) == ["When"]
+        # The gateway stamps the start when the call runs, so a clock time here would be wrong by
+        # however long the user took to press Create.
         assert details["When"] == "Starts when you confirm, 30 minutes"
-        assert details["Title"] == "Google Meet meeting"
 
     def test_the_answer_leads_with_the_choice_and_keeps_the_token_for_the_model(self) -> None:
         value = self._card()["options"][0]["value"]
