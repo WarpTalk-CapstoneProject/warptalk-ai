@@ -6,6 +6,7 @@ from openai import AsyncOpenAI
 from security_worker.scanners import OpenAISecurityScanner
 from shared.base_worker import BaseWorker
 from shared.config import SecuritySettings, resolve_openai_api_key
+from shared.provider_calls import observed_openai_http_client
 
 RESULT_TTL_SECONDS = 300
 
@@ -61,7 +62,9 @@ class SecurityWorker(BaseWorker):
         api_key = resolve_openai_api_key(self.security_settings.api_key)
         if not api_key:
             self.logger.warning("OPENAI_API_KEY is not configured for security_worker")
-        self.openai_client = AsyncOpenAI(api_key=api_key)
+        self.openai_client = AsyncOpenAI(
+            api_key=api_key, http_client=observed_openai_http_client("security")
+        )
         self.openai_scanner = OpenAISecurityScanner(self.openai_client, self.security_settings)
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:

@@ -27,6 +27,7 @@ from shared.prosody import (
     to_delivery,
     update_baseline,
 )
+from shared.provider_calls import classify_exception, record_provider_call
 from shared.schemas import (
     STT_FRAME_STREAM,
     STT_UNKNOWN_CONFIDENCE,
@@ -775,6 +776,7 @@ class STTWorker(BaseWorker):
             prosody_task = asyncio.create_task(self._measure_prosody(chunk))
 
         t0 = time.monotonic()
+        vendor_outcome = "ok"
         try:
             model = self._require_model()
 
@@ -975,6 +977,10 @@ class STTWorker(BaseWorker):
                 speech_ms=chunk.speech_ms,
             )
         except Exception as exc:
+            # Swallowed so the meeting keeps going, which is exactly why it must be counted:
+            # this attempt produced no transcript. See BaseWorker.note_attempt_outcome.
+            self.note_attempt_outcome("vendor_error")
+            vendor_outcome = classify_exception(exc)
             await self.redis.publish_system_event(
                 room_id=chunk.meeting_id,
                 event_type="stt_unavailable",
@@ -994,6 +1000,11 @@ class STTWorker(BaseWorker):
             )
             segments = []
         inference_ms = int((time.monotonic() - t0) * 1000)
+        # The realtime websocket has no HTTP request for the observed client to see, so the call
+        # is counted here, once per chunk sent to OpenAI (shared/provider_calls).
+        await record_provider_call(
+            "openai", "stt-realtime", vendor_outcome, inference_ms, self.stt_settings.model
+        )
 
         # Awaited even when recognition failed, so the task is never left orphaned — and its
         # baseline update is still worth keeping: the speaker did speak, whatever the model

@@ -23,6 +23,7 @@ from openai import AsyncOpenAI
 
 from shared.logger import get_logger
 from shared.openai_options import completion_options
+from shared.provider_calls import observed_openai_http_client
 
 logger = get_logger(__name__)
 
@@ -362,7 +363,11 @@ class OpenAISuggester:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required for the suggestion worker")
 
-        self._client = AsyncOpenAI(api_key=self.api_key, timeout=self.request_timeout_seconds)
+        self._client = AsyncOpenAI(
+            api_key=self.api_key,
+            timeout=self.request_timeout_seconds,
+            http_client=observed_openai_http_client("suggestion"),
+        )
         logger.info(
             "suggester_client_initialized",
             decide_model=self.decide_model,

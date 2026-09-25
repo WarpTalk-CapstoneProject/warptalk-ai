@@ -749,7 +749,17 @@ class ChatRequestMessage(BaseModel):
     # WT-687: plugin keys the user switched off for this conversation, as a JSON array, or "".
     # "" is what an older AssistantService sends, and it means every installed plugin is offered.
     disabled_plugin_keys_json: str = ""
+    #: Which conversation store the turn belongs to: "workspace" (every conversation until now)
+    #: or "platform" (a system admin's WarpBot in the admin portal). A platform turn carries NO
+    #: workspace_id and is offered only the read-only platform admin tools — never retrieval,
+    #: plugins or workspace tools — so nothing from one scope can reach the other's answer.
+    #: "" / missing is "workspace": an older AssistantService never sends the field.
+    scope: str = "workspace"
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+
+    @property
+    def is_platform(self) -> bool:
+        return (self.scope or "").strip().lower() == "platform"
 
     def to_redis(self) -> dict[str, str]:
         return {
@@ -764,6 +774,7 @@ class ChatRequestMessage(BaseModel):
             "mentions_json": self.mentions_json,
             "images_json": self.images_json,
             "disabled_plugin_keys_json": self.disabled_plugin_keys_json,
+            "scope": self.scope,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -773,7 +784,9 @@ class ChatRequestMessage(BaseModel):
         return cls(
             request_id=d["request_id"],
             conversation_id=d["conversation_id"],
-            workspace_id=d["workspace_id"],
+            # A platform turn has no workspace; AssistantService sends "" rather than omitting it,
+            # and a missing key is read the same way instead of failing the whole turn.
+            workspace_id=d.get("workspace_id", ""),
             user_id=d["user_id"],
             origin=d.get("origin", "assistant"),
             bearer_token=d.get("bearer_token", ""),
@@ -782,6 +795,7 @@ class ChatRequestMessage(BaseModel):
             mentions_json=d.get("mentions_json", ""),
             images_json=d.get("images_json", ""),
             disabled_plugin_keys_json=d.get("disabled_plugin_keys_json", ""),
+            scope=d.get("scope", "") or "workspace",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 
@@ -964,6 +978,9 @@ class ChatResultMessage(BaseModel):
     #: for a reply drawn from the conversation rather than from a tool result — see
     #: ai_assistant_worker/citations.py for why this is not simply "the tools that ran".
     sources_json: str = ""
+    #: Echo of the request's scope, so AssistantService finalizes the answer in the store the
+    #: question came from (assistant_messages vs platform_messages) without guessing by id.
+    scope: str = "workspace"
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
     def to_redis(self) -> dict[str, str]:
@@ -978,6 +995,7 @@ class ChatResultMessage(BaseModel):
             "tool_detail": self.tool_detail,
             "tool_calls_json": self.tool_calls_json,
             "sources_json": self.sources_json,
+            "scope": self.scope,
             "timestamp_ms": str(self.timestamp_ms),
         }
 
@@ -998,6 +1016,7 @@ class ChatResultMessage(BaseModel):
             # field is read rather than rejected — the same rolling-deploy rule the rest of this
             # schema follows.
             sources_json=d.get("sources_json", ""),
+            scope=d.get("scope", "") or "workspace",
             timestamp_ms=int(d.get("timestamp_ms", "0")),
         )
 

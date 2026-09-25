@@ -26,6 +26,7 @@ from shared.config import STTSettings
 from shared.lang import base_language
 from shared.logger import get_logger
 from shared.openai_options import realtime_session_expired
+from shared.provider_calls import observed_openai_http_client
 from shared.schemas import STT_UNKNOWN_CONFIDENCE
 from shared.text_utils import split_into_sentences
 
@@ -1263,7 +1264,9 @@ class OpenAISTT:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required for OpenAI STT")
 
-        self._client = AsyncOpenAI(api_key=self.api_key)
+        self._client = AsyncOpenAI(
+            api_key=self.api_key, http_client=observed_openai_http_client("stt")
+        )
         logger.info("openai_stt_ready", model=self.model)
 
     async def _open_warm_socket(self) -> dict[str, Any]:
