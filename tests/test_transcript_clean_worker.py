@@ -15,6 +15,7 @@ import asyncio
 import json
 import uuid
 from typing import Any
+from unittest.mock import MagicMock
 
 from shared.config import WorkerSettings
 from shared.control_markers import MEETING_END_MARKER, SYSTEM_SPEAKER_ID
@@ -183,10 +184,27 @@ class TestTheWireContract:
 
     async def test_a_non_guid_segment_id_is_dropped_rather_than_breaking_the_row(self):
         worker, redis, _ = build_worker()
+        valid = str(uuid.uuid4())
+        await worker.process(b"1-0", stt("We should ship it", segment_id="not-a-guid", end_ms=500))
+        await worker.process(
+            b"1-1", stt("today.", segment_id=valid, start_ms=500, end_ms=1000)
+        )
+        await worker._flush_meeting(MEETING_ID, reason="meeting_end")
+
+        assert json.loads(clean_messages(redis)[0]["segment_ids"]) == [valid]
+
+    async def test_a_sentence_with_no_valid_segment_ids_is_not_published(self):
+        # If EVERY id in the sentence fails the GUID check, publishing would send
+        # segment_ids: [] -- the transcript service rejects that and dead-letters the message
+        # after retries, which is worse than publishing nothing here.
+        worker, redis, _ = build_worker()
+        worker.logger = MagicMock()
         await worker.process(b"1-0", stt("We should ship it today.", segment_id="not-a-guid"))
         await worker._flush_meeting(MEETING_ID, reason="meeting_end")
 
-        assert json.loads(clean_messages(redis)[0]["segment_ids"]) == []
+        assert clean_messages(redis) == []
+        warnings = [c.args[0] for c in worker.logger.warning.call_args_list]
+        assert "transcript_clean_no_valid_segment_ids" in warnings
 
 
 class TestWhenTheModelDoesNotAnswer:
