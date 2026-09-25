@@ -142,6 +142,8 @@ async def test_collect_metrics_reports_lag_pending_heartbeats_and_dead_letters()
         # Stage-latency histograms. Pinned like the other two: an exporter that
         # silently stops scanning a pattern reports a healthy, idle pipeline.
         ("warptalk:latency:*", None),
+        # Stage attempt outcomes (success rates), same reasoning.
+        ("warptalk:outcome:*", None),
     ]
 
 

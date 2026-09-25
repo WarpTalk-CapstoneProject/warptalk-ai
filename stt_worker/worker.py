@@ -868,6 +868,9 @@ class STTWorker(BaseWorker):
                 speech_ms=chunk.speech_ms,
             )
         except Exception as exc:
+            # Swallowed so the meeting keeps going, which is exactly why it must be counted:
+            # this attempt produced no transcript. See BaseWorker.note_attempt_outcome.
+            self.note_attempt_outcome("vendor_error")
             await self.redis.publish_system_event(
                 room_id=chunk.meeting_id,
                 event_type="stt_unavailable",

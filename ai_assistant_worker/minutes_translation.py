@@ -183,3 +183,56 @@ def _blank(source_item: Any) -> Any:
         return blank_item
 
     return source_item
+
+
+def render_in_language(
+    source: dict[str, Any],
+    translated: Any,
+    language: str,
+) -> dict[str, Any] | None:
+    """`source` — a whole published summary — with its words replaced by `translated`'s.
+
+    `translated` is one language's half as `merge_translation` builds it (and as a summary's own
+    `translations[<code>]` stores it): the overview string and the section lists, items still
+    carrying the source's moments and owners. Everything else — `templateKey`, `citations`, the
+    moments — is the source's, because a translation is the same summary and makes no new claims.
+
+    COMPLETE OR NOTHING. A reader who switched the summary into Vietnamese must not be shown a
+    document whose second section is still in English, or whose items are blank because the model
+    skipped them: that reads as a Vietnamese summary with holes in it, and nothing on the page
+    says which parts were never translated. So every section the source has words in must come
+    back with the same number of items, every item with words — otherwise None, and the caller
+    reports a failure the reader can see and retry.
+    """
+    if not isinstance(translated, dict):
+        return None
+
+    rendered: dict[str, Any] = {
+        key: value for key, value in source.items() if key != "translations"
+    }
+
+    overview = source.get("summary")
+    if isinstance(overview, str) and overview.strip():
+        replacement = translated.get("summary")
+        if not isinstance(replacement, str) or not replacement.strip():
+            return None
+        rendered["summary"] = replacement
+
+    for key, value in source.items():
+        if key in NON_SECTION_KEYS or not isinstance(value, list):
+            continue
+        if not any(_readable(item).strip() for item in value):
+            # Nothing to translate in this section; it stays exactly as it is (usually empty).
+            continue
+
+        replacement_items = translated.get(key)
+        if not isinstance(replacement_items, list) or len(replacement_items) != len(value):
+            return None
+        for source_item, replacement_item in zip(value, replacement_items):
+            if _readable(source_item).strip() and not _readable(replacement_item).strip():
+                return None
+        rendered[key] = replacement_items
+
+    rendered["summaryLanguage"] = language
+    rendered["insufficientData"] = False
+    return rendered

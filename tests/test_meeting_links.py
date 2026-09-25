@@ -204,7 +204,7 @@ class TestGoogleMeetConfirmationCard:
             tool_name="save_issue",
             tool_label="Save issue",
         )["questions"][0]
-        assert question["header"] == "Confirm plugin action"
+        assert question["header"] == "Allow plugin action"
         assert question["question"].startswith('Run "Save issue"?')
         assert "details" not in question
 

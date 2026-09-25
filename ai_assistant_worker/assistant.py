@@ -11,7 +11,11 @@ from typing import Any, cast
 
 from openai import AsyncOpenAI
 
-from ai_assistant_worker.minutes_translation import collect_translatable, merge_translation
+from ai_assistant_worker.minutes_translation import (
+    collect_translatable,
+    merge_translation,
+    render_in_language,
+)
 from ai_assistant_worker.summary_grounding import ground_summary, strip_all_citations
 from ai_assistant_worker.summary_templates import (
     build_system_prompt,
@@ -19,7 +23,7 @@ from ai_assistant_worker.summary_templates import (
     spoken_text_only,
 )
 from shared.config import AssistantSettings
-from shared.languages import normalize_language_code
+from shared.languages import language_name, normalize_language_code
 from shared.logger import get_logger
 from shared.openai_options import completion_options
 
@@ -347,6 +351,52 @@ When extracting action items:
                 "summaryLanguage": language,
             }
 
+    async def translate_summary(
+        self,
+        source: dict[str, Any],
+        language: str,
+    ) -> dict[str, Any] | None:
+        """The published summary `source`, written in `language`. None when it cannot be done.
+
+        What a reader gets when they switch a finished meeting's summary — or its biên bản — into
+        another of the meeting's languages. A TRANSLATION of the summary the host published, not a
+        new summary written from the transcript: same sections, same items, same cited moments.
+        Writing a fresh one gave the reader a different document in their language (sections the
+        model happened to fill this time and not last time), and the biên bản then refused to
+        show it beside itself because the sections no longer lined up.
+
+        Free when the summary already carries this language: `generate_structured_summary`
+        translates a multi-language meeting's summary into every other language as it is written
+        (`translations`), and that copy is used as-is. Otherwise one translation call, through
+        the same strings-only pass the minutes use, so no moment can be invented on the way.
+        """
+        code = normalize_language_code(language)
+        if not code:
+            return None
+
+        source_language = normalize_language_code(str(source.get("summaryLanguage") or ""))
+        if code == source_language:
+            # Already in it. The backend serves this case from the artifact and never asks, but
+            # answering it correctly costs nothing.
+            return render_in_language(source, source, code)
+
+        carried = (source.get("translations") or {}).get(code)
+        rendered = render_in_language(source, carried, code)
+        if rendered is not None:
+            logger.info("summary_translation_reused", language=code)
+            return rendered
+
+        translations = await self._translate_for_minutes(source, [code], source_language)
+        rendered = render_in_language(source, (translations or {}).get(code), code)
+        if rendered is None:
+            logger.warning(
+                "summary_translation_incomplete",
+                language=code,
+                language_name=language_name(code),
+                source_language=source_language or "as-spoken",
+            )
+        return rendered
+
     async def _translate_for_minutes(
         self,
         summary: dict[str, Any],
@@ -376,6 +426,10 @@ When extracting action items:
         if not payload:
             return None
 
+        # A summary written before anybody could choose a language carries "" — say so in words
+        # rather than prompting with "The source is ."
+        source_label = summary_language or "in the language the meeting was held in"
+
         try:
             client = self._require_client()
             response = await client.chat.completions.create(
@@ -385,7 +439,8 @@ When extracting action items:
                         "role": "system",
                         "content": (
                             "You translate a meeting summary that has already been written. "
-                            f"The source is {summary_language}. Return a JSON object keyed by "
+                            f"The source is {source_label}. "
+                            "Return a JSON object keyed by "
                             f"each of these language codes: {', '.join(wanted)}. Each value has "
                             "EXACTLY the same keys as the input, and every array has EXACTLY the "
                             "same number of elements in the same order — each element is the "

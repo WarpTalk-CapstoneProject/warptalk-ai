@@ -35,7 +35,7 @@ from ai_assistant_worker.assistant import MeetingAssistant
 from ai_assistant_worker.summary_templates import format_transcript_line, resolve_template
 from shared.base_worker import BaseWorker
 from shared.config import AssistantSettings, ChatAssistantSettings, resolve_openai_api_key
-from shared.languages import known_language_code
+from shared.languages import known_language_code, language_name, normalize_language_code
 from shared.schemas import SummaryRequestMessage, SummaryResultMessage
 
 # One page is enough for any meeting this product records, and a bounded read means a
@@ -90,6 +90,30 @@ class SummaryTemplateWorker(BaseWorker):
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         request = SummaryRequestMessage.from_redis(data)
         template = resolve_template(request.template_key)
+
+        # A READER'S RENDERING MUST COME BACK IN THE LANGUAGE THEY PICKED, OR SAY WHY NOT.
+        #
+        # The backend files a rendering under the pair stamped in its content and looks it up
+        # under the pair that was asked for. For a canonical rewrite, dropping an unrecognised
+        # language to "as spoken" (WT-703, below) is a fair degradation — the host still gets a
+        # summary. For a reader's rendering it is a trap: the summary is stamped "", filed under
+        # "", never found under the language they chose, and the retry does exactly the same.
+        # So that case is refused here, with the reason, before any work is spent.
+        if (
+            request.delivery == "variant"
+            and request.summary_language.strip()
+            and not known_language_code(request.summary_language)
+        ):
+            await self._publish_failure(
+                request,
+                template.key,
+                f"Summaries cannot be written in '{request.summary_language.strip()[:16]}'.",
+            )
+            return
+
+        if request.mode == "translate" and request.summary_language.strip():
+            await self._translate(request, template.key)
+            return
 
         try:
             transcript = await self._load_transcript(request)
@@ -162,6 +186,8 @@ class SummaryTemplateWorker(BaseWorker):
                 # the two apart — see SummaryRequestMessage.delivery.
                 delivery=request.delivery,
                 content_json=json.dumps(content, ensure_ascii=False),
+                requested_template_key=_requested_template(request),
+                summary_language=normalize_language_code(request.summary_language),
             ).to_redis(),
         )
         self.logger.info(
@@ -169,6 +195,56 @@ class SummaryTemplateWorker(BaseWorker):
             room_id=request.room_id,
             template=template.key,
             language=summary_language or "as-spoken",
+        )
+
+    async def _translate(self, request: SummaryRequestMessage, template_key: str) -> None:
+        """Answer a language switch by translating the published summary it was sent with.
+
+        No transcript is read: the summary being translated IS the meeting's record of what was
+        said, and translating it is what keeps the reader's version the same document as
+        everybody else's. This is also why it cannot fail with "Could not read the transcript."
+        """
+        language = known_language_code(request.summary_language)
+        try:
+            source = json.loads(request.source_content_json or "")
+        except json.JSONDecodeError:
+            source = None
+        if not isinstance(source, dict):
+            await self._publish_failure(
+                request, template_key, "The published summary could not be read to translate it."
+            )
+            return
+
+        assert self.assistant is not None, "load_model() must run before process()"
+        rendered = await self.assistant.translate_summary(source, language)
+        if rendered is None:
+            await self._publish_failure(
+                request,
+                template_key,
+                f"The summary could not be translated into {language_name(language)}. "
+                "Please try again.",
+            )
+            return
+
+        await self.publish(
+            "assistant:summary_results",
+            request.room_id,
+            SummaryResultMessage(
+                request_id=request.request_id,
+                room_id=request.room_id,
+                template_key=str(rendered.get("templateKey") or template_key),
+                status="completed",
+                delivery=request.delivery,
+                content_json=json.dumps(rendered, ensure_ascii=False),
+                requested_template_key=_requested_template(request),
+                summary_language=normalize_language_code(request.summary_language),
+            ).to_redis(),
+        )
+        self.logger.info(
+            "summary_translated",
+            room_id=request.room_id,
+            template=rendered.get("templateKey") or template_key,
+            language=language,
         )
 
     async def _load_transcript(self, request: SummaryRequestMessage) -> str:
@@ -257,6 +333,8 @@ class SummaryTemplateWorker(BaseWorker):
                 # side effect would inherit a silent misroute.
                 delivery=request.delivery,
                 error=error,
+                requested_template_key=_requested_template(request),
+                summary_language=normalize_language_code(request.summary_language),
             ).to_redis(),
         )
 
@@ -266,3 +344,8 @@ class SummaryTemplateWorker(BaseWorker):
         if self._transcript_client is not None:
             await self._transcript_client.aclose()
             self._transcript_client = None
+
+
+def _requested_template(request: SummaryRequestMessage) -> str:
+    """The template the request asked for, as the backend spells it. See SummaryResultMessage."""
+    return (request.template_key or "general").strip().lower()

@@ -133,8 +133,8 @@ def test_confirmation_question_carries_hidden_token_value() -> None:
 
     question = question_payload["questions"][0]
     confirm = question["options"][0]
-    assert question["header"] == "Confirm plugin action"
-    assert confirm["label"] == "Confirm"
+    assert question["header"] == "Allow plugin action"
+    assert confirm["label"] == "Allow"
     assert "token-1" in confirm["value"]
 
 
@@ -146,7 +146,7 @@ def test_confirmation_question_offers_always_allow_with_the_token_and_the_flag()
 
     labels = [option["label"] for option in question_payload["questions"][0]["options"]]
     always = question_payload["questions"][0]["options"][1]
-    assert labels == ["Confirm", "Always allow", "Cancel"]
+    assert labels == ["Allow", "Always allow", "Cancel"]
     assert "token-1" in always["value"]
     assert "alwaysAllow: true" in always["value"]
 
@@ -252,9 +252,45 @@ def test_selector_drops_names_the_responses_api_would_reject() -> None:
     ]
 
 
-def test_selector_keeps_only_the_first_of_two_identically_named_tools() -> None:
+def test_selector_drops_a_name_two_plugins_claim_for_both_of_them() -> None:
+    """A name two plugins claim is ambiguous, and an ambiguous name is not offered at all.
+
+    The handler binds the name to one pluginKey, so keeping "the first" meant whichever plugin was
+    listed first received every call - a private MCP server declaring ``google_drive_search`` got
+    Drive's queries whenever it came first. This side cannot tell the trusted claimant from the
+    other, so it keeps neither.
+    """
     accepted, rejected = select_mcp_tool_entries(
-        [_entry("search", "notion"), _entry("search", "linear")],
+        [
+            _entry("google_drive_search", "ws_crm_1a2b3c4d"),
+            _entry("google_drive_search", "google_drive"),
+            _entry("notion_search", "notion"),
+        ],
+        reserved_names=set(),
+    )
+
+    assert [item["name"] for item in accepted] == ["notion_search"]
+    assert rejected == [
+        ("mcp_tool_name_ambiguous", "google_drive_search"),
+        ("mcp_tool_name_ambiguous", "google_drive_search"),
+    ]
+
+
+def test_selector_treats_names_differing_only_in_case_as_one_name() -> None:
+    accepted, rejected = select_mcp_tool_entries(
+        [_entry("google_drive_search", "google_drive"), _entry("Google_Drive_Search", "ws_crm")],
+        reserved_names=set(),
+    )
+
+    assert accepted == []
+    assert [reason for reason, _ in rejected] == ["mcp_tool_name_ambiguous"] * 2
+
+
+def test_selector_keeps_the_first_when_one_plugin_repeats_its_own_name() -> None:
+    # Both entries would execute against the same plugin, so nothing is ambiguous; only the
+    # Responses API's objection to a repeated function name has to be avoided.
+    accepted, rejected = select_mcp_tool_entries(
+        [_entry("search", "notion"), _entry("search", "notion")],
         reserved_names=set(),
     )
 
@@ -265,7 +301,7 @@ def test_selector_keeps_only_the_first_of_two_identically_named_tools() -> None:
 
 def test_selector_never_shadows_a_built_in_tool() -> None:
     accepted, rejected = select_mcp_tool_entries(
-        [_entry("create_meeting"), _entry("notion_search")],
+        [_entry("create_meeting"), _entry("Create_Meeting", "ws_crm"), _entry("notion_search")],
         reserved_names={"create_meeting"},
     )
 
