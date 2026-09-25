@@ -95,22 +95,23 @@ def normalize_mcp_tool_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {"isSuccess": False, "error": "Plugin tool returned an invalid response."}
 
+    result: dict[str, Any] = dict(payload)
+
     # "Always allow" is the one answer that changes something beyond this call: the card is gone
     # for this tool from now on. Nothing else on the way back says so, and a setting that changed
     # in silence is one the user finds out about the day WarpBot acts without asking.
-    if payload.get("appliedToolPolicy") == "allow":
-        payload = dict(payload)
-        payload["instruction"] = (
+    if result.get("appliedToolPolicy") == "allow":
+        result["instruction"] = (
             "The user chose Always allow, so this tool now runs without a confirmation card. "
             "Tell them in one short clause that you will not ask again for this action, and "
             "that they can change it in the plugin's settings."
         )
 
-    error_code = payload.get("errorCode")
-    if payload.get("isSuccess") is not False or not isinstance(error_code, str):
-        return payload
+    error_code = result.get("errorCode")
+    if result.get("isSuccess") is not False or not isinstance(error_code, str):
+        return result
 
-    normalized = dict(payload)
+    normalized = dict(result)
     if error_code == "connection_required":
         plugin_key = payload.get("pluginKey")
         plugin_label = payload.get("pluginLabel")
