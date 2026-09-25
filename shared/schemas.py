@@ -423,7 +423,8 @@ class STTResultMessage(BaseModel):
 
 # Where CleanSentenceMessage travels. Published through BaseWorker.publish like every result
 # stream, so it lands on the global `transcript:clean` AND on `transcript:clean:{meeting_id}`
-# — the per-meeting key is the one the backend reads.
+# — but the global stream is what both backend consumers actually read. The per-meeting key is
+# a by-product of BaseWorker.publish (written with a TTL); nothing reads it today.
 TRANSCRIPT_CLEAN_STREAM = "transcript:clean"
 
 
