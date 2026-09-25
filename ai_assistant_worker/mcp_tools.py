@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 #: What the Responses API accepts as a function name. An MCP server is free to call its tool
@@ -94,11 +95,23 @@ def normalize_mcp_tool_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {"isSuccess": False, "error": "Plugin tool returned an invalid response."}
 
-    error_code = payload.get("errorCode")
-    if payload.get("isSuccess") is not False or not isinstance(error_code, str):
-        return payload
+    result: dict[str, Any] = dict(payload)
 
-    normalized = dict(payload)
+    # "Always allow" is the one answer that changes something beyond this call: the card is gone
+    # for this tool from now on. Nothing else on the way back says so, and a setting that changed
+    # in silence is one the user finds out about the day WarpBot acts without asking.
+    if result.get("appliedToolPolicy") == "allow":
+        result["instruction"] = (
+            "The user chose Always allow, so this tool now runs without a confirmation card. "
+            "Tell them in one short clause that you will not ask again for this action, and "
+            "that they can change it in the plugin's settings."
+        )
+
+    error_code = result.get("errorCode")
+    if result.get("isSuccess") is not False or not isinstance(error_code, str):
+        return result
+
+    normalized = dict(result)
     if error_code == "connection_required":
         plugin_key = payload.get("pluginKey")
         plugin_label = payload.get("pluginLabel")
@@ -306,30 +319,68 @@ def build_mcp_operator_setup_action(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+#: The one write tool whose card says what it will create rather than "a plugin action".
+GOOGLE_MEET_CREATE_TOOL = "google_calendar_create_meet_event"
+
+#: Meetings are booked by people in Vietnam; UTC+7 has no DST, so a fixed offset is exact.
+_CARD_TIMEZONE = timezone(timedelta(hours=7), "ICT")
+
+
 def build_mcp_confirmation_questions(
     payload: dict[str, Any],
     *,
     tool_name: str,
+    tool_label: str | None = None,
+    arguments: dict[str, Any] | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
+    """The confirmation card for a write the user's policy wants approved.
+
+    Each option's ``value`` is what comes back as the user's next message. It is two paragraphs:
+    the choice as a person would say it, then the machine line the model needs to act on it
+    (tool name and token). The web shows the first and hides the second, so the bubble reads
+    "Create" instead of a token.
+
+    ``details`` are label/value rows the card draws under the question (Title, When, Calendar),
+    so the user sees exactly what is about to be written to their calendar.
+    """
     token = str(payload.get("confirmationToken") or "").strip()
-    message = str(
-        payload.get("message")
-        or "WarpBot wants to change data in a connected app. Confirm before it continues."
-    )
+
+    if tool_name == GOOGLE_MEET_CREATE_TOOL:
+        header = "Google Meet"
+        question, details = _google_meet_confirmation(arguments or {}, now)
+        confirm_label = "Create"
+        confirm_description = "Create this Google Meet meeting once."
+    else:
+        label = (tool_label or "").strip()
+        header = "Allow plugin action"
+        question = str(
+            payload.get("message")
+            or "WarpBot wants to change data in a connected app. Confirm before it continues."
+        )
+        if label and label != tool_name:
+            question = f'Run "{label}"?\n{question}'
+        details = []
+        confirm_label = "Allow"
+        confirm_description = "Run this action once."
 
     return {
         "questions": [
             {
-                "header": "Allow plugin action",
-                "question": message,
+                "header": header,
+                "question": question,
+                **({"details": details} if details else {}),
                 "options": [
                     {
                         # Allow runs this one call; Always allow also stops the card for this tool.
-                        # The value text keeps saying "Confirm": it is what the model reads back.
-                        "label": "Allow",
-                        "description": "Run this action once.",
+                        # Each value leads with the choice as a person would say it and keeps the
+                        # machine line ("Confirm the … plugin action") under it: the web shows the
+                        # first and hides the second, and the model reads the second.
+                        "label": confirm_label,
+                        "description": confirm_description,
                         "value": (
-                            f"Confirm the {tool_name} plugin action. confirmationToken: {token}"
+                            f"{confirm_label}\n\nConfirm the {tool_name} plugin action. "
+                            f"confirmationToken: {token}"
                         ),
                     },
                     {
@@ -338,16 +389,72 @@ def build_mcp_confirmation_questions(
                         "label": "Always allow",
                         "description": "Run it now and stop asking for this tool.",
                         "value": (
-                            f"Confirm the {tool_name} plugin action and always allow it from now "
-                            f"on. confirmationToken: {token} alwaysAllow: true"
+                            f"Always allow\n\nConfirm the {tool_name} plugin action and always "
+                            f"allow it from now on. confirmationToken: {token} alwaysAllow: true"
                         ),
                     },
                     {
                         "label": "Cancel",
                         "description": "Do not run this action.",
-                        "value": f"Do not run the {tool_name} plugin action.",
+                        "value": f"Cancel\n\nDo not run the {tool_name} plugin action.",
                     },
                 ],
             }
         ]
     }
+
+
+def _google_meet_confirmation(
+    arguments: dict[str, Any], now: datetime | None = None
+) -> tuple[str, list[dict[str, str]]]:
+    """The question and the rows under it — only the things somebody actually chose."""
+    title = _argument_text(arguments, "summary")
+    current = (now or datetime.now(UTC)).astimezone(_CARD_TIMEZONE)
+    start = _parse_instant(_argument_text(arguments, "start"))
+    if start is None:
+        # The gateway stamps the start when the call actually runs, which is after the user reads
+        # this card. Printing a clock time here would be wrong by however long they took.
+        when = "Starts when you confirm, 30 minutes"
+    else:
+        end = _parse_instant(_argument_text(arguments, "end")) or start + timedelta(minutes=30)
+        local_start = start.astimezone(_CARD_TIMEZONE)
+        local_end = end.astimezone(_CARD_TIMEZONE)
+        days = (local_start.date() - current.date()).days
+        day = {0: "Today", 1: "Tomorrow"}.get(days) or f"{local_start:%a %d %b}"
+        if local_end.date() == local_start.date():
+            finish = f"{local_end:%H:%M}"
+        else:
+            finish = f"{local_end:%a %d %b %H:%M}"
+        when = f"{day} {local_start:%H:%M} – {finish} (GMT+7)"
+
+    # Only what somebody actually decided. A title nobody gave, and a calendar nobody chose,
+    # read as facts about this meeting when they are neither: the title would be the server's
+    # default and the calendar is always the user's primary one. A card of invented rows is
+    # worse than a short card - it asks the reader to check things that were never in question.
+    details = []
+    if title:
+        details.append({"label": "Title", "value": title})
+    details.append({"label": "When", "value": when})
+
+    attendees = arguments.get("attendees")
+    if isinstance(attendees, list):
+        emails = [a.strip() for a in attendees if isinstance(a, str) and a.strip()]
+        if emails:
+            details.append({"label": "Guests", "value": ", ".join(emails)})
+    return "Create a Google Meet meeting?", details
+
+
+def _argument_text(arguments: dict[str, Any], key: str) -> str:
+    value = arguments.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _parse_instant(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    # A time with no offset is read the way the user meant it: Vietnam time.
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=_CARD_TIMEZONE)
