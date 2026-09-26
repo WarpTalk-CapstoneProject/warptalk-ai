@@ -542,10 +542,10 @@ class TestAgentLoop:
         question_events = [p for p in published if p["type_"] == "question"]
         assert len(question_events) == 1
         action_payload = json.loads(question_events[0]["tool_calls_json"])
-        assert action_payload["pluginConnection"] == {
-            "type": "plugin_connection_required",
+        assert action_payload["permission"] == {
+            "kind": "connect",
+            "action": "Google Drive",
             "pluginKey": "google_workspace",
-            "pluginLabel": "Google Drive",
             "connectionStatus": "expired",
             "connectedAccountEmail": "user@example.test",
             "message": "Your Google Drive connection has expired.",

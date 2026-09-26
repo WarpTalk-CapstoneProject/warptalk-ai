@@ -9,7 +9,6 @@ card says what it will create.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -151,63 +150,46 @@ def test_helpers() -> None:
     assert meet_code_from_url("https://meet.google.com/landing") is None
 
 
-class TestGoogleMeetConfirmationCard:
-    NOW = datetime(2026, 9, 18, 8, 40, 27, tzinfo=UTC)  # 15:40:27 in Vietnam
-
-    def _card(self, **arguments: Any) -> dict[str, Any]:
+class TestPermissionPrompt:
+    def _prompt(self) -> dict[str, Any]:
         payload = {"confirmationToken": "token-1", "message": "Confirm this action."}
         return build_mcp_confirmation_questions(
             payload,
             tool_name="google_calendar_create_meet_event",
             tool_label="Create Google Meet meeting",
-            arguments=arguments,
-            now=self.NOW,
-        )["questions"][0]
+        )["permission"]
 
-    def _details(self, question: dict[str, Any]) -> dict[str, str]:
-        return {row["label"]: row["value"] for row in question["details"]}
+    def test_it_names_the_action_and_nothing_else(self) -> None:
+        # One prompt shape for every ask. It used to carry rows per tool — Title, When, Calendar —
+        # built from the arguments, and those were the server's defaults as often as the user's
+        # words, so the card described decisions nobody had made.
+        prompt = self._prompt()
+        assert prompt["kind"] == "tool"
+        assert prompt["action"] == "Create Google Meet meeting"
+        assert prompt["toolName"] == "google_calendar_create_meet_event"
+        assert set(prompt) == {"kind", "action", "toolName", "options"}
 
-    def test_it_says_what_it_will_create(self) -> None:
-        question = self._card(
-            summary="Roadmap",
-            start="2026-09-19T03:00:00Z",
-            end="2026-09-19T03:45:00Z",
-            attendees=["a@example.test"],
-        )
-        assert question["header"] == "Google Meet"
-        assert question["question"] == "Create a Google Meet meeting?"
-        assert self._details(question) == {
-            "Title": "Roadmap",
-            "When": "Tomorrow 10:00 – 10:45 (GMT+7)",
-            "Guests": "a@example.test",
-        }
-        assert question["options"][0]["label"] == "Create"
-
-    def test_it_invents_nothing_the_user_did_not_choose(self) -> None:
-        # No title given means no Title row: the one that would appear is the server's default,
-        # not a decision. The calendar is never a choice either - it is always the user's own.
-        details = self._details(self._card())
-        assert list(details) == ["When"]
-        # The gateway stamps the start when the call runs, so a clock time here would be wrong by
-        # however long the user took to press Create.
-        assert details["When"] == "Starts when you confirm, 30 minutes"
+    def test_the_answers_read_as_a_person_would_say_them(self) -> None:
+        labels = [option["label"] for option in self._prompt()["options"]]
+        assert labels == [
+            "Yes",
+            "Yes, and don't ask again for this tool",
+            "No, and tell WarpBot what to do differently",
+        ]
 
     def test_the_answer_leads_with_the_choice_and_keeps_the_token_for_the_model(self) -> None:
-        value = self._card()["options"][0]["value"]
+        value = self._prompt()["options"][0]["value"]
         human, machine = value.split("\n\n", 1)
-        assert human == "Create"
+        assert human == "Yes"
         assert "google_calendar_create_meet_event" in machine
         assert "confirmationToken: token-1" in machine
 
-    def test_other_tools_name_their_label(self) -> None:
-        question = build_mcp_confirmation_questions(
+    def test_a_tool_with_no_label_is_named_by_its_own_name(self) -> None:
+        prompt = build_mcp_confirmation_questions(
             {"confirmationToken": "t", "message": "Confirm this action."},
             tool_name="save_issue",
-            tool_label="Save issue",
-        )["questions"][0]
-        assert question["header"] == "Allow plugin action"
-        assert question["question"].startswith('Run "Save issue"?')
-        assert "details" not in question
+        )["permission"]
+        assert prompt["action"] == "save_issue"
 
 
 def test_the_prompt_separates_warptalk_rooms_from_google_meet() -> None:
@@ -332,6 +314,6 @@ class TestAgentLoopGuaranteesTheLink:
 
         questions = [p for p in published if p.get("type_") == "question"]
         assert len(questions) == 1
-        card = json.loads(questions[0]["tool_calls_json"])["questions"][0]
-        assert card["header"] == "Google Meet"
-        assert {"label": "Title", "value": "Standup"} in card["details"]
+        prompt = json.loads(questions[0]["tool_calls_json"])["permission"]
+        assert prompt["kind"] == "tool"
+        assert prompt["action"] == "Create Google Meet meeting"

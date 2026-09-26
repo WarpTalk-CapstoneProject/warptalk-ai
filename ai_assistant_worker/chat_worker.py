@@ -1173,7 +1173,6 @@ class ChatAssistantWorker(BaseWorker):
                             normalized,
                             tool_name=tool_name,
                             tool_label=tool_label,
-                            arguments=tool_arguments,
                         )
                     ),
                 )

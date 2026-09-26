@@ -64,10 +64,10 @@ def test_plugin_connection_action_payload_can_be_forwarded_to_clients() -> None:
     )
 
     assert payload == {
-        "pluginConnection": {
-            "type": "plugin_connection_required",
+        "permission": {
+            "kind": "connect",
+            "action": "Google Calendar",
             "pluginKey": "google_workspace",
-            "pluginLabel": "Google Calendar",
             "connectionStatus": "not_connected",
             "connectedAccountEmail": None,
             "message": "Connect Google Calendar before WarpBot can use it.",
@@ -131,10 +131,12 @@ def test_confirmation_question_carries_hidden_token_value() -> None:
         tool_name="google_calendar_create_event",
     )
 
-    question = question_payload["questions"][0]
-    confirm = question["options"][0]
-    assert question["header"] == "Allow plugin action"
-    assert confirm["label"] == "Allow"
+    prompt = question_payload["permission"]
+    confirm = prompt["options"][0]
+    assert prompt["kind"] == "tool"
+    # The action is the tool's own label; with none, its name. Nothing else is described.
+    assert prompt["action"] == "google_calendar_create_event"
+    assert confirm["label"] == "Yes"
     assert "token-1" in confirm["value"]
 
 
@@ -144,9 +146,13 @@ def test_confirmation_question_offers_always_allow_with_the_token_and_the_flag()
         tool_name="linear_save_issue",
     )
 
-    labels = [option["label"] for option in question_payload["questions"][0]["options"]]
-    always = question_payload["questions"][0]["options"][1]
-    assert labels == ["Allow", "Always allow", "Cancel"]
+    labels = [option["label"] for option in question_payload["permission"]["options"]]
+    always = question_payload["permission"]["options"][1]
+    assert labels == [
+        "Yes",
+        "Yes, and don't ask again for this tool",
+        "No, and tell WarpBot what to do differently",
+    ]
     assert "token-1" in always["value"]
     assert "alwaysAllow: true" in always["value"]
 
