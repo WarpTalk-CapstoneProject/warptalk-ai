@@ -40,6 +40,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from shared.languages import normalize_language_code
+
 #: The fields of an item that hold words a person reads. `owner` is deliberately absent; so are
 #: `atMs` and `alsoAtMs`, which are moments and not language.
 TRANSLATABLE_FIELDS = ("text", "task")
@@ -85,6 +87,41 @@ def collect_translatable(summary: dict[str, Any]) -> dict[str, Any]:
             payload[key] = strings
 
     return payload
+
+
+def answer_for_language(
+    answered: Any,
+    language: str,
+    wanted: list[str],
+    payload: dict[str, Any],
+) -> Any:
+    """What the model returned for `language`, found in the shapes it actually answers in.
+
+    The prompt asks for `{"<code>": {...payload keys...}}`. Asked for ONE language, the model
+    routinely answers with the payload itself — `{"summary": ..., "openQuestions": [...]}` — and
+    no language key at all. Reading only `answered[code]` turned every such answer into "no
+    translation", so a summary switch into Vietnamese failed on every retry while the model had
+    translated it correctly each time (WT-858; reproduced against production's model, 2/2).
+
+    An unwrapped answer is accepted only when one language was asked for, so it cannot be the
+    wrong language's half, and only when it carries a key of the payload that was sent. A regional
+    key ("vi-VN", "VI") is the same language. Everything else is still `merge_translation`'s to
+    judge — alignment is checked there exactly as before.
+    """
+    if not isinstance(answered, dict):
+        return None
+
+    if language in answered:
+        return answered[language]
+
+    for key, value in answered.items():
+        if isinstance(key, str) and normalize_language_code(key) == language:
+            return value
+
+    if len(wanted) == 1 and wanted[0] == language and any(key in answered for key in payload):
+        return answered
+
+    return None
 
 
 def merge_translation(

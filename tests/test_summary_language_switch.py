@@ -262,3 +262,66 @@ def test_the_new_request_and_result_fields_survive_the_redis_round_trip() -> Non
     )
     back = SummaryResultMessage.from_redis(result.to_redis())
     assert (back.requested_template_key, back.summary_language) == ("general", "vi")
+
+
+# ── WT-858: the model's answer for ONE language comes back unwrapped ─────────────────────────
+
+
+def _model_answering(content: dict[str, Any]) -> MeetingAssistant:
+    """An assistant whose model call returns `content` as the JSON body."""
+    assistant = MeetingAssistant(api_key="test-key")
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = json.dumps(content, ensure_ascii=False)
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(return_value=response)
+    assistant._client = client
+    return assistant
+
+
+def _published_without_translations() -> dict[str, Any]:
+    # Production's shape for the WT-858 room: an English general summary, one open question,
+    # no carried translations — so a switch to Vietnamese has to ask the model.
+    source = _published()
+    del source["translations"]
+    source["actionItems"] = []
+    return source
+
+
+@pytest.mark.asyncio
+async def test_a_single_language_answer_without_its_language_key_is_still_the_translation() -> None:
+    # What gpt-5.6-luna returned on every retry for that room: the payload itself, not
+    # {"vi": payload}. Reading only answered["vi"] made each of them "could not be translated".
+    assistant = _model_answering(
+        {"summary": "Nhóm đã xem xét hệ thống AI.", "openQuestions": ["Độ trễ có ổn không?"]}
+    )
+
+    rendered = await assistant.translate_summary(_published_without_translations(), "vi")
+
+    assert rendered is not None
+    assert rendered["summaryLanguage"] == "vi"
+    assert rendered["summary"] == "Nhóm đã xem xét hệ thống AI."
+    assert rendered["openQuestions"] == [{"text": "Độ trễ có ổn không?", "atMs": 12_000}]
+
+
+@pytest.mark.asyncio
+async def test_a_regional_language_key_is_the_same_language() -> None:
+    assistant = _model_answering(
+        {"vi-VN": {"summary": "Nhóm đã họp.", "openQuestions": ["Độ trễ?"]}}
+    )
+
+    rendered = await assistant.translate_summary(_published_without_translations(), "vi")
+
+    assert rendered is not None
+    assert rendered["summary"] == "Nhóm đã họp."
+
+
+@pytest.mark.asyncio
+async def test_an_unwrapped_answer_is_not_guessed_at_when_several_languages_were_asked() -> None:
+    # With two languages asked, a bare payload could be either one's half; it is refused.
+    source = _published_without_translations()
+    assistant = _model_answering({"summary": "Nhóm đã họp.", "openQuestions": ["Độ trễ?"]})
+
+    translations = await assistant._translate_for_minutes(source, ["vi", "ja"], "en")
+
+    assert translations is None
