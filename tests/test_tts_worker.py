@@ -170,7 +170,9 @@ class TestTTSWorker:
         worker = _make_worker(mock_redis_client, worker_settings)
 
         mock_redis_client._redis.hget.return_value = None
-        mock_redis_client._redis.get.return_value = b"cached-audio"
+        # A real rendering: a 44-byte WAV header followed by samples. A header alone is not a
+        # hit — see test_an_empty_cached_wav_is_a_miss below.
+        mock_redis_client._redis.get.return_value = b"\x00" * 44 + b"cached-audio"
 
         await worker.process(b"msg-1", _make_msg().to_redis())
 

@@ -575,6 +575,59 @@ class LiveKitTTSPublisher:
                 voice_key=k[3],
             )
 
+    def retire_voice_variants(
+        self, meeting_id: str, speaker_id: str, target_lang: str, keep: set[str]
+    ) -> list[str]:
+        """Disconnect this speaker's bots for `target_lang` whose voice_key is not in `keep`.
+
+        Returns the voice_keys it retired. The default track (voice_key "") is never retired.
+
+        WHY WAITING FOR THE IDLE SWEEP IS NOT GOOD ENOUGH
+            A listener who picked a voice hears ONLY that voice's track for a speaker while it
+            is in the room: resolveInterpreterTracks (web) drops the speaker's default track as
+            soon as a matching `ai-interpreter-{lang}-voice-{id8}-{speaker}` exists, and the
+            speaker's own microphone is muted because the speaker counts as dubbed.
+
+            The worker stops rendering that variant the moment the speaker has a voice of their
+            own (a live clone landing mid-meeting, a profile pick) — see
+            TTSWorker._resolve_voice_variants. The bot did not leave with it. It stayed until
+            SESSION_IDLE_TIMEOUT_S, so for a full minute that listener was subscribed to a
+            track nothing would ever speak on again, and heard neither the dub nor the speaker.
+
+            Production 30 Sep, room 01a0f21a: the clone was cached at 18:42:33, the preference
+            bot left at 18:43:30, and the 7 sentences in between went only to the default
+            track that listener had been told to ignore — the "earlier sentences are not dubbed
+            in my voice, later ones are" report.
+
+        A bot mid-sentence is left for the reaper: cutting a line off is worse than letting it
+        finish, and the idle sweep still removes it a minute later at the latest.
+        """
+        stale = [
+            key
+            for key in self._bots
+            if key[0] == meeting_id
+            and key[1] == speaker_id
+            and key[2] == target_lang
+            and key[3]
+            and key[3] not in keep
+            and not self._is_publishing(key)
+        ]
+        for key in stale:
+            bot = self._bots.pop(key)
+            self._locks.pop(key, None)
+            # Fire-and-forget, like the sweep: the sentence that made this decision is about to
+            # be synthesized, and must not wait on a WebRTC teardown to start.
+            asyncio.create_task(self._close_bot(bot))
+            logger.info(
+                "livekit_tts_bot_retired",
+                meeting_id=meeting_id,
+                speaker_id=speaker_id,
+                target_lang=target_lang,
+                voice_key=key[3],
+                reason="voice_variant_no_longer_rendered",
+            )
+        return [key[3] for key in stale]
+
     def _is_publishing(self, key: _BotKey) -> bool:
         """Whether publish_pcm currently holds this key's lock.
 
