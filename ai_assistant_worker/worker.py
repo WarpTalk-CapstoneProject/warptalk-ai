@@ -67,6 +67,16 @@ def substantive_segments(segments: list[TranscriptSegment]) -> list[TranscriptSe
     ]
 
 
+# One summary per meeting end: `assistant:summary:claim:{meeting_id}`. Ten minutes covers every
+# duplicated marker (seconds apart) and a summary slow enough to reach the processing timeout, and
+# is short enough that a room ended again later is summarised again.
+_SUMMARY_CLAIM_TTL_SECONDS = 10 * 60
+
+
+def _summary_claim_key(meeting_id: str) -> str:
+    return f"assistant:summary:claim:{meeting_id}"
+
+
 class AIAssistantWorker(BaseWorker):
     """AI Assistant worker — non-realtime meeting summarization."""
 
@@ -221,7 +231,61 @@ class AIAssistantWorker(BaseWorker):
         # and tts_worker sang it. Anything reading stt:results has to be able to ask the same
         # question, and the answer has to be in one place.
         if is_end_marker:
-            await self._generate_summary(stt_result.meeting_id)
+            if not await self._claim_summary(stt_result.meeting_id):
+                self.logger.info(
+                    "summary_already_claimed",
+                    meeting_id=stt_result.meeting_id,
+                    segment_id=stt_result.segment_id,
+                )
+                self._forget_meeting_locally(stt_result.meeting_id)
+                return
+            try:
+                await self._generate_summary(stt_result.meeting_id)
+            except BaseException:
+                await self._release_summary_claim(stt_result.meeting_id)
+                raise
+
+    async def _claim_summary(self, meeting_id: str) -> bool:
+        """Whether THIS delivery of the end-of-meeting marker is the one that summarises.
+
+        TWO MARKERS, TWO REPLICAS, TWO SUMMARIES. The backend publishes `__MEETING_END__` more
+        than once for one meeting (production: 1-4 per meeting, 50ms-2s apart), and each copy is
+        its own stream entry. On one replica that was harmless: the copies are processed in
+        turn, the first summary forgets the meeting, and the second finds nothing left. With two
+        replicas in `assistant-workers` - an HPA scale-out, or simply the old and new pod of a
+        surge rollout - the copies land on different pods at the same moment, both read the
+        whole Redis transcript buffer before either forgets it, and the meeting gets two model
+        calls and two summaries written over each other.
+
+        SET NX per meeting, so exactly one delivery wins wherever it lands. Kept after success
+        (for the TTL) so a late copy is still recognised; given back on failure so the retry of
+        the failed one can still summarise. Fails OPEN on a Redis error: a second summary is a
+        better failure than none, and the summary path needs Redis anyway.
+        """
+        try:
+            return await self.redis.set_if_absent(
+                _summary_claim_key(meeting_id), self._consumer_name, _SUMMARY_CLAIM_TTL_SECONDS
+            )
+        except Exception:
+            self.logger.warning("summary_claim_failed", meeting_id=meeting_id, exc_info=True)
+            return True
+
+    async def _release_summary_claim(self, meeting_id: str) -> None:
+        try:
+            await self.redis.delete_if_value(_summary_claim_key(meeting_id), self._consumer_name)
+        except Exception:
+            self.logger.warning("summary_claim_release_failed", meeting_id=meeting_id)
+
+    def _forget_meeting_locally(self, meeting_id: str) -> None:
+        """Drop this replica's in-memory copy of a meeting another replica is summarising.
+
+        Memory only. The Redis buffer is the winner's input and it deletes it when it is done;
+        deleting it from here could pull it out from under a summary still reading it.
+        """
+        self._transcripts.pop(meeting_id, None)
+        self._pause_gaps.pop(meeting_id, None)
+        self._gap_open.discard(meeting_id)
+        self._filler_only_ms.pop(meeting_id, None)
 
     def _note_pause_gap(self, meeting_id: str, timestamp_ms: int) -> None:
         """Remember that this moment was dropped, so the gap can be named in the transcript.

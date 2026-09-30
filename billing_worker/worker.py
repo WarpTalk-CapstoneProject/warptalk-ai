@@ -194,6 +194,9 @@ class BillingSettlementWorker:
     max_delivery_attempts = 5
     heartbeat_interval_seconds = 10
     heartbeat_ttl_seconds = 30
+    # Same values as BaseWorker; see there.
+    consumer_prune_idle_ms = 60 * 60 * 1000
+    consumer_housekeeping_interval_seconds = 300.0
 
     def __init__(
         self,
@@ -369,6 +372,39 @@ class BillingSettlementWorker:
                     )
                 continue
             await self.redis.redis.xack(stream, group, message_id)
+        await self._prune_idle_consumers(stream, group)
+
+    async def _prune_idle_consumers(self, stream: str, group: str) -> None:
+        """Delete this group's dead consumers, at most once per interval. Best effort.
+
+        The same housekeeping BaseWorker does for every other stream consumer (see
+        shared.base_worker._prune_idle_consumers): one consumer per pod name ever started, and
+        production carried 33 on each billing group for one live replica. Settlement itself is
+        idempotent (every charge carries an idempotency key), so this is tidiness, not safety.
+        """
+        last_run: dict[tuple[str, str], float] = getattr(self, "_prune_last_run", None) or {}
+        self._prune_last_run = last_run
+        now = time.monotonic()
+        previous = last_run.get((stream, group))
+        if previous is not None and now - previous < self.consumer_housekeeping_interval_seconds:
+            return
+        last_run[(stream, group)] = now
+        try:
+            deleted = await self.redis.prune_idle_consumers(
+                stream,
+                group,
+                keep=self._consumer_name,
+                min_idle_ms=self.consumer_prune_idle_ms,
+            )
+        except Exception:
+            self.logger.warning(
+                "stream_consumer_prune_failed", stream=stream, group=group, exc_info=True
+            )
+            return
+        if deleted:
+            self.logger.info(
+                "stream_consumers_pruned", stream=stream, group=group, count=len(deleted)
+            )
 
     async def _publish_heartbeat(self) -> None:
         hostname = self._consumer_name.removeprefix("billing-")

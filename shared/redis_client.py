@@ -102,6 +102,14 @@ return 0
 """
 
 
+def _info_field(info: Any, field: str) -> Any:
+    """One field of an XINFO reply, whichever way redis-py decoded its keys."""
+    if not isinstance(info, dict):
+        return None
+    value = info.get(field)
+    return info.get(field.encode()) if value is None else value
+
+
 def _redact_redis_url(url: str) -> str:
     """Return a log-safe endpoint without credentials or query parameters."""
     try:
@@ -670,6 +678,68 @@ class RedisStreamClient:
             count=count,
         )
         return list(result[1]) if len(result) > 1 else []
+
+    async def prune_idle_consumers(
+        self,
+        stream: str,
+        group: str,
+        *,
+        keep: str,
+        min_idle_ms: int,
+    ) -> list[str]:
+        """Delete consumers that are gone: nothing pending, and silent for `min_idle_ms`.
+
+        WHY THEY PILE UP. A consumer is named after the pod (`{worker}-{hostname}`), and every
+        rollout, crash or reschedule makes a new pod name. Redis never forgets the old one, so
+        production carried 62 consumers on `audio:frames`/stt-frame-workers for one live pod.
+        They cost little, but they bury the one consumer that matters in every XINFO read, and
+        a dead consumer that DOES hold entries is indistinguishable from a live one at a glance.
+
+        WHY THIS IS SAFE, AND ONLY UNDER BOTH CONDITIONS.
+          * `pending == 0` — XGROUP DELCONSUMER drops the consumer's pending entries with it,
+            which would make them unclaimable forever. Entries held by a dead consumer are
+            XAUTOCLAIMed by the live workers (`reclaim_stale`) first; once that has moved them,
+            the corpse is empty and this deletes it on a later pass.
+          * `idle >= min_idle_ms` — `idle` is the time since the consumer last TRIED to read
+            (Redis 7.2+; production runs 8.x). A live consumer polls with a 2-5s block and
+            never goes longer than one message's processing timeout between reads, so the
+            caller passes a threshold far above both. A consumer that silent owns no process.
+          * Never `keep` (the caller itself), whatever Redis reports.
+        A consumer deleted by mistake is also harmless on the next read: XREADGROUP recreates it.
+
+        Best effort by contract: returns the names it deleted and never raises for a missing
+        group — pruning is housekeeping, and it must not take a consume loop down with it.
+        """
+        try:
+            consumers = await self._retry(self.redis.xinfo_consumers, stream, group)
+        except aioredis.ResponseError as error:
+            if "NOGROUP" in str(error) or "no such key" in str(error).lower():
+                return []
+            raise
+
+        deleted: list[str] = []
+        for consumer in consumers or []:
+            raw_name = _info_field(consumer, "name")
+            name = raw_name.decode("utf-8", "replace") if isinstance(raw_name, bytes) else raw_name
+            if not name or name == keep:
+                continue
+            if int(_info_field(consumer, "pending") or 0) != 0:
+                continue
+            if int(_info_field(consumer, "idle") or 0) < min_idle_ms:
+                continue
+            held = await self._retry(self.redis.xgroup_delconsumer, stream, group, name)
+            if int(held or 0) != 0:
+                # Cannot happen for a consumer that is really gone (nothing reads as it), and
+                # would mean the entries it held are now orphaned. Loud, so it is seen.
+                logger.error(
+                    "stream_consumer_pruned_with_pending",
+                    stream=stream,
+                    group=group,
+                    consumer=name,
+                    pending=int(held),
+                )
+            deleted.append(name)
+        return deleted
 
     async def pending_delivery_count(
         self,
