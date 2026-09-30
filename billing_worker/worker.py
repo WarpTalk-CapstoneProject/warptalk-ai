@@ -89,6 +89,8 @@ from shared.schemas import (
 logger = get_logger("worker.billing")
 
 TRANSLATION_CHARGE_TYPE = "TRANSLATION"
+# The idempotency namespace for dubbing, whichever voice produced it. See _handle_tts.
+DUBBING_IDEMPOTENCY_PREFIX = "AUDIO_DUBBING"
 BACKFILL_RESULT_STREAM = "translate:backfill_results"
 BILLED_STREAMS = ("translate:results", BACKFILL_RESULT_STREAM, "tts:results")
 SettlementHandler = Callable[[Mapping[Any, Any]], Awaitable[None]]
@@ -192,6 +194,9 @@ class BillingSettlementWorker:
     max_delivery_attempts = 5
     heartbeat_interval_seconds = 10
     heartbeat_ttl_seconds = 30
+    # Same values as BaseWorker; see there.
+    consumer_prune_idle_ms = 60 * 60 * 1000
+    consumer_housekeeping_interval_seconds = 300.0
 
     def __init__(
         self,
@@ -367,6 +372,39 @@ class BillingSettlementWorker:
                     )
                 continue
             await self.redis.redis.xack(stream, group, message_id)
+        await self._prune_idle_consumers(stream, group)
+
+    async def _prune_idle_consumers(self, stream: str, group: str) -> None:
+        """Delete this group's dead consumers, at most once per interval. Best effort.
+
+        The same housekeeping BaseWorker does for every other stream consumer (see
+        shared.base_worker._prune_idle_consumers): one consumer per pod name ever started, and
+        production carried 33 on each billing group for one live replica. Settlement itself is
+        idempotent (every charge carries an idempotency key), so this is tidiness, not safety.
+        """
+        last_run: dict[tuple[str, str], float] = getattr(self, "_prune_last_run", None) or {}
+        self._prune_last_run = last_run
+        now = time.monotonic()
+        previous = last_run.get((stream, group))
+        if previous is not None and now - previous < self.consumer_housekeeping_interval_seconds:
+            return
+        last_run[(stream, group)] = now
+        try:
+            deleted = await self.redis.prune_idle_consumers(
+                stream,
+                group,
+                keep=self._consumer_name,
+                min_idle_ms=self.consumer_prune_idle_ms,
+            )
+        except Exception:
+            self.logger.warning(
+                "stream_consumer_prune_failed", stream=stream, group=group, exc_info=True
+            )
+            return
+        if deleted:
+            self.logger.info(
+                "stream_consumers_pruned", stream=stream, group=group, count=len(deleted)
+            )
 
     async def _publish_heartbeat(self) -> None:
         hostname = self._consumer_name.removeprefix("billing-")
@@ -810,6 +848,19 @@ class BillingSettlementWorker:
             self.logger.warning("segment_id_extraction_failed", raw_segment_id=msg.segment_id)
 
         quantity_s = _translation_quantity_seconds(msg)
+        # ONE CHARGE PER (STT SEGMENT, TARGET LANGUAGE) — NOT PER TRANSLATED CHUNK.
+        #
+        # translation_worker splits one STT segment into sentences and publishes each as its own
+        # message ("{stt_segment}-{lang}-c{idx}"), and every one of them carries the WHOLE
+        # segment's start_ms/end_ms, because that is the speech it came from. Keyed on the chunk,
+        # a segment split into three sentences was charged three times its duration. The quantity
+        # is the segment's seconds of source speech, so the segment is what the key names: the
+        # first chunk to arrive pays for all of it and the others replay.
+        #
+        # The same key is what makes a duplicate harmless whatever produced it — a redelivery, a
+        # retry that republished a chunk, two replicas racing a reclaimed entry: all of them name
+        # the same (segment, language, service) and settle_usage_charge replays the second.
+        billing_segment = underlying_segment_id or msg.segment_id
         outcome = await self.db.record_usage_and_charge(
             subscription_id=subscription_id,
             user_id=msg.speaker_id,
@@ -824,12 +875,7 @@ class BillingSettlementWorker:
             source_language_code=msg.source_lang,
             target_language_code=msg.target_lang,
             transcript_segment_id=underlying_segment_id,
-            # msg.segment_id here IS deterministic (translation_worker builds it as
-            # f"{stt_result.segment_id}-{target_lang}-c{idx}"), so this key is redelivery-safe. The
-            # idempotency key keeps using the raw composite msg.segment_id, unaffected by
-            # the extraction above (which only changes what's stored in reference_id /
-            # transcript_segment_id).
-            idempotency_key=f"{TRANSLATION_CHARGE_TYPE}:{msg.segment_id}:{msg.target_lang}",
+            idempotency_key=f"{TRANSLATION_CHARGE_TYPE}:{billing_segment}:{msg.target_lang}",
             # WT-446. Rides in `details` rather than as a new settle_usage_charge argument: the
             # column on usage_records is GENERATED from exactly this key, so the 200-line
             # settlement function — which decides whether a workspace can pay at all — is not
@@ -994,7 +1040,13 @@ class BillingSettlementWorker:
             unit="second",
             target_language_code=msg.target_lang,
             transcript_segment_id=underlying_segment_id,
-            idempotency_key=f"{charge_type}:{msg.segment_id}:{msg.target_lang}",
+            # One dub charge per (translated chunk, target language), whichever voice rendered
+            # it. The charge TYPE follows the voice (a clone is priced differently), but the key
+            # must not: a message retried after the speaker's clone became ready is the same
+            # sentence dubbed once more, and a key carrying the charge type let it be charged
+            # under both. A second charge for the key is a unique violation, which
+            # record_usage_and_charge reads as the replay it is.
+            idempotency_key=f"{DUBBING_IDEMPOTENCY_PREFIX}:{msg.segment_id}:{msg.target_lang}",
             details={
                 "clone_provider": msg.clone_provider,
                 "voice_mode": msg.voice_mode,

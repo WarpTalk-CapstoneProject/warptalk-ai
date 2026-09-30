@@ -1614,6 +1614,13 @@ class TTSWorker(BaseWorker):
             the recording could not be turned into a voice.
         """
         while self._running:
+            # A request left pending by a pod that died mid-clone gets one more attempt: this
+            # loop promises an answer for every request, and without it that one never had one.
+            await self._housekeep_side_group(
+                _CLONE_REQUEST_STREAM,
+                self._clone_request_group,
+                redeliver=self._handle_upload_clone_request,
+            )
             try:
                 async for msg_id, data in self.redis.consume(
                     stream=_CLONE_REQUEST_STREAM,
@@ -1714,6 +1721,8 @@ class TTSWorker(BaseWorker):
             measured on. A preview is exactly that case, so it matches a real dub of one.
         """
         while self._running:
+            # Minutes later nobody is still waiting on the button: a stale preview is dropped.
+            await self._housekeep_side_group(_PREVIEW_REQUEST_STREAM, self._preview_request_group)
             try:
                 async for _msg_id, data in self.redis.consume(
                     stream=_PREVIEW_REQUEST_STREAM,
@@ -1899,6 +1908,8 @@ class TTSWorker(BaseWorker):
         carried_seen: set[tuple[str, str]] = set()
 
         while self._running:
+            # Clone sampling buffers live speech; a stale chunk would be appended out of order.
+            await self._housekeep_side_group("audio:chunks", self._audio_consumer_group)
             try:
                 async for _msg_id, data in self.redis.consume(
                     stream="audio:chunks",
@@ -2501,6 +2512,13 @@ class TTSWorker(BaseWorker):
             or promotion becomes a leak in a place the sweep has been told to leave alone.
         """
         while self._running:
+            # A deletion left pending by a pod that died mid-request is a withdrawn consent that
+            # was never carried out; it gets one more attempt rather than none.
+            await self._housekeep_side_group(
+                _VOICE_DELETE_STREAM,
+                self._voice_delete_group,
+                redeliver=self._handle_voice_delete_request,
+            )
             try:
                 async for _msg_id, data in self.redis.consume(
                     stream=_VOICE_DELETE_STREAM,
@@ -2509,27 +2527,30 @@ class TTSWorker(BaseWorker):
                     block_ms=5000,
                     count=10,
                 ):
-                    voice_id = _decode_field(data, "voice_id")
-                    if not voice_id:
-                        continue
-                    # The answer is not reported back. A voice that will not delete is retried by
-                    # nothing, and that is deliberate: the row is already gone on the far side, so
-                    # there is nobody left to tell, and the sweep cannot reach a `profile-` name.
-                    # It is logged loudly instead, because for the consent case it is the
-                    # difference between a promise kept and a promise broken.
-                    if await self._require_cartesia().delete_voice(voice_id):
-                        self.logger.info("voice_deleted_on_request", voice_id=voice_id)
-                    else:
-                        self.logger.error(
-                            "voice_delete_on_request_failed",
-                            voice_id=voice_id,
-                            reason=_decode_field(data, "reason") or "unspecified",
-                        )
+                    await self._handle_voice_delete_request(data)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger.exception("voice_delete_consumer_error")
                 await asyncio.sleep(1.0)
+
+    async def _handle_voice_delete_request(self, data: dict[bytes, bytes]) -> None:
+        voice_id = _decode_field(data, "voice_id")
+        if not voice_id:
+            return
+        # The answer is not reported back. A voice that will not delete is retried by
+        # nothing, and that is deliberate: the row is already gone on the far side, so
+        # there is nobody left to tell, and the sweep cannot reach a `profile-` name.
+        # It is logged loudly instead, because for the consent case it is the
+        # difference between a promise kept and a promise broken.
+        if await self._require_cartesia().delete_voice(voice_id):
+            self.logger.info("voice_deleted_on_request", voice_id=voice_id)
+        else:
+            self.logger.error(
+                "voice_delete_on_request_failed",
+                voice_id=voice_id,
+                reason=_decode_field(data, "reason") or "unspecified",
+            )
 
     def _generation_config(
         self, translation: TranslationResultMessage
