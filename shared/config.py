@@ -703,6 +703,15 @@ class ChatAssistantSettings(BaseSettings):
     # Redis Stream / SignalR traffic bounded, matching the rest of the pipeline's coarse
     # buffered-unit convention (STT/TTS/AI-assistant results are never per-token either).
     chunk_flush_chars: int = 40
+    # WT-881: the OpenAI SDK's default read timeout is 600s, so a stream that went quiet
+    # mid-answer — no delta, no response.completed — left the widget on "Running..." for ten
+    # minutes, which to a user is forever. The read timeout is the longest SILENCE between two
+    # bytes of the stream, not the length of the answer: a long answer that keeps streaming is
+    # never cut. It has to stay above the longest gap a reasoning model leaves before its first
+    # event, so raise ASSISTANT_CHAT_OPENAI_READ_TIMEOUT_SECONDS rather than removing it if a
+    # heavier model starts tripping it.
+    openai_connect_timeout_seconds: float = 10.0
+    openai_read_timeout_seconds: float = 90.0
     workspace_service_url: str = "http://localhost:5106"
     assistant_service_url: str = "http://localhost:5108"
     transcript_service_url: str = "http://localhost:5103"
