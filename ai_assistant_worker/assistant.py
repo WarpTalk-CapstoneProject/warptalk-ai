@@ -12,6 +12,7 @@ from typing import Any, cast
 from openai import AsyncOpenAI
 
 from ai_assistant_worker.minutes_translation import (
+    answer_for_language,
     collect_translatable,
     merge_translation,
     render_in_language,
@@ -444,7 +445,10 @@ When extracting action items:
                             "You translate a meeting summary that has already been written. "
                             f"The source is {source_label}. "
                             "Return a JSON object keyed by "
-                            f"each of these language codes: {', '.join(wanted)}. Each value has "
+                            f"each of these language codes: {', '.join(wanted)} — even when "
+                            "there is only one, e.g. "
+                            f'{{"{wanted[0]}": {{...}}}}. '
+                            "Each value has "
                             "EXACTLY the same keys as the input, and every array has EXACTLY the "
                             "same number of elements in the same order — each element is the "
                             "translation of the element in that position. Translate the words "
@@ -473,7 +477,9 @@ When extracting action items:
 
         translations: dict[str, dict[str, Any]] = {}
         for lang in wanted:
-            merged = merge_translation(summary, answered.get(lang))
+            merged = merge_translation(
+                summary, answer_for_language(answered, lang, wanted, payload)
+            )
             if merged:
                 translations[lang] = merged
             else:
