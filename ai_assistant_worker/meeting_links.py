@@ -80,13 +80,16 @@ class MeetingLink:
         return f"{MEETING_MARKER_PREFIX}{body.replace('>', _ESCAPED_GT)} -->"
 
 
-def room_url(room_id: str) -> str:
-    """The slug-less address of a WarpTalk room.
+def room_url(room_id: str, slug: str | None = None) -> str:
+    """The address of a WarpTalk room, slug-qualified when known.
 
-    The worker is not told the workspace slug. ``/rooms/{id}`` is the address notifications
-    already use, and the web redirects it to ``/{slug}/rooms/{id}`` for the open workspace.
+    If a workspace slug is available, produces ``/{slug}/rooms/{id}`` so the browser opens
+    the canonical room detail page directly. Falls back to ``/rooms/{id}`` when unknown.
     """
-    return f"/rooms/{room_id.strip()}"
+    clean_id = room_id.strip()
+    if slug and slug.strip():
+        return f"/{slug.strip()}/rooms/{clean_id}"
+    return f"/rooms/{clean_id}"
 
 
 def meet_code_from_url(url: str) -> str | None:

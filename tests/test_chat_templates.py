@@ -255,6 +255,73 @@ class TestFormatMentions:
         assert "prefer its tools" in message
         assert "look it up" not in message
 
+    # WT-887: @summary: / @minutes: / @transcript: carry the meeting's room id as entityId.
+    ROOM_ID = "8f0c2a1e-5b7d-4e2a-9c31-1d2e3f4a5b6c"
+
+    def _artifact_mention(self, entity_type: str) -> str | None:
+        return _format_mentions(
+            json.dumps(
+                [
+                    {
+                        "entityType": entity_type,
+                        "entityId": self.ROOM_ID,
+                        "label": "Sprint sync",
+                        "workspaceId": "ws-1",
+                    }
+                ]
+            )
+        )
+
+    def test_summary_mention_requires_reading_the_summary_first(self) -> None:
+        message = self._artifact_mention("summary")
+        assert message is not None
+        assert 'meeting summary of "Sprint sync"' in message
+        assert f"MUST call get_meeting_summary with meeting_id={self.ROOM_ID}" in message
+        assert "an appropriate tool" not in message
+
+    def test_transcript_mention_requires_reading_the_transcript_first(self) -> None:
+        message = self._artifact_mention("transcript")
+        assert message is not None
+        assert 'meeting transcript of "Sprint sync"' in message
+        assert f"MUST call get_transcript with meeting_id={self.ROOM_ID}" in message
+        assert "before_sequence" in message
+
+    def test_minutes_mention_reads_the_summary_and_says_it_is_not_the_minutes(self) -> None:
+        """No tool reads minutes; the closest read is named, and not passed off as the minutes."""
+        message = self._artifact_mention("minutes")
+        assert message is not None
+        assert 'meeting minutes of "Sprint sync"' in message
+        assert f"get_meeting_summary with meeting_id={self.ROOM_ID}" in message
+        assert f"get_room_detail with room_id={self.ROOM_ID}" in message
+        assert "cannot be read from here" in message
+
+    def test_artifact_type_is_normalized_like_any_other(self) -> None:
+        message = _format_mentions(json.dumps([{"id": "room-9", "type": " Summary "}]))
+        assert message is not None
+        assert "get_meeting_summary with meeting_id=room-9" in message
+
+    def test_artifact_mentions_sit_alongside_plain_references(self) -> None:
+        message = _format_mentions(
+            json.dumps(
+                [
+                    {"entityType": "document", "entityId": "doc-1", "label": "Spec"},
+                    {"entityType": "transcript", "entityId": "room-9", "label": "Standup"},
+                ]
+            )
+        )
+        assert message is not None
+        assert "get_document" in message
+        assert "get_transcript with meeting_id=room-9" in message
+
+    def test_unknown_type_gets_no_artifact_instruction(self) -> None:
+        """An unrecognised type keeps today's generic hint; it never borrows a MUST-read."""
+        message = _format_mentions(
+            json.dumps([{"entityType": "recording", "entityId": "room-9", "label": "x"}])
+        )
+        assert message is not None
+        assert "an appropriate tool" in message
+        assert "MUST call" not in message
+
 
 class TestWebSearchIsTheLastResort:
     """WT — "nếu không có trong glossary thì tự search web".

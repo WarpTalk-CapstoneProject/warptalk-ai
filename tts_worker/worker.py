@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import hashlib
 import json
 import time
@@ -238,6 +239,53 @@ def _clone_failure(exc: BaseException) -> tuple[str, str]:
     if code == "VOICE_NOT_FOUND":
         return "UNKNOWN", message
     return code, message
+
+
+# Refusals no later clip can change: the account's plan, its credits, or its credentials. A clip
+# the vendor could not use, a rate limit or an outage is worth another attempt; these are not.
+_PERMANENT_CLONE_REFUSALS = frozenset(
+    {"PROVIDER_PLAN_REQUIRED", "PROVIDER_QUOTA_EXCEEDED", "PROVIDER_REJECTED"}
+)
+
+
+def _settle_live_clone(
+    task: asyncio.Task[Any],
+    *,
+    key: tuple[str, str],
+    attempted_score: float,
+    previous_score: float | None,
+    spent_upgrade: bool,
+    cloned_score: dict[tuple[str, str], float],
+    upgrades_used: dict[tuple[str, str], int],
+    clone_refused: set[tuple[str, str]],
+) -> None:
+    """Undo the capture loop's optimism about an in-meeting clone that did not happen (WT-874).
+
+    The loop records `cloned_score[key]` the moment it STARTS a clone, because the clone runs as
+    a background task. Nothing took it back when Cartesia refused, so the loop went on treating
+    the speaker as cloned: with a clip score of 1.0 no upgrade can beat it, and it published
+    `cloned_best_possible` right after `clone_failed` — production room 01a0e5dd, 28 Sep, 16s
+    apart. The meeting UI then showed the speaker's voice as done while every listener heard a
+    stock voice, and no further attempt was ever made.
+
+    A failure now restores the score the previous clone had (or none), refunds an upgrade it
+    spent, and, for a refusal no clip can fix, stops capturing that speaker for the meeting.
+    `None` (a test double, or an older caller) and "" (cached) change nothing.
+    """
+    if task.cancelled() or task.exception() is not None:
+        return
+    outcome = task.result()
+    if not outcome:
+        return
+    if cloned_score.get(key) == attempted_score:
+        if previous_score is None:
+            cloned_score.pop(key, None)
+        else:
+            cloned_score[key] = previous_score
+    if spent_upgrade and upgrades_used.get(key, 0) > 0:
+        upgrades_used[key] -= 1
+    if outcome in _PERMANENT_CLONE_REFUSALS:
+        clone_refused.add(key)
 
 
 # WT-B — a clone that outlives the meeting it was made in.
@@ -1906,6 +1954,9 @@ class TTSWorker(BaseWorker):
         # speaker: doing it per chunk would re-seed the bar after an upgrade had raised it and
         # walk the score back down to whatever the previous meeting managed.
         carried_seen: set[tuple[str, str]] = set()
+        # WT-874: speakers the vendor has refused to clone for a reason another clip cannot fix
+        # (the account's plan, its credits, its credentials). See _settle_live_clone.
+        clone_refused: set[tuple[str, str]] = set()
 
         while self._running:
             # Clone sampling buffers live speech; a stale chunk would be appended out of order.
@@ -1958,6 +2009,16 @@ class TTSWorker(BaseWorker):
                             buffer_seconds.pop(key, None)
                             buffer_lang.pop(key, None)
                             carried_seen.discard(key)
+                            continue
+
+                        # The vendor already said no in a way the next clip cannot change. The
+                        # `clone_failed:` state it published stays the last word; capturing
+                        # again would only flash "capturing" → "cloning" → "failed" at the
+                        # speaker every ten seconds and spend a refused vendor call each time.
+                        if key in clone_refused:
+                            buffers.pop(key, None)
+                            buffer_seconds.pop(key, None)
+                            buffer_lang.pop(key, None)
                             continue
 
                         # Read per chunk, not once per process: an operator's change in the
@@ -2183,7 +2244,8 @@ class TTSWorker(BaseWorker):
                                 # listening to may change for a BETTER likeness; being in the
                                 # right language is not that, and charging it here would let one
                                 # mistimed language hint use up the speaker's only improvement.
-                                if is_upgrade and not language_is_stale:
+                                spent_upgrade = is_upgrade and not language_is_stale
+                                if spent_upgrade:
                                     upgrades_used[key] = upgrades_used.get(key, 0) + 1
                                 self.logger.info(
                                     "voice_clone_sample_accepted",
@@ -2203,7 +2265,7 @@ class TTSWorker(BaseWorker):
                                     score=assessment.score,
                                     active_speech_ratio=assessment.active_speech_ratio,
                                 )
-                                asyncio.create_task(
+                                clone_task = asyncio.create_task(
                                     self._clone_and_cache(
                                         chunk.meeting_id,
                                         chunk.speaker_id,
@@ -2215,6 +2277,18 @@ class TTSWorker(BaseWorker):
                                         # clone comes back chipmunked rather than refused.
                                         chunk.sample_rate,
                                         assessment.score,
+                                    )
+                                )
+                                clone_task.add_done_callback(
+                                    functools.partial(
+                                        _settle_live_clone,
+                                        key=key,
+                                        attempted_score=assessment.score,
+                                        previous_score=previous_score,
+                                        spent_upgrade=spent_upgrade,
+                                        cloned_score=cloned_score,
+                                        upgrades_used=upgrades_used,
+                                        clone_refused=clone_refused,
                                     )
                                 )
                             elif assessment.accepted:
@@ -2351,8 +2425,12 @@ class TTSWorker(BaseWorker):
         language: str = "en",
         sample_rate: int = 16000,
         score: float | None = None,
-    ) -> None:
+    ) -> str:
         """Clone voice via Cartesia and cache voice_id in Redis.
+
+        Returns "" once the voice is cached, else the `_clone_failure` code for why it is not.
+        The capture loop reads it (see _settle_live_clone): until WT-874 it assumed every clone it
+        started had succeeded, so a refused one still counted as the speaker's clone.
 
         `score` is the accepted clip's quality, carried through only so the terminal `cloned`
         state can publish it. Acceptance and quality are two different questions here:
@@ -2381,6 +2459,7 @@ class TTSWorker(BaseWorker):
         """
         label = f"{_IN_MEETING_VOICE_PREFIX}{speaker_id[:8]}-{meeting_id[:8]}"
         key = (meeting_id, speaker_id)
+        cached = False
         try:
             voice_id = await self._require_cartesia().clone_voice(
                 wav_header(len(audio_bytes), sample_rate) + audio_bytes,
@@ -2389,6 +2468,7 @@ class TTSWorker(BaseWorker):
             )
             cache_key = f"voice:{meeting_id}:{speaker_id}"
             await self.redis.hset(cache_key, "voice_id", voice_id)
+            cached = True
             # WHICH LANGUAGE THIS VOICE IS. A Cartesia clone is keyed by language, so a voice and
             # the language it was built from are one fact, and storing only half of it is why a
             # clone made under an unresolved "auto" (and therefore under "en") could never be
@@ -2411,6 +2491,7 @@ class TTSWorker(BaseWorker):
                 payload={"speakerId": speaker_id, "voiceId": voice_id},
             )
             await self._offer_carry_over(speaker_id, language, voice_id, score)
+            return ""
         except Exception as e:
             self.logger.error(
                 "voice_clone_failed",
@@ -2428,6 +2509,9 @@ class TTSWorker(BaseWorker):
             # Truncated because it goes on the wire to a UI, and a Cartesia stack trace is not a
             # message for a person in a meeting.
             await self._note_clone_state(key, f"clone_failed:{str(e)[:120]}")
+            # A failure AFTER the voice was cached (publishing, the carry-over hand-off) still left
+            # the speaker with a usable clone, so it is not reported to the loop as "no clone".
+            return "" if cached else _clone_failure(e)[0]
 
     async def _offer_carry_over(
         self,
