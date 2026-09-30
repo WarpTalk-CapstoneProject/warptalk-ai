@@ -932,6 +932,16 @@ class TTSWorker(BaseWorker):
         variants = await self._resolve_voice_variants(
             translation.meeting_id, translation.speaker_id, translation.target_lang
         )
+        # Before synthesizing: a listener is still subscribed to any variant track this speaker
+        # no longer gets, and hears nothing on it. See LiveKitTTSPublisher.retire_voice_variants.
+        publisher = getattr(self, "livekit_publisher", None)
+        if publisher is not None:
+            publisher.retire_voice_variants(
+                translation.meeting_id,
+                translation.speaker_id,
+                translation.target_lang,
+                keep={voice_key for _voice_id, _voice_type, voice_key in variants},
+            )
 
         # Once per message, not once per voice variant: the variants are the same sentence
         # rendered in different voices, so the second one must not be judged as arriving after
@@ -1325,7 +1335,11 @@ class TTSWorker(BaseWorker):
 
         if self.tts_settings.cache_enabled:
             cached_audio = await self.redis.get(cache_key)
-            if cached_audio:
+            # A header with no samples is not a rendering. Before WT-874 a retired Cartesia
+            # context returned exactly that and it was cached like any other line, so for the
+            # cache's TTL the same words in the same voice replayed as silence without ever
+            # reaching Cartesia again. Treated as a miss, it is simply synthesized.
+            if cached_audio and len(cached_audio) > _WAV_HEADER_BYTES:
                 if voice_key:
                     # Extra voice variant — LiveKit only, never a second billing event
                     # for content already billed via the default variant's publish.
@@ -1470,7 +1484,7 @@ class TTSWorker(BaseWorker):
                     # not by the LiveKit push, and both must see every synthesized sentence.
                     publish_to_livekit=not already_spoken,
                 )
-            if self.tts_settings.cache_enabled:
+            if self.tts_settings.cache_enabled and len(audio_bytes) > _WAV_HEADER_BYTES:
                 await self.redis.set_with_ttl(
                     cache_key, audio_bytes, self.tts_settings.cache_ttl_seconds
                 )
@@ -1492,7 +1506,8 @@ class TTSWorker(BaseWorker):
             # arrived here looking exactly like a success with duration_ms=0 — which is how a
             # dropped sentence stayed invisible while every other field said the pipeline was
             # healthy. `synthesized=False` is that case, stated rather than inferred.
-            synthesized=bool(audio_bytes),
+            # Samples, not bytes: a bare WAV header is truthy and is exactly the WT-874 silence.
+            synthesized=len(audio_bytes) > _WAV_HEADER_BYTES,
             # Streamed into the track during synthesis rather than pushed after it. Not a
             # failure — but it changes which publish branch ran, and therefore what to expect
             # on tts:results.
