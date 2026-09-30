@@ -356,3 +356,49 @@ async def test_a_timeout_reports_the_ids_the_server_was_actually_sending(monkeyp
     message = str(caught.value)
     assert "flush_id=0" in message, "the id that was awaited is not in the error"
     assert "[7]" in message, "the ids the server sent are not in the error"
+
+
+@pytest.mark.asyncio
+async def test_a_context_that_ends_before_any_audio_raises_instead_of_returning_silence() -> None:
+    """WT-874. A stale `done` was read back as a finished sentence: a bare 44-byte header,
+    truthy, so the worker logged it as synthesized and never fell back. The listener heard
+    nothing for every other sentence."""
+    transport = _ScriptedContext([[_Done()]])
+    ctx = ProsodyContext(transport, SAMPLE_RATE)
+
+    with pytest.raises(RuntimeError, match="before any audio"):
+        await ctx.speak("Chỉ một sơ suất đơn giản.")
+
+    assert ctx.is_closed
+
+
+@pytest.mark.asyncio
+async def test_a_receive_stream_that_ends_empty_raises() -> None:
+    # The SDK returns an empty iterator for a context whose queue it has dropped.
+    transport = _ScriptedContext([[]])
+    ctx = ProsodyContext(transport, SAMPLE_RATE)
+
+    with pytest.raises(RuntimeError, match="before any audio"):
+        await ctx.speak("Một.")
+
+    assert ctx.is_closed
+
+
+@pytest.mark.asyncio
+async def test_an_idle_context_reads_as_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cartesia retires an idle context by queueing a `done` nobody reads until the next push.
+    Production reused one 2s later fine and lost every sentence 7s+ later, so the worker must
+    see an idle context as spent before it pushes onto it."""
+    import tts_worker.prosody_context as module
+
+    now = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    transport = _ScriptedContext([[_Chunk(_pcm(10), 0), _FlushDone(0)]])
+    ctx = ProsodyContext(transport, SAMPLE_RATE)
+    await ctx.speak("Một.")
+
+    now[0] += module.CONTEXT_IDLE_EXPIRY_SECONDS - 0.5
+    assert not ctx.is_closed
+
+    now[0] += 1.0
+    assert ctx.is_closed

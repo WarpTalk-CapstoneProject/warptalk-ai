@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
@@ -63,6 +64,17 @@ logger = get_logger(__name__)
 # under a second; anything near this bound is already a failure, not a slow success. Generous
 # enough never to fire on a healthy call, short enough that a wedged socket costs one sentence.
 SENTENCE_TIMEOUT_SECONDS = 6.0
+
+# How long a context may sit unused before this side stops trusting that the server still has it.
+#
+# Cartesia retires an idle context on its own and says so only by queueing a `done`, which nobody
+# reads until the next sentence is pushed onto the context and collects it. Production 28 Sep
+# (room 01a0e5dd, WT-874): a sentence 2s after the previous one on the same turn played, every
+# one 7s or more after it read the stale `done` instead and was dropped — alternating, so the
+# listener heard sentence 1 and 3 dubbed and sentence 2 as the original only. There is no
+# documented number to tune against; 4s sits below the shortest gap seen to fail, and retiring a
+# live context early costs one fresh context, while trusting a dead one costs a sentence.
+CONTEXT_IDLE_EXPIRY_SECONDS = 4.0
 
 
 class ContextTransport(Protocol):
@@ -113,6 +125,8 @@ class ProsodyContext:
         self._closed = False
         #: Every flush_id seen on this context, so a timeout can say what the server WAS sending.
         self._seen_flush_ids: set[int] = set()
+        #: `time.monotonic()` of the last sign of life from the server; see is_closed.
+        self._last_activity = time.monotonic()
 
     @property
     def sentences_spoken(self) -> int:
@@ -127,8 +141,13 @@ class ProsodyContext:
         context spent. The caller sees a perfectly successful sentence and has no other way to
         learn that the next one cannot be spoken on this context — which is exactly how a dead
         context stayed in the worker's turn map and cost a fallback per turn. See WT-405.
+
+        Also closed once it has been idle past CONTEXT_IDLE_EXPIRY_SECONDS: by then the server
+        has very likely retired it, and the `done` saying so is still unread in the queue.
         """
-        return self._closed
+        if self._closed:
+            return True
+        return time.monotonic() - self._last_activity > CONTEXT_IDLE_EXPIRY_SECONDS
 
     async def speak(
         self,
@@ -194,6 +213,7 @@ class ProsodyContext:
         on_pcm: Callable[[bytes], Awaitable[None]] | None = None,
     ) -> tuple[bytes, int]:
         pcm = bytearray()
+        flushed = False
         async for event in self._transport.receive():
             kind = getattr(event, "type", None)
 
@@ -223,6 +243,7 @@ class ProsodyContext:
                 continue
 
             if kind == "flush_done" and getattr(event, "flush_id", None) == expected_flush:
+                flushed = True
                 break
 
             if kind == "done":
@@ -230,7 +251,32 @@ class ProsodyContext:
                 # arrived is what there is; it is not an error, but nothing more is coming.
                 self._closed = True
                 break
+        else:
+            # The receive stream ran out without a terminal event — the SDK hands back an empty
+            # iterator for a context whose queue it has already dropped. Nothing more can
+            # arrive on this context either.
+            self._closed = True
 
+        if not pcm and not flushed:
+            # WT-874. A context that ends before producing a single sample of THIS sentence, and
+            # without the server acknowledging it with its flush_done, did not speak it.
+            # Returning the bare 44-byte header here looked exactly like success: the header is
+            # truthy, so the worker logged `synthesized=True, duration_ms=0`, skipped the
+            # one-shot fallback, and the listener heard nothing.
+            #
+            # Production 28 Sep, room 01a0e5dd: 37 of 90 dubs came back this way, almost all in
+            # 0-1 ms, alternating with the ones that played. The server had already retired the
+            # idle context (see CONTEXT_IDLE_EXPIRY_SECONDS), its `done` was sitting in the queue,
+            # and the next sentence pushed onto the dead context and read that `done` back
+            # instantly. Raising sends the sentence to the one-shot fallback, which is what a
+            # dead context is supposed to cost.
+            self._closed = True
+            raise RuntimeError(
+                f"Cartesia context ended before any audio for flush_id={expected_flush}; "
+                f"saw flush_ids={sorted(self._seen_flush_ids)}"
+            )
+
+        self._last_activity = time.monotonic()
         duration_ms = int(len(pcm) / 2 / self._sample_rate * 1000) if self._sample_rate else 0
         return bytes(wav_header(len(pcm), self._sample_rate) + pcm), duration_ms
 
