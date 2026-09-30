@@ -16,6 +16,7 @@ import signal
 import socket
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -109,6 +110,13 @@ class BaseWorker(ABC):
     # How long an entry must sit unacknowledged before another consumer may take it
     # (XAUTOCLAIM), on top of the processing timeout. See `_reclaim_min_idle_ms`.
     reclaim_margin_seconds: float = 30
+    # Consumers silent this long with nothing pending are deleted from the group. An hour is
+    # two orders of magnitude above the longest gap a live consumer leaves between two reads
+    # (one processing timeout), so nothing alive is ever near it. See prune_idle_consumers.
+    consumer_prune_idle_ms: int = 60 * 60 * 1000
+    # Housekeeping (pruning, and reclaiming side groups) is not worth a Redis round trip on
+    # every idle poll; once per this many seconds per (stream, group) is plenty.
+    consumer_housekeeping_interval_seconds: float = 300
 
     def __init__(
         self,
@@ -771,6 +779,107 @@ class BaseWorker(ABC):
         timeout_ms = int(self.processing_timeout_seconds * 1000)
         return max(60_000, timeout_ms + int(self.reclaim_margin_seconds * 1000))
 
+    def _housekeeping_due(self, stream: str, group: str) -> bool:
+        """Rate-limit housekeeping per (stream, group). True at most once per interval."""
+        # getattr: several test suites build workers with __new__ and never run __init__.
+        last_run: dict[tuple[str, str], float] = getattr(self, "_housekeeping_last_run", None) or {}
+        self._housekeeping_last_run = last_run
+        now = time.monotonic()
+        previous = last_run.get((stream, group))
+        if previous is not None and now - previous < self.consumer_housekeeping_interval_seconds:
+            return False
+        last_run[(stream, group)] = now
+        return True
+
+    async def _prune_idle_consumers(self, stream: str, group: str) -> None:
+        """Delete this group's dead consumers (0 pending, silent for an hour). Best effort.
+
+        Every pod name is a new consumer, so without this a group collects one corpse per
+        rollout forever (production: 62 on stt-frame-workers, 59 on translate-workers). What
+        makes deleting them safe is spelled out on RedisStreamClient.prune_idle_consumers.
+        Called after the reclaim, so a dead consumer's entries have been moved to a live one
+        before it is looked at; one that still holds entries is skipped and retried next pass.
+        """
+        try:
+            deleted = await self.redis.prune_idle_consumers(
+                stream,
+                group,
+                keep=self._consumer_name,
+                min_idle_ms=self.consumer_prune_idle_ms,
+            )
+        except Exception:
+            self.logger.warning(
+                "stream_consumer_prune_failed", stream=stream, group=group, exc_info=True
+            )
+            return
+        if deleted:
+            self.logger.info(
+                "stream_consumers_pruned",
+                stream=stream,
+                group=group,
+                count=len(deleted),
+            )
+
+    async def _housekeep_side_group(
+        self,
+        stream: str,
+        group: str,
+        redeliver: Callable[[dict[bytes, bytes]], Awaitable[None]] | None = None,
+    ) -> None:
+        """Recover and prune a SECONDARY consumer group — one read with `redis.consume` directly.
+
+        The main input stream has `_recover_stale_messages`. The side loops (STT's frame reader,
+        TTS's clone, preview, delete and clone-sampling readers) had nothing: an entry left
+        pending by a pod killed mid-handler, or by a handler that raised, stayed on that consumer
+        until the stream itself expired. Rate-limited, and best effort — a housekeeping failure
+        must never stop the loop it runs in.
+
+        `redeliver=None` means the entries are worthless once stale (live audio frames): they are
+        acknowledged and dropped. Otherwise each is handed to `redeliver` ONCE and acknowledged
+        whatever happens; these handlers were never retried before, and one extra attempt is
+        recovery, not a new retry policy.
+        """
+        if not self._housekeeping_due(stream, group):
+            return
+        try:
+            entries = await self.redis.reclaim_stale(
+                stream,
+                group,
+                self._consumer_name,
+                min_idle_ms=self._reclaim_min_idle_ms(),
+            )
+        except Exception:
+            self.logger.warning(
+                "stream_side_group_reclaim_failed", stream=stream, group=group, exc_info=True
+            )
+            entries = []
+        for message_id, data in entries:
+            if redeliver is not None:
+                try:
+                    await redeliver(data)
+                except Exception:
+                    self.logger.exception(
+                        "stream_side_group_redelivery_failed",
+                        stream=stream,
+                        group=group,
+                        message_id=message_id,
+                    )
+            try:
+                await self.redis.redis.xack(stream, group, message_id)
+            except Exception:
+                self.logger.warning(
+                    "stream_side_group_ack_failed", stream=stream, group=group, exc_info=True
+                )
+        if entries:
+            self.logger.info(
+                "stream_side_group_recovered",
+                stream=stream,
+                group=group,
+                count=len(entries),
+                redelivered=redeliver is not None,
+            )
+        await self._prune_idle_consumers(stream, group)
+
     async def _recover_stale_messages(self) -> None:
         """Reprocess messages abandoned in the consumer group's pending list."""
         messages = await self.redis.reclaim_stale(
@@ -835,6 +944,10 @@ class BaseWorker(ABC):
                 self.consumer_group,
                 message_id,
             )
+        # After the reclaim, never before it: a dead consumer's entries have to be moved to a
+        # live one first, or it still holds them and is (correctly) skipped.
+        if self._housekeeping_due(self.input_stream, self.consumer_group):
+            await self._prune_idle_consumers(self.input_stream, self.consumer_group)
 
     def note_attempt_outcome(self, outcome: str) -> None:
         """Mark the message being processed as failed even though `process()` will return.

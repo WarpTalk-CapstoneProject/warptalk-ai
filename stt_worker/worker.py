@@ -290,6 +290,10 @@ class STTWorker(BaseWorker):
         """
         group = "stt-frame-workers"
         while not self._shutdown_event.is_set():
+            # A frame left pending (a pod killed mid-append, an append that raised) is worthless
+            # minutes later — its turn is long closed — so it is acknowledged and dropped, never
+            # replayed into a live session. Also prunes the group's dead consumers.
+            await self._housekeep_side_group(STT_FRAME_STREAM, group)
             try:
                 async for _msg_id, data in self.redis.consume(
                     stream=STT_FRAME_STREAM,
