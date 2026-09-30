@@ -188,6 +188,42 @@ _MENTION_TOOL_HINTS = {
     "member": "search_workspace_members",
 }
 
+# WT-887. @summary: / @minutes: / @transcript: attach one ARTIFACT of a meeting rather than the
+# meeting itself; the entity_id is the meeting's room id (the same id a room mention carries) and
+# the label is its title. The ticket asks for the artifact's content to be "loaded into the
+# answer context", and a soft "look it up with ..." left it to the model whether to read it at
+# all — so these are phrased as a required first step, keyed to the exact argument.
+#
+# DELIBERATE: the worker does not pre-fetch the content itself. The tool call is the path that
+# authorizes with the caller's own token (_authorize_meeting_access) and registers the WT-647
+# citation; reading ahead of the model would mean either a second copy of that path or calling
+# a handler outside the agent loop's bookkeeping, and a transcript does not fit in one read
+# anyway (get_transcript pages). Requiring the call keeps the access check and the citation
+# exactly what they are for any other read of the same meeting.
+#
+# Minutes (biên bản) have no read tool: the only minutes endpoint this package calls is the
+# share grant. The closest existing read is the summary plus the room detail, and the model is
+# told so rather than left to present a summary as the signed minutes.
+_ARTIFACT_MENTION_READS = {
+    "summary": (
+        "meeting summary",
+        "you MUST call get_meeting_summary with meeting_id={id} before answering, and answer "
+        "from what it returns",
+    ),
+    "transcript": (
+        "meeting transcript",
+        "you MUST call get_transcript with meeting_id={id} before answering (page with "
+        "before_sequence or range='beginning' when the question is about an earlier part), and "
+        "answer from what it returns",
+    ),
+    "minutes": (
+        "meeting minutes",
+        "you MUST call get_meeting_summary with meeting_id={id} (and get_room_detail with "
+        "room_id={id} for when and who) before answering. The minutes document itself cannot "
+        "be read from here, so say the answer comes from the meeting's summary, not the minutes",
+    ),
+}
+
 # A mention of the assistant itself is how the user summoned it, not a thing to look up.
 # MeetingChatService forwards the whole mention list, so "@WarpBot" arrives here on every
 # in-meeting turn; rendering it as a reference produced the instruction "look up agent
@@ -250,6 +286,14 @@ def _format_mentions(mentions_json: str) -> str | None:
             lines.append(
                 f'- plugin "{label}" (id={entity_id}) — the user explicitly selected this '
                 "plugin for this request; prefer its tools over any other way of answering."
+            )
+            continue
+        artifact_read = _ARTIFACT_MENTION_READS.get(entity_type)
+        if artifact_read is not None:
+            noun, instruction = artifact_read
+            lines.append(
+                f'- {noun} of "{label}" (meeting id={entity_id}) — '
+                f"{instruction.format(id=entity_id)}."
             )
             continue
         tool_hint = _MENTION_TOOL_HINTS.get(entity_type, "an appropriate tool")
