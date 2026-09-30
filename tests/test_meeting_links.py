@@ -146,6 +146,8 @@ class TestEnsureMeetingLinks:
 
 def test_helpers() -> None:
     assert room_url(" r-1 ") == "/rooms/r-1"
+    assert room_url(" r-1 ", slug="acme") == "/acme/rooms/r-1"
+    assert room_url(" r-1 ", slug="  ") == "/rooms/r-1"
     assert meet_code_from_url(f"{MEET_URL}?authuser=0") == "abc-defg-hij"
     assert meet_code_from_url("https://meet.google.com/landing") is None
 
