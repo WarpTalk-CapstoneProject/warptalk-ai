@@ -18,6 +18,9 @@ from typing import Any
 
 from shared.base_worker import TERMINAL_ROOM_STATUSES, BaseWorker
 from shared.config import STTSettings, resolve_openai_api_key
+from shared.disfluency import detect_question, prepass
+from shared.disfluency.normalize import resolve_language
+from shared.integration_status import OPENAI, IntegrationReport, credential_report
 from shared.prosody import (
     SpeakerBaseline,
     measure,
@@ -25,6 +28,7 @@ from shared.prosody import (
     to_delivery,
     update_baseline,
 )
+from shared.provider_calls import classify_exception, record_provider_call
 from shared.schemas import (
     STT_FRAME_STREAM,
     STT_UNKNOWN_CONFIDENCE,
@@ -111,6 +115,11 @@ _MAX_GLOSSARY_CHARS = 240
 # workspace and global terms can be told apart.
 _MAX_STT_KEYWORDS = 16
 
+# At most one `transcript_clean_failed` warning per this many seconds per worker. A prepass rule
+# that throws on one sentence tends to throw on every sentence of the meeting; the count of the
+# ones swallowed in between travels on the next warning, so nothing is hidden, only folded.
+_CLEAN_ERROR_LOG_INTERVAL_S = 60.0
+
 # Long enough to outlive any real meeting, short enough that a finished room's anchor expires on
 # its own. Matches the horizon the other per-room keys use.
 _TRANSCRIPT_ANCHOR_TTL_S = 6 * 60 * 60
@@ -136,6 +145,17 @@ def _chunk_audio_duration_ms(chunk: AudioChunkMessage) -> int:
     sample_rate = max(chunk.sample_rate, 1)
     samples = len(chunk.audio_data) // 2
     return int(samples * 1000 / sample_rate)
+
+
+# `stt:chunk:published:{audio:chunks entry id}` — see STTWorker._chunk_already_published. As
+# long as a chunk can still be redelivered: five deliveries, each after the reclaim threshold,
+# and a consumer-group replay of the retained stream.
+_CHUNK_PUBLISHED_KEY_PREFIX = "stt:chunk:published:"
+_CHUNK_PUBLISHED_TTL_SECONDS = 2 * 60 * 60
+
+
+def _chunk_published_key(message_id: bytes) -> str:
+    return _CHUNK_PUBLISHED_KEY_PREFIX + message_id.decode("utf-8", errors="replace")
 
 
 def _build_segment_id(
@@ -201,7 +221,21 @@ class STTWorker(BaseWorker):
         # See _elapsed_ms: this replaced a per-TRACK chunk counter that reset on every
         # ingress reconnect and sent the transcript clock back to zero mid-meeting.
         self._transcript_anchors: dict[str, int] = {}
+        # meeting_id -> (speaker_id, was-a-question) of the last FINAL line published for that
+        # meeting. The clean-transcript prepass needs it: "Ờ." after somebody else asked
+        # "Anh gửi báo cáo chưa?" is an answer and must survive, while the same "ờ" opening a
+        # speaker's own ramble is a hesitation. See _with_clean_text.
+        self._last_final_turn: dict[str, tuple[str, bool]] = {}
+        # Monotonic time of the last prepass failure that was logged — see _with_clean_text.
+        self._clean_error_logged_at = 0.0
+        self._clean_errors_suppressed = 0
         self._prewarm_listener_task: asyncio.Task[None] | None = None
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        s = self.stt_settings
+        return {
+            OPENAI: credential_report(resolve_openai_api_key(s.api_key), f"stt model {s.model}")
+        }
 
     async def load_model(self) -> None:
         self.model = OpenAISTT(
@@ -223,6 +257,15 @@ class STTWorker(BaseWorker):
         # with flash mode off simply publishes nothing and this loop blocks on an empty stream,
         # which costs one idle XREAD.
         self._frame_consumer_task = asyncio.create_task(self._consume_speech_frames())
+        # The Japanese tagger (fugashi + a ~50 MB dictionary) is built on first Japanese use.
+        # Built here, off the event loop, so the first Japanese sentence of the process does not
+        # pay for it inside a live meeting's publish path. Best-effort: a failure here only means
+        # the first real call pays instead, and _with_clean_text already survives anything.
+        if self._clean_enabled():
+            try:
+                await asyncio.to_thread(prepass, "えーと、はい", "ja")
+            except Exception as exc:
+                self.logger.warning("transcript_clean_warmup_failed", error=str(exc))
 
     async def _consume_speech_frames(self) -> None:
         """Append live speech to each speaker's open session WHILE they are still talking.
@@ -247,6 +290,10 @@ class STTWorker(BaseWorker):
         """
         group = "stt-frame-workers"
         while not self._shutdown_event.is_set():
+            # A frame left pending (a pod killed mid-append, an append that raised) is worthless
+            # minutes later — its turn is long closed — so it is acknowledged and dropped, never
+            # replayed into a live session. Also prunes the group's dead consumers.
+            await self._housekeep_side_group(STT_FRAME_STREAM, group)
             try:
                 async for _msg_id, data in self.redis.consume(
                     stream=STT_FRAME_STREAM,
@@ -584,6 +631,7 @@ class STTWorker(BaseWorker):
         self._stt_prompts.pop(room_id, None)
         getattr(self, "_stt_keywords", {}).pop(room_id, None)
         getattr(self, "_transcript_anchors", {}).pop(room_id, None)
+        getattr(self, "_last_final_turn", {}).pop(room_id, None)
         getattr(self, "_recent_transcripts", {}).pop(room_id, None)
         self._room_languages.pop(room_id, None)
         getattr(self, "_room_noise_reduction", {}).pop(room_id, None)
@@ -618,6 +666,133 @@ class STTWorker(BaseWorker):
         if self.model is not None:
             await self.model.close()
 
+    def _clean_enabled(self) -> bool:
+        # getattr: the test suites build workers with __new__, so `settings` may not exist.
+        settings = getattr(self, "settings", None)
+        return bool(getattr(settings, "transcript_clean_enabled", True))
+
+    def _with_clean_text(self, result: STTResultMessage) -> STTResultMessage:
+        """`result` with the WT-716 clean-transcript fields filled in, or `result` unchanged.
+
+        THE ONE PLACE THE LIVE PATH CLEANS. Every line that reaches `stt:results` goes through
+        _publish_stt_result, and that is the only caller — so the early per-sentence flush and
+        the end-of-turn segment are cleaned by the same code, after `_filter_segments` has
+        already had its say (hallucination, echo and repetition filters are untouched and still
+        judge the raw text, exactly as before).
+
+        `text` is never changed. The raw line stays the record billing, retranscribe and
+        corrections work from; the clean one travels beside it and consumers pick it up via
+        `display_text`.
+
+        NEVER COSTS A SEGMENT. The prepass deletes words by rule, and a rule that throws on
+        some input nobody anticipated must not take the sentence down with it: any exception
+        leaves the message exactly as it was (no clean fields, i.e. pre-WT-716 behaviour) and
+        is logged — once a minute at most, because a rule that fails on one sentence usually
+        fails on every sentence of the meeting, and a warning per line would bury the log.
+
+        Not set at all when the kill switch is off, for a line with no text (the end-of-turn
+        marker), or for a language the prepass does not handle — `clean_text=None` means "no
+        clean version was computed", which is the truth in all three cases.
+        """
+        if not result.text.strip() or not self._clean_enabled():
+            return result
+        try:
+            last_turns: dict[str, tuple[str, bool]] = self.__dict__.setdefault(
+                "_last_final_turn", {}
+            )
+            previous = last_turns.get(result.meeting_id)
+            prev_turn_is_question = (
+                previous is not None and previous[0] != result.speaker_id and previous[1]
+            )
+            is_question = result.text.rstrip().endswith(("?", "？")) or detect_question(
+                result.text, result.language
+            )
+            # Recorded BEFORE deciding whether this language is cleanable: a Korean question
+            # is still a question the next speaker may be answering.
+            last_turns[result.meeting_id] = (result.speaker_id, is_question)
+
+            if resolve_language(result.language, result.text) is None:
+                return result
+            cleaned = prepass(
+                result.text,
+                result.language,
+                prev_turn_is_question=prev_turn_is_question,
+            )
+            return result.model_copy(
+                update={
+                    "clean_text": cleaned.clean_text,
+                    "clean_flags": tuple(sorted(cleaned.flags)),
+                }
+            )
+        except Exception as exc:
+            now = time.monotonic()
+            last_logged = getattr(self, "_clean_error_logged_at", 0.0)
+            if not last_logged or now - last_logged >= _CLEAN_ERROR_LOG_INTERVAL_S:
+                self.logger.warning(
+                    "transcript_clean_failed",
+                    meeting_id=result.meeting_id,
+                    segment_id=result.segment_id,
+                    language=result.language,
+                    error=repr(exc),
+                    suppressed_since_last=getattr(self, "_clean_errors_suppressed", 0),
+                )
+                self._clean_error_logged_at = now
+                self._clean_errors_suppressed = 0
+            else:
+                self._clean_errors_suppressed = getattr(self, "_clean_errors_suppressed", 0) + 1
+            return result
+
+    async def _publish_stt_result(
+        self, result: STTResultMessage, source_message_id: bytes | None = None
+    ) -> STTResultMessage:
+        """Publish one line to `stt:results`, cleaned first. Returns what was published.
+
+        `source_message_id` is the `audio:chunks` entry the line was transcribed from. It is
+        marked BEFORE the line goes out, so a later delivery of the same entry knows that this
+        chunk has already reached the transcript (see `_chunk_already_published`).
+        """
+        result = self._with_clean_text(result)
+        if source_message_id is not None:
+            await self._mark_chunk_published(source_message_id)
+        await self.publish("stt:results", result.meeting_id, result.to_redis())
+        return result
+
+    async def _mark_chunk_published(self, message_id: bytes) -> None:
+        """Record that `message_id` has put at least one line on `stt:results`. Best effort."""
+        try:
+            await self.redis.set_with_ttl(
+                _chunk_published_key(message_id), "1", _CHUNK_PUBLISHED_TTL_SECONDS
+            )
+        except Exception:
+            self.logger.warning("stt_chunk_mark_failed", exc_info=True)
+
+    async def _chunk_already_published(self, message_id: bytes) -> bool:
+        """Whether an earlier delivery of this `audio:chunks` entry already published from it.
+
+        AT MOST ONCE PER CHUNK, BECAUSE A SECOND TRANSCRIPTION IS A SECOND SEGMENT.
+        A segment id is derived from the chunk's entry id AND the recognised text
+        (`_build_segment_id`), and recognition is not deterministic: the same audio transcribed
+        twice comes back with different punctuation, a different sentence split, a different
+        early/final boundary. So a chunk delivered twice — its first attempt published and then
+        died before XACK, or raised after its early sentences were already out — produced a
+        second set of segments with NEW ids, which nothing downstream could recognise as a
+        repeat: shown twice in the transcript, dubbed twice, and billed twice, because every
+        billing key is built from the segment id.
+
+        So the first line published from a chunk marks it, and any later delivery of a marked
+        chunk is acknowledged without transcribing. What that trades is deliberate: a first
+        attempt that died part-way loses its remainder rather than repeating its beginning, and
+        the remainder is minutes stale by the time a reclaim could deliver it. An attempt that
+        failed BEFORE publishing anything left no mark and is retried in full, as before.
+
+        Fails open on a Redis error — the publish that follows needs the same Redis.
+        """
+        try:
+            marker = await self.redis.get(_chunk_published_key(message_id))
+        except Exception:
+            return False
+        return marker in (b"1", "1")
+
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Process one audio chunk: transcribe and publish results."""
         chunk = AudioChunkMessage.from_redis(data)
@@ -632,6 +807,16 @@ class STTWorker(BaseWorker):
 
         if chunk.meeting_id in self._paused_rooms:
             self.logger.debug("skipping_paused_room", meeting_id=chunk.meeting_id)
+            return
+
+        if await self._chunk_already_published(message_id):
+            self.logger.warning(
+                "stt_chunk_already_transcribed",
+                meeting_id=chunk.meeting_id,
+                speaker_id=chunk.speaker_id,
+                chunk_index=chunk.chunk_index,
+                message_id=message_id,
+            )
             return
 
         current_timestamp_ms = int(time.time() * 1000)
@@ -668,6 +853,7 @@ class STTWorker(BaseWorker):
             prosody_task = asyncio.create_task(self._measure_prosody(chunk))
 
         t0 = time.monotonic()
+        vendor_outcome = "ok"
         try:
             model = self._require_model()
 
@@ -762,7 +948,7 @@ class STTWorker(BaseWorker):
                     timestamp_ms=chunk.timestamp_ms,
                     prosody=None,
                 )
-                await self.publish("stt:results", chunk.meeting_id, result.to_redis())
+                result = await self._publish_stt_result(result, message_id)
                 self.logger.info(
                     "stt_early_sentence",
                     meeting_id=chunk.meeting_id,
@@ -868,6 +1054,10 @@ class STTWorker(BaseWorker):
                 speech_ms=chunk.speech_ms,
             )
         except Exception as exc:
+            # Swallowed so the meeting keeps going, which is exactly why it must be counted:
+            # this attempt produced no transcript. See BaseWorker.note_attempt_outcome.
+            self.note_attempt_outcome("vendor_error")
+            vendor_outcome = classify_exception(exc)
             await self.redis.publish_system_event(
                 room_id=chunk.meeting_id,
                 event_type="stt_unavailable",
@@ -887,6 +1077,11 @@ class STTWorker(BaseWorker):
             )
             segments = []
         inference_ms = int((time.monotonic() - t0) * 1000)
+        # The realtime websocket has no HTTP request for the observed client to see, so the call
+        # is counted here, once per chunk sent to OpenAI (shared/provider_calls).
+        await record_provider_call(
+            "openai", "stt-realtime", vendor_outcome, inference_ms, self.stt_settings.model
+        )
 
         # Awaited even when recognition failed, so the task is never left orphaned — and its
         # baseline update is still worth keeping: the speaker did speak, whatever the model
@@ -931,7 +1126,7 @@ class STTWorker(BaseWorker):
                 prosody=prosody,
             )
 
-            await self.publish("stt:results", chunk.meeting_id, result.to_redis())
+            result = await self._publish_stt_result(result, message_id)
 
             self.logger.info(
                 "segment_transcribed",
@@ -976,7 +1171,7 @@ class STTWorker(BaseWorker):
                 is_final_chunk=True,
                 timestamp_ms=chunk.timestamp_ms,
             )
-            await self.publish("stt:results", chunk.meeting_id, result.to_redis())
+            await self._publish_stt_result(result, message_id)
 
     async def _measure_prosody(self, chunk: AudioChunkMessage) -> ProsodyEnvelope | None:
         """How this chunk was said, relative to how this speaker normally says things.

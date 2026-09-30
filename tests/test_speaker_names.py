@@ -108,9 +108,11 @@ class TestTheSummariserActuallyUsesIt:
                 ("speaker-nobody-knows", "agreed", 2000),
             ]
         }
-        # Bypassing __init__ means bypassing every field it sets. WT-605 added these two.
+        # Bypassing __init__ means bypassing every field it sets. WT-605 added the first two,
+        # WT-716 the third.
         worker._pause_gaps = {}
         worker._gap_open = set()
+        worker._filler_only_ms = {}
 
         async def _get(key: str):
             return None

@@ -30,7 +30,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from shared.languages import language_name, normalize_language_code
+from shared.languages import known_language_code, language_name
 
 
 @dataclass(frozen=True)
@@ -355,7 +355,10 @@ def _language_rule(language: str | None) -> str:
     language. That produces a document in two languages with no stated original, which is
     worse than one in the wrong language: the reader cannot tell which half to trust.
     """
-    code = normalize_language_code(language)
+    # WT-703: only a code the map can name reaches the prompt. An unrecognised value is read
+    # as no choice rather than echoed, because the name below is spliced into the system
+    # prompt and `language_name` returns whatever it was given when it does not know it.
+    code = known_language_code(language)
     if not code:
         # Nobody chose. The behaviour every summary written before this argument existed was
         # produced under, and still the right answer for a room that never expressed one.

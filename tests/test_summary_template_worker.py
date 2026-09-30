@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from ai_assistant_worker.summary_template_worker import SummaryTemplateWorker
+from shared.config import WorkerSettings
 from shared.schemas import SummaryRequestMessage, SummaryResultMessage
 
 ROOM = "019f6a39-a32c-7745-886e-1fe622c1f747"
@@ -39,6 +40,29 @@ def _published(worker: SummaryTemplateWorker) -> SummaryResultMessage:
     args = worker.publish.await_args.args  # type: ignore[attr-defined]
     assert args[0] == "assistant:summary_results"
     return SummaryResultMessage.from_redis(args[2])
+
+
+def test_a_worker_built_the_way_main_builds_it_has_somewhere_to_read_from(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WT-684. __main__ passes no transcript URL. Every other test in this file does, which is
+    # how an empty base_url — and "Could not read the transcript." on every template switch —
+    # reached production unseen.
+    monkeypatch.setenv("ASSISTANT_CHAT_TRANSCRIPT_SERVICE_URL", "http://transcript-service:5103")
+
+    worker = SummaryTemplateWorker(settings=WorkerSettings())
+
+    assert worker.transcript_base_url == "http://transcript-service:5103"
+
+
+def test_a_worker_with_no_configuration_still_has_an_absolute_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ASSISTANT_CHAT_TRANSCRIPT_SERVICE_URL", raising=False)
+
+    worker = SummaryTemplateWorker(settings=WorkerSettings())
+
+    assert worker.transcript_base_url.startswith("http")
 
 
 @pytest.mark.asyncio

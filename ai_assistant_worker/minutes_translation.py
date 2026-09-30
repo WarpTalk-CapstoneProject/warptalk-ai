@@ -40,6 +40,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from shared.languages import normalize_language_code
+
 #: The fields of an item that hold words a person reads. `owner` is deliberately absent; so are
 #: `atMs` and `alsoAtMs`, which are moments and not language.
 TRANSLATABLE_FIELDS = ("text", "task")
@@ -85,6 +87,41 @@ def collect_translatable(summary: dict[str, Any]) -> dict[str, Any]:
             payload[key] = strings
 
     return payload
+
+
+def answer_for_language(
+    answered: Any,
+    language: str,
+    wanted: list[str],
+    payload: dict[str, Any],
+) -> Any:
+    """What the model returned for `language`, found in the shapes it actually answers in.
+
+    The prompt asks for `{"<code>": {...payload keys...}}`. Asked for ONE language, the model
+    routinely answers with the payload itself — `{"summary": ..., "openQuestions": [...]}` — and
+    no language key at all. Reading only `answered[code]` turned every such answer into "no
+    translation", so a summary switch into Vietnamese failed on every retry while the model had
+    translated it correctly each time (WT-858; reproduced against production's model, 2/2).
+
+    An unwrapped answer is accepted only when one language was asked for, so it cannot be the
+    wrong language's half, and only when it carries a key of the payload that was sent. A regional
+    key ("vi-VN", "VI") is the same language. Everything else is still `merge_translation`'s to
+    judge — alignment is checked there exactly as before.
+    """
+    if not isinstance(answered, dict):
+        return None
+
+    if language in answered:
+        return answered[language]
+
+    for key, value in answered.items():
+        if isinstance(key, str) and normalize_language_code(key) == language:
+            return value
+
+    if len(wanted) == 1 and wanted[0] == language and any(key in answered for key in payload):
+        return answered
+
+    return None
 
 
 def merge_translation(
@@ -147,9 +184,12 @@ def _readable(item: Any) -> str:
 def _with_text(source_item: Any, replacement: Any) -> Any:
     """`source_item` with its readable string swapped, and everything else untouched."""
     if not isinstance(replacement, str) or not replacement.strip():
-        # Nothing usable came back for this one. The source string is more useful to a reader
-        # than a blank line, and leaves the two halves the same length.
-        return source_item
+        # Nothing usable came back for this one, so it is left BLANK rather than filled with the
+        # source words. Copying the source in printed a Vietnamese sentence under a [ja] tag — a
+        # line claiming to be Japanese that was never translated (WT-685). The list keeps its
+        # length, and a blank line is dropped when the minutes are drawn up, so the reader sees
+        # the section as untranslated instead of mislabelled.
+        return _blank(source_item)
 
     if isinstance(source_item, str):
         return replacement
@@ -164,3 +204,72 @@ def _with_text(source_item: Any, replacement: Any) -> Any:
         return translated_item
 
     return source_item
+
+
+def _blank(source_item: Any) -> Any:
+    """`source_item` with its readable string emptied — an untranslated slot, not a copy."""
+    if isinstance(source_item, str):
+        return ""
+
+    if isinstance(source_item, dict):
+        blank_item = dict(source_item)
+        for field in TRANSLATABLE_FIELDS:
+            if isinstance(source_item.get(field), str):
+                blank_item[field] = ""
+                return blank_item
+        return blank_item
+
+    return source_item
+
+
+def render_in_language(
+    source: dict[str, Any],
+    translated: Any,
+    language: str,
+) -> dict[str, Any] | None:
+    """`source` — a whole published summary — with its words replaced by `translated`'s.
+
+    `translated` is one language's half as `merge_translation` builds it (and as a summary's own
+    `translations[<code>]` stores it): the overview string and the section lists, items still
+    carrying the source's moments and owners. Everything else — `templateKey`, `citations`, the
+    moments — is the source's, because a translation is the same summary and makes no new claims.
+
+    COMPLETE OR NOTHING. A reader who switched the summary into Vietnamese must not be shown a
+    document whose second section is still in English, or whose items are blank because the model
+    skipped them: that reads as a Vietnamese summary with holes in it, and nothing on the page
+    says which parts were never translated. So every section the source has words in must come
+    back with the same number of items, every item with words — otherwise None, and the caller
+    reports a failure the reader can see and retry.
+    """
+    if not isinstance(translated, dict):
+        return None
+
+    rendered: dict[str, Any] = {
+        key: value for key, value in source.items() if key != "translations"
+    }
+
+    overview = source.get("summary")
+    if isinstance(overview, str) and overview.strip():
+        replacement = translated.get("summary")
+        if not isinstance(replacement, str) or not replacement.strip():
+            return None
+        rendered["summary"] = replacement
+
+    for key, value in source.items():
+        if key in NON_SECTION_KEYS or not isinstance(value, list):
+            continue
+        if not any(_readable(item).strip() for item in value):
+            # Nothing to translate in this section; it stays exactly as it is (usually empty).
+            continue
+
+        replacement_items = translated.get(key)
+        if not isinstance(replacement_items, list) or len(replacement_items) != len(value):
+            return None
+        for source_item, replacement_item in zip(value, replacement_items):
+            if _readable(source_item).strip() and not _readable(replacement_item).strip():
+                return None
+        rendered[key] = replacement_items
+
+    rendered["summaryLanguage"] = language
+    rendered["insufficientData"] = False
+    return rendered

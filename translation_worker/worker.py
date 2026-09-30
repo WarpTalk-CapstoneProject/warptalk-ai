@@ -11,6 +11,7 @@ Passthrough: if source_lang == target_lang, forward without translation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import time
@@ -20,7 +21,9 @@ from typing import Any, cast
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
 from shared.control_markers import is_control_marker, is_system_speaker
+from shared.integration_status import OPENAI, IntegrationReport, credential_report
 from shared.lang import is_same_language
+from shared.languages import known_language_code
 from shared.schemas import (
     ProsodyEnvelope,
     STTResultMessage,
@@ -117,6 +120,13 @@ def _select_relevance_context(text: str, meeting_context: list[str] | None) -> l
     return meeting_context
 
 
+# One key per published chunk: `translate:published:{segment_id}`. Long enough to cover every
+# retry a message can get (five deliveries, each after the reclaim threshold) and a consumer-group
+# replay of the retained stream; short enough that the keys never add up to anything.
+_PUBLISHED_KEY_PREFIX = "translate:published:"
+_PUBLISHED_TTL_SECONDS = 2 * 60 * 60
+
+
 class TranslationWorker(BaseWorker):
     """Translation worker using OpenAI gpt-4.1-mini."""
 
@@ -160,6 +170,17 @@ class TranslationWorker(BaseWorker):
         ] = {}
         self._speculative_semaphore = asyncio.Semaphore(1)
         self._speculative_listener_task: asyncio.Task[None] | None = None
+        # (meeting_id, raw value) pairs already warned about by _get_target_languages.
+        self._warned_unknown_targets: set[tuple[str, str]] = set()
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        s = self.translation_settings
+        return {
+            OPENAI: credential_report(
+                resolve_openai_api_key(s.api_key),
+                f"translation model {s.model}, realtime model {s.realtime_model}",
+            )
+        }
 
     async def load_model(self) -> None:
         """Initialize OpenAI translation client."""
@@ -439,6 +460,17 @@ class TranslationWorker(BaseWorker):
             )
             return
 
+        # WT-699 / TC3705: the workspace cannot pay for this. billing_worker sets the flag when
+        # settle_usage_charge refuses a charge for this room and keeps it set only while the
+        # subscription stays suspended, so this is the stage that stops spending — before the
+        # paid LLM call and before tts_worker renders a dub nobody will be billed for.
+        if await self._credits_suspended(stt_result.meeting_id):
+            self.logger.info(
+                "translation_skipped_credits_exhausted",
+                meeting_id=stt_result.meeting_id,
+            )
+            return
+
         current_timestamp_ms = int(time.time() * 1000)
         e2e_latency_ms = current_timestamp_ms - stt_result.timestamp_ms
         await self.redis.publish_telemetry(stt_result.meeting_id, self.worker_name, e2e_latency_ms)
@@ -455,8 +487,38 @@ class TranslationWorker(BaseWorker):
         # always retains it even after several accepted utterances have accumulated.
         meeting_context = recent_context[-3:] + static_context
 
+        # WHAT GETS TRANSLATED IS THE CLEAN LINE, NOT THE RAW ONE (WT-716).
+        #
+        # `display_text` is `clean_text` when the STT worker's deterministic prepass produced
+        # one and the raw `text` otherwise, so a deployment with TRANSCRIPT_CLEAN_ENABLED off —
+        # or a message from a replica that predates the field — translates exactly what it
+        # always did. Nothing here reads the flag: the presence of the field is the contract.
+        #
+        # WHY THE CLEAN SIDE IS THE RIGHT INPUT. "um so we uh we need to finalize the budget"
+        # spends tokens on the fillers, invites the model to render them as words in the target
+        # language ("ええと、そのー"), and then hands tts_worker a sentence to SPEAK with the
+        # hesitations of a different language's speaker baked in. The raw line is still the
+        # record — it travels untouched on `stt:results` and is what corrections and billing
+        # work from — but it is not what a listener should hear.
+        mt_source = stt_result.display_text
+
+        # Filler-only ("Ummm", "えーと"): the prepass says there is no sentence here at all.
+        # Debug, not info, because on a live meeting this fires often and means nothing went
+        # wrong. Note what is NOT skipped: a filler-only segment that also closes the turn still
+        # falls into the `not sentences` branch below and publishes the empty final-chunk
+        # marker, because that marker is the turn boundary every downstream consumer waits for
+        # and losing it would strand the turn, not tidy it.
+        if stt_result.clean_text == "":
+            self.logger.debug(
+                "filler_only_segment_not_translated",
+                meeting_id=stt_result.meeting_id,
+                speaker_id=stt_result.speaker_id,
+                segment_id=stt_result.segment_id,
+                original=stt_result.text[:60],
+            )
+
         # Split long STT results into smaller sentences (streaming mechanism)
-        sentences = split_into_sentences(stt_result.text)
+        sentences = split_into_sentences(mt_source)
 
         if not sentences:
             if stt_result.is_final_chunk:
@@ -479,9 +541,7 @@ class TranslationWorker(BaseWorker):
                         is_early=stt_result.is_early,
                         prosody=stt_result.prosody,
                     )
-                    await self.publish(
-                        "translate:results", stt_result.meeting_id, result.to_redis()
-                    )
+                    await self._publish_once(stt_result.meeting_id, result)
             return
 
         publish_results = await asyncio.gather(
@@ -497,7 +557,61 @@ class TranslationWorker(BaseWorker):
             )
         )
         if any(publish_results) and stt_result.confidence >= self._CONTEXT_MIN_CONFIDENCE:
-            self._remember_source_context(stt_result.meeting_id, stt_result.text)
+            # The clean line, for the same reason it is what was translated: this context is fed
+            # back to the model as "what has been said in this meeting", and a history of
+            # "um, so, uh" teaches it nothing except to expect more of them.
+            self._remember_source_context(stt_result.meeting_id, mt_source)
+
+    async def _publish_once(self, meeting_id: str, result: TranslationResultMessage) -> bool:
+        """Publish one translated chunk unless this exact chunk has already gone out.
+
+        WHY A REDELIVERED MESSAGE WOULD OTHERWISE BE SPOKEN TWICE. `process` publishes chunk by
+        chunk, as each translation lands. If chunk 1's model call then fails, the message stays
+        pending and is retried from the top, and chunk 0 — already captioned and already dubbed
+        — is published again: a second caption and a second dub of the same sentence. The same
+        happens when the consumer group is recreated at `0` (`ensure_consumer_group`) and every
+        retained `stt:results` entry is replayed, and when a pod dies between publishing and
+        acknowledging.
+
+        `segment_id` is `{stt segment}-{lang}-c{idx}`, fully determined by the STT segment and
+        the sentence split, so it names the same chunk on every attempt. The claim is taken
+        BEFORE the publish and given back if the publish fails, so a failed publish is retried
+        rather than lost. Fails open on a Redis error: the publish needs the same Redis, and a
+        duplicate is a better failure than a missing sentence.
+        """
+        key = f"{_PUBLISHED_KEY_PREFIX}{result.segment_id}"
+        try:
+            fresh = await self.redis.set_if_absent(key, "1", _PUBLISHED_TTL_SECONDS)
+        except Exception:
+            fresh = True
+        if not fresh:
+            self.logger.info(
+                "translation_chunk_already_published",
+                meeting_id=meeting_id,
+                segment_id=result.segment_id,
+            )
+            return False
+        try:
+            await self.publish("translate:results", meeting_id, result.to_redis())
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self.redis.delete(key)
+            raise
+        return True
+
+    async def _credits_suspended(self, room_id: str) -> bool:
+        """Whether billing_worker has stopped this room for a refused charge (WT-699 / TC3705).
+
+        Fails OPEN on a Redis error: the charge itself is still refused by the settlement
+        function, so a blip here costs a few unbilled sentences, never a paying room its meeting.
+        """
+        try:
+            raw = await self.redis.get(f"translationRoom:{room_id}:ai_service_suspended")
+        except Exception:
+            return False
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return raw == "true"
 
     async def _translate_and_publish(
         self,
@@ -722,7 +836,8 @@ class TranslationWorker(BaseWorker):
             )
 
             # Publish IMMEDIATELY so TTS can synthesize while next chunk is translated
-            await self.publish("translate:results", stt_result.meeting_id, result.to_redis())
+            if not await self._publish_once(stt_result.meeting_id, result):
+                continue
             published_any = True
 
             self.logger.info(
@@ -775,8 +890,19 @@ class TranslationWorker(BaseWorker):
             if user_id == speaker_id:
                 continue
             lang = raw_lang.decode() if isinstance(raw_lang, bytes) else raw_lang
-            if lang:
-                targets.add(lang)
+            if not lang:
+                continue
+            # WT-704. The hash is written by TranslationRoomHub from the client's own
+            # SignalR arguments, only lowercased and cut at '-', and when the workspace has
+            # no language whitelist nothing else filters it. translator._lang_name falls
+            # back to its input for an unknown code, so whatever a participant sent here
+            # went into the translation prompt verbatim — and was paid for once per
+            # utterance. A value this worker cannot name is not a translation target.
+            known = known_language_code(lang)
+            if not known:
+                self._warn_unknown_target_once(meeting_id, lang)
+                continue
+            targets.add(known)
 
         # No other participant registered yet — avoid assuming Vietnamese for all users.
         targets = targets or {"en"}
@@ -813,6 +939,33 @@ class TranslationWorker(BaseWorker):
                 targets -= echoes
 
         return targets
+
+    # Bounds _warned_unknown_targets: a worker lives for many meetings, and the values being
+    # remembered are attacker-chosen, so the set must not grow without limit.
+    _MAX_WARNED_UNKNOWN_TARGETS = 1024
+
+    def _warn_unknown_target_once(self, meeting_id: str, raw_lang: str) -> None:
+        """Log a dropped listen-language once per (room, value), not once per utterance.
+
+        _get_target_languages runs for every STT result and every speculative prefetch, so
+        an unconditional warning would repeat for as long as the listener stays in the room.
+        """
+        warned: set[tuple[str, str]] | None = getattr(self, "_warned_unknown_targets", None)
+        if warned is None:
+            warned = set()
+            self._warned_unknown_targets = warned
+        key = (meeting_id, raw_lang)
+        if key in warned:
+            return
+        if len(warned) >= self._MAX_WARNED_UNKNOWN_TARGETS:
+            warned.clear()
+        warned.add(key)
+        self.logger.warning(
+            "unknown_target_language_dropped",
+            meeting_id=meeting_id,
+            # Truncated and repr'd: the value is untrusted client input.
+            target_lang=repr(raw_lang[:64]),
+        )
 
     async def _get_mt_glossary(self, meeting_id: str) -> list[dict[str, str]]:
         """This meeting's workspace glossary, as [{"source": ..., "target": ...}, ...] —

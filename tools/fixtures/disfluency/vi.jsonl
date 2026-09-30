@@ -1,0 +1,20 @@
+{"id": "V1", "language": "vi", "raw": "ờ thì cái dự án này ừm tuần sau mới xong", "expected_clean": "Thì cái dự án này tuần sau mới xong.", "kind": "filler"}
+{"id": "V2", "language": "vi", "raw": "Ờ.", "expected_clean": "Ờ.", "kind": "trap", "prev_turn_is_question": true, "standalone_turn": true}
+{"id": "V3", "language": "vi", "raw": "Dạ vâng, em gửi rồi ạ", "expected_clean": "Dạ vâng, em gửi rồi ạ.", "kind": "clean_control"}
+{"id": "V4", "language": "vi", "raw": "mai anh đi Hà Nội à", "expected_clean": "Mai anh đi Hà Nội à?", "kind": "clean_control"}
+{"id": "V5", "language": "vi", "raw": "Chị à, mai họp nhé", "expected_clean": "Chị à, mai họp nhé.", "kind": "trap"}
+{"id": "V6", "language": "vi", "raw": "tôi tôi nghĩ là là mình nên từ từ làm", "expected_clean": "Tôi nghĩ là mình nên từ từ làm.", "kind": "stutter"}
+{"id": "V7", "language": "vi", "raw": "con diều bay là là trên ruộng", "expected_clean": "Con diều bay là là trên ruộng.", "kind": "trap"}
+{"id": "V8", "language": "vi", "raw": "Đi đi, muộn rồi", "expected_clean": "Đi đi, muộn rồi.", "kind": "trap"}
+{"id": "V9", "language": "vi", "raw": "ai ai cũng đồng ý", "expected_clean": "Ai ai cũng đồng ý.", "kind": "trap"}
+{"id": "V10", "language": "vi", "raw": "họp thứ hai, à không, thứ ba", "expected_clean": "Họp thứ hai, à không, thứ ba.", "kind": "self_repair"}
+{"id": "V11", "language": "vi", "raw": "nhà mình có nuôi ba ba", "expected_clean": "Nhà mình có nuôi ba ba.", "kind": "trap"}
+{"id": "V12", "language": "vi", "raw": "ừmmm ờ để em xem", "expected_clean": "Để em xem.", "kind": "filler"}
+{"id": "V13", "language": "vi", "raw": "kiểu dáng cái áo này đẹp", "expected_clean": "Kiểu dáng cái áo này đẹp.", "kind": "trap"}
+{"id": "V14", "language": "vi", "raw": "Anh gửi báo cáo chưa", "expected_clean": "Anh gửi báo cáo chưa?", "kind": "clean_control"}
+{"id": "V15", "language": "vi", "raw": "Em không đi", "expected_clean": "Em không đi.", "kind": "clean_control"}
+{"id": "V16", "language": "vi", "raw": "Cái này bao nhiêu tiền", "expected_clean": "Cái này bao nhiêu tiền?", "kind": "clean_control"}
+{"id": "V17", "language": "vi", "raw": "thì ờ mình chốt phương án một nhé", "expected_clean": "Thì mình chốt phương án một nhé.", "kind": "filler"}
+{"id": "V18", "language": "vi", "raw": "ừm bên mình không giảm 5 phần trăm", "expected_clean": "Bên mình không giảm 5 phần trăm.", "kind": "filler"}
+{"id": "V19", "language": "vi", "raw": "vâng vâng em hiểu rồi", "expected_clean": "Vâng vâng em hiểu rồi.", "kind": "trap"}
+{"id": "V20", "language": "vi", "raw": "nó xa xa thôi", "expected_clean": "Nó xa xa thôi.", "kind": "trap"}

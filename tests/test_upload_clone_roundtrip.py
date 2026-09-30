@@ -26,6 +26,7 @@ from tts_worker.worker import (
     _CLONE_RESULT_TTL_SECONDS,
     _CLONE_SAMPLE_PREFIX,
     TTSWorker,
+    _clone_failure,
 )
 
 PROFILE = "019fff06-2b98-7e1d-a923-1f53d10b455a"
@@ -166,3 +167,103 @@ async def test_the_recording_is_deleted_even_when_cloning_failed() -> None:
     await worker._handle_upload_clone_request(_request())
 
     worker.redis.delete.assert_awaited_once_with(f"{_CLONE_SAMPLE_PREFIX}{PROFILE}")
+
+
+# ── the answer says WHY, in a form AuthService can store (2026-09-18) ────────────────────────
+
+
+class APIStatusError(Exception):  # noqa: N818 — named as the Cartesia SDK names it
+    """Stand-in for cartesia.APIStatusError: CI does not install the `tts` extra.
+
+    402 has no SDK subclass, so this bare class is exactly what the SDK raises for it.
+    """
+
+    def __init__(self, status_code: int, body: object) -> None:
+        super().__init__(f"Error code: {status_code} - {body}")
+        self.status_code = status_code
+        self.body = body
+
+
+_PLAN_BODY = {
+    "error_code": "plan_upgrade_required",
+    "message": "This feature is not available on the free tier, please upgrade your subscription.",
+    "title": "Feature not available",
+    "request_id": "ba4473ac-d1ff-45b0-9c54-d8343dcd7110",
+}
+
+
+@pytest.mark.asyncio
+async def test_a_free_plan_refusal_is_named_as_the_plan_not_as_a_provider_error() -> None:
+    """The production failure of 2026-09-18, verbatim from the vendor.
+
+    Filed under the generic "the voice provider returned an error" it told nobody that the fix
+    was an account upgrade, and the only other record of it was a log line a deploy deleted.
+    """
+    worker = _worker()
+    worker.cartesia.clone_voice = AsyncMock(side_effect=APIStatusError(402, _PLAN_BODY))
+
+    await worker._handle_upload_clone_request(_request())
+
+    answer = _answer(worker)
+    assert answer["voiceId"] is None
+    assert answer["errorCode"] == "PROVIDER_PLAN_REQUIRED"
+    assert "plan" in answer["error"]
+    # The stored detail is for a person, not a log reader.
+    assert "request_id" not in answer["error"]
+    assert "ba4473ac" not in answer["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_402_that_is_not_about_the_plan_is_read_as_credits() -> None:
+    worker = _worker()
+    worker.cartesia.clone_voice = AsyncMock(
+        side_effect=APIStatusError(402, {"error_code": "insufficient_credits", "message": "x"})
+    )
+
+    await worker._handle_upload_clone_request(_request())
+
+    assert _answer(worker)["errorCode"] == "PROVIDER_QUOTA_EXCEEDED"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_recording_carries_the_providers_one_line_reason() -> None:
+    worker = _worker()
+    worker.cartesia.clone_voice = AsyncMock(
+        side_effect=APIStatusError(
+            400, {"error_code": "invalid_clip", "message": "Clip is too short.", "request_id": "r"}
+        )
+    )
+
+    await worker._handle_upload_clone_request(_request())
+
+    answer = _answer(worker)
+    assert answer["errorCode"] == "SAMPLE_REJECTED"
+    assert answer["error"].endswith("Clip is too short.")
+    assert "request_id" not in answer["error"]
+
+
+@pytest.mark.asyncio
+async def test_an_expired_sample_is_coded_so_the_page_can_ask_for_a_new_take() -> None:
+    worker = _worker(sample=None)
+
+    await worker._handle_upload_clone_request(_request())
+
+    assert _answer(worker)["errorCode"] == "SAMPLE_EXPIRED"
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        (401, "PROVIDER_REJECTED"),
+        (403, "PROVIDER_REJECTED"),
+        (429, "PROVIDER_BUSY"),
+        (503, "PROVIDER_UNAVAILABLE"),
+        (422, "SAMPLE_REJECTED"),
+    ],
+)
+def test_the_status_code_decides_the_clone_failure_code(status: int, code: str) -> None:
+    assert _clone_failure(APIStatusError(status, {}))[0] == code
+
+
+def test_an_unrecognised_exception_is_unknown_not_a_guessed_cause() -> None:
+    assert _clone_failure(RuntimeError("boom")) == ("UNKNOWN", "boom")

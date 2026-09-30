@@ -54,3 +54,17 @@ def normalize_language_code(code: str | None) -> str:
     if not code:
         return ""
     return code.strip().split("-")[0].lower()
+
+
+def known_language_code(code: str | None) -> str:
+    """The normalized code when it is one we can name, otherwise "" (nobody chose).
+
+    WT-703. `language_name` falls back to its input, which is right for a translation prompt
+    naming a code the web added before this map caught up, and wrong for any string that
+    arrived from outside: a summary language of "klingon" — or a sentence of instructions —
+    went into the system prompt verbatim. Anything this map cannot name is therefore treated
+    as no choice at all, so an unrecognised value can only ever cost the reader the language
+    they wanted, never put its own text in front of the model.
+    """
+    normalized = normalize_language_code(code)
+    return normalized if normalized in LANGUAGE_NAMES else ""

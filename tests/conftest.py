@@ -144,3 +144,37 @@ def sample_audio_bytes() -> bytes:
     sf.write(buffer, audio, 16000, format="WAV")
     buffer.seek(0)
     return buffer.read()
+
+
+class FakeClock:
+    """A monotonic clock the test moves by hand, for the platform settings cache."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def fake_clock() -> FakeClock:
+    return FakeClock()
+
+
+@pytest.fixture
+def settings_redis(redis_settings: RedisSettings) -> RedisStreamClient:
+    """A RedisStreamClient over fakeredis — real HGETALL/GET semantics, bytes replies included.
+
+    For the platform settings tests: a setting is "published" by writing the same hash the
+    workspace service writes (`platform:settings:v1:platform`, field = key, value = JSON).
+    """
+    import fakeredis.aioredis
+
+    client = RedisStreamClient.__new__(RedisStreamClient)
+    client._settings = redis_settings
+    client._pool = None
+    client._redis = fakeredis.aioredis.FakeRedis()
+    return client

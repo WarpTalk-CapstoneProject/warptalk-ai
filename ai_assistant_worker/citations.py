@@ -34,7 +34,9 @@ from typing import Any
 
 #: What a source IS, for the chip that shows it. A closed set, mirrored by the web client — an
 #: open one would produce a different icon per source and no way to group them.
-SOURCE_KINDS = ("document", "glossary", "knowledge", "meeting", "transcript", "web")
+#: "admin" is a platform-scope source: a page of the admin portal, with its path as the ref. Only
+#: the platform WarpBot issues it, and the client links it only when the ref is an /admin path.
+SOURCE_KINDS = ("document", "glossary", "knowledge", "meeting", "transcript", "web", "admin")
 
 #: `[S1]`, `[S12]`. Bracketed so ordinary prose cannot accidentally match: a model writing about a
 #: variable called S1 does not cite anything, and one writing "[S1]" is unambiguously citing.

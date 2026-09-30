@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from copy import deepcopy
 from typing import Any
@@ -17,12 +18,25 @@ MCP_MAX_DYNAMIC_TOOLS = 64
 MCP_MAX_DESCRIPTION_CHARS = 1024
 
 
+def mcp_tool_needs_confirmation(*, effect: str | None, policy: str | None = None) -> bool:
+    """Whether AssistantService will ask before running this tool.
+
+    WT-687: the user's per-tool ``policy`` decides when AssistantService sends one - a trusted
+    write tool runs straight away, a read tool the user wants to see coming asks. A service older
+    than the setting sends no policy, and then the old rule applies: writes ask.
+    """
+    if policy:
+        return policy == "approval"
+    return effect == "write"
+
+
 def with_mcp_confirmation_parameter(
     parameters: dict[str, Any],
     *,
     effect: str | None,
+    policy: str | None = None,
 ) -> dict[str, Any]:
-    if effect != "write":
+    if not mcp_tool_needs_confirmation(effect=effect, policy=policy):
         return parameters
 
     updated = deepcopy(parameters)
@@ -35,26 +49,68 @@ def with_mcp_confirmation_parameter(
                 "description": "Confirmation token from WarpBot's previous confirmation card.",
             },
         )
+        properties.setdefault(
+            "alwaysAllow",
+            {
+                "type": "boolean",
+                "description": (
+                    "True only when the user answered the confirmation card with Always allow."
+                ),
+            },
+        )
     return updated
 
 
 def split_mcp_tool_arguments(arguments: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     clean_arguments = dict(arguments)
+    # Ours, not the provider's: AssistantService reads it off the request, and a server handed an
+    # argument its schema never declared may refuse the call.
+    clean_arguments.pop("alwaysAllow", None)
     token = clean_arguments.pop("confirmationToken", None)
     if isinstance(token, str) and token.strip():
         return clean_arguments, token.strip()
     return clean_arguments, None
 
 
+def read_mcp_always_allow(arguments: dict[str, Any]) -> bool:
+    """WT-687: the user chose Always allow on the card. Only a real ``true`` counts."""
+    return arguments.get("alwaysAllow") is True
+
+
+def parse_disabled_plugin_keys(disabled_plugin_keys_json: str) -> list[str]:
+    """WT-687: the plugin keys switched off for this conversation, tolerating an absent field."""
+    if not disabled_plugin_keys_json:
+        return []
+    try:
+        raw = json.loads(disabled_plugin_keys_json)
+    except ValueError:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [key.strip() for key in raw if isinstance(key, str) and key.strip()]
+
+
 def normalize_mcp_tool_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {"isSuccess": False, "error": "Plugin tool returned an invalid response."}
 
-    error_code = payload.get("errorCode")
-    if payload.get("isSuccess") is not False or not isinstance(error_code, str):
-        return payload
+    result: dict[str, Any] = dict(payload)
 
-    normalized = dict(payload)
+    # "Always allow" is the one answer that changes something beyond this call: the card is gone
+    # for this tool from now on. Nothing else on the way back says so, and a setting that changed
+    # in silence is one the user finds out about the day WarpBot acts without asking.
+    if result.get("appliedToolPolicy") == "allow":
+        result["instruction"] = (
+            "The user chose Always allow, so this tool now runs without a confirmation card. "
+            "Tell them in one short clause that you will not ask again for this action, and "
+            "that they can change it in the plugin's settings."
+        )
+
+    error_code = result.get("errorCode")
+    if result.get("isSuccess") is not False or not isinstance(error_code, str):
+        return result
+
+    normalized = dict(result)
     if error_code == "connection_required":
         plugin_key = payload.get("pluginKey")
         plugin_label = payload.get("pluginLabel")
@@ -131,9 +187,33 @@ def select_mcp_tool_entries(
     plugins that both expose ``search``, makes the Responses API reject the *entire* request -
     so the user would lose the built-in tools as well, with the discovery error swallowed and no
     hint as to why WarpBot suddenly went quiet.
+
+    A name two *different* plugins claim is dropped for both, not kept for whichever came first.
+    The model calls a tool by name alone and the handler turns that name into the pluginKey it
+    executes with, so "first wins" let a workspace Owner's private MCP server declare
+    ``google_drive_search`` and receive the queries meant for Drive whenever it happened to be
+    listed first. AssistantService now settles every such collision by trust before the list
+    leaves it; this is the fail-closed backstop for a service that has not, since this side cannot
+    tell which claimant is the trusted one. A plugin repeating its *own* name is harmless - both
+    entries execute against the same plugin - and keeps its first entry as before.
+    Names are compared case-folded throughout: two names that differ only in case are one name
+    to the model reading the list.
     """
     if not isinstance(tools_payload, list):
         return [], []
+
+    reserved_folded = {reserved.casefold() for reserved in reserved_names}
+
+    # Pass one: every plugin claiming each name, before anything is accepted - the first claimant
+    # must not be let through just because the second has not been seen yet.
+    claimants: dict[str, set[str]] = {}
+    for item in tools_payload:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        plugin_key = str(item.get("pluginKey") or "").strip()
+        if name and plugin_key:
+            claimants.setdefault(name.casefold(), set()).add(plugin_key)
 
     accepted: list[dict[str, Any]] = []
     rejected: list[tuple[str, str]] = []
@@ -144,18 +224,22 @@ def select_mcp_tool_entries(
             continue
         name = str(item.get("name") or "").strip()
         plugin_key = str(item.get("pluginKey") or "").strip()
-        if not name or not plugin_key or name in reserved_names:
+        folded = name.casefold()
+        if not name or not plugin_key or folded in reserved_folded:
             continue
         if not MCP_TOOL_NAME_PATTERN.fullmatch(name):
             rejected.append(("mcp_tool_name_rejected", name))
             continue
-        if name in seen_names:
+        if len(claimants.get(folded, ())) > 1:
+            rejected.append(("mcp_tool_name_ambiguous", name))
+            continue
+        if folded in seen_names:
             rejected.append(("mcp_tool_name_duplicate", name))
             continue
         if len(accepted) >= MCP_MAX_DYNAMIC_TOOLS:
             rejected.append(("mcp_tool_budget_exhausted", name))
             break
-        seen_names.add(name)
+        seen_names.add(folded)
         accepted.append(item)
 
     return accepted, rejected
@@ -180,7 +264,15 @@ def redact_mcp_tool_payload_for_model(payload: dict[str, Any]) -> dict[str, Any]
     return redacted
 
 
+#: EVERY ask that stands between WarpBot and an action travels in this one shape.
+#:
+#: There were three: a confirmation card with per-tool rows invented from the arguments, a second
+#: card for a plugin that needed connecting, and a third for a provider only an operator can
+#: register. Three shapes for one question — "may I?" — and the rows described defaults nobody had
+#: chosen, which reads as fact. A prompt now carries the action being asked about and the answers;
+#: the detail of what happened belongs to the result, which the user reads afterwards.
 def build_mcp_plugin_connection_action(payload: dict[str, Any]) -> dict[str, Any]:
+    """The prompt for a plugin the user has not connected yet."""
     user_action = payload.get("userAction")
     if not isinstance(user_action, dict):
         return {}
@@ -194,10 +286,10 @@ def build_mcp_plugin_connection_action(payload: dict[str, Any]) -> dict[str, Any
         return {}
 
     return {
-        "pluginConnection": {
-            "type": "plugin_connection_required",
+        "permission": {
+            "kind": "connect",
+            "action": plugin_label,
             "pluginKey": plugin_key,
-            "pluginLabel": plugin_label,
             "connectionStatus": connection_status,
             "connectedAccountEmail": user_action.get("connectedAccountEmail"),
             "message": user_action.get("message"),
@@ -206,12 +298,10 @@ def build_mcp_plugin_connection_action(payload: dict[str, Any]) -> dict[str, Any
 
 
 def build_mcp_operator_setup_action(payload: dict[str, Any]) -> dict[str, Any]:
-    """Surface a provider that no registration mechanism can reach.
+    """The prompt for a provider that no registration mechanism can reach.
 
-    Kept separate from ``build_mcp_plugin_connection_action`` on purpose: the two look similar but
-    mean opposite things to a user. One says "press Connect", the other says "no button here will
-    help". Merging them would put a Connect button on a flow that has already exhausted the
-    registration ladder.
+    Its own kind rather than a variant of ``connect``: the two look alike and mean opposite things.
+    One says "press Connect", this one says no button here will help, so it offers none.
     """
     user_action = payload.get("userAction")
     if not isinstance(user_action, dict):
@@ -225,10 +315,10 @@ def build_mcp_operator_setup_action(payload: dict[str, Any]) -> dict[str, Any]:
         return {}
 
     return {
-        "pluginOperatorSetup": {
-            "type": "plugin_needs_operator_setup",
+        "permission": {
+            "kind": "blocked",
+            "action": plugin_label,
             "pluginKey": plugin_key,
-            "pluginLabel": plugin_label,
             "message": user_action.get("message"),
         }
     }
@@ -238,32 +328,48 @@ def build_mcp_confirmation_questions(
     payload: dict[str, Any],
     *,
     tool_name: str,
+    tool_label: str | None = None,
 ) -> dict[str, Any]:
+    """The prompt for a write the user's policy wants confirmed.
+
+    Every option's ``value`` is what comes back as the user's next message: the choice as a person
+    would say it, then the machine line the model acts on (tool name and token). The web shows the
+    first and hides the second, so the bubble reads "Yes" rather than a token.
+
+    The prompt names the action and nothing else. It used to carry rows per tool - a title, a
+    time, a calendar - built from the arguments, but those were the server's defaults as often as
+    they were the user's words, and a row that says "Title: Google Meet meeting" reads as a
+    decision somebody made. What was actually created is in the result, which the card under the
+    answer shows afterwards.
+    """
     token = str(payload.get("confirmationToken") or "").strip()
-    message = str(
-        payload.get("message")
-        or "WarpBot wants to change data in a connected app. Confirm before it continues."
-    )
+    action = (tool_label or "").strip() or tool_name
 
     return {
-        "questions": [
-            {
-                "header": "Confirm plugin action",
-                "question": message,
-                "options": [
-                    {
-                        "label": "Confirm",
-                        "description": "Run this write action once.",
-                        "value": (
-                            f"Confirm the {tool_name} plugin action. confirmationToken: {token}"
-                        ),
-                    },
-                    {
-                        "label": "Cancel",
-                        "description": "Do not run this action.",
-                        "value": f"Do not run the {tool_name} plugin action.",
-                    },
-                ],
-            }
-        ]
+        "permission": {
+            "kind": "tool",
+            "action": action,
+            "toolName": tool_name,
+            "options": [
+                {
+                    "label": "Yes",
+                    "value": (
+                        f"Yes\n\nConfirm the {tool_name} plugin action. confirmationToken: {token}"
+                    ),
+                },
+                {
+                    # WT-687. Runs this call and stops asking for this tool. The token still has
+                    # to validate before AssistantService records the choice.
+                    "label": "Yes, and don't ask again for this tool",
+                    "value": (
+                        f"Always allow\n\nConfirm the {tool_name} plugin action and always "
+                        f"allow it from now on. confirmationToken: {token} alwaysAllow: true"
+                    ),
+                },
+                {
+                    "label": "No, and tell WarpBot what to do differently",
+                    "value": f"Cancel\n\nDo not run the {tool_name} plugin action.",
+                },
+            ],
+        }
     }

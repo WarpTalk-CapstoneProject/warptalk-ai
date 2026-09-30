@@ -128,6 +128,28 @@ class WorkerSettings(BaseSettings):
     # consumes them), so it lives on the shared settings rather than on either one.
     stt_streaming_enabled: bool = True
 
+    # Clean transcript, tier 1 (WT-716): run the deterministic disfluency prepass
+    # (shared.disfluency.prepass) on every final STT segment right before it is published, and
+    # carry the result as `clean_text`/`clean_flags` beside the untouched raw `text`.
+    #
+    # WHY IT IS ON THE LIVE PATH AT ALL
+    #   "um so we uh we need to finalize the budget" is what STT hears and what a subtitle,
+    #   a dub and a translation should NOT say. The prepass is pure CPU, rule-based and
+    #   sub-millisecond on a sentence, so it can sit in front of translation without costing
+    #   the meeting any latency — which the LLM tier (transcript_clean_worker) cannot.
+    #
+    # WHY A KILL SWITCH
+    #   The rules delete words. A rule that is wrong for some real room deletes the wrong
+    #   words in every subtitle and every dub of that room, live, with no way to take it back.
+    #   Off means the STT worker simply does not set the fields: every consumer then reads
+    #   `display_text` == raw `text`, i.e. exactly what the pipeline did before WT-716 — no
+    #   deploy of any other worker needed to get back there.
+    #
+    # Env TRANSCRIPT_CLEAN_ENABLED. Read by the STT worker only (the producer); consumers key
+    # off the presence of the fields, never off this flag, so replicas that disagree during a
+    # rollout cannot produce a message that means two things.
+    transcript_clean_enabled: bool = True
+
     # Max only for uninterrupted speech; ordinary short turns still flush on VAD silence.
     # Six seconds gives the model enough lexical context for natural Vietnamese sentences
     # containing English technical terms without adding delay after an ordinary pause.
@@ -593,6 +615,14 @@ class TTSSettings(BaseSettings):
     # uncommon case, and the pool refills in the background the moment one is taken.
     tts_warm_pool_size: int = 2
 
+    # How many Cartesia generations this process may have in flight at once. The account's plan
+    # caps concurrency (currently 2: `429 concurrency_limited ... Current limit: 2`), and the
+    # consume loop dispatches up to 8 keys at a time, so without a gate a meeting with a few
+    # speakers and target languages overruns the plan and every excess sentence fails outright.
+    # Waiting for a slot costs a fraction of a sentence; a 429 costs the whole one. Keep this at
+    # the plan's limit divided by the number of TTS replicas (tts-worker is a singleton).
+    cartesia_max_concurrency: int = 2
+
     # Delete in-meeting clones from the Cartesia account once nothing can reach them.
     #
     # Every in-meeting clone creates a real voice in the account, and until this existed
@@ -681,6 +711,15 @@ class ChatAssistantSettings(BaseSettings):
     # Redis Stream / SignalR traffic bounded, matching the rest of the pipeline's coarse
     # buffered-unit convention (STT/TTS/AI-assistant results are never per-token either).
     chunk_flush_chars: int = 40
+    # WT-881: the OpenAI SDK's default read timeout is 600s, so a stream that went quiet
+    # mid-answer — no delta, no response.completed — left the widget on "Running..." for ten
+    # minutes, which to a user is forever. The read timeout is the longest SILENCE between two
+    # bytes of the stream, not the length of the answer: a long answer that keeps streaming is
+    # never cut. It has to stay above the longest gap a reasoning model leaves before its first
+    # event, so raise ASSISTANT_CHAT_OPENAI_READ_TIMEOUT_SECONDS rather than removing it if a
+    # heavier model starts tripping it.
+    openai_connect_timeout_seconds: float = 10.0
+    openai_read_timeout_seconds: float = 90.0
     workspace_service_url: str = "http://localhost:5106"
     assistant_service_url: str = "http://localhost:5108"
     transcript_service_url: str = "http://localhost:5103"

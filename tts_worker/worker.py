@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import hashlib
 import json
 import time
@@ -27,8 +28,21 @@ from typing import Any, cast
 from shared import isochrony
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
+from shared.integration_status import (
+    CARTESIA,
+    LIVEKIT,
+    IntegrationReport,
+    credential_report,
+    livekit_report,
+)
 from shared.lang import base_language, is_same_language
+from shared.platform_settings import (
+    FLAG_VOICE_CLONE,
+    VOICE_CLONE_MIN_SECONDS,
+    VOICE_CLONE_UPGRADE_MARGIN,
+)
 from shared.prosody import SPEED_MAX, Arousal, Delivery, Valence, to_generation_config
+from shared.provider_calls import classify_exception, record_provider_call
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
 from tts_worker.clone_sample_quality import MAX_SAMPLE_SCORE, assess_clone_sample
 from tts_worker.livekit_publisher import LiveKitTTSPublisher, TrackStream
@@ -153,6 +167,125 @@ def _preview_failure(exc: BaseException) -> tuple[str, str]:
     # Unknown: the code says so plainly rather than inventing a cause, and the message still
     # carries something for the logs.
     return "UNKNOWN", str(exc)[:200]
+
+
+#: The upload clone's answer when the recording was gone before the worker reached it.
+CLONE_SAMPLE_EXPIRED = "SAMPLE_EXPIRED"
+
+
+def _provider_error_body(exc: BaseException) -> tuple[str, str]:
+    """(error_code, message) from a Cartesia API error body, or ("", "") when there is none.
+
+    Read by attribute rather than by importing the SDK's exception types: the CI environment does
+    not install the `tts` extra, and the classifier has to be testable there.
+    """
+    body = getattr(exc, "body", None)
+    if not isinstance(body, Mapping):
+        return "", ""
+    code = body.get("error_code")
+    message = body.get("message")
+    return (
+        code if isinstance(code, str) else "",
+        message if isinstance(message, str) else "",
+    )
+
+
+def _clone_failure(exc: BaseException) -> tuple[str, str]:
+    """An upload-clone failure as (code, message), from whatever the provider SDK threw.
+
+    WHY THIS IS NOT `_preview_failure`
+        Cartesia answers a clone on the Free plan with HTTP 402 `plan_upgrade_required`. There is
+        no SDK subclass for 402, so it arrives as the bare `APIStatusError` — which
+        `_preview_failure` files under PROVIDER_UNAVAILABLE, "the voice provider returned an
+        error". That sentence is exactly what hid the 2026-09-18 outage: every upload from the
+        day the account dropped to Free failed at the vendor in four seconds, and the only record
+        of why was a log line that the next deploy deleted. The status code is the diagnosis, so
+        it is read first; the class name is only the fallback.
+
+    The CODE is what AuthService stores and the page translates. The MESSAGE is stored beside it
+    as the detail, so it must never carry a request id or a Python repr — for a sample the
+    provider refused, it is the provider's own one-line reason ("clip too short"), which is the
+    one thing that tells the person what to change in the next take.
+    """
+    status = getattr(exc, "status_code", None)
+    provider_code, provider_message = _provider_error_body(exc)
+
+    if status == 402:
+        if provider_code == "plan_upgrade_required":
+            return (
+                "PROVIDER_PLAN_REQUIRED",
+                "the voice provider account's plan does not include voice cloning",
+            )
+        return "PROVIDER_QUOTA_EXCEEDED", "the voice provider account is out of credits"
+    if status in (400, 413, 415, 422):
+        detail = provider_message.strip()[:160]
+        return (
+            "SAMPLE_REJECTED",
+            f"the voice provider could not use this recording: {detail}"
+            if detail
+            else "the voice provider could not use this recording",
+        )
+    if status in (401, 403):
+        return "PROVIDER_REJECTED", "the voice provider rejected our credentials"
+    if status == 429:
+        return "PROVIDER_BUSY", "the voice provider is rate limiting us"
+    if isinstance(status, int) and status >= 500:
+        return "PROVIDER_UNAVAILABLE", "the voice provider returned an error"
+
+    code, message = _preview_failure(exc)
+    if code == "VOICE_NOT_RENDERABLE":
+        # A 400-family error the SDK typed but whose status was not readable above.
+        return "SAMPLE_REJECTED", "the voice provider could not use this recording"
+    if code == "VOICE_NOT_FOUND":
+        return "UNKNOWN", message
+    return code, message
+
+
+# Refusals no later clip can change: the account's plan, its credits, or its credentials. A clip
+# the vendor could not use, a rate limit or an outage is worth another attempt; these are not.
+_PERMANENT_CLONE_REFUSALS = frozenset(
+    {"PROVIDER_PLAN_REQUIRED", "PROVIDER_QUOTA_EXCEEDED", "PROVIDER_REJECTED"}
+)
+
+
+def _settle_live_clone(
+    task: asyncio.Task[Any],
+    *,
+    key: tuple[str, str],
+    attempted_score: float,
+    previous_score: float | None,
+    spent_upgrade: bool,
+    cloned_score: dict[tuple[str, str], float],
+    upgrades_used: dict[tuple[str, str], int],
+    clone_refused: set[tuple[str, str]],
+) -> None:
+    """Undo the capture loop's optimism about an in-meeting clone that did not happen (WT-874).
+
+    The loop records `cloned_score[key]` the moment it STARTS a clone, because the clone runs as
+    a background task. Nothing took it back when Cartesia refused, so the loop went on treating
+    the speaker as cloned: with a clip score of 1.0 no upgrade can beat it, and it published
+    `cloned_best_possible` right after `clone_failed` — production room 01a0e5dd, 28 Sep, 16s
+    apart. The meeting UI then showed the speaker's voice as done while every listener heard a
+    stock voice, and no further attempt was ever made.
+
+    A failure now restores the score the previous clone had (or none), refunds an upgrade it
+    spent, and, for a refusal no clip can fix, stops capturing that speaker for the meeting.
+    `None` (a test double, or an older caller) and "" (cached) change nothing.
+    """
+    if task.cancelled() or task.exception() is not None:
+        return
+    outcome = task.result()
+    if not outcome:
+        return
+    if cloned_score.get(key) == attempted_score:
+        if previous_score is None:
+            cloned_score.pop(key, None)
+        else:
+            cloned_score[key] = previous_score
+    if spent_upgrade and upgrades_used.get(key, 0) > 0:
+        upgrades_used[key] -= 1
+    if outcome in _PERMANENT_CLONE_REFUSALS:
+        clone_refused.add(key)
 
 
 # WT-B — a clone that outlives the meeting it was made in.
@@ -420,6 +553,7 @@ class TTSWorker(BaseWorker):
             model=self.tts_settings.model,
             sample_rate=self.tts_settings.sample_rate,
             speed=self.tts_settings.speed,
+            max_concurrency=self.tts_settings.cartesia_max_concurrency,
         )
         await self.cartesia.load()
         # Before any consumer starts: the first sentence of the first turn is the one that
@@ -435,6 +569,47 @@ class TTSWorker(BaseWorker):
         if self.tts_settings.voice_catalog_warm_enabled:
             asyncio.create_task(self._warm_voice_catalogs())
         self.logger.info("tts_worker_ready", model=self.tts_settings.model)
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        reports = {
+            CARTESIA: credential_report(
+                self.tts_settings.api_key, f"tts model {self.tts_settings.model}"
+            )
+        }
+        if self.tts_settings.stream_to_livekit:
+            reports[LIVEKIT] = livekit_report(self.settings.livekit, "dub tracks")
+        return reports
+
+    # ------------------------------------------------------------------
+    # Platform settings (read live; the TTS_* env value is the fallback)
+    # ------------------------------------------------------------------
+
+    async def _clone_min_seconds(self) -> float:
+        """`meetings.voice_clone.min_sample_seconds`; falls back to the TTS_ env value."""
+        return await self.platform_settings().get_float(
+            VOICE_CLONE_MIN_SECONDS, float(self.tts_settings.voice_clone_min_seconds)
+        )
+
+    async def _clone_upgrade_margin(self) -> float:
+        """`meetings.voice_clone.upgrade_margin`, falling back to TTS_VOICE_CLONE_UPGRADE_MARGIN."""
+        return await self.platform_settings().get_float(
+            VOICE_CLONE_UPGRADE_MARGIN, float(self.tts_settings.voice_clone_upgrade_margin)
+        )
+
+    async def _voice_clone_allowed(self, meeting_id: str) -> bool:
+        """`flags.voice_clone` for this room's workspace — the platform's kill switch for cloning.
+
+        Off means no NEW in-meeting clone is started and no cloned voice is used to synthesize;
+        dubs go out in the standard voice. On leaves the consent and entitlement gates exactly
+        as they were: this can only narrow them. The workspace comes from MeetingService's room
+        projection and is looked up only when the flag's value could depend on it.
+        """
+        reader = self.platform_settings()
+
+        async def workspace() -> str | None:
+            return await reader.room_workspace_id(meeting_id)
+
+        return await reader.is_enabled(FLAG_VOICE_CLONE, resolve_workspace=workspace)
 
     async def _consume_loop(self) -> None:
         """Dispatch process() concurrently across DIFFERENT (speaker, target_lang)
@@ -1197,14 +1372,28 @@ class TTSWorker(BaseWorker):
 
         t0 = time.monotonic()
         try:
-            sentence = await self._synthesize_sentence(
-                translation=translation,
-                text=text,
-                voice_id=voice_id,
-                voice_key=voice_key,
-                generation_config=generation_config,
-            )
+            # One Cartesia slot for the whole sentence, fallback included — see
+            # TTSSettings.cartesia_max_concurrency. Waiting here is counted in the latency on
+            # purpose: it is time the listener spends waiting too.
+            async with self._require_cartesia().generation_slot():
+                sentence = await self._synthesize_sentence(
+                    translation=translation,
+                    text=text,
+                    voice_id=voice_id,
+                    voice_key=voice_key,
+                    generation_config=generation_config,
+                )
         except Exception as e:
+            # Swallowed so the next sentence still plays; counted so a Cartesia outage (402 quota,
+            # 5xx) shows as a TTS success rate falling rather than as silence.
+            self.note_attempt_outcome("vendor_error")
+            await record_provider_call(
+                "cartesia",
+                "tts",
+                classify_exception(e),
+                int((time.monotonic() - t0) * 1000),
+                self.tts_settings.model,
+            )
             # Carried the error and the voice and nothing else, so a failure could not be tied
             # to the sentence that failed: the one question worth asking of this line — WHICH
             # line went silent — was the one it could not answer.
@@ -1242,6 +1431,17 @@ class TTSWorker(BaseWorker):
         # rise. It is still the right measure of "how long the worker was busy with this
         # sentence"; it is no longer a measure of how long anyone waited to hear it.
         await self.redis.record_latency("tts_synthesis", synthesis_latency_ms)
+        # Cartesia's latency is its time to first audio; with streaming on, the whole synthesis
+        # time also contains playback (see above) and would make the vendor look 5x slower.
+        await record_provider_call(
+            "cartesia",
+            "tts",
+            "ok",
+            int((sentence.first_audio_at - t0) * 1000)
+            if sentence.first_audio_at is not None
+            else synthesis_latency_ms,
+            self.tts_settings.model,
+        )
         if sentence.first_audio_at is not None:
             # What the listener actually experiences, and the only number that answers the
             # complaint this work came from. Same t0 as above, so the two are comparable.
@@ -1393,6 +1593,10 @@ class TTSWorker(BaseWorker):
         """
         if not self.is_voice_clone_consented(meeting_id, speaker_id):
             return None
+        # The platform kill switch, checked on every call for the same reason consent is: turned
+        # off mid-meeting, the very next dub goes out in the standard voice.
+        if not await self._voice_clone_allowed(meeting_id):
+            return None
         cached = await self.redis.hget(f"voice:{meeting_id}:{speaker_id}", "voice_id")
         if cached:
             return cached.decode() if isinstance(cached, bytes) else cached
@@ -1458,6 +1662,13 @@ class TTSWorker(BaseWorker):
             the recording could not be turned into a voice.
         """
         while self._running:
+            # A request left pending by a pod that died mid-clone gets one more attempt: this
+            # loop promises an answer for every request, and without it that one never had one.
+            await self._housekeep_side_group(
+                _CLONE_REQUEST_STREAM,
+                self._clone_request_group,
+                redeliver=self._handle_upload_clone_request,
+            )
             try:
                 async for msg_id, data in self.redis.consume(
                     stream=_CLONE_REQUEST_STREAM,
@@ -1482,13 +1693,23 @@ class TTSWorker(BaseWorker):
         sample_key = f"{_CLONE_SAMPLE_PREFIX}{profile_id}"
         result_key = f"{_CLONE_RESULT_PREFIX}{profile_id}"
 
-        async def answer(voice_id: str | None, error: str | None) -> None:
+        async def answer(
+            voice_id: str | None, error: str | None, error_code: str | None = None
+        ) -> None:
             # Seven days, because somebody may upload and not open the page for a while, and
             # losing the id would mean paying Cartesia again for a voice we already made.
+            #
+            # errorCode travels beside the message so AuthService can STORE why, not just that:
+            # the reason used to exist only in two log lines, and a deploy took both.
+            payload: dict[str, str | None] = {
+                "voiceId": voice_id,
+                "provider": "cartesia",
+                "error": error,
+            }
+            if error_code is not None:
+                payload["errorCode"] = error_code
             await self.redis.set_with_ttl(
-                result_key,
-                json.dumps({"voiceId": voice_id, "provider": "cartesia", "error": error}),
-                _CLONE_RESULT_TTL_SECONDS,
+                result_key, json.dumps(payload), _CLONE_RESULT_TTL_SECONDS
             )
 
         try:
@@ -1496,7 +1717,11 @@ class TTSWorker(BaseWorker):
             if not sample:
                 # The audio outlived by its TTL, or the request was replayed after the sample was
                 # collected. Said plainly rather than left pending forever.
-                await answer(None, "the uploaded recording was no longer available to clone")
+                await answer(
+                    None,
+                    "the uploaded recording was no longer available to clone",
+                    CLONE_SAMPLE_EXPIRED,
+                )
                 return
 
             audio = sample.encode("utf-8") if isinstance(sample, str) else sample
@@ -1511,8 +1736,11 @@ class TTSWorker(BaseWorker):
                 "uploaded_voice_cloned", profile_id=profile_id, bytes=len(audio), language=language
             )
         except Exception as exc:
-            self.logger.exception("uploaded_voice_clone_failed", profile_id=profile_id)
-            await answer(None, str(exc)[:200])
+            code, message = _clone_failure(exc)
+            self.logger.exception(
+                "uploaded_voice_clone_failed", profile_id=profile_id, error_code=code
+            )
+            await answer(None, message, code)
         finally:
             # The bytes are biometric data and there is no reason to keep them once we are done
             # with them, whichever way it went. The TTL is the backstop, not the plan.
@@ -1541,6 +1769,8 @@ class TTSWorker(BaseWorker):
             measured on. A preview is exactly that case, so it matches a real dub of one.
         """
         while self._running:
+            # Minutes later nobody is still waiting on the button: a stale preview is dropped.
+            await self._housekeep_side_group(_PREVIEW_REQUEST_STREAM, self._preview_request_group)
             try:
                 async for _msg_id, data in self.redis.consume(
                     stream=_PREVIEW_REQUEST_STREAM,
@@ -1589,9 +1819,11 @@ class TTSWorker(BaseWorker):
 
         try:
             text = _PREVIEW_TEXT.get(language) or _PREVIEW_TEXT["en"]
-            audio_bytes, duration_ms, _resolved = await self._require_cartesia().synthesize(
-                text, language, voice_id
-            )
+            cartesia = self._require_cartesia()
+            async with cartesia.generation_slot():
+                audio_bytes, duration_ms, _resolved = await cartesia.synthesize(
+                    text, language, voice_id
+                )
             if not audio_bytes:
                 await answer(None, "the provider returned no audio for this voice", "NO_AUDIO")
                 return
@@ -1722,8 +1954,13 @@ class TTSWorker(BaseWorker):
         # speaker: doing it per chunk would re-seed the bar after an upgrade had raised it and
         # walk the score back down to whatever the previous meeting managed.
         carried_seen: set[tuple[str, str]] = set()
+        # WT-874: speakers the vendor has refused to clone for a reason another clip cannot fix
+        # (the account's plan, its credits, its credentials). See _settle_live_clone.
+        clone_refused: set[tuple[str, str]] = set()
 
         while self._running:
+            # Clone sampling buffers live speech; a stale chunk would be appended out of order.
+            await self._housekeep_side_group("audio:chunks", self._audio_consumer_group)
             try:
                 async for _msg_id, data in self.redis.consume(
                     stream="audio:chunks",
@@ -1760,6 +1997,34 @@ class TTSWorker(BaseWorker):
                             # re-clone on their next acceptable clip.
                             carried_seen.discard(key)
                             continue
+
+                        # The platform kill switch (flags.voice_clone). Off: no new clone is
+                        # started, and nothing is buffered for one — the audio is biometric, and
+                        # holding it for a clone that cannot happen is holding it for nothing.
+                        # Said out loud like every other exit here, so a switched-off platform
+                        # does not read as broken cloning.
+                        if not await self._voice_clone_allowed(chunk.meeting_id):
+                            await self._note_clone_state(key, "disabled_by_platform")
+                            buffers.pop(key, None)
+                            buffer_seconds.pop(key, None)
+                            buffer_lang.pop(key, None)
+                            carried_seen.discard(key)
+                            continue
+
+                        # The vendor already said no in a way the next clip cannot change. The
+                        # `clone_failed:` state it published stays the last word; capturing
+                        # again would only flash "capturing" → "cloning" → "failed" at the
+                        # speaker every ten seconds and spend a refused vendor call each time.
+                        if key in clone_refused:
+                            buffers.pop(key, None)
+                            buffer_seconds.pop(key, None)
+                            buffer_lang.pop(key, None)
+                            continue
+
+                        # Read per chunk, not once per process: an operator's change in the
+                        # settings console applies to the next chunk without a restart.
+                        min_seconds = await self._clone_min_seconds()
+                        upgrade_margin = await self._clone_upgrade_margin()
 
                         # WT-B: adopt the bar a previous meeting's clone set, once per speaker.
                         #
@@ -1878,8 +2143,7 @@ class TTSWorker(BaseWorker):
                         if (
                             not language_is_stale
                             and best_so_far is not None
-                            and best_so_far + self.tts_settings.voice_clone_upgrade_margin
-                            > MAX_SAMPLE_SCORE
+                            and best_so_far + upgrade_margin > MAX_SAMPLE_SCORE
                         ):
                             await self._note_clone_state(
                                 key, "cloned_best_possible", score=best_so_far
@@ -1902,10 +2166,10 @@ class TTSWorker(BaseWorker):
                             key,
                             "capturing",
                             seconds=buffer_seconds[key],
-                            required_seconds=float(self.tts_settings.voice_clone_min_seconds),
+                            required_seconds=float(min_seconds),
                         )
 
-                        if buffer_seconds[key] >= self.tts_settings.voice_clone_min_seconds:
+                        if buffer_seconds[key] >= min_seconds:
                             # NOT UNDER A GUESS ABOUT THE LANGUAGE.
                             #
                             # `_resolve_clone_language` returns None while the speaker's language
@@ -1969,10 +2233,7 @@ class TTSWorker(BaseWorker):
                                 # a Vietnamese speaker.
                                 worth_cloning = True
                             else:
-                                worth_cloning = (
-                                    assessment.score
-                                    >= previous_score + self.tts_settings.voice_clone_upgrade_margin
-                                )
+                                worth_cloning = assessment.score >= previous_score + upgrade_margin
                             if worth_cloning:
                                 audio_snapshot = bytes(buffers.pop(key))
                                 del buffer_seconds[key]
@@ -1983,14 +2244,14 @@ class TTSWorker(BaseWorker):
                                 # listening to may change for a BETTER likeness; being in the
                                 # right language is not that, and charging it here would let one
                                 # mistimed language hint use up the speaker's only improvement.
-                                if is_upgrade and not language_is_stale:
+                                spent_upgrade = is_upgrade and not language_is_stale
+                                if spent_upgrade:
                                     upgrades_used[key] = upgrades_used.get(key, 0) + 1
                                 self.logger.info(
                                     "voice_clone_sample_accepted",
                                     speaker_id=chunk.speaker_id,
                                     seconds=round(
-                                        buffer_seconds.get(key, 0.0)
-                                        or self.tts_settings.voice_clone_min_seconds,
+                                        buffer_seconds.get(key, 0.0) or min_seconds,
                                         1,
                                     ),
                                     active_speech_ratio=round(assessment.active_speech_ratio, 3),
@@ -2004,7 +2265,7 @@ class TTSWorker(BaseWorker):
                                     score=assessment.score,
                                     active_speech_ratio=assessment.active_speech_ratio,
                                 )
-                                asyncio.create_task(
+                                clone_task = asyncio.create_task(
                                     self._clone_and_cache(
                                         chunk.meeting_id,
                                         chunk.speaker_id,
@@ -2016,6 +2277,18 @@ class TTSWorker(BaseWorker):
                                         # clone comes back chipmunked rather than refused.
                                         chunk.sample_rate,
                                         assessment.score,
+                                    )
+                                )
+                                clone_task.add_done_callback(
+                                    functools.partial(
+                                        _settle_live_clone,
+                                        key=key,
+                                        attempted_score=assessment.score,
+                                        previous_score=previous_score,
+                                        spent_upgrade=spent_upgrade,
+                                        cloned_score=cloned_score,
+                                        upgrades_used=upgrades_used,
+                                        clone_refused=clone_refused,
                                     )
                                 )
                             elif assessment.accepted:
@@ -2152,8 +2425,12 @@ class TTSWorker(BaseWorker):
         language: str = "en",
         sample_rate: int = 16000,
         score: float | None = None,
-    ) -> None:
+    ) -> str:
         """Clone voice via Cartesia and cache voice_id in Redis.
+
+        Returns "" once the voice is cached, else the `_clone_failure` code for why it is not.
+        The capture loop reads it (see _settle_live_clone): until WT-874 it assumed every clone it
+        started had succeeded, so a refused one still counted as the speaker's clone.
 
         `score` is the accepted clip's quality, carried through only so the terminal `cloned`
         state can publish it. Acceptance and quality are two different questions here:
@@ -2182,6 +2459,7 @@ class TTSWorker(BaseWorker):
         """
         label = f"{_IN_MEETING_VOICE_PREFIX}{speaker_id[:8]}-{meeting_id[:8]}"
         key = (meeting_id, speaker_id)
+        cached = False
         try:
             voice_id = await self._require_cartesia().clone_voice(
                 wav_header(len(audio_bytes), sample_rate) + audio_bytes,
@@ -2190,6 +2468,7 @@ class TTSWorker(BaseWorker):
             )
             cache_key = f"voice:{meeting_id}:{speaker_id}"
             await self.redis.hset(cache_key, "voice_id", voice_id)
+            cached = True
             # WHICH LANGUAGE THIS VOICE IS. A Cartesia clone is keyed by language, so a voice and
             # the language it was built from are one fact, and storing only half of it is why a
             # clone made under an unresolved "auto" (and therefore under "en") could never be
@@ -2212,6 +2491,7 @@ class TTSWorker(BaseWorker):
                 payload={"speakerId": speaker_id, "voiceId": voice_id},
             )
             await self._offer_carry_over(speaker_id, language, voice_id, score)
+            return ""
         except Exception as e:
             self.logger.error(
                 "voice_clone_failed",
@@ -2229,6 +2509,9 @@ class TTSWorker(BaseWorker):
             # Truncated because it goes on the wire to a UI, and a Cartesia stack trace is not a
             # message for a person in a meeting.
             await self._note_clone_state(key, f"clone_failed:{str(e)[:120]}")
+            # A failure AFTER the voice was cached (publishing, the carry-over hand-off) still left
+            # the speaker with a usable clone, so it is not reported to the loop as "no clone".
+            return "" if cached else _clone_failure(e)[0]
 
     async def _offer_carry_over(
         self,
@@ -2313,6 +2596,13 @@ class TTSWorker(BaseWorker):
             or promotion becomes a leak in a place the sweep has been told to leave alone.
         """
         while self._running:
+            # A deletion left pending by a pod that died mid-request is a withdrawn consent that
+            # was never carried out; it gets one more attempt rather than none.
+            await self._housekeep_side_group(
+                _VOICE_DELETE_STREAM,
+                self._voice_delete_group,
+                redeliver=self._handle_voice_delete_request,
+            )
             try:
                 async for _msg_id, data in self.redis.consume(
                     stream=_VOICE_DELETE_STREAM,
@@ -2321,27 +2611,30 @@ class TTSWorker(BaseWorker):
                     block_ms=5000,
                     count=10,
                 ):
-                    voice_id = _decode_field(data, "voice_id")
-                    if not voice_id:
-                        continue
-                    # The answer is not reported back. A voice that will not delete is retried by
-                    # nothing, and that is deliberate: the row is already gone on the far side, so
-                    # there is nobody left to tell, and the sweep cannot reach a `profile-` name.
-                    # It is logged loudly instead, because for the consent case it is the
-                    # difference between a promise kept and a promise broken.
-                    if await self._require_cartesia().delete_voice(voice_id):
-                        self.logger.info("voice_deleted_on_request", voice_id=voice_id)
-                    else:
-                        self.logger.error(
-                            "voice_delete_on_request_failed",
-                            voice_id=voice_id,
-                            reason=_decode_field(data, "reason") or "unspecified",
-                        )
+                    await self._handle_voice_delete_request(data)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger.exception("voice_delete_consumer_error")
                 await asyncio.sleep(1.0)
+
+    async def _handle_voice_delete_request(self, data: dict[bytes, bytes]) -> None:
+        voice_id = _decode_field(data, "voice_id")
+        if not voice_id:
+            return
+        # The answer is not reported back. A voice that will not delete is retried by
+        # nothing, and that is deliberate: the row is already gone on the far side, so
+        # there is nobody left to tell, and the sweep cannot reach a `profile-` name.
+        # It is logged loudly instead, because for the consent case it is the
+        # difference between a promise kept and a promise broken.
+        if await self._require_cartesia().delete_voice(voice_id):
+            self.logger.info("voice_deleted_on_request", voice_id=voice_id)
+        else:
+            self.logger.error(
+                "voice_delete_on_request_failed",
+                voice_id=voice_id,
+                reason=_decode_field(data, "reason") or "unspecified",
+            )
 
     def _generation_config(
         self, translation: TranslationResultMessage

@@ -88,6 +88,29 @@ class BillingRepository:
 
             return subscription_id, workspace_uuid
 
+    async def get_service_state(
+        self, subscription_id: uuid.UUID
+    ) -> tuple[str | None, str | None] | None:
+        """(service_state, suspended_reason) of one subscription, or None when it is gone.
+
+        WT-699 / TC3705: read by the suspension watch to learn when a workspace that was refused a
+        charge can pay again — a resume, a renewal, a contract change — so the room it stopped can
+        translate again without anybody restarting it.
+        """
+        assert self._pool is not None, "call connect() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT service_state, suspended_reason
+                FROM subscription.subscriptions
+                WHERE id = $1
+                """,
+                subscription_id,
+            )
+        if row is None:
+            return None
+        return row["service_state"], row["suspended_reason"]
+
     async def record_usage_and_charge(
         self,
         *,
@@ -176,33 +199,56 @@ class BillingRepository:
             applied_currency = rate["currency"]
             credits_consumed = calculate_credit_charge(quantity, unit_price)
 
-            row = await conn.fetchrow(
-                """
-                SELECT applied, transaction_id, usage_record_id,
-                       balance_after, service_state, suspended_reason
-                FROM subscription.settle_usage_charge(
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                    $10, $11, $12, $13, $14, $15, $16, $17::jsonb
+            try:
+                row = await conn.fetchrow(
+                    """
+                    SELECT applied, transaction_id, usage_record_id,
+                           balance_after, service_state, suspended_reason
+                    FROM subscription.settle_usage_charge(
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                        $10, $11, $12, $13, $14, $15, $16, $17::jsonb
+                    )
+                    """,
+                    subscription_id,
+                    user_uuid,
+                    workspace_id,
+                    usage_type,
+                    charge_type,
+                    reference_uuid,
+                    reference_type,
+                    room_uuid,
+                    segment_uuid,
+                    quantity,
+                    unit,
+                    credits_consumed,
+                    idempotency_key,
+                    rate_card_id,
+                    unit_price,
+                    applied_currency,
+                    _to_jsonb(details or {}),
                 )
-                """,
-                subscription_id,
-                user_uuid,
-                workspace_id,
-                usage_type,
-                charge_type,
-                reference_uuid,
-                reference_type,
-                room_uuid,
-                segment_uuid,
-                quantity,
-                unit,
-                credits_consumed,
-                idempotency_key,
-                rate_card_id,
-                unit_price,
-                applied_currency,
-                _to_jsonb(details or {}),
-            )
+            except asyncpg.UniqueViolationError:
+                # The key is already charged, under a row the function's own replay probe did not
+                # match: that probe also compares reference_id and charge_type, so a retry whose
+                # voice changed (standard -> clone), or an event with no reference id
+                # (`reference_id = NULL` is never true), falls through to the INSERT and hits
+                # ux_credit_transactions_idempotency_key instead. The statement failed and
+                # nothing was charged; the key's existing charge IS this event's charge. It is a
+                # replay — raising would redeliver it five times into the dead-letter stream.
+                logger.info(
+                    "usage_charge_replayed",
+                    charge_type=charge_type,
+                    idempotency_key=idempotency_key,
+                    via="unique_violation",
+                )
+                return SettlementOutcome(
+                    applied=False,
+                    replayed=True,
+                    balance_after=None,
+                    service_state=None,
+                    suspended_reason=None,
+                    credits_consumed=credits_consumed,
+                )
 
         if row is None:
             # settle_usage_charge always RETURN QUERYs exactly one row on every path. Getting

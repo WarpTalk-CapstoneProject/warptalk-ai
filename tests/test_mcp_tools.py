@@ -5,6 +5,8 @@ from ai_assistant_worker.mcp_tools import (
     build_mcp_confirmation_questions,
     build_mcp_plugin_connection_action,
     normalize_mcp_tool_payload,
+    parse_disabled_plugin_keys,
+    read_mcp_always_allow,
     redact_mcp_tool_payload_for_model,
     select_mcp_tool_entries,
     split_mcp_tool_arguments,
@@ -62,10 +64,10 @@ def test_plugin_connection_action_payload_can_be_forwarded_to_clients() -> None:
     )
 
     assert payload == {
-        "pluginConnection": {
-            "type": "plugin_connection_required",
+        "permission": {
+            "kind": "connect",
+            "action": "Google Calendar",
             "pluginKey": "google_workspace",
-            "pluginLabel": "Google Calendar",
             "connectionStatus": "not_connected",
             "connectedAccountEmail": None,
             "message": "Connect Google Calendar before WarpBot can use it.",
@@ -129,11 +131,60 @@ def test_confirmation_question_carries_hidden_token_value() -> None:
         tool_name="google_calendar_create_event",
     )
 
-    question = question_payload["questions"][0]
-    confirm = question["options"][0]
-    assert question["header"] == "Confirm plugin action"
-    assert confirm["label"] == "Confirm"
+    prompt = question_payload["permission"]
+    confirm = prompt["options"][0]
+    assert prompt["kind"] == "tool"
+    # The action is the tool's own label; with none, its name. Nothing else is described.
+    assert prompt["action"] == "google_calendar_create_event"
+    assert confirm["label"] == "Yes"
     assert "token-1" in confirm["value"]
+
+
+def test_confirmation_question_offers_always_allow_with_the_token_and_the_flag() -> None:
+    question_payload = build_mcp_confirmation_questions(
+        {"message": "Confirm first.", "confirmationToken": "token-1"},
+        tool_name="linear_save_issue",
+    )
+
+    labels = [option["label"] for option in question_payload["permission"]["options"]]
+    always = question_payload["permission"]["options"][1]
+    assert labels == [
+        "Yes",
+        "Yes, and don't ask again for this tool",
+        "No, and tell WarpBot what to do differently",
+    ]
+    assert "token-1" in always["value"]
+    assert "alwaysAllow: true" in always["value"]
+
+
+def test_policy_decides_whether_a_tool_asks_and_effect_is_the_fallback() -> None:
+    parameters = {"type": "object", "properties": {}}
+
+    trusted_write = with_mcp_confirmation_parameter(parameters, effect="write", policy="allow")
+    watched_read = with_mcp_confirmation_parameter(parameters, effect="read", policy="approval")
+    legacy_write = with_mcp_confirmation_parameter(parameters, effect="write", policy="")
+
+    assert "confirmationToken" not in trusted_write["properties"]
+    assert {"confirmationToken", "alwaysAllow"} <= set(watched_read["properties"])
+    assert "confirmationToken" in legacy_write["properties"]
+
+
+def test_always_allow_is_read_only_from_a_real_true_and_never_reaches_the_provider() -> None:
+    raw = {"title": "Bug", "confirmationToken": "t", "alwaysAllow": True}
+
+    arguments, token = split_mcp_tool_arguments(raw)
+
+    assert read_mcp_always_allow(raw) is True
+    assert read_mcp_always_allow({"alwaysAllow": "true"}) is False
+    assert arguments == {"title": "Bug"}
+    assert token == "t"
+
+
+def test_disabled_plugin_keys_tolerate_an_absent_or_malformed_field() -> None:
+    assert parse_disabled_plugin_keys("") == []
+    assert parse_disabled_plugin_keys("not json") == []
+    assert parse_disabled_plugin_keys('{"linear": true}') == []
+    assert parse_disabled_plugin_keys('[" linear ", 3, ""]') == ["linear"]
 
 
 def test_split_mcp_tool_arguments_removes_confirmation_token_from_provider_args() -> None:
@@ -207,9 +258,45 @@ def test_selector_drops_names_the_responses_api_would_reject() -> None:
     ]
 
 
-def test_selector_keeps_only_the_first_of_two_identically_named_tools() -> None:
+def test_selector_drops_a_name_two_plugins_claim_for_both_of_them() -> None:
+    """A name two plugins claim is ambiguous, and an ambiguous name is not offered at all.
+
+    The handler binds the name to one pluginKey, so keeping "the first" meant whichever plugin was
+    listed first received every call - a private MCP server declaring ``google_drive_search`` got
+    Drive's queries whenever it came first. This side cannot tell the trusted claimant from the
+    other, so it keeps neither.
+    """
     accepted, rejected = select_mcp_tool_entries(
-        [_entry("search", "notion"), _entry("search", "linear")],
+        [
+            _entry("google_drive_search", "ws_crm_1a2b3c4d"),
+            _entry("google_drive_search", "google_drive"),
+            _entry("notion_search", "notion"),
+        ],
+        reserved_names=set(),
+    )
+
+    assert [item["name"] for item in accepted] == ["notion_search"]
+    assert rejected == [
+        ("mcp_tool_name_ambiguous", "google_drive_search"),
+        ("mcp_tool_name_ambiguous", "google_drive_search"),
+    ]
+
+
+def test_selector_treats_names_differing_only_in_case_as_one_name() -> None:
+    accepted, rejected = select_mcp_tool_entries(
+        [_entry("google_drive_search", "google_drive"), _entry("Google_Drive_Search", "ws_crm")],
+        reserved_names=set(),
+    )
+
+    assert accepted == []
+    assert [reason for reason, _ in rejected] == ["mcp_tool_name_ambiguous"] * 2
+
+
+def test_selector_keeps_the_first_when_one_plugin_repeats_its_own_name() -> None:
+    # Both entries would execute against the same plugin, so nothing is ambiguous; only the
+    # Responses API's objection to a repeated function name has to be avoided.
+    accepted, rejected = select_mcp_tool_entries(
+        [_entry("search", "notion"), _entry("search", "notion")],
         reserved_names=set(),
     )
 
@@ -220,7 +307,7 @@ def test_selector_keeps_only_the_first_of_two_identically_named_tools() -> None:
 
 def test_selector_never_shadows_a_built_in_tool() -> None:
     accepted, rejected = select_mcp_tool_entries(
-        [_entry("create_meeting"), _entry("notion_search")],
+        [_entry("create_meeting"), _entry("Create_Meeting", "ws_crm"), _entry("notion_search")],
         reserved_names={"create_meeting"},
     )
 
@@ -240,3 +327,30 @@ def test_selector_caps_how_many_tools_one_turn_will_carry() -> None:
 
 def test_selector_tolerates_a_catalog_that_is_not_a_list() -> None:
     assert select_mcp_tool_entries({"tools": []}, reserved_names=set()) == ([], [])
+
+
+def test_always_allow_tells_the_model_the_card_is_gone_for_this_tool() -> None:
+    """The one answer that changes something beyond this call has to reach the user.
+
+    Pressing Always allow turns the confirmation card off for this tool. Nothing else on the way
+    back says so, so a user who pressed it once finds out the next time WarpBot acts without
+    asking - which is exactly the moment it should not be a surprise.
+    """
+    payload = normalize_mcp_tool_payload(
+        {
+            "isSuccess": True,
+            "appliedToolPolicy": "allow",
+            "data": {"provider": "google_meet"},
+        }
+    )
+
+    assert "Always allow" in payload["instruction"]
+    assert "not ask again" in payload["instruction"]
+    # The result itself is untouched.
+    assert payload["data"] == {"provider": "google_meet"}
+
+
+def test_an_ordinary_result_carries_no_instruction() -> None:
+    payload = normalize_mcp_tool_payload({"isSuccess": True, "data": {"files": []}})
+
+    assert "instruction" not in payload
