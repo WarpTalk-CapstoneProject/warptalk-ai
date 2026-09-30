@@ -16,6 +16,8 @@ WHAT THESE PIN
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -23,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from ai_assistant_worker.chat_templates import (
     GENERAL,
+    GLOSSARY_EXPORT_RULES,
     MEETING,
     MEETING_CHAT,
     build_system_prompt,
@@ -691,6 +694,21 @@ class TestPromptSaysProseIsNotAnAction:
             assert "NEVER say something is saved" in prompt
             assert "add_glossary_term" in prompt
             assert "create_glossary" in prompt
+
+    def test_every_template_exports_glossary_terms_as_importable_csv(self) -> None:
+        # WT-884: an aligned table pasted into Excel lands in one column and Import cannot read
+        # it. The header must be the importer's own (web SAMPLE_TEMPLATE_HEADER's first four).
+        for template in (GENERAL, MEETING, MEETING_CHAT):
+            prompt = build_system_prompt(template)
+            assert "```csv" in prompt
+            assert "Term,Translation,Context,Field" in prompt
+            assert "never say you did" in prompt
+
+    def test_the_prompts_quoting_example_is_valid_csv(self) -> None:
+        # The example the model copies from has to be right, or every export inherits the bug.
+        rule = next(line for line in GLOSSARY_EXPORT_RULES if "double every quote" in line)
+        quoted = rule.split("becomes ", 1)[1].rsplit(". Replace", 1)[0]
+        assert next(csv.reader(io.StringIO(quoted))) == ['say "hi", ok']
 
     def test_only_the_meeting_chat_is_told_about_the_handoff(self) -> None:
         assert CONTINUE_IN_WIDGET_TOOL in build_system_prompt(MEETING_CHAT)
