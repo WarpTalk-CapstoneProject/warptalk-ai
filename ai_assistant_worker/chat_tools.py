@@ -1543,14 +1543,19 @@ async def _create_meeting(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     # than "created" and leave the user to go and check.
     room = created.get("firstOccurrence") or created
     room_id = room.get("id")
+    slug = await _workspace_slug(ctx)
     return json.dumps(
         {
             "status": "created",
             "kind": "warptalk_room",
             "id": room_id,
-            # The address the user opens. Handed over ready-made because the model has no slug to
-            # build one with; the web redirects /rooms/{id} into the open workspace.
-            "room_url": room_url(room_id) if isinstance(room_id, str) and room_id.strip() else None,
+            # The address the user opens. Slug-qualified so the browser opens the canonical room
+            # detail page directly without depending on a client-side redirect.
+            "room_url": (
+                room_url(room_id, slug=slug)
+                if isinstance(room_id, str) and room_id.strip()
+                else None
+            ),
             "title": room.get("title"),
             "room_code": room.get("translationRoomCode"),
             "room_type": room.get("translationRoomType") or draft.translation_room_type,
