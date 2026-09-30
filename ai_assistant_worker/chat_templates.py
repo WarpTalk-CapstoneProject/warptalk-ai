@@ -208,6 +208,11 @@ _ACTIONS: tuple[tuple[str, str], ...] = (
         "the user wants a meeting or a follow-up scheduled",
     ),
     (
+        "create_glossary",
+        "the user wants a new glossary created. It needs a name and both language codes — ask "
+        "for any the user did not give, never guess a language",
+    ),
+    (
         "add_glossary_term",
         "the user wants a term added, or how a term is translated fixed, in the glossary",
     ),
