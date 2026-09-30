@@ -109,7 +109,7 @@ def test_timeout_defaults_bound_connect_and_silence() -> None:
     timeout = openai_timeout(ChatAssistantSettings())
 
     assert timeout.connect == 10.0
-    assert timeout.read == 30.0
+    assert timeout.read == 90.0
 
 
 def test_timeout_is_configurable_from_the_environment(monkeypatch: Any) -> None:

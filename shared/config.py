@@ -711,7 +711,7 @@ class ChatAssistantSettings(BaseSettings):
     # event, so raise ASSISTANT_CHAT_OPENAI_READ_TIMEOUT_SECONDS rather than removing it if a
     # heavier model starts tripping it.
     openai_connect_timeout_seconds: float = 10.0
-    openai_read_timeout_seconds: float = 30.0
+    openai_read_timeout_seconds: float = 90.0
     workspace_service_url: str = "http://localhost:5106"
     assistant_service_url: str = "http://localhost:5108"
     transcript_service_url: str = "http://localhost:5103"
