@@ -147,6 +147,17 @@ def _chunk_audio_duration_ms(chunk: AudioChunkMessage) -> int:
     return int(samples * 1000 / sample_rate)
 
 
+# `stt:chunk:published:{audio:chunks entry id}` — see STTWorker._chunk_already_published. As
+# long as a chunk can still be redelivered: five deliveries, each after the reclaim threshold,
+# and a consumer-group replay of the retained stream.
+_CHUNK_PUBLISHED_KEY_PREFIX = "stt:chunk:published:"
+_CHUNK_PUBLISHED_TTL_SECONDS = 2 * 60 * 60
+
+
+def _chunk_published_key(message_id: bytes) -> str:
+    return _CHUNK_PUBLISHED_KEY_PREFIX + message_id.decode("utf-8", errors="replace")
+
+
 def _build_segment_id(
     meeting_id: str,
     speaker_id: str,
@@ -727,11 +738,56 @@ class STTWorker(BaseWorker):
                 self._clean_errors_suppressed = getattr(self, "_clean_errors_suppressed", 0) + 1
             return result
 
-    async def _publish_stt_result(self, result: STTResultMessage) -> STTResultMessage:
-        """Publish one line to `stt:results`, cleaned first. Returns what was published."""
+    async def _publish_stt_result(
+        self, result: STTResultMessage, source_message_id: bytes | None = None
+    ) -> STTResultMessage:
+        """Publish one line to `stt:results`, cleaned first. Returns what was published.
+
+        `source_message_id` is the `audio:chunks` entry the line was transcribed from. It is
+        marked BEFORE the line goes out, so a later delivery of the same entry knows that this
+        chunk has already reached the transcript (see `_chunk_already_published`).
+        """
         result = self._with_clean_text(result)
+        if source_message_id is not None:
+            await self._mark_chunk_published(source_message_id)
         await self.publish("stt:results", result.meeting_id, result.to_redis())
         return result
+
+    async def _mark_chunk_published(self, message_id: bytes) -> None:
+        """Record that `message_id` has put at least one line on `stt:results`. Best effort."""
+        try:
+            await self.redis.set_with_ttl(
+                _chunk_published_key(message_id), "1", _CHUNK_PUBLISHED_TTL_SECONDS
+            )
+        except Exception:
+            self.logger.warning("stt_chunk_mark_failed", exc_info=True)
+
+    async def _chunk_already_published(self, message_id: bytes) -> bool:
+        """Whether an earlier delivery of this `audio:chunks` entry already published from it.
+
+        AT MOST ONCE PER CHUNK, BECAUSE A SECOND TRANSCRIPTION IS A SECOND SEGMENT.
+        A segment id is derived from the chunk's entry id AND the recognised text
+        (`_build_segment_id`), and recognition is not deterministic: the same audio transcribed
+        twice comes back with different punctuation, a different sentence split, a different
+        early/final boundary. So a chunk delivered twice — its first attempt published and then
+        died before XACK, or raised after its early sentences were already out — produced a
+        second set of segments with NEW ids, which nothing downstream could recognise as a
+        repeat: shown twice in the transcript, dubbed twice, and billed twice, because every
+        billing key is built from the segment id.
+
+        So the first line published from a chunk marks it, and any later delivery of a marked
+        chunk is acknowledged without transcribing. What that trades is deliberate: a first
+        attempt that died part-way loses its remainder rather than repeating its beginning, and
+        the remainder is minutes stale by the time a reclaim could deliver it. An attempt that
+        failed BEFORE publishing anything left no mark and is retried in full, as before.
+
+        Fails open on a Redis error — the publish that follows needs the same Redis.
+        """
+        try:
+            marker = await self.redis.get(_chunk_published_key(message_id))
+        except Exception:
+            return False
+        return marker in (b"1", "1")
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Process one audio chunk: transcribe and publish results."""
@@ -747,6 +803,16 @@ class STTWorker(BaseWorker):
 
         if chunk.meeting_id in self._paused_rooms:
             self.logger.debug("skipping_paused_room", meeting_id=chunk.meeting_id)
+            return
+
+        if await self._chunk_already_published(message_id):
+            self.logger.warning(
+                "stt_chunk_already_transcribed",
+                meeting_id=chunk.meeting_id,
+                speaker_id=chunk.speaker_id,
+                chunk_index=chunk.chunk_index,
+                message_id=message_id,
+            )
             return
 
         current_timestamp_ms = int(time.time() * 1000)
@@ -878,7 +944,7 @@ class STTWorker(BaseWorker):
                     timestamp_ms=chunk.timestamp_ms,
                     prosody=None,
                 )
-                result = await self._publish_stt_result(result)
+                result = await self._publish_stt_result(result, message_id)
                 self.logger.info(
                     "stt_early_sentence",
                     meeting_id=chunk.meeting_id,
@@ -1056,7 +1122,7 @@ class STTWorker(BaseWorker):
                 prosody=prosody,
             )
 
-            result = await self._publish_stt_result(result)
+            result = await self._publish_stt_result(result, message_id)
 
             self.logger.info(
                 "segment_transcribed",
@@ -1101,7 +1167,7 @@ class STTWorker(BaseWorker):
                 is_final_chunk=True,
                 timestamp_ms=chunk.timestamp_ms,
             )
-            await self._publish_stt_result(result)
+            await self._publish_stt_result(result, message_id)
 
     async def _measure_prosody(self, chunk: AudioChunkMessage) -> ProsodyEnvelope | None:
         """How this chunk was said, relative to how this speaker normally says things.

@@ -106,6 +106,9 @@ class BaseWorker(ABC):
     heartbeat_interval_seconds: int = 10
     heartbeat_ttl_seconds: int = 30
     processing_timeout_seconds: float = 120
+    # How long an entry must sit unacknowledged before another consumer may take it
+    # (XAUTOCLAIM), on top of the processing timeout. See `_reclaim_min_idle_ms`.
+    reclaim_margin_seconds: float = 30
 
     def __init__(
         self,
@@ -750,12 +753,31 @@ class BaseWorker(ABC):
                 # Exponential backoff before retry
                 await asyncio.sleep(1.0)
 
+    def _reclaim_min_idle_ms(self) -> int:
+        """The idle time after which a pending entry is ABANDONED rather than in progress.
+
+        XAUTOCLAIM cannot tell "the consumer holding this died" from "the consumer holding this
+        is still working on it" — both are just an entry nobody has acknowledged. The only thing
+        that separates them is time: `_process_and_log_errors` cancels any attempt at
+        `processing_timeout_seconds`, so an entry idle for longer than that plus a margin is
+        certainly not being processed by anyone.
+
+        The threshold used to be a flat 60s against a 120s processing timeout. With two replicas
+        in a group (an HPA scale-out, or simply the old and new pod of a surge rollout), a message
+        that took 61s — a meeting summary on a long transcript, a WarpBot answer that ran a few
+        tools — was taken by the OTHER replica's idle poll and run a second time while the first
+        was still running it: two summaries, two chat answers, two sets of tool side effects.
+        """
+        timeout_ms = int(self.processing_timeout_seconds * 1000)
+        return max(60_000, timeout_ms + int(self.reclaim_margin_seconds * 1000))
+
     async def _recover_stale_messages(self) -> None:
         """Reprocess messages abandoned in the consumer group's pending list."""
         messages = await self.redis.reclaim_stale(
             self.input_stream,
             self.consumer_group,
             self._consumer_name,
+            min_idle_ms=self._reclaim_min_idle_ms(),
         )
         for message_id, data in messages:
             try:
