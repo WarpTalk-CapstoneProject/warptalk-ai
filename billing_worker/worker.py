@@ -89,6 +89,8 @@ from shared.schemas import (
 logger = get_logger("worker.billing")
 
 TRANSLATION_CHARGE_TYPE = "TRANSLATION"
+# The idempotency namespace for dubbing, whichever voice produced it. See _handle_tts.
+DUBBING_IDEMPOTENCY_PREFIX = "AUDIO_DUBBING"
 BACKFILL_RESULT_STREAM = "translate:backfill_results"
 BILLED_STREAMS = ("translate:results", BACKFILL_RESULT_STREAM, "tts:results")
 SettlementHandler = Callable[[Mapping[Any, Any]], Awaitable[None]]
@@ -810,6 +812,19 @@ class BillingSettlementWorker:
             self.logger.warning("segment_id_extraction_failed", raw_segment_id=msg.segment_id)
 
         quantity_s = _translation_quantity_seconds(msg)
+        # ONE CHARGE PER (STT SEGMENT, TARGET LANGUAGE) — NOT PER TRANSLATED CHUNK.
+        #
+        # translation_worker splits one STT segment into sentences and publishes each as its own
+        # message ("{stt_segment}-{lang}-c{idx}"), and every one of them carries the WHOLE
+        # segment's start_ms/end_ms, because that is the speech it came from. Keyed on the chunk,
+        # a segment split into three sentences was charged three times its duration. The quantity
+        # is the segment's seconds of source speech, so the segment is what the key names: the
+        # first chunk to arrive pays for all of it and the others replay.
+        #
+        # The same key is what makes a duplicate harmless whatever produced it — a redelivery, a
+        # retry that republished a chunk, two replicas racing a reclaimed entry: all of them name
+        # the same (segment, language, service) and settle_usage_charge replays the second.
+        billing_segment = underlying_segment_id or msg.segment_id
         outcome = await self.db.record_usage_and_charge(
             subscription_id=subscription_id,
             user_id=msg.speaker_id,
@@ -824,12 +839,7 @@ class BillingSettlementWorker:
             source_language_code=msg.source_lang,
             target_language_code=msg.target_lang,
             transcript_segment_id=underlying_segment_id,
-            # msg.segment_id here IS deterministic (translation_worker builds it as
-            # f"{stt_result.segment_id}-{target_lang}-c{idx}"), so this key is redelivery-safe. The
-            # idempotency key keeps using the raw composite msg.segment_id, unaffected by
-            # the extraction above (which only changes what's stored in reference_id /
-            # transcript_segment_id).
-            idempotency_key=f"{TRANSLATION_CHARGE_TYPE}:{msg.segment_id}:{msg.target_lang}",
+            idempotency_key=f"{TRANSLATION_CHARGE_TYPE}:{billing_segment}:{msg.target_lang}",
             # WT-446. Rides in `details` rather than as a new settle_usage_charge argument: the
             # column on usage_records is GENERATED from exactly this key, so the 200-line
             # settlement function — which decides whether a workspace can pay at all — is not
@@ -994,7 +1004,13 @@ class BillingSettlementWorker:
             unit="second",
             target_language_code=msg.target_lang,
             transcript_segment_id=underlying_segment_id,
-            idempotency_key=f"{charge_type}:{msg.segment_id}:{msg.target_lang}",
+            # One dub charge per (translated chunk, target language), whichever voice rendered
+            # it. The charge TYPE follows the voice (a clone is priced differently), but the key
+            # must not: a message retried after the speaker's clone became ready is the same
+            # sentence dubbed once more, and a key carrying the charge type let it be charged
+            # under both. A second charge for the key is a unique violation, which
+            # record_usage_and_charge reads as the replay it is.
+            idempotency_key=f"{DUBBING_IDEMPOTENCY_PREFIX}:{msg.segment_id}:{msg.target_lang}",
             details={
                 "clone_provider": msg.clone_provider,
                 "voice_mode": msg.voice_mode,

@@ -11,6 +11,7 @@ Passthrough: if source_lang == target_lang, forward without translation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import time
@@ -117,6 +118,13 @@ def _select_relevance_context(text: str, meeting_context: list[str] | None) -> l
     if utterance_tokens & context_tokens:
         return []
     return meeting_context
+
+
+# One key per published chunk: `translate:published:{segment_id}`. Long enough to cover every
+# retry a message can get (five deliveries, each after the reclaim threshold) and a consumer-group
+# replay of the retained stream; short enough that the keys never add up to anything.
+_PUBLISHED_KEY_PREFIX = "translate:published:"
+_PUBLISHED_TTL_SECONDS = 2 * 60 * 60
 
 
 class TranslationWorker(BaseWorker):
@@ -533,9 +541,7 @@ class TranslationWorker(BaseWorker):
                         is_early=stt_result.is_early,
                         prosody=stt_result.prosody,
                     )
-                    await self.publish(
-                        "translate:results", stt_result.meeting_id, result.to_redis()
-                    )
+                    await self._publish_once(stt_result.meeting_id, result)
             return
 
         publish_results = await asyncio.gather(
@@ -555,6 +561,43 @@ class TranslationWorker(BaseWorker):
             # back to the model as "what has been said in this meeting", and a history of
             # "um, so, uh" teaches it nothing except to expect more of them.
             self._remember_source_context(stt_result.meeting_id, mt_source)
+
+    async def _publish_once(self, meeting_id: str, result: TranslationResultMessage) -> bool:
+        """Publish one translated chunk unless this exact chunk has already gone out.
+
+        WHY A REDELIVERED MESSAGE WOULD OTHERWISE BE SPOKEN TWICE. `process` publishes chunk by
+        chunk, as each translation lands. If chunk 1's model call then fails, the message stays
+        pending and is retried from the top, and chunk 0 — already captioned and already dubbed
+        — is published again: a second caption and a second dub of the same sentence. The same
+        happens when the consumer group is recreated at `0` (`ensure_consumer_group`) and every
+        retained `stt:results` entry is replayed, and when a pod dies between publishing and
+        acknowledging.
+
+        `segment_id` is `{stt segment}-{lang}-c{idx}`, fully determined by the STT segment and
+        the sentence split, so it names the same chunk on every attempt. The claim is taken
+        BEFORE the publish and given back if the publish fails, so a failed publish is retried
+        rather than lost. Fails open on a Redis error: the publish needs the same Redis, and a
+        duplicate is a better failure than a missing sentence.
+        """
+        key = f"{_PUBLISHED_KEY_PREFIX}{result.segment_id}"
+        try:
+            fresh = await self.redis.set_if_absent(key, "1", _PUBLISHED_TTL_SECONDS)
+        except Exception:
+            fresh = True
+        if not fresh:
+            self.logger.info(
+                "translation_chunk_already_published",
+                meeting_id=meeting_id,
+                segment_id=result.segment_id,
+            )
+            return False
+        try:
+            await self.publish("translate:results", meeting_id, result.to_redis())
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self.redis.delete(key)
+            raise
+        return True
 
     async def _credits_suspended(self, room_id: str) -> bool:
         """Whether billing_worker has stopped this room for a refused charge (WT-699 / TC3705).
@@ -793,7 +836,8 @@ class TranslationWorker(BaseWorker):
             )
 
             # Publish IMMEDIATELY so TTS can synthesize while next chunk is translated
-            await self.publish("translate:results", stt_result.meeting_id, result.to_redis())
+            if not await self._publish_once(stt_result.meeting_id, result):
+                continue
             published_any = True
 
             self.logger.info(
