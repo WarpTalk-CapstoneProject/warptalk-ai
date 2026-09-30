@@ -302,12 +302,37 @@ async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> st
     return json.dumps(matches[:8])
 
 
+def _history_params(ctx: ToolContext, **params: Any) -> dict[str, Any]:
+    """Query string for `/translation-rooms/history`, which is workspace-scoped (WT-881).
+
+    GetTranslationRoomHistoryAsync answers a request without `workspaceId` with a 400
+    ValidationError. Every reader of that route goes through here so a new caller cannot
+    forget it — the two that existed both had, and WarpBot answered "could not look up recent
+    meetings" to every question about a meeting.
+    """
+    return {"workspaceId": ctx.workspace_id, **params}
+
+
 async def _list_recent_meetings(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     query = (arguments or {}).get("query") or ""
+    if not ctx.workspace_id:
+        # A turn with no workspace (the platform-scope admin chat forces "") has no meeting list
+        # to read: the route would only answer 400. Say what is actually true instead of
+        # reporting a failure that reads as an outage.
+        logger.warning("list_recent_meetings_no_workspace")
+        return json.dumps(
+            {
+                "error": (
+                    "Meetings belong to a workspace, and this conversation is not in one. "
+                    "Open WarpBot from inside a workspace to look up its meetings."
+                ),
+                "reason": "no_workspace",
+            }
+        )
     try:
         response = await ctx.translation_room_client.get(
             "/api/v1/translation-rooms/history",
-            params={"search": query, "page": 1, "pageSize": 5},
+            params=_history_params(ctx, search=query, page=1, pageSize=5),
             headers=_auth_headers(ctx),
         )
         if response.status_code != 200:
@@ -456,10 +481,14 @@ async def _visible_meeting_ids(ctx: ToolContext) -> list[str]:
     open, the safe reading is "nothing", not "everything". It costs a member their transcript
     search for one request; the alternative hands them somebody else's meeting.
     """
+    if not ctx.workspace_id:
+        # No workspace, no meetings to scope to — and "nothing" is the fail-closed answer anyway.
+        logger.warning("visible_meetings_lookup_no_workspace")
+        return []
     try:
         response = await ctx.translation_room_client.get(
             "/api/v1/translation-rooms/history",
-            params={"page": 1, "pageSize": MAX_SCOPED_ROOM_IDS},
+            params=_history_params(ctx, page=1, pageSize=MAX_SCOPED_ROOM_IDS),
             headers=_auth_headers(ctx),
         )
         if response.status_code != 200:
