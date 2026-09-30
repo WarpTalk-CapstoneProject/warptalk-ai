@@ -47,6 +47,7 @@ class CartesiaSynthesizer:
         model: str = "sonic-3.5",
         sample_rate: int = 44100,
         speed: str = "fast",
+        max_concurrency: int = 2,
     ) -> None:
         self.api_key = api_key
         self.model = model
@@ -66,6 +67,18 @@ class CartesiaSynthesizer:
         self._warm_connections: deque[tuple[Any, float]] = deque()
         self._warm_target = 0
         self._warm_refill_task: asyncio.Task[None] | None = None
+        # See TTSSettings.cartesia_max_concurrency. One gate for every generation this process
+        # starts, prosody context and one-shot alike, because Cartesia counts them together.
+        self._generation_slots = asyncio.Semaphore(max(1, max_concurrency))
+
+    def generation_slot(self) -> asyncio.Semaphore:
+        """Hold for the whole of one sentence's generation, fallback included.
+
+        Held by the caller rather than inside `synthesize`, so a prosody-context sentence and
+        the one-shot fallback it drops into count as ONE generation, not as a second request
+        queued behind the first one's own slot.
+        """
+        return self._generation_slots
 
     async def load(self) -> None:
         self._client = AsyncCartesia(

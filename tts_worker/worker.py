@@ -505,6 +505,7 @@ class TTSWorker(BaseWorker):
             model=self.tts_settings.model,
             sample_rate=self.tts_settings.sample_rate,
             speed=self.tts_settings.speed,
+            max_concurrency=self.tts_settings.cartesia_max_concurrency,
         )
         await self.cartesia.load()
         # Before any consumer starts: the first sentence of the first turn is the one that
@@ -1323,13 +1324,17 @@ class TTSWorker(BaseWorker):
 
         t0 = time.monotonic()
         try:
-            sentence = await self._synthesize_sentence(
-                translation=translation,
-                text=text,
-                voice_id=voice_id,
-                voice_key=voice_key,
-                generation_config=generation_config,
-            )
+            # One Cartesia slot for the whole sentence, fallback included — see
+            # TTSSettings.cartesia_max_concurrency. Waiting here is counted in the latency on
+            # purpose: it is time the listener spends waiting too.
+            async with self._require_cartesia().generation_slot():
+                sentence = await self._synthesize_sentence(
+                    translation=translation,
+                    text=text,
+                    voice_id=voice_id,
+                    voice_key=voice_key,
+                    generation_config=generation_config,
+                )
         except Exception as e:
             # Swallowed so the next sentence still plays; counted so a Cartesia outage (402 quota,
             # 5xx) shows as a TTS success rate falling rather than as silence.
@@ -1757,9 +1762,11 @@ class TTSWorker(BaseWorker):
 
         try:
             text = _PREVIEW_TEXT.get(language) or _PREVIEW_TEXT["en"]
-            audio_bytes, duration_ms, _resolved = await self._require_cartesia().synthesize(
-                text, language, voice_id
-            )
+            cartesia = self._require_cartesia()
+            async with cartesia.generation_slot():
+                audio_bytes, duration_ms, _resolved = await cartesia.synthesize(
+                    text, language, voice_id
+                )
             if not audio_bytes:
                 await answer(None, "the provider returned no audio for this voice", "NO_AUDIO")
                 return

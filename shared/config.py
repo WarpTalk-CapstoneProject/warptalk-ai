@@ -615,6 +615,14 @@ class TTSSettings(BaseSettings):
     # uncommon case, and the pool refills in the background the moment one is taken.
     tts_warm_pool_size: int = 2
 
+    # How many Cartesia generations this process may have in flight at once. The account's plan
+    # caps concurrency (currently 2: `429 concurrency_limited ... Current limit: 2`), and the
+    # consume loop dispatches up to 8 keys at a time, so without a gate a meeting with a few
+    # speakers and target languages overruns the plan and every excess sentence fails outright.
+    # Waiting for a slot costs a fraction of a sentence; a 429 costs the whole one. Keep this at
+    # the plan's limit divided by the number of TTS replicas (tts-worker is a singleton).
+    cartesia_max_concurrency: int = 2
+
     # Delete in-meeting clones from the Cartesia account once nothing can reach them.
     #
     # Every in-meeting clone creates a real voice in the account, and until this existed

@@ -9,6 +9,7 @@ utterance whose prosody could not be measured, which is exactly what a preview i
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from typing import Any
@@ -33,6 +34,13 @@ class _Cartesia:
         self._audio = audio
         self._raises = raises
         self.calls: list[dict[str, Any]] = []
+        # A preview shares the meeting's Cartesia concurrency budget, so it is taken through the
+        # same gate; see TTSSettings.cartesia_max_concurrency. Wide open here: these tests are
+        # about WHICH rendering a preview is, not about how many fit at once.
+        self._slot = asyncio.Semaphore(64)
+
+    def generation_slot(self) -> asyncio.Semaphore:
+        return self._slot
 
     async def synthesize(
         self,
