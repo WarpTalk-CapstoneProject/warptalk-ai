@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import re
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Any, cast
 
 from shared.base_worker import BaseWorker
@@ -125,6 +127,48 @@ def _select_relevance_context(text: str, meeting_context: list[str] | None) -> l
 # replay of the retained stream; short enough that the keys never add up to anything.
 _PUBLISHED_KEY_PREFIX = "translate:published:"
 _PUBLISHED_TTL_SECONDS = 2 * 60 * 60
+
+
+# ONE SPEAKER'S SENTENCES REACH translate:results IN THE ORDER THEY WERE SPOKEN.
+#
+# stt:results is in speech order: stt_worker serialises each speaker. This worker translates up to
+# _CONCURRENCY_LIMIT messages at once, which is right for latency, and published each one the
+# moment ITS translation landed, which was not right for order. A long sentence A and a short
+# sentence B spoken after it raced, and B could reach tts:results first. tts_worker keeps each
+# (speaker, language) strictly in arrival order, so the listener heard B, then A (late and sped
+# up by the catch-up rule). The owner heard this as "if A has not been dubbed when B is, A is
+# lost". Production kept 14 such inversions in the retained translate:results window.
+#
+# Translation still runs concurrently. Only the PUBLISH waits: B's first publish waits until A's
+# message has finished. The wait is bounded: a stalled A must not silence everyone after it. When
+# the bound is hit, the wait is logged and B goes out. A is still published when it lands.
+# Nothing is dropped either way.
+_PUBLISH_ORDER_WAIT_SECONDS = 10.0
+
+
+@dataclass
+class _PublishTurn:
+    """The previous message from the same speaker, which this one must not overtake."""
+
+    predecessor: asyncio.Event | None
+    waived: bool = False
+
+
+# Set by _consume_loop before process() starts. Copied into process()'s own task (wait_for) and
+# into its per-language gather, which is how _publish_once finds it without a new parameter on
+# every path. A message reached any other way (reclaim, a test calling process() directly) has
+# none, and publishes as it always did.
+_publish_turn: contextvars.ContextVar[_PublishTurn | None] = contextvars.ContextVar(
+    "translation_publish_turn", default=None
+)
+
+
+def _speaker_key(data: dict[bytes, bytes]) -> tuple[str, str]:
+    def field(name: bytes) -> str:
+        value = data.get(name, b"")
+        return value.decode() if isinstance(value, bytes) else str(value)
+
+    return field(b"meeting_id"), field(b"speaker_id")
 
 
 class TranslationWorker(BaseWorker):
@@ -384,8 +428,27 @@ class TranslationWorker(BaseWorker):
             consumer=self._consumer_name,
         )
 
+        # (meeting, speaker) -> the done-event of that speaker's most recently started message.
+        tails: dict[tuple[str, str], asyncio.Event] = {}
+
         async def _run(message_id: bytes, data: dict[bytes, bytes]) -> None:
-            await self._process_and_log_errors(message_id, data)
+            # Taken BEFORE the first await. consume_concurrent starts handlers in stream order and
+            # each one runs to its first suspension before the next begins, so the ticket order
+            # is the order the speaker spoke in.
+            key = _speaker_key(data)
+            done = asyncio.Event()
+            predecessor = tails.get(key)
+            tails[key] = done
+            token = _publish_turn.set(_PublishTurn(predecessor))
+            try:
+                await self._process_and_log_errors(message_id, data)
+            finally:
+                # Always, a failure included: the next sentence must not wait on one that will
+                # only come back through the reclaim path minutes from now.
+                done.set()
+                _publish_turn.reset(token)
+                if tails.get(key) is done:
+                    del tails[key]
 
         while not self._shutdown_event.is_set():
             try:
@@ -562,6 +625,40 @@ class TranslationWorker(BaseWorker):
             # "um, so, uh" teaches it nothing except to expect more of them.
             self._remember_source_context(stt_result.meeting_id, mt_source)
 
+    async def _wait_for_earlier_sentence(
+        self, meeting_id: str, result: TranslationResultMessage
+    ) -> None:
+        """Hold this publish until the same speaker's previous message is out. See
+        _PUBLISH_ORDER_WAIT_SECONDS."""
+        turn = _publish_turn.get()
+        if turn is None or turn.waived or turn.predecessor is None:
+            return
+        if turn.predecessor.is_set():
+            return
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(turn.predecessor.wait(), _PUBLISH_ORDER_WAIT_SECONDS)
+        except TimeoutError:
+            # Waived for the rest of this message, so its other sentences and languages do not
+            # each wait out the bound again.
+            turn.waived = True
+            self.logger.warning(
+                "translation_publish_order_wait_timeout",
+                meeting_id=meeting_id,
+                speaker_id=result.speaker_id,
+                segment_id=result.segment_id,
+                waited_ms=int((time.monotonic() - started) * 1000),
+            )
+            return
+        waited_ms = int((time.monotonic() - started) * 1000)
+        self.logger.info(
+            "translation_publish_held_for_order",
+            meeting_id=meeting_id,
+            speaker_id=result.speaker_id,
+            segment_id=result.segment_id,
+            waited_ms=waited_ms,
+        )
+
     async def _publish_once(self, meeting_id: str, result: TranslationResultMessage) -> bool:
         """Publish one translated chunk unless this exact chunk has already gone out.
 
@@ -579,6 +676,7 @@ class TranslationWorker(BaseWorker):
         rather than lost. Fails open on a Redis error: the publish needs the same Redis, and a
         duplicate is a better failure than a missing sentence.
         """
+        await self._wait_for_earlier_sentence(meeting_id, result)
         key = f"{_PUBLISHED_KEY_PREFIX}{result.segment_id}"
         try:
             fresh = await self.redis.set_if_absent(key, "1", _PUBLISHED_TTL_SECONDS)
