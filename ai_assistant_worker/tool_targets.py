@@ -58,6 +58,7 @@ _TARGET_KEYS: dict[str, tuple[str, ...]] = {
     "lookup_plugins": ("plugin_key", "query"),
     "create_meeting": ("title",),
     "create_action_item": ("task",),
+    "create_glossary": ("name",),
     "add_glossary_term": ("source_term",),
     # The address is somebody's email, and in a meeting the trail is read by the whole room.
     "share_meeting_minutes": (),

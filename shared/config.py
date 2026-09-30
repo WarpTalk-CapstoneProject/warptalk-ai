@@ -615,6 +615,14 @@ class TTSSettings(BaseSettings):
     # uncommon case, and the pool refills in the background the moment one is taken.
     tts_warm_pool_size: int = 2
 
+    # How many Cartesia generations this process may have in flight at once. The account's plan
+    # caps concurrency (currently 2: `429 concurrency_limited ... Current limit: 2`), and the
+    # consume loop dispatches up to 8 keys at a time, so without a gate a meeting with a few
+    # speakers and target languages overruns the plan and every excess sentence fails outright.
+    # Waiting for a slot costs a fraction of a sentence; a 429 costs the whole one. Keep this at
+    # the plan's limit divided by the number of TTS replicas (tts-worker is a singleton).
+    cartesia_max_concurrency: int = 2
+
     # Delete in-meeting clones from the Cartesia account once nothing can reach them.
     #
     # Every in-meeting clone creates a real voice in the account, and until this existed
@@ -703,6 +711,15 @@ class ChatAssistantSettings(BaseSettings):
     # Redis Stream / SignalR traffic bounded, matching the rest of the pipeline's coarse
     # buffered-unit convention (STT/TTS/AI-assistant results are never per-token either).
     chunk_flush_chars: int = 40
+    # WT-881: the OpenAI SDK's default read timeout is 600s, so a stream that went quiet
+    # mid-answer — no delta, no response.completed — left the widget on "Running..." for ten
+    # minutes, which to a user is forever. The read timeout is the longest SILENCE between two
+    # bytes of the stream, not the length of the answer: a long answer that keeps streaming is
+    # never cut. It has to stay above the longest gap a reasoning model leaves before its first
+    # event, so raise ASSISTANT_CHAT_OPENAI_READ_TIMEOUT_SECONDS rather than removing it if a
+    # heavier model starts tripping it.
+    openai_connect_timeout_seconds: float = 10.0
+    openai_read_timeout_seconds: float = 90.0
     workspace_service_url: str = "http://localhost:5106"
     assistant_service_url: str = "http://localhost:5108"
     transcript_service_url: str = "http://localhost:5103"

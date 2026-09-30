@@ -23,7 +23,7 @@ from typing import Any, cast
 from urllib.parse import urlparse
 
 import httpx
-from openai import AsyncOpenAI
+from openai import APITimeoutError, AsyncOpenAI
 
 from ai_assistant_worker.chat_templates import PERSONA, build_system_prompt, resolve_template
 from ai_assistant_worker.chat_tools import (
@@ -93,6 +93,27 @@ from shared.provider_calls import observed_openai_http_client
 from shared.schemas import ChatRequestMessage, ChatResultMessage
 
 SIBLING_SERVICE_TIMEOUT_SECONDS = 15.0
+
+#: What the reader sees when the model's stream goes silent past the read timeout (WT-881).
+STREAM_STALLED_MESSAGE = (
+    "WarpBot stopped receiving a reply from the model, so this answer was cut short. "
+    "Please try again."
+)
+
+
+def openai_timeout(settings: ChatAssistantSettings) -> httpx.Timeout:
+    """The chat client's timeout: a bounded connect, and a bounded SILENCE while streaming.
+
+    WT-881. Without it the SDK's 600s default applied, and `async for event in stream` sat on a
+    stream that had stopped sending — no delta, no response.completed — with the widget on
+    "Running..." the whole time. httpx's read timeout is per read, so it fires on a quiet stream
+    and never on a long one that keeps talking.
+    """
+    return httpx.Timeout(
+        settings.openai_read_timeout_seconds,
+        connect=settings.openai_connect_timeout_seconds,
+    )
+
 
 #: What the client shows while OpenAI runs a hosted web search. Not in ASSISTANT_TOOL_LABELS on
 #: the web side because it is not a local tool — but from the reader's chair it is the same thing
@@ -551,7 +572,9 @@ class ChatAssistantWorker(BaseWorker):
             raise RuntimeError("OPENAI_API_KEY is required for ChatAssistantWorker")
 
         self._openai = AsyncOpenAI(
-            api_key=api_key, http_client=observed_openai_http_client("assistant-chat")
+            api_key=api_key,
+            http_client=observed_openai_http_client("assistant-chat"),
+            timeout=openai_timeout(self.chat_settings),
         )
         self._workspace_client = httpx.AsyncClient(
             base_url=self.chat_settings.workspace_service_url,
@@ -681,6 +704,18 @@ class ChatAssistantWorker(BaseWorker):
                 if cited
                 else "",
             )
+        except (httpx.TimeoutException, APITimeoutError) as exc:
+            # WT-881. A stalled stream now raises instead of hanging; it ends the turn the way
+            # every other failure does — type "failed" — so AssistantService closes the message
+            # and the widget leaves "Running...". Its own branch only for the wording:
+            # str(httpx.ReadTimeout) is often empty or a socket message, neither of which tells a
+            # reader what happened.
+            self.logger.warning(
+                "chat_stream_timed_out",
+                request_id=request.request_id,
+                reason=type(exc).__name__,
+            )
+            await self._publish_result(request, type_="failed", content=STREAM_STALLED_MESSAGE)
         except Exception as exc:
             self.logger.exception("chat_turn_failed", request_id=request.request_id)
             await self._publish_result(
