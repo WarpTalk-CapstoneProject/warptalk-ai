@@ -1842,8 +1842,9 @@ async def _add_glossary_term(ctx: ToolContext, arguments: dict[str, Any]) -> str
             {
                 "status": "no_glossary",
                 "instruction": (
-                    "This workspace has no glossary yet, so nothing was saved. Tell the user to "
-                    "create one on the Glossary page first."
+                    "This workspace has no glossary yet, so nothing was saved. Offer to create "
+                    "one with create_glossary — ask the user for its name and its two languages "
+                    "— then add the term to it."
                 ),
             }
         )
@@ -1924,6 +1925,134 @@ async def _add_glossary_term(ctx: ToolContext, arguments: dict[str, Any]) -> str
         "glossary": glossary.get("name"),
         "source_term": source_term,
         "target_term": target_term,
+    }
+    if slug:
+        result["glossary_link"] = f"/{slug}/glossary"
+    return json.dumps(result, ensure_ascii=False)
+
+
+#: A language code as the glossary stores it — "vi", "en", "zh-CN" — and never a language NAME.
+#: The column is VARCHAR(10) (CreateGlossaryDto), and "Vietnamese" would be saved as a glossary
+#: whose language matches nothing the translation pipeline ever asks for.
+_LANGUAGE_CODE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,4})?$")
+
+
+async def _create_glossary(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Create a glossary in this workspace, and hand back its name so terms can go straight in.
+
+    POSTs the same body the Glossary page sends (WorkspaceService.createGlossary), as the caller:
+    the transcript service decides who may create one (Owner/Admin) and its refusal is passed
+    through in its own words. workspaceId comes from ctx, never from the model.
+
+    The languages are never defaulted. A glossary is a (source → target) pair and every term in
+    it is read that way, so a guessed pair is a glossary that silently never applies.
+    """
+    name = _text_arg(arguments, "name")
+    source_language = _text_arg(arguments, "source_language")
+    target_language = _text_arg(arguments, "target_language")
+    missing = [
+        key
+        for key, value in (
+            ("name", name),
+            ("source_language", source_language),
+            ("target_language", target_language),
+        )
+        if not value
+    ]
+    if missing:
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": missing,
+                "instruction": (
+                    "Nothing was created. Ask the user (ask_user) for what is missing — the "
+                    "glossary's name, the language its terms are spoken in and the language they "
+                    "are translated into. Never guess a language."
+                ),
+            }
+        )
+
+    problems = [
+        f"{key} '{value}' is not a language code — pass a code such as 'vi', 'en' or 'ja'."
+        for key, value in (
+            ("source_language", source_language),
+            ("target_language", target_language),
+        )
+        if not _LANGUAGE_CODE.match(value)
+    ]
+    if len(name) > 100:
+        problems.append("name is longer than 100 characters.")
+    if problems:
+        return json.dumps({"status": "invalid", "problems": problems}, ensure_ascii=False)
+
+    description = _text_arg(arguments, "description")
+    try:
+        response = await ctx.transcript_client.post(
+            "/api/v1/glossaries",
+            json={
+                "workspaceId": ctx.workspace_id,
+                "name": name,
+                "description": description[:500] or None,
+                "sourceLanguage": source_language,
+                "targetLanguage": target_language,
+            },
+            headers=_auth_headers(ctx),
+        )
+    except Exception:
+        logger.exception("create_glossary_request_error")
+        return json.dumps(
+            {
+                "status": "failed",
+                "reason": "Could not reach the glossary service. Nothing was created.",
+            }
+        )
+
+    if response.status_code == 409:
+        return json.dumps(
+            {
+                "status": "already_exists",
+                "glossary": name,
+                "reason": _error_reason(response),
+                "instruction": (
+                    "Nothing was created: this workspace already has a glossary with that name. "
+                    "Tell the user, and offer to add the terms to it with add_glossary_term "
+                    "(glossary_name set to this name) or to pick another name."
+                ),
+            },
+            ensure_ascii=False,
+        )
+    if response.status_code not in (200, 201):
+        logger.warning("create_glossary_failed", status=response.status_code)
+        return json.dumps(
+            {
+                "status": "failed",
+                "http_status": response.status_code,
+                "reason": _error_reason(response)
+                or "The glossary service refused the request. Nothing was created.",
+                "instruction": "Nothing was created. Tell the user why, in the service's words.",
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        created = response.json()
+    except Exception:
+        created = {}
+    if not isinstance(created, dict):
+        created = {}
+
+    created_name = created.get("name") or name
+    slug = await _workspace_slug(ctx)
+    result: dict[str, Any] = {
+        "status": "created",
+        "glossary_id": created.get("id"),
+        "glossary": created_name,
+        "source_language": created.get("sourceLanguage") or source_language,
+        "target_language": created.get("targetLanguage") or target_language,
+        "instruction": (
+            "It is created and empty. To put terms in it, call add_glossary_term once per term "
+            f"with glossary_name '{created_name}'. Confirm in one line with the link."
+        ),
     }
     if slug:
         result["glossary_link"] = f"/{slug}/glossary"
@@ -2509,6 +2638,45 @@ TOOLS: list[ChatTool] = [
             "required": ["task", "owner"],
         },
         handler=_create_action_item,
+    ),
+    ChatTool(
+        name="create_glossary",
+        description=(
+            "CREATE a new glossary in this workspace — a named (source → target) language pair "
+            "that terms are added to. Call this when the user asks to create, make or start a "
+            "glossary. It needs a name and BOTH languages: if the user did not say them, ask "
+            "(ask_user) — never guess a language. It is created empty; to fill it, call "
+            "add_glossary_term with the name this returns."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The glossary's name, as the user gave it. At most 100 chars.",
+                },
+                "source_language": {
+                    "type": "string",
+                    "description": (
+                        "Language code the terms are spoken in, e.g. 'vi', 'en', 'ja'. A code, "
+                        "not a name. Only what the user said — ask if they did not say."
+                    ),
+                },
+                "target_language": {
+                    "type": "string",
+                    "description": (
+                        "Language code the terms are translated into, e.g. 'en'. A code, not a "
+                        "name. Only what the user said — ask if they did not say."
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional one-line description. Empty if none.",
+                },
+            },
+            "required": ["name", "source_language", "target_language"],
+        },
+        handler=_create_glossary,
     ),
     ChatTool(
         name="add_glossary_term",

@@ -16,6 +16,8 @@ WHAT THESE PIN
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -23,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from ai_assistant_worker.chat_templates import (
     GENERAL,
+    GLOSSARY_EXPORT_RULES,
     MEETING,
     MEETING_CHAT,
     build_system_prompt,
@@ -35,6 +38,7 @@ from ai_assistant_worker.chat_tools import (
     _add_glossary_term,
     _continue_in_widget,
     _create_action_item,
+    _create_glossary,
     _share_meeting_minutes,
     offered_on,
 )
@@ -351,6 +355,167 @@ class TestAddGlossaryTerm:
 
         transcript.post.assert_not_awaited()
         assert result["status"] == "no_glossary"
+        assert "create_glossary" in result["instruction"]
+
+
+class TestCreateGlossary:
+    """WT-884: asked to create a glossary, WarpBot had no tool that could."""
+
+    @staticmethod
+    def _created(**overrides: Any) -> dict[str, Any]:
+        glossary = {
+            "id": "g-new",
+            "workspaceId": "ws-1",
+            "name": "Sales",
+            "description": None,
+            "sourceLanguage": "vi",
+            "targetLanguage": "en",
+            "termCount": 0,
+            "isActive": True,
+        }
+        glossary.update(overrides)
+        return glossary
+
+    async def test_posts_the_glossary_pages_body_as_the_caller(self) -> None:
+        transcript = AsyncMock()
+        transcript.post.return_value = _response(201, self._created())
+
+        result = json.loads(
+            await _create_glossary(
+                _ctx(transcript_client=transcript),
+                {
+                    "name": "Sales",
+                    "source_language": "vi",
+                    "target_language": "en",
+                    "description": "",
+                },
+            )
+        )
+
+        assert transcript.post.await_args.args[0] == "/api/v1/glossaries"
+        assert transcript.post.await_args.kwargs["json"] == {
+            "workspaceId": "ws-1",
+            "name": "Sales",
+            "description": None,
+            "sourceLanguage": "vi",
+            "targetLanguage": "en",
+        }
+        assert transcript.post.await_args.kwargs["headers"] == {"Authorization": "Bearer t"}
+        assert result["status"] == "created"
+        assert result["glossary_id"] == "g-new"
+        assert result["glossary"] == "Sales"
+        assert result["glossary_link"] == "/acme/glossary"
+        assert "add_glossary_term" in result["instruction"]
+
+    async def test_the_created_glossary_takes_terms_by_the_name_it_returned(self) -> None:
+        # The chain the tool's result tells the model to take: create, then add by name.
+        transcript = AsyncMock()
+        transcript.post.return_value = _response(201, self._created())
+        created = json.loads(
+            await _create_glossary(
+                _ctx(transcript_client=transcript),
+                {"name": "Sales", "source_language": "vi", "target_language": "en"},
+            )
+        )
+
+        transcript = AsyncMock()
+        transcript.get.return_value = _response(
+            200, [{"id": "g-old", "name": "Product"}, self._created()]
+        )
+        transcript.post.return_value = _response(201)
+        await _add_glossary_term(
+            _ctx(transcript_client=transcript),
+            {
+                "source_term": "chốt đơn",
+                "target_term": "close the deal",
+                "glossary_name": created["glossary"],
+            },
+        )
+
+        assert transcript.post.await_args.args[0] == "/api/v1/glossaries/g-new/terms"
+
+    async def test_the_schema_requires_both_languages(self) -> None:
+        schema = TOOLS_BY_NAME["create_glossary"].parameters
+        assert set(schema["required"]) == {"name", "source_language", "target_language"}
+        assert "never guess" in TOOLS_BY_NAME["create_glossary"].description
+
+    async def test_missing_languages_ask_rather_than_guess(self) -> None:
+        transcript = AsyncMock()
+
+        result = json.loads(
+            await _create_glossary(
+                _ctx(transcript_client=transcript),
+                {"name": "Sales", "source_language": "", "target_language": ""},
+            )
+        )
+
+        transcript.post.assert_not_awaited()
+        assert result["status"] == "needs_more_information"
+        assert result["missing"] == ["source_language", "target_language"]
+
+    async def test_a_language_name_is_not_a_code(self) -> None:
+        transcript = AsyncMock()
+
+        result = json.loads(
+            await _create_glossary(
+                _ctx(transcript_client=transcript),
+                {"name": "Sales", "source_language": "Vietnamese", "target_language": "en"},
+            )
+        )
+
+        transcript.post.assert_not_awaited()
+        assert result["status"] == "invalid"
+
+    async def test_a_refusal_is_passed_through_in_the_services_words(self) -> None:
+        transcript = AsyncMock()
+        transcript.post.return_value = _response(
+            403, "Only the workspace Owner or Admin can manage the glossary."
+        )
+
+        result = json.loads(
+            await _create_glossary(
+                _ctx(transcript_client=transcript),
+                {"name": "Sales", "source_language": "vi", "target_language": "en"},
+            )
+        )
+
+        assert result["status"] == "failed"
+        assert result["http_status"] == 403
+        assert result["reason"] == "Only the workspace Owner or Admin can manage the glossary."
+
+    async def test_a_rejected_language_is_surfaced(self) -> None:
+        transcript = AsyncMock()
+        transcript.post.return_value = _response(
+            400, {"error": "Language 'ko' is not allowed in this workspace."}
+        )
+
+        result = json.loads(
+            await _create_glossary(
+                _ctx(transcript_client=transcript),
+                {"name": "Sales", "source_language": "ko", "target_language": "en"},
+            )
+        )
+
+        assert result["status"] == "failed"
+        assert result["http_status"] == 400
+        assert "not allowed" in result["reason"]
+
+    async def test_a_taken_name_offers_the_existing_glossary(self) -> None:
+        transcript = AsyncMock()
+        transcript.post.return_value = _response(409, "A glossary named 'Sales' already exists.")
+
+        result = json.loads(
+            await _create_glossary(
+                _ctx(transcript_client=transcript),
+                {"name": "Sales", "source_language": "vi", "target_language": "en"},
+            )
+        )
+
+        assert result["status"] == "already_exists"
+        assert "add_glossary_term" in result["instruction"]
+
+    async def test_the_trail_names_the_glossary(self) -> None:
+        assert describe_tool_target("create_glossary", {"name": "Sales"}) == "Sales"
 
 
 class TestShareMeetingMinutes:
@@ -528,6 +693,22 @@ class TestPromptSaysProseIsNotAnAction:
             assert "create_action_item" in prompt
             assert "NEVER say something is saved" in prompt
             assert "add_glossary_term" in prompt
+            assert "create_glossary" in prompt
+
+    def test_every_template_exports_glossary_terms_as_importable_csv(self) -> None:
+        # WT-884: an aligned table pasted into Excel lands in one column and Import cannot read
+        # it. The header must be the importer's own (web SAMPLE_TEMPLATE_HEADER's first four).
+        for template in (GENERAL, MEETING, MEETING_CHAT):
+            prompt = build_system_prompt(template)
+            assert "```csv" in prompt
+            assert "Term,Translation,Context,Field" in prompt
+            assert "never say you did" in prompt
+
+    def test_the_prompts_quoting_example_is_valid_csv(self) -> None:
+        # The example the model copies from has to be right, or every export inherits the bug.
+        rule = next(line for line in GLOSSARY_EXPORT_RULES if "double every quote" in line)
+        quoted = rule.split("becomes ", 1)[1].rsplit(". Replace", 1)[0]
+        assert next(csv.reader(io.StringIO(quoted))) == ['say "hi", ok']
 
     def test_only_the_meeting_chat_is_told_about_the_handoff(self) -> None:
         assert CONTINUE_IN_WIDGET_TOOL in build_system_prompt(MEETING_CHAT)

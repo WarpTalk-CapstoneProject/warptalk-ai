@@ -208,6 +208,11 @@ _ACTIONS: tuple[tuple[str, str], ...] = (
         "the user wants a meeting or a follow-up scheduled",
     ),
     (
+        "create_glossary",
+        "the user wants a new glossary created. It needs a name and both language codes — ask "
+        "for any the user did not give, never guess a language",
+    ),
+    (
         "add_glossary_term",
         "the user wants a term added, or how a term is translated fixed, in the glossary",
     ),
@@ -445,6 +450,31 @@ MEETING_KIND_RULES: tuple[str, ...] = (
 )
 
 
+#: WT-884: asked to export glossary terms "for Excel", WarpBot printed a space-aligned table. Pasted
+#: into Excel it landed in one column, and the Glossary page's Import could not read it at all.
+#: The header is the importer's own (web: SAMPLE_TEMPLATE_HEADER / HEADER_ALIASES in
+#: glossary-import-dialog.tsx), and its CSV reader is line-based — a quoted line break splits a row
+#: there, so line breaks inside a field are flattened rather than quoted.
+GLOSSARY_EXPORT_RULES: tuple[str, ...] = (
+    "EXPORTING GLOSSARY TERMS - FOR EXCEL OR THE GLOSSARY PAGE'S IMPORT",
+    "- When the user wants glossary terms exported, downloaded, copied into Excel or a "
+    "spreadsheet, or in a file they can import, answer with ONE fenced ```csv code block. Never "
+    "an aligned or markdown table: pasted into Excel that lands in a single column, and Import "
+    "cannot read it.",
+    "- Its first line is exactly: Term,Translation,Context,Field - the columns Import "
+    "recognises. Then one line per term: the term, its translation, its context (empty if "
+    "none), its domain (empty if none).",
+    "- Comma-separated. Wrap a field in double quotes when it contains a comma or a double "
+    'quote, and double every quote inside it: say "hi", ok becomes "say ""hi"", ok". Replace a '
+    "line break inside a field with a space. Keep every character as it is - Vietnamese "
+    "diacritics, Japanese, Chinese - never transliterate.",
+    "- Only terms a tool returned this turn; never invent one. search_terminology returns at "
+    "most 8 matches per search, so if the list may be incomplete, say so.",
+    "- After the block, tell the user to copy it into a file saved as .csv (UTF-8) and use "
+    "Import on the Glossary page. You cannot attach, send or download files - never say you did.",
+)
+
+
 def build_system_prompt(template: ChatTemplate, web_search_enabled: bool = True) -> str:
     """Generate the system prompt from the template.
 
@@ -531,6 +561,7 @@ def build_system_prompt(template: ChatTemplate, web_search_enabled: bool = True)
         )
 
     lines.extend(["", *MEETING_KIND_RULES])
+    lines.extend(["", *GLOSSARY_EXPORT_RULES])
 
     if template.style:
         lines.extend(["", "STYLE", template.style])
