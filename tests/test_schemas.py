@@ -546,3 +546,21 @@ def test_translation_language_pairs(lang_pair: tuple[str, str]) -> None:
     restored = TranslationResultMessage.from_redis(msg.to_redis())
     assert restored.source_lang == src
     assert restored.target_lang == tgt
+
+
+def test_chat_request_disabled_plugin_keys_roundtrip_and_default() -> None:
+    request = ChatRequestMessage(
+        request_id="request-1",
+        conversation_id="conversation-1",
+        workspace_id="workspace-1",
+        user_id="user-1",
+        disabled_plugin_keys_json='["linear"]',
+    )
+
+    restored = ChatRequestMessage.from_redis(request.to_redis())
+    legacy = request.to_redis()
+    del legacy["disabled_plugin_keys_json"]
+
+    assert restored.disabled_plugin_keys_json == '["linear"]'
+    # An AssistantService older than WT-687 does not send the field at all.
+    assert ChatRequestMessage.from_redis(legacy).disabled_plugin_keys_json == ""

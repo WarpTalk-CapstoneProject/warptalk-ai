@@ -16,6 +16,7 @@ import json
 
 from ai_assistant_worker.chat_templates import (
     DOCUMENT,
+    EXTERNAL_MEETING_WIDGET,
     GENERAL,
     MEETING,
     MEETING_CHAT,
@@ -97,6 +98,59 @@ class TestBuildSystemPrompt:
     def test_meeting_chat_carries_its_style_and_others_do_not(self) -> None:
         assert "STYLE" in build_system_prompt(MEETING_CHAT)
         assert "STYLE" not in build_system_prompt(GENERAL)
+
+
+class TestExternalMeetingWidget:
+    """WT-620: the private WarpBot tab in the desktop app's Google Meet widget.
+
+    Before this page type existed it fell back to GENERAL, which drops MEETING's entity_id →
+    meeting_id binding — so the widget's own room id reached the model as trivia and "what did
+    they just say?" went unanswered from the transcript sitting one tool call away.
+    """
+
+    def test_the_widget_page_type_resolves_to_its_own_template(self) -> None:
+        assert resolve_template(page_type="external_meeting_widget") is EXTERNAL_MEETING_WIDGET
+        assert (
+            resolve_template(origin="assistant", page_type=" External_Meeting_Widget ")
+            is EXTERNAL_MEETING_WIDGET
+        )
+
+    def test_it_is_not_the_general_fallback(self) -> None:
+        assert resolve_template(page_type="external_meeting_widget") is not GENERAL
+
+    def test_it_retrieves_exactly_like_a_meeting(self) -> None:
+        """Composed from MEETING, so a source added there reaches the widget too."""
+        assert EXTERNAL_MEETING_WIDGET.sources == MEETING.sources
+        assert EXTERNAL_MEETING_WIDGET.binding == MEETING.binding
+        assert ("get_transcript", "meeting_id") in EXTERNAL_MEETING_WIDGET.binding.arguments
+
+    def test_the_prompt_binds_the_entity_id_to_the_transcript(self) -> None:
+        prompt = build_system_prompt(EXTERNAL_MEETING_WIDGET)
+        assert "THE ID YOU WERE GIVEN" in prompt
+        assert "meeting_id of get_transcript" in prompt
+
+    def test_the_prompt_carries_the_surface_notes(self) -> None:
+        prompt = build_system_prompt(EXTERNAL_MEETING_WIDGET)
+        assert "Google Meet, not in WarpTalk" in prompt
+        assert '"Other side"' in prompt
+        assert "most recent part of the transcript" in prompt
+        assert "460px" in prompt
+        assert "Lead with the answer" in prompt
+
+    def test_it_keeps_the_meeting_situation_and_only_adds_to_it(self) -> None:
+        assert EXTERNAL_MEETING_WIDGET.situation.startswith(MEETING.situation)
+
+    def test_the_surface_notes_stay_off_the_ordinary_meeting_page(self) -> None:
+        """The in_meeting page is still MEETING — the web app's meeting page is not a Meet call."""
+        assert resolve_template(page_type="in_meeting") is MEETING
+        prompt = build_system_prompt(MEETING)
+        # The surface note, not the words: every prompt now carries MEETING_KIND_RULES, which
+        # name Google Meet as a product the user can ask for.
+        assert "Google Meet, not in WarpTalk" not in prompt
+        assert "460px" not in prompt
+
+    def test_it_is_a_registered_template(self) -> None:
+        assert TEMPLATES["external_meeting_widget"] is EXTERNAL_MEETING_WIDGET
 
 
 class TestPageContext:
@@ -200,6 +254,73 @@ class TestFormatMentions:
         assert 'plugin "Google Drive" (id=google_workspace:drive)' in message
         assert "prefer its tools" in message
         assert "look it up" not in message
+
+    # WT-887: @summary: / @minutes: / @transcript: carry the meeting's room id as entityId.
+    ROOM_ID = "8f0c2a1e-5b7d-4e2a-9c31-1d2e3f4a5b6c"
+
+    def _artifact_mention(self, entity_type: str) -> str | None:
+        return _format_mentions(
+            json.dumps(
+                [
+                    {
+                        "entityType": entity_type,
+                        "entityId": self.ROOM_ID,
+                        "label": "Sprint sync",
+                        "workspaceId": "ws-1",
+                    }
+                ]
+            )
+        )
+
+    def test_summary_mention_requires_reading_the_summary_first(self) -> None:
+        message = self._artifact_mention("summary")
+        assert message is not None
+        assert 'meeting summary of "Sprint sync"' in message
+        assert f"MUST call get_meeting_summary with meeting_id={self.ROOM_ID}" in message
+        assert "an appropriate tool" not in message
+
+    def test_transcript_mention_requires_reading_the_transcript_first(self) -> None:
+        message = self._artifact_mention("transcript")
+        assert message is not None
+        assert 'meeting transcript of "Sprint sync"' in message
+        assert f"MUST call get_transcript with meeting_id={self.ROOM_ID}" in message
+        assert "before_sequence" in message
+
+    def test_minutes_mention_reads_the_summary_and_says_it_is_not_the_minutes(self) -> None:
+        """No tool reads minutes; the closest read is named, and not passed off as the minutes."""
+        message = self._artifact_mention("minutes")
+        assert message is not None
+        assert 'meeting minutes of "Sprint sync"' in message
+        assert f"get_meeting_summary with meeting_id={self.ROOM_ID}" in message
+        assert f"get_room_detail with room_id={self.ROOM_ID}" in message
+        assert "cannot be read from here" in message
+
+    def test_artifact_type_is_normalized_like_any_other(self) -> None:
+        message = _format_mentions(json.dumps([{"id": "room-9", "type": " Summary "}]))
+        assert message is not None
+        assert "get_meeting_summary with meeting_id=room-9" in message
+
+    def test_artifact_mentions_sit_alongside_plain_references(self) -> None:
+        message = _format_mentions(
+            json.dumps(
+                [
+                    {"entityType": "document", "entityId": "doc-1", "label": "Spec"},
+                    {"entityType": "transcript", "entityId": "room-9", "label": "Standup"},
+                ]
+            )
+        )
+        assert message is not None
+        assert "get_document" in message
+        assert "get_transcript with meeting_id=room-9" in message
+
+    def test_unknown_type_gets_no_artifact_instruction(self) -> None:
+        """An unrecognised type keeps today's generic hint; it never borrows a MUST-read."""
+        message = _format_mentions(
+            json.dumps([{"entityType": "recording", "entityId": "room-9", "label": "x"}])
+        )
+        assert message is not None
+        assert "an appropriate tool" in message
+        assert "MUST call" not in message
 
 
 class TestWebSearchIsTheLastResort:

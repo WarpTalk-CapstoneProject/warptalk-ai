@@ -1,0 +1,21 @@
+{"id": "E1", "language": "en", "raw": "um so we uh we need to finalize the budget", "expected_clean": "So we need to finalize the budget.", "kind": "filler"}
+{"id": "E2", "language": "en", "raw": "Uh-huh.", "expected_clean": "Uh-huh.", "kind": "trap", "prev_turn_is_question": true, "standalone_turn": true}
+{"id": "E3", "language": "en", "raw": "I like the new layout", "expected_clean": "I like the new layout.", "kind": "clean_control"}
+{"id": "E4", "language": "en", "raw": "It was very very expensive", "expected_clean": "It was very very expensive.", "kind": "trap"}
+{"id": "E5", "language": "en", "raw": "the the con- contract is signed", "expected_clean": "The contract is signed.", "kind": "stutter"}
+{"id": "E6", "language": "en", "raw": "We should meet on Monday, I mean Tuesday.", "expected_clean": "We should meet on Monday, I mean Tuesday.", "kind": "self_repair"}
+{"id": "E7", "language": "en", "raw": "What I mean is we're over budget", "expected_clean": "What I mean is we're over budget.", "kind": "trap"}
+{"id": "E8", "language": "en", "raw": "No no no, don't merge it yet", "expected_clean": "No no no, don't merge it yet.", "kind": "trap"}
+{"id": "E9", "language": "en", "raw": "What he had had was sold", "expected_clean": "What he had had was sold.", "kind": "trap"}
+{"id": "E10", "language": "en", "raw": "Let's cover pre- and post-launch metrics", "expected_clean": "Let's cover pre- and post-launch metrics.", "kind": "trap"}
+{"id": "E11", "language": "en", "raw": "we need to, we need to go through the list", "expected_clean": "We need to go through the list.", "kind": "stutter"}
+{"id": "E12", "language": "en", "raw": "Ummm", "expected_clean": "", "kind": "filler"}
+{"id": "E13", "language": "en", "raw": "Hmm.", "expected_clean": "Hmm.", "kind": "trap", "prev_turn_is_question": true, "standalone_turn": true}
+{"id": "E14", "language": "en", "raw": "Do you have the file", "expected_clean": "Do you have the file?", "kind": "clean_control"}
+{"id": "E15", "language": "en", "raw": "I know what you mean", "expected_clean": "I know what you mean.", "kind": "clean_control"}
+{"id": "E16", "language": "en", "raw": "It's ready, isn't it", "expected_clean": "It's ready, isn't it?", "kind": "clean_control"}
+{"id": "E17", "language": "en", "raw": "so um like I was saying we need the numbers", "expected_clean": "So like I was saying we need the numbers.", "kind": "filler"}
+{"id": "E18", "language": "en", "raw": "um we don't ship 3 units", "expected_clean": "We don't ship 3 units.", "kind": "filler"}
+{"id": "E19", "language": "en", "raw": "we we we should wait", "expected_clean": "We should wait.", "kind": "stutter"}
+{"id": "E20", "language": "en", "raw": "she said no no to the deal", "expected_clean": "She said no no to the deal.", "kind": "trap"}
+{"id": "E21", "language": "en", "raw": "so so far we are on track", "expected_clean": "So so far we are on track.", "kind": "trap"}

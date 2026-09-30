@@ -7,6 +7,7 @@ that matters most in a live meeting — that every failure still produces audio.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -83,6 +84,14 @@ class _FakeSynthesizer:
         self.opened: list[str] = []
         self.turns: list[_FakeTurn] = []
         self.connections: list[_FakeConnection] = []
+        # The real synthesizer gates every generation on this; see
+        # TTSSettings.cartesia_max_concurrency. Wide open here, so these tests keep measuring
+        # which path was taken rather than how many fit through the gate — that is
+        # tests/test_tts_cartesia_concurrency.py's job.
+        self._slot = asyncio.Semaphore(64)
+
+    def generation_slot(self) -> asyncio.Semaphore:
+        return self._slot
 
     async def synthesize(
         self, *, text: str, language: str, voice_id: str | None, generation_config: Any

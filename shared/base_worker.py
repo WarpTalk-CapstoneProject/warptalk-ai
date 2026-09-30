@@ -10,18 +10,28 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import signal
 import socket
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from redis.asyncio.client import PubSub
 
 from shared.config import RedisSettings, WorkerSettings
 from shared.health_probe import heartbeat_key
+from shared.integration_status import (
+    REPORT_INTERVAL_SECONDS,
+    IntegrationReport,
+    publish_integration_status,
+)
 from shared.logger import get_logger
+from shared.platform_settings import PlatformSettings, reader_for
+from shared.provider_calls import bind_provider_calls
 from shared.redis_client import RedisStreamClient
 from shared.transcript_pause import is_transcript_paused as _read_transcript_paused
 
@@ -37,6 +47,21 @@ from shared.transcript_pause import is_transcript_paused as _read_transcript_pau
 # was missing here, so an expired room's bot was never released; "TIMEOUT" is not a status
 # the backend has ever published, so that entry never matched anything.
 TERMINAL_ROOM_STATUSES = frozenset({"FAILED", "ENDED", "CANCELLED", "EXPIRED"})
+
+
+@dataclass
+class _AttemptOutcome:
+    """What `process()` reported about the attempt it is running, beyond returning or raising."""
+
+    outcome: str | None = None
+
+
+# The attempt currently being processed in this task. A mutable holder rather than a plain value
+# so a note made inside `asyncio.wait_for` — which on 3.11 runs the coroutine in a child task with
+# a COPY of the context — still reaches the caller that records it.
+_current_attempt: contextvars.ContextVar[_AttemptOutcome | None] = contextvars.ContextVar(
+    "warptalk_current_attempt", default=None
+)
 
 
 class BaseWorker(ABC):
@@ -82,6 +107,16 @@ class BaseWorker(ABC):
     heartbeat_interval_seconds: int = 10
     heartbeat_ttl_seconds: int = 30
     processing_timeout_seconds: float = 120
+    # How long an entry must sit unacknowledged before another consumer may take it
+    # (XAUTOCLAIM), on top of the processing timeout. See `_reclaim_min_idle_ms`.
+    reclaim_margin_seconds: float = 30
+    # Consumers silent this long with nothing pending are deleted from the group. An hour is
+    # two orders of magnitude above the longest gap a live consumer leaves between two reads
+    # (one processing timeout), so nothing alive is ever near it. See prune_idle_consumers.
+    consumer_prune_idle_ms: int = 60 * 60 * 1000
+    # Housekeeping (pruning, and reclaiming side groups) is not worth a Redis round trip on
+    # every idle poll; once per this many seconds per (stream, group) is plenty.
+    consumer_housekeeping_interval_seconds: float = 300
 
     def __init__(
         self,
@@ -125,6 +160,9 @@ class BaseWorker(ABC):
             # 1. Connect to Redis
             await self.redis.connect()
             self.logger.info("redis_connected")
+            # Provider calls (OpenAI over httpx, Cartesia/OpenAI websockets) are counted on this
+            # connection from here on; see shared/provider_calls.
+            bind_provider_calls(self.redis)
             await self._publish_heartbeat()
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
@@ -189,6 +227,46 @@ class BaseWorker(ABC):
             ),
             self.heartbeat_ttl_seconds,
         )
+        await self._report_integrations()
+
+    # ------------------------------------------------------------------
+    # Platform settings and integration status
+    # ------------------------------------------------------------------
+
+    def platform_settings(self) -> PlatformSettings:
+        """Operator-chosen settings, read live over this worker's Redis client.
+
+        Read at the moment a value is used, never once at startup: a change made in the console
+        reaches a running worker within the reader's cache TTL, without a restart. Every getter
+        takes the worker's own env/pydantic value as its fallback, so a key nobody has set
+        changes nothing. See shared/platform_settings.py.
+        """
+        return reader_for(self)
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        """The integrations this worker uses and whether each is configured. None by default.
+
+        Overridden by workers that call a vendor. Model names only in `detail` — never a key, a
+        secret or a URL (see shared/integration_status.py).
+        """
+        return {}
+
+    async def _report_integrations(self) -> None:
+        """Rides the heartbeat, throttled to REPORT_INTERVAL_SECONDS. Never raises."""
+        try:
+            now = time.monotonic()
+            last: float | None = getattr(self, "_integrations_reported_at", None)
+            if last is not None and now - last < REPORT_INTERVAL_SECONDS:
+                return
+            reports = self.integration_reports()
+            if not reports:
+                return
+            if await publish_integration_status(self.redis, self.worker_name, reports):
+                self._integrations_reported_at = now
+        except Exception:
+            log = getattr(self, "logger", None)
+            if log is not None:
+                log.warning("integration_status_report_failed", exc_info=True)
 
     async def _heartbeat_loop(self) -> None:
         while not self._shutdown_event.is_set():
@@ -683,12 +761,132 @@ class BaseWorker(ABC):
                 # Exponential backoff before retry
                 await asyncio.sleep(1.0)
 
+    def _reclaim_min_idle_ms(self) -> int:
+        """The idle time after which a pending entry is ABANDONED rather than in progress.
+
+        XAUTOCLAIM cannot tell "the consumer holding this died" from "the consumer holding this
+        is still working on it" — both are just an entry nobody has acknowledged. The only thing
+        that separates them is time: `_process_and_log_errors` cancels any attempt at
+        `processing_timeout_seconds`, so an entry idle for longer than that plus a margin is
+        certainly not being processed by anyone.
+
+        The threshold used to be a flat 60s against a 120s processing timeout. With two replicas
+        in a group (an HPA scale-out, or simply the old and new pod of a surge rollout), a message
+        that took 61s — a meeting summary on a long transcript, a WarpBot answer that ran a few
+        tools — was taken by the OTHER replica's idle poll and run a second time while the first
+        was still running it: two summaries, two chat answers, two sets of tool side effects.
+        """
+        timeout_ms = int(self.processing_timeout_seconds * 1000)
+        return max(60_000, timeout_ms + int(self.reclaim_margin_seconds * 1000))
+
+    def _housekeeping_due(self, stream: str, group: str) -> bool:
+        """Rate-limit housekeeping per (stream, group). True at most once per interval."""
+        # getattr: several test suites build workers with __new__ and never run __init__.
+        last_run: dict[tuple[str, str], float] = getattr(self, "_housekeeping_last_run", None) or {}
+        self._housekeeping_last_run = last_run
+        now = time.monotonic()
+        previous = last_run.get((stream, group))
+        if previous is not None and now - previous < self.consumer_housekeeping_interval_seconds:
+            return False
+        last_run[(stream, group)] = now
+        return True
+
+    async def _prune_idle_consumers(self, stream: str, group: str) -> None:
+        """Delete this group's dead consumers (0 pending, silent for an hour). Best effort.
+
+        Every pod name is a new consumer, so without this a group collects one corpse per
+        rollout forever (production: 62 on stt-frame-workers, 59 on translate-workers). What
+        makes deleting them safe is spelled out on RedisStreamClient.prune_idle_consumers.
+        Called after the reclaim, so a dead consumer's entries have been moved to a live one
+        before it is looked at; one that still holds entries is skipped and retried next pass.
+        """
+        try:
+            deleted = await self.redis.prune_idle_consumers(
+                stream,
+                group,
+                keep=self._consumer_name,
+                min_idle_ms=self.consumer_prune_idle_ms,
+            )
+        except Exception:
+            self.logger.warning(
+                "stream_consumer_prune_failed", stream=stream, group=group, exc_info=True
+            )
+            return
+        if deleted:
+            self.logger.info(
+                "stream_consumers_pruned",
+                stream=stream,
+                group=group,
+                count=len(deleted),
+            )
+
+    async def _housekeep_side_group(
+        self,
+        stream: str,
+        group: str,
+        redeliver: Callable[[dict[bytes, bytes]], Awaitable[None]] | None = None,
+    ) -> None:
+        """Recover and prune a SECONDARY consumer group — one read with `redis.consume` directly.
+
+        The main input stream has `_recover_stale_messages`. The side loops (STT's frame reader,
+        TTS's clone, preview, delete and clone-sampling readers) had nothing: an entry left
+        pending by a pod killed mid-handler, or by a handler that raised, stayed on that consumer
+        until the stream itself expired. Rate-limited, and best effort — a housekeeping failure
+        must never stop the loop it runs in.
+
+        `redeliver=None` means the entries are worthless once stale (live audio frames): they are
+        acknowledged and dropped. Otherwise each is handed to `redeliver` ONCE and acknowledged
+        whatever happens; these handlers were never retried before, and one extra attempt is
+        recovery, not a new retry policy.
+        """
+        if not self._housekeeping_due(stream, group):
+            return
+        try:
+            entries = await self.redis.reclaim_stale(
+                stream,
+                group,
+                self._consumer_name,
+                min_idle_ms=self._reclaim_min_idle_ms(),
+            )
+        except Exception:
+            self.logger.warning(
+                "stream_side_group_reclaim_failed", stream=stream, group=group, exc_info=True
+            )
+            entries = []
+        for message_id, data in entries:
+            if redeliver is not None:
+                try:
+                    await redeliver(data)
+                except Exception:
+                    self.logger.exception(
+                        "stream_side_group_redelivery_failed",
+                        stream=stream,
+                        group=group,
+                        message_id=message_id,
+                    )
+            try:
+                await self.redis.redis.xack(stream, group, message_id)
+            except Exception:
+                self.logger.warning(
+                    "stream_side_group_ack_failed", stream=stream, group=group, exc_info=True
+                )
+        if entries:
+            self.logger.info(
+                "stream_side_group_recovered",
+                stream=stream,
+                group=group,
+                count=len(entries),
+                redelivered=redeliver is not None,
+            )
+        await self._prune_idle_consumers(stream, group)
+
     async def _recover_stale_messages(self) -> None:
         """Reprocess messages abandoned in the consumer group's pending list."""
         messages = await self.redis.reclaim_stale(
             self.input_stream,
             self.consumer_group,
             self._consumer_name,
+            min_idle_ms=self._reclaim_min_idle_ms(),
         )
         for message_id, data in messages:
             try:
@@ -731,6 +929,7 @@ class BaseWorker(ABC):
                         self.consumer_group,
                         message_id,
                     )
+                    await self._record_outcome("dead_letter")
                     self.logger.error(
                         "message_dead_lettered",
                         message_id=message_id,
@@ -745,14 +944,50 @@ class BaseWorker(ABC):
                 self.consumer_group,
                 message_id,
             )
+        # After the reclaim, never before it: a dead consumer's entries have to be moved to a
+        # live one first, or it still holds them and is (correctly) skipped.
+        if self._housekeeping_due(self.input_stream, self.consumer_group):
+            await self._prune_idle_consumers(self.input_stream, self.consumer_group)
+
+    def note_attempt_outcome(self, outcome: str) -> None:
+        """Mark the message being processed as failed even though `process()` will return.
+
+        For the failures a worker deliberately swallows so the meeting keeps going — the STT
+        vendor refusing a chunk, Cartesia refusing a sentence. Those paths return normally, so
+        without this they would be counted as successes and the stage success rate would stay at
+        100% through a total vendor outage. No-op outside a `_process_and_log_errors` call.
+        """
+        attempt = _current_attempt.get()
+        if attempt is not None:
+            attempt.outcome = outcome
+
+    async def _record_outcome(self, outcome: str) -> None:
+        # record_outcome is already best effort; this also covers a client that is not a real
+        # RedisStreamClient (a test double), because nothing here may turn into a message error.
+        try:
+            await self.redis.record_outcome(self.worker_name, outcome)
+        except Exception:
+            self.logger.debug("outcome_record_skipped", outcome=outcome, exc_info=True)
 
     async def _process_and_log_errors(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        attempt = _AttemptOutcome()
+        token = _current_attempt.set(attempt)
+        outcome = "error"
         try:
             await asyncio.wait_for(
                 self.process(message_id, data),
                 timeout=self.processing_timeout_seconds,
             )
             self._last_progress_unix_ms = int(time.time() * 1000)
+            outcome = attempt.outcome or "ok"
+        except TimeoutError:
+            outcome = "timeout"
+            self.logger.exception(
+                "process_error",
+                message_id=message_id,
+                stream=self.input_stream,
+            )
+            raise
         except Exception:
             self.logger.exception(
                 "process_error",
@@ -762,6 +997,11 @@ class BaseWorker(ABC):
             # Propagate so the Redis consumer does not XACK the message. It remains
             # pending and can be reclaimed/retried by this or another worker.
             raise
+        finally:
+            _current_attempt.reset(token)
+            # Every attempt, retries included: the rate is "attempts that worked", and a message
+            # that fails three times before succeeding was three failures a listener waited on.
+            await self._record_outcome(outcome)
 
     # ------------------------------------------------------------------
     # Signal handling

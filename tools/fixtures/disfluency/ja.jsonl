@@ -1,0 +1,21 @@
+{"id": "J1", "language": "ja", "raw": "えーと、あのー、来週の会議ですが", "expected_clean": "来週の会議ですが", "kind": "filler"}
+{"id": "J2", "language": "ja", "raw": "あの資料はもう送りました", "expected_clean": "あの資料はもう送りました。", "kind": "trap"}
+{"id": "J3", "language": "ja", "raw": "はい。", "expected_clean": "はい。", "kind": "trap", "standalone_turn": true}
+{"id": "J4", "language": "ja", "raw": "ええと、ええ、そうです。", "expected_clean": "ええ、そうです。", "kind": "filler"}
+{"id": "J5", "language": "ja", "raw": "まだまだ時間があります", "expected_clean": "まだまだ時間があります。", "kind": "trap"}
+{"id": "J6", "language": "ja", "raw": "どんどん進めましょう", "expected_clean": "どんどん進めましょう。", "kind": "trap"}
+{"id": "J7", "language": "ja", "raw": "わ、私が担当します。", "expected_clean": "私が担当します。", "kind": "stutter"}
+{"id": "J8", "language": "ja", "raw": "月曜、じゃなくて火曜に出します。", "expected_clean": "月曜、じゃなくて火曜に出します。", "kind": "self_repair"}
+{"id": "J9", "language": "ja", "raw": "赤じゃなくて青がいいです。", "expected_clean": "赤じゃなくて青がいいです。", "kind": "trap"}
+{"id": "J10", "language": "ja", "raw": "ちょっと待ってください", "expected_clean": "ちょっと待ってください。", "kind": "clean_control"}
+{"id": "J11", "language": "ja", "raw": "なんか飲みますか", "expected_clean": "なんか飲みますか？", "kind": "trap"}
+{"id": "J12", "language": "ja", "raw": "もしもし、聞こえますか", "expected_clean": "もしもし、聞こえますか？", "kind": "trap"}
+{"id": "J13", "language": "ja", "raw": "うーん。", "expected_clean": "うーん。", "kind": "trap", "standalone_turn": true}
+{"id": "J14", "language": "ja", "raw": "その、その件は、えー、確認します。", "expected_clean": "その件は、確認します。", "kind": "stutter"}
+{"id": "J15", "language": "ja", "raw": "資料は届きましたか", "expected_clean": "資料は届きましたか？", "kind": "clean_control"}
+{"id": "J16", "language": "ja", "raw": "来るかどうか分からない", "expected_clean": "来るかどうか分からない。", "kind": "clean_control"}
+{"id": "J17", "language": "ja", "raw": "えっと、その、来週までに出します", "expected_clean": "その、来週までに出します。", "kind": "filler"}
+{"id": "J18", "language": "ja", "raw": "えーと、3件は出しません", "expected_clean": "3件は出しません。", "kind": "filler"}
+{"id": "J19", "language": "ja", "raw": "私は、私はそう思います", "expected_clean": "私はそう思います。", "kind": "stutter"}
+{"id": "J20", "language": "ja", "raw": "そうそう、それです", "expected_clean": "そうそう、それです。", "kind": "trap"}
+{"id": "J21", "language": "ja", "raw": "ときどき遅れます", "expected_clean": "ときどき遅れます。", "kind": "trap"}

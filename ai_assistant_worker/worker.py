@@ -30,6 +30,8 @@ from ai_assistant_worker.transcript_buffer import (
 from shared.base_worker import BaseWorker
 from shared.config import AssistantSettings, resolve_openai_api_key
 from shared.control_markers import is_control_marker
+from shared.integration_status import OPENAI, IntegrationReport, credential_report
+from shared.languages import known_language_code
 from shared.schemas import STTResultMessage
 
 #: One accumulated STT segment: (speaker, text, timestamp_ms).
@@ -65,6 +67,16 @@ def substantive_segments(segments: list[TranscriptSegment]) -> list[TranscriptSe
     ]
 
 
+# One summary per meeting end: `assistant:summary:claim:{meeting_id}`. Ten minutes covers every
+# duplicated marker (seconds apart) and a summary slow enough to reach the processing timeout, and
+# is short enough that a room ended again later is summarised again.
+_SUMMARY_CLAIM_TTL_SECONDS = 10 * 60
+
+
+def _summary_claim_key(meeting_id: str) -> str:
+    return f"assistant:summary:claim:{meeting_id}"
+
+
 class AIAssistantWorker(BaseWorker):
     """AI Assistant worker — non-realtime meeting summarization."""
 
@@ -96,6 +108,16 @@ class AIAssistantWorker(BaseWorker):
         # Meetings whose most recent segment was dropped, so the next dropped one extends that
         # window instead of opening a second one beside it.
         self._gap_open: set[str] = set()
+        # WT-716. The earliest moment of a line this worker dropped for being nothing but
+        # fillers, per meeting — the one thing a skipped line still owes the summary. See
+        # `_note_filler_only`.
+        self._filler_only_ms: dict[str, int] = {}
+
+    def integration_reports(self) -> dict[str, IntegrationReport]:
+        s = self.assistant_settings
+        return {
+            OPENAI: credential_report(resolve_openai_api_key(s.api_key), f"summary model {s.model}")
+        }
 
     async def load_model(self) -> None:
         """Initialize OpenAI client."""
@@ -137,11 +159,41 @@ class AIAssistantWorker(BaseWorker):
             return
         self._gap_open.discard(stt_result.meeting_id)
 
+        # WT-716 — THE MODEL READS THE CLEAN WORDING; THE CITATIONS STILL POINT AT THE RAW RECORD.
+        #
+        # `display_text` is the prepass's clean line when one was computed and the raw STT text
+        # when it was not, so an older producer — or a language `shared.disfluency` does not
+        # handle — summarises exactly as it did before this existed. What the model gains is a
+        # transcript without "um", "ờ" and half-restarted words, which is the same text a reader
+        # sees under the Clean toggle: the summary and the transcript it cites now agree on the
+        # words as well as on the moments.
+        #
+        # NOTHING AN ANCHOR IS MADE OF CHANGES. A summary citation is an `atMs` offset and
+        # nothing else — `summary_grounding` checks exact membership in the set of offsets
+        # `format_transcript_line` printed (WT-663, zero tolerance), and those offsets come from
+        # `timestamp_ms`, which this does not touch. WT-655 seeks on segment ids the backend
+        # holds against the RAW segments, which this worker never emits. No template asks the
+        # model to quote the transcript verbatim, so there is no exact-quote check for a change
+        # of wording to break.
+        if not is_end_marker and stt_result.clean_text == "":
+            # Filler-only ("Ummm", "Ờ"): the clean view shows nothing for this line, so the model
+            # is shown nothing for it either. Dropped here rather than appended as an empty
+            # string because `substantive_segments` would drop it at render time anyway — and an
+            # empty entry would still spend a slot in the capped Redis buffer. Its MOMENT is
+            # kept: see `_note_filler_only`.
+            self._note_filler_only(stt_result.meeting_id, stt_result.timestamp_ms)
+            self.logger.debug(
+                "transcript_segment_skipped_filler_only",
+                meeting_id=stt_result.meeting_id,
+                segment_id=stt_result.segment_id,
+            )
+            return
+
         # Accumulate transcript
         if stt_result.meeting_id not in self._transcripts:
             self._transcripts[stt_result.meeting_id] = []
 
-        segment = (stt_result.speaker_id, stt_result.text, stt_result.timestamp_ms)
+        segment = (stt_result.speaker_id, stt_result.display_text, stt_result.timestamp_ms)
         self._transcripts[stt_result.meeting_id].append(segment)
 
         # WT-536: the same segment, somewhere a restart cannot erase it. A deploy between the
@@ -179,7 +231,61 @@ class AIAssistantWorker(BaseWorker):
         # and tts_worker sang it. Anything reading stt:results has to be able to ask the same
         # question, and the answer has to be in one place.
         if is_end_marker:
-            await self._generate_summary(stt_result.meeting_id)
+            if not await self._claim_summary(stt_result.meeting_id):
+                self.logger.info(
+                    "summary_already_claimed",
+                    meeting_id=stt_result.meeting_id,
+                    segment_id=stt_result.segment_id,
+                )
+                self._forget_meeting_locally(stt_result.meeting_id)
+                return
+            try:
+                await self._generate_summary(stt_result.meeting_id)
+            except BaseException:
+                await self._release_summary_claim(stt_result.meeting_id)
+                raise
+
+    async def _claim_summary(self, meeting_id: str) -> bool:
+        """Whether THIS delivery of the end-of-meeting marker is the one that summarises.
+
+        TWO MARKERS, TWO REPLICAS, TWO SUMMARIES. The backend publishes `__MEETING_END__` more
+        than once for one meeting (production: 1-4 per meeting, 50ms-2s apart), and each copy is
+        its own stream entry. On one replica that was harmless: the copies are processed in
+        turn, the first summary forgets the meeting, and the second finds nothing left. With two
+        replicas in `assistant-workers` - an HPA scale-out, or simply the old and new pod of a
+        surge rollout - the copies land on different pods at the same moment, both read the
+        whole Redis transcript buffer before either forgets it, and the meeting gets two model
+        calls and two summaries written over each other.
+
+        SET NX per meeting, so exactly one delivery wins wherever it lands. Kept after success
+        (for the TTL) so a late copy is still recognised; given back on failure so the retry of
+        the failed one can still summarise. Fails OPEN on a Redis error: a second summary is a
+        better failure than none, and the summary path needs Redis anyway.
+        """
+        try:
+            return await self.redis.set_if_absent(
+                _summary_claim_key(meeting_id), self._consumer_name, _SUMMARY_CLAIM_TTL_SECONDS
+            )
+        except Exception:
+            self.logger.warning("summary_claim_failed", meeting_id=meeting_id, exc_info=True)
+            return True
+
+    async def _release_summary_claim(self, meeting_id: str) -> None:
+        try:
+            await self.redis.delete_if_value(_summary_claim_key(meeting_id), self._consumer_name)
+        except Exception:
+            self.logger.warning("summary_claim_release_failed", meeting_id=meeting_id)
+
+    def _forget_meeting_locally(self, meeting_id: str) -> None:
+        """Drop this replica's in-memory copy of a meeting another replica is summarising.
+
+        Memory only. The Redis buffer is the winner's input and it deletes it when it is done;
+        deleting it from here could pull it out from under a summary still reading it.
+        """
+        self._transcripts.pop(meeting_id, None)
+        self._pause_gaps.pop(meeting_id, None)
+        self._gap_open.discard(meeting_id)
+        self._filler_only_ms.pop(meeting_id, None)
 
     def _note_pause_gap(self, meeting_id: str, timestamp_ms: int) -> None:
         """Remember that this moment was dropped, so the gap can be named in the transcript.
@@ -193,6 +299,27 @@ class AIAssistantWorker(BaseWorker):
             return
         gaps.append([timestamp_ms, timestamp_ms])
         self._gap_open.add(meeting_id)
+
+    def _note_filler_only(self, meeting_id: str, timestamp_ms: int) -> None:
+        """Keep a dropped filler-only line's MOMENT, so the citations do not all move. WT-716.
+
+        Every offset in the prompt is measured from the earliest segment of the meeting, and the
+        meeting page resolves a cited `atMs` against the SAVED transcript — which still holds the
+        filler-only line, because `text` is never rewritten and the backend stores every segment.
+        So dropping "Ummm" when it happens to be the first thing anybody said would move the
+        origin forward to the next line and shift EVERY citation in that meeting by the gap
+        between them. The line goes; the moment it started at stays.
+
+        Only the earliest is worth keeping: a filler-only line in the middle of a meeting is
+        already inside the span the origin was taken from, and one at the end cannot move it.
+
+        In memory only, like `_pause_gaps` and for the same reason. A meeting recovered from the
+        Redis buffer after a restart falls back to the earliest segment it can see, which is
+        exactly what this path did before WT-716 — degraded, never wrong in a new way.
+        """
+        previous = self._filler_only_ms.get(meeting_id)
+        if previous is None or timestamp_ms < previous:
+            self._filler_only_ms[meeting_id] = timestamp_ms
 
     async def _generate_summary(self, meeting_id: str) -> None:
         """Generate and publish meeting summary."""
@@ -231,6 +358,13 @@ class AIAssistantWorker(BaseWorker):
         # to the first segment so a cited atMs resolves against the stored transcript,
         # which is rendered the same way: a base time plus a per-segment offset.
         base_ms = min(ts for _, _, ts in segments)
+
+        # WT-716: a meeting that opened with a line of pure fillers still started when that line
+        # started. Taking the origin from the first line the model is SHOWN would move every
+        # citation in the summary by however long the "Ummm" ran. See `_note_filler_only`.
+        filler_only_ms = self._filler_only_ms.get(meeting_id)
+        if filler_only_ms is not None:
+            base_ms = min(base_ms, filler_only_ms)
 
         # WT-529 — `speaker` here is the LiveKit participant identity
         # ("speaker-019f0d00-0de0-7000-9000-000000000003"), and it went into the prompt
@@ -308,6 +442,17 @@ class AIAssistantWorker(BaseWorker):
                 )
         except Exception:
             self.logger.warning("failed_to_read_summary_language", meeting_id=meeting_id)
+
+        # WT-703: same guard as SummaryTemplateWorker. The key is written by another service,
+        # and whatever it holds would otherwise reach the prompt verbatim.
+        requested_summary_language = summary_language
+        summary_language = known_language_code(requested_summary_language)
+        if requested_summary_language.strip() and not summary_language:
+            self.logger.warning(
+                "summary_language_unrecognised",
+                meeting_id=meeting_id,
+                requested=repr(requested_summary_language[:16]),
+            )
 
         # Generate summary
         assistant = self._require_assistant()
@@ -426,6 +571,7 @@ class AIAssistantWorker(BaseWorker):
         self._transcripts.pop(meeting_id, None)
         self._pause_gaps.pop(meeting_id, None)
         self._gap_open.discard(meeting_id)
+        self._filler_only_ms.pop(meeting_id, None)
         try:
             await self.redis.delete(buffer_key(meeting_id))
         except Exception:

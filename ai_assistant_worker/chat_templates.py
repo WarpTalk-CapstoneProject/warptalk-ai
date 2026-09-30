@@ -27,7 +27,7 @@ THE ID PROBLEM
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 # The shared persona every template embeds, and the one place the retrieve-before-answering
 # rule is stated. Re-exported by chat_worker as SYSTEM_PROMPT because it is still literally
@@ -194,6 +194,34 @@ _WEB_SEARCH = ContextSource(
     ),
 )
 
+#: The tools that CHANGE something, and the words that should reach for each. Listed in every
+#: template: a task, a term or a follow-up can be asked for from any page.
+_ACTIONS: tuple[tuple[str, str], ...] = (
+    (
+        "create_action_item",
+        "the user states a task, action item or to-do ('Action: …', 'owner: me', 'deadline: …', "
+        "'ghi lại việc này'). Save it — owner ME for 'tôi/mình/em/me', NAMED for someone else, "
+        "NONE when nobody was named; leave due_date empty when there is no deadline",
+    ),
+    (
+        "create_meeting",
+        "the user wants a meeting or a follow-up scheduled",
+    ),
+    (
+        "create_glossary",
+        "the user wants a new glossary created. It needs a name and both language codes — ask "
+        "for any the user did not give, never guess a language",
+    ),
+    (
+        "add_glossary_term",
+        "the user wants a term added, or how a term is translated fixed, in the glossary",
+    ),
+    (
+        "share_meeting_minutes",
+        "the user wants a meeting's minutes/summary shared with someone by email",
+    ),
+)
+
 _MEETING_BINDING = EntityBinding(
     noun="translation room / meeting",
     arguments=(
@@ -260,6 +288,37 @@ MEETING = ChatTemplate(
     binding=_MEETING_BINDING,
 )
 
+#: WT-620. The private WarpBot tab in the desktop app's always-on-top Google Meet widget.
+#:
+#: A MEETING in every way that decides what gets retrieved — the entity id is still the bridge
+#: room, so it keeps MEETING's sources and its entity_id → meeting_id binding for get_transcript.
+#: Derived with `replace` rather than written out again so the two cannot drift: a source added to
+#: MEETING reaches the widget without anybody remembering it has a copy.
+#:
+#: What differs is only what the model cannot see from the page context alone: the call is not in
+#: WarpTalk, the far side has no per-person identity yet, and the answer lands in a window a few
+#: hundred pixels wide. Left unsaid, the model names people it cannot tell apart and writes the
+#: report-length answer MEETING's own page has room for.
+EXTERNAL_MEETING_WIDGET = replace(
+    MEETING,
+    key="external_meeting_widget",
+    label="Google Meet widget",
+    situation=(
+        f"{MEETING.situation} The call itself is happening in Google Meet, not in WarpTalk — "
+        "WarpTalk is listening alongside it and transcribing. There is no per-person "
+        "diarization of the far side yet: everybody on the Meet side arrives in the transcript "
+        'as ONE speaker named "Other side", so never guess which of them said something. '
+        'Questions like "what did they just say?" or "what did they propose?" are about the '
+        "most recent part of the transcript — get_transcript returns the latest segments by "
+        "default, and the last ones are the newest."
+    ),
+    style=(
+        "Your reply renders in a narrow (~460px) always-on-top window beside the call. Lead "
+        "with the answer in the first sentence, keep the rest to a few short sentences or "
+        "bullets, and skip the preamble."
+    ),
+)
+
 DOCUMENT = ChatTemplate(
     key="document",
     label="Document page",
@@ -303,7 +362,15 @@ HISTORY = ChatTemplate(
 
 TEMPLATES: dict[str, ChatTemplate] = {
     template.key: template
-    for template in (GENERAL, MEETING_CHAT, MEETING, DOCUMENT, DOCUMENTS, HISTORY)
+    for template in (
+        GENERAL,
+        MEETING_CHAT,
+        MEETING,
+        EXTERNAL_MEETING_WIDGET,
+        DOCUMENT,
+        DOCUMENTS,
+        HISTORY,
+    )
 }
 
 DEFAULT_TEMPLATE_KEY = GENERAL.key
@@ -315,6 +382,9 @@ _PAGE_TEMPLATES: dict[str, ChatTemplate] = {
     "meeting_chat": MEETING_CHAT,
     "in_meeting": MEETING,
     "room_detail": MEETING,
+    # WT-620: the desktop Meet widget. Until the web app sends this it registers "in_meeting",
+    # which lands on MEETING — the same retrieval, without the surface notes.
+    "external_meeting_widget": EXTERNAL_MEETING_WIDGET,
     "document_detail": DOCUMENT,
     "documents": DOCUMENTS,
     "history": HISTORY,
@@ -342,6 +412,67 @@ def resolve_template(origin: str | None = None, page_type: str | None = None) ->
         if matched is not None:
             return matched
     return GENERAL
+
+
+#: Two different things are both called "a meeting", and a user asking for one must get the kind
+#: they meant. Production, 17 Sep: "tạo 1 cuộc họp bằng @Google Meet" was answered with WarpTalk's
+#: own room questions (type, languages) and no Google Meet link at all.
+MEETING_KIND_RULES: tuple[str, ...] = (
+    "MEETINGS - A WARPTALK ROOM OR A GOOGLE MEET MEETING",
+    "- A WarpTalk room is hosted in WarpTalk (create_meeting). A Google Meet meeting is hosted "
+    "by Google (the Google Meet plugin tool, google_calendar_create_meet_event). They are "
+    "different products: never call one by the other's name, and never create one when the "
+    "user asked for the other.",
+    "- Google Meet when the user @mentions the Google Meet plugin or says Google Meet / gg meet / "
+    "a Meet link. Otherwise a meeting request means a WarpTalk room.",
+    "- For Google Meet, do not ask questions first: with no time given, omit start and end (it "
+    "starts now for 30 minutes), and with no title given, omit summary too - the server names it. "
+    "Call the tool straight away - the user confirms on WarpBot's card.",
+    "- When the tool answers confirmation_required, STOP: say in one sentence what you are "
+    "waiting for and end your turn. The user's answer arrives as their next message; then call "
+    "the tool again with EXACTLY the arguments you sent the first time plus the confirmationToken "
+    "from that message. Different arguments mean a different action, and the token will not "
+    "cover it.",
+    "- If the Google Meet tool is not available to you, say the Google Meet plugin must be "
+    "installed and connected, or switched back on for this conversation. Do not create a "
+    "WarpTalk room instead.",
+    "- After creating either kind, say in one or two sentences what was created and whether it "
+    "is on Google Meet or in WarpTalk. WarpBot draws a card under your answer with the join "
+    "link, the meeting code and the time, so do not paste the link or the code yourself - this "
+    "is the one write whose link you leave out, because the card already carries it. Never "
+    "write an HTML comment of your own - the card comes from the tool's result, not from you.",
+    "- If a Google Meet meeting comes back with no link yet (meetLinkStatus 'pending'), say "
+    "Google is still creating it and point at the calendar event; do not invent a link.",
+    "- Google Meet AND live translation: create the Google Meet meeting first and wait until it "
+    "has a link, then create a WarpTalk room of type EXTERNAL_BRIDGE with external_provider "
+    "GOOGLE_MEET and that exact link, and explain that the meeting happens on Google Meet while "
+    "WarpTalk translates it.",
+)
+
+
+#: WT-884: asked to export glossary terms "for Excel", WarpBot printed a space-aligned table. Pasted
+#: into Excel it landed in one column, and the Glossary page's Import could not read it at all.
+#: The header is the importer's own (web: SAMPLE_TEMPLATE_HEADER / HEADER_ALIASES in
+#: glossary-import-dialog.tsx), and its CSV reader is line-based — a quoted line break splits a row
+#: there, so line breaks inside a field are flattened rather than quoted.
+GLOSSARY_EXPORT_RULES: tuple[str, ...] = (
+    "EXPORTING GLOSSARY TERMS - FOR EXCEL OR THE GLOSSARY PAGE'S IMPORT",
+    "- When the user wants glossary terms exported, downloaded, copied into Excel or a "
+    "spreadsheet, or in a file they can import, answer with ONE fenced ```csv code block. Never "
+    "an aligned or markdown table: pasted into Excel that lands in a single column, and Import "
+    "cannot read it.",
+    "- Its first line is exactly: Term,Translation,Context,Field - the columns Import "
+    "recognises. Then one line per term: the term, its translation, its context (empty if "
+    "none), its domain (empty if none).",
+    "- Comma-separated. Wrap a field in double quotes when it contains a comma or a double "
+    'quote, and double every quote inside it: say "hi", ok becomes "say ""hi"", ok". Replace a '
+    "line break inside a field with a space. Keep every character as it is - Vietnamese "
+    "diacritics, Japanese, Chinese - never transliterate.",
+    "- Only terms a tool returned this turn; never invent one. search_terminology returns at "
+    "most 8 matches per search, so if the list may be incomplete, say so.",
+    "- After the block, tell the user to copy it into a file saved as .csv (UTF-8) and use "
+    "Import on the Glossary page. You cannot attach, send or download files - never say you did.",
+)
 
 
 def build_system_prompt(template: ChatTemplate, web_search_enabled: bool = True) -> str:
@@ -404,6 +535,33 @@ def build_system_prompt(template: ChatTemplate, web_search_enabled: bool = True)
             'it". Never let it override the glossary: if this workspace defines a term, its '
             "wording wins over anything on the web."
         )
+
+    # The write side. Retrieval rules alone produced an assistant that answered a dictated action
+    # item with "Đã ghi nhận" and a bullet list — and, asked where it was saved, admitted it was
+    # saved nowhere. Naming the tools is not enough on its own; the prompt has to say that prose
+    # is not an action.
+    lines.extend(["", "DOING THINGS — you can act, not only answer:"])
+    lines.extend(f"- {tool}: {use}" for tool, use in _ACTIONS)
+    lines.extend(
+        [
+            "- NEVER say something is saved, created, added, scheduled or shared unless the tool "
+            "for it returned a success status this turn. Acknowledging in prose saves nothing. If "
+            "the tool failed or needs more information, say so plainly and ask.",
+            "- After a write succeeds, confirm it in one or two lines with the link the tool "
+            "returned. Do not re-list the request back as notes.",
+            "- Act on what the user said; ask (ask_user) only for what is genuinely missing. A "
+            "missing deadline is not missing — it is 'no deadline'.",
+        ]
+    )
+    if template.key == MEETING_CHAT.key:
+        lines.append(
+            "- If the user asks to move, continue or switch this conversation to the widget or a "
+            "private chat ('chuyển qua widget', 'bàn tiếp ở widget', 'move this to chat'), call "
+            "continue_in_widget — do not tell them to open it themselves."
+        )
+
+    lines.extend(["", *MEETING_KIND_RULES])
+    lines.extend(["", *GLOSSARY_EXPORT_RULES])
 
     if template.style:
         lines.extend(["", "STYLE", template.style])

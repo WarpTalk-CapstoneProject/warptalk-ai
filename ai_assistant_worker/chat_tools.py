@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -28,6 +29,8 @@ from ai_assistant_worker.meeting_draft import (
     missing_fields,
     validate,
 )
+from ai_assistant_worker.meeting_links import room_url
+from shared.control_markers import is_external_bridge_speaker
 from shared.logger import get_logger
 from shared.openai_options import completion_options
 from shared.redis_client import RedisStreamClient
@@ -35,7 +38,18 @@ from shared.redis_client import RedisStreamClient
 logger = get_logger(__name__)
 
 SEMANTIC_SEARCH_TIMEOUT_SECONDS = 8.0
+#: How many segments one get_transcript call hands the model — a WINDOW, not a cap on the meeting.
+#: Which window is the caller's choice (see _read_transcript_window); by default it is the last one.
 TRANSCRIPT_SEGMENT_LIMIT = 200
+#: get_transcript's `range` values. The first is the default.
+TRANSCRIPT_RANGES = ("latest", "beginning")
+#: Upper bound on reads for one before_sequence window. One read is the normal case and two covers
+#: gaps in the numbering; the bound only exists so a pathological transcript cannot loop.
+TRANSCRIPT_WINDOW_MAX_READS = 4
+#: What get_transcript calls the EXTERNAL_BRIDGE stand-in (WT-525/WT-620). The seat is not a user,
+#: so TranscriptService's name lookup fails and the stored segment keeps the raw participant uuid
+#: as its speakerName — which the model would otherwise quote as a person's name.
+EXTERNAL_BRIDGE_SPEAKER_LABEL = "Other side"
 DOCUMENT_EXCERPT_CHAR_LIMIT = 4000
 # search_documents returns names and ids for the model to choose from, not content, so a
 # handful is enough to disambiguate "the onboarding spec" — and the cap keeps a workspace
@@ -75,6 +89,15 @@ class ToolContext:
     #: without one simply produces no citations rather than failing.
     citations: SourceRegistry | None = None
     assistant_client: httpx.AsyncClient | None = None
+    #: Where this turn was asked from: "meeting_chat" for @WarpBot in a meeting's chat, anything
+    #: else for the widget. Decides whether continue_in_widget is offered at all.
+    origin: str = "assistant"
+    #: The page the question was asked on, from page_context_json. The quick actions fall back to
+    #: it when the model leaves meeting_id empty — on a meeting page "add this as an action item"
+    #: means THIS meeting, and making the model restate an id it was already handed is how it ends
+    #: up inventing one.
+    page_type: str | None = None
+    page_entity_id: str | None = None
 
 
 @dataclass
@@ -279,12 +302,37 @@ async def _search_terminology(ctx: ToolContext, arguments: dict[str, Any]) -> st
     return json.dumps(matches[:8])
 
 
+def _history_params(ctx: ToolContext, **params: Any) -> dict[str, Any]:
+    """Query string for `/translation-rooms/history`, which is workspace-scoped (WT-881).
+
+    GetTranslationRoomHistoryAsync answers a request without `workspaceId` with a 400
+    ValidationError. Every reader of that route goes through here so a new caller cannot
+    forget it — the two that existed both had, and WarpBot answered "could not look up recent
+    meetings" to every question about a meeting.
+    """
+    return {"workspaceId": ctx.workspace_id, **params}
+
+
 async def _list_recent_meetings(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     query = (arguments or {}).get("query") or ""
+    if not ctx.workspace_id:
+        # A turn with no workspace (the platform-scope admin chat forces "") has no meeting list
+        # to read: the route would only answer 400. Say what is actually true instead of
+        # reporting a failure that reads as an outage.
+        logger.warning("list_recent_meetings_no_workspace")
+        return json.dumps(
+            {
+                "error": (
+                    "Meetings belong to a workspace, and this conversation is not in one. "
+                    "Open WarpBot from inside a workspace to look up its meetings."
+                ),
+                "reason": "no_workspace",
+            }
+        )
     try:
         response = await ctx.translation_room_client.get(
             "/api/v1/translation-rooms/history",
-            params={"search": query, "page": 1, "pageSize": 5},
+            params=_history_params(ctx, search=query, page=1, pageSize=5),
             headers=_auth_headers(ctx),
         )
         if response.status_code != 200:
@@ -433,10 +481,14 @@ async def _visible_meeting_ids(ctx: ToolContext) -> list[str]:
     open, the safe reading is "nothing", not "everything". It costs a member their transcript
     search for one request; the alternative hands them somebody else's meeting.
     """
+    if not ctx.workspace_id:
+        # No workspace, no meetings to scope to — and "nothing" is the fail-closed answer anyway.
+        logger.warning("visible_meetings_lookup_no_workspace")
+        return []
     try:
         response = await ctx.translation_room_client.get(
             "/api/v1/translation-rooms/history",
-            params={"page": 1, "pageSize": MAX_SCOPED_ROOM_IDS},
+            params=_history_params(ctx, page=1, pageSize=MAX_SCOPED_ROOM_IDS),
             headers=_auth_headers(ctx),
         )
         if response.status_code != 200:
@@ -1009,12 +1061,156 @@ async def _meeting_title(ctx: ToolContext, meeting_id: str) -> str | None:
     return str(room.get("title") or "").strip() or None
 
 
+class _SegmentReadError(Exception):
+    """The segments endpoint answered with something other than a page."""
+
+
+@dataclass
+class _SegmentWindow:
+    """A contiguous run of one transcript's segments, and where it sits in the whole.
+
+    `skip` is the index of the first segment in `items` among ALL the transcript's segments, so
+    `skip > 0` means earlier segments exist and `skip + len(items) < total` means later ones do.
+    """
+
+    items: list[dict[str, Any]]
+    total: int
+    skip: int
+
+
+def _sequence_of(segment: dict[str, Any]) -> int:
+    try:
+        return int(segment.get("sequenceOrder") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _read_segment_page(
+    ctx: ToolContext, transcript_id: str, skip: int, take: int
+) -> tuple[list[dict[str, Any]], int | None]:
+    """One page of GET /api/v1/transcripts/{id}/segments, ascending, plus its totalCount.
+
+    totalCount is None when the responder did not send one; callers fall back to what they read.
+    """
+    response = await ctx.transcript_client.get(
+        f"/api/v1/transcripts/{transcript_id}/segments",
+        params={"skip": skip, "take": take},
+        headers=_auth_headers(ctx),
+    )
+    if response.status_code != 200:
+        logger.warning("get_transcript_segments_failed", status=response.status_code)
+        raise _SegmentReadError
+    body = response.json() or {}
+    items = [s for s in (body.get("items") or []) if isinstance(s, dict)]
+    total = body.get("totalCount")
+    known = total if isinstance(total, int) and not isinstance(total, bool) else None
+    return sorted(items, key=_sequence_of), known
+
+
+async def _read_transcript_window(
+    ctx: ToolContext, transcript_id: str, *, from_beginning: bool, before: int | None
+) -> _SegmentWindow:
+    """The TRANSCRIPT_SEGMENT_LIMIT segments the caller asked for.
+
+    WHY THE DEFAULT IS THE END
+        This used to read `skip=0, take=200` and stop, so in a meeting past 200 segments the
+        latest speech — exactly what somebody in a live call asks about ("what did they just
+        propose?") — was never returned at all, and the model answered from the opening minutes
+        as though they were the whole meeting. The endpoint is ordered ascending with no way to
+        ask for the tail, so the tail is found by learning totalCount first. The first page is
+        the probe: it IS the answer for any meeting that fits in one window, which keeps short
+        meetings at one read.
+
+    before_sequence — PRECISE, NOT AN ESTIMATE
+        Segments come out of TranscriptService numbered 1, 2, 3… per transcript by an atomic
+        counter (UnitOfWork.AdvanceTranscriptForNewSegmentAsync), so at most `before - 1` of them
+        can precede `before`, and index i always carries a number ≥ i + 1. That makes
+        `skip = before - 1 - LIMIT` exact whenever the numbering has no holes — one read.
+
+        It can have holes: the counter is bumped by its own statement before the segment row is
+        saved, so a failed save (and its redelivery) burns a number. A window aimed by arithmetic
+        then overshoots — it contains segments numbered ≥ `before`. Those are filtered out, and
+        because what remains is a prefix of the page, it says exactly how many segments precede
+        `before`; one more read re-aims the window so it is full again. A window that holds
+        nothing below `before` (more holes than a window is long) only narrows the upper bound
+        and reads again, capped at TRANSCRIPT_WINDOW_MAX_READS.
+    """
+    limit = TRANSCRIPT_SEGMENT_LIMIT
+
+    if before is None:
+        items, total = await _read_segment_page(ctx, transcript_id, 0, limit)
+        # A responder without totalCount leaves the first page as all this can know.
+        if from_beginning or total is None or total <= limit:
+            return _SegmentWindow(items, total if total is not None else len(items), 0)
+        skip = total - limit
+        items, latest_total = await _read_segment_page(ctx, transcript_id, skip, limit)
+        # A live meeting keeps growing between the two reads; report the newer count, so a
+        # segment spoken in between shows up as omittedLater rather than vanishing.
+        return _SegmentWindow(items, max(total, latest_total or 0), skip)
+
+    # `end` is always an upper bound on how many segments precede `before`.
+    end = max(before - 1, 0)
+    window = _SegmentWindow([], 0, 0)
+    for _ in range(TRANSCRIPT_WINDOW_MAX_READS):
+        skip = max(0, end - limit)
+        page, total = await _read_segment_page(ctx, transcript_id, skip, limit)
+        known_total = total if total is not None else skip + len(page)
+        below = [s for s in page if _sequence_of(s) < before]
+        window = _SegmentWindow(below, known_total, skip)
+        if below or skip == 0:
+            exact_end = skip + len(below)
+            if max(0, exact_end - limit) == skip:
+                return window
+            end = exact_end
+        else:
+            end = min(skip, known_total)
+    logger.warning("get_transcript_window_not_settled", transcript_id=transcript_id, before=before)
+    return window
+
+
+def _transcript_window_arguments(
+    arguments: dict[str, Any],
+) -> tuple[bool, int | None] | str:
+    """(from_beginning, before_sequence), or the error to hand back to the model."""
+    raw_range = str(arguments.get("range") or TRANSCRIPT_RANGES[0]).strip().lower()
+    if raw_range not in TRANSCRIPT_RANGES:
+        return f'range must be one of {", ".join(TRANSCRIPT_RANGES)} (default "latest").'
+
+    raw_before = arguments.get("before_sequence")
+    if raw_before is None or raw_before == "":
+        return raw_range == "beginning", None
+    if isinstance(raw_before, bool):
+        return "before_sequence must be a positive integer."
+    try:
+        before = int(raw_before)
+    except (TypeError, ValueError):
+        return "before_sequence must be a positive integer."
+    if before < 1:
+        return "before_sequence must be a positive integer."
+    # An explicit position outranks `range`: it already says which part of the meeting.
+    return False, before
+
+
+def _speaker_label(segment: dict[str, Any]) -> Any:
+    """The segment's speaker as the model should repeat it."""
+    for candidate in (segment.get("speakerParticipantId"), segment.get("speakerName")):
+        if isinstance(candidate, str) and is_external_bridge_speaker(candidate):
+            return EXTERNAL_BRIDGE_SPEAKER_LABEL
+    return segment.get("speakerName")
+
+
 async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
-    meeting_id = ((arguments or {}).get("meeting_id") or "").strip()
+    arguments = arguments or {}
+    meeting_id = (arguments.get("meeting_id") or "").strip()
     if not meeting_id:
         return json.dumps(
             {"error": "A meeting_id is required — call list_recent_meetings first to find one."}
         )
+
+    parsed = _transcript_window_arguments(arguments)
+    if isinstance(parsed, str):
+        return json.dumps({"error": parsed})
+    from_beginning, before = parsed
 
     try:
         transcript_response = await ctx.transcript_client.get(
@@ -1036,17 +1232,18 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
                 {"segments": [], "note": "No transcript exists for this meeting yet."}
             )
 
-        segments_response = await ctx.transcript_client.get(
-            f"/api/v1/transcripts/{transcript_id}/segments",
-            params={"skip": 0, "take": TRANSCRIPT_SEGMENT_LIMIT},
-            headers=_auth_headers(ctx),
-        )
-        if segments_response.status_code != 200:
-            logger.warning("get_transcript_segments_failed", status=segments_response.status_code)
+        try:
+            window = await _read_transcript_window(
+                ctx, str(transcript_id), from_beginning=from_beginning, before=before
+            )
+        except _SegmentReadError:
             return json.dumps({"error": "Could not look up the transcript segments right now."})
 
-        items = segments_response.json().get("items", [])
-        ordered = sorted(items, key=lambda s: s.get("sequenceOrder", 0))
+        ordered = window.items
+        omitted_earlier = window.skip > 0
+        omitted_later = window.skip + len(ordered) < window.total
+        returned_from = _sequence_of(ordered[0]) if ordered else None
+        returned_to = _sequence_of(ordered[-1]) if ordered else None
 
         # WT-647. What a meeting's participants actually SAID is the strongest evidence this
         # assistant ever hands the model, and it was the one kind that arrived anonymous: the
@@ -1068,24 +1265,43 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             if ordered
             else None
         )
-        return json.dumps(
-            _with_marker(
+        result: dict[str, Any] = {
+            "transcriptId": transcript_id,
+            "status": transcript.get("status"),
+            "totalSegments": window.total,
+            "returnedFrom": returned_from,
+            "returnedTo": returned_to,
+            "omittedEarlier": omitted_earlier,
+            "omittedLater": omitted_later,
+            "segments": [
                 {
-                    "transcriptId": transcript_id,
-                    "status": transcript.get("status"),
-                    "segments": [
-                        {
-                            "speaker": s.get("speakerName"),
-                            "language": s.get("originalLanguage"),
-                            "text": s.get("originalText"),
-                            "startMs": s.get("startTimeMs"),
-                        }
-                        for s in ordered
-                    ],
-                },
-                marker,
+                    "speaker": _speaker_label(s),
+                    "language": s.get("originalLanguage"),
+                    "text": s.get("originalText"),
+                    "startMs": s.get("startTimeMs"),
+                }
+                for s in ordered
+            ],
+        }
+        # Said in the result as well as in the tool description: the description is read once
+        # per turn, and this is the moment the model decides whether it has the whole meeting.
+        hints = []
+        if omitted_earlier and returned_from is not None:
+            hints.append(
+                "Earlier segments exist and are not included; to read them, call get_transcript "
+                f"again with before_sequence={returned_from}."
             )
-        )
+        # Only for range=beginning. A before_sequence page omits later segments by definition —
+        # the model just came from them — and a latest window only does so by the odd segment
+        # spoken between its two reads.
+        if omitted_later and from_beginning:
+            hints.append(
+                "Later segments exist and are not included; call get_transcript without range "
+                "or before_sequence to read the most recent part."
+            )
+        if hints:
+            result["note"] = " ".join(hints)
+        return json.dumps(_with_marker(result, marker))
     except Exception:
         logger.exception("get_transcript_error")
         return json.dumps({"error": "Could not look up the transcript right now."})
@@ -1245,9 +1461,11 @@ async def _ask_user(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             "question_count": len(questions),
             "instruction": (
                 "The question card is now on the user's screen. End your turn WITHOUT calling "
-                "another tool and WITHOUT guessing an answer. Say one short sentence telling "
-                "them you need these details, then stop. Their reply arrives as a normal "
-                "message on your next turn."
+                "another tool and WITHOUT guessing an answer. Say one short sentence that NAMES "
+                "the details you still need (e.g. 'I still need the title and the languages'), "
+                "then stop. Do not refer to 'the card' - the sentence must make sense on its "
+                "own, because the card is not kept when the conversation is reopened. Their "
+                "reply arrives as a normal message on your next turn."
             ),
         }
     )
@@ -1324,12 +1542,23 @@ async def _create_meeting(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     # the room itself. Both are reported, so the model can say "every weekday from Monday" rather
     # than "created" and leave the user to go and check.
     room = created.get("firstOccurrence") or created
+    room_id = room.get("id")
+    slug = await _workspace_slug(ctx)
     return json.dumps(
         {
             "status": "created",
-            "id": room.get("id"),
+            "kind": "warptalk_room",
+            "id": room_id,
+            # The address the user opens. Slug-qualified so the browser opens the canonical room
+            # detail page directly without depending on a client-side redirect.
+            "room_url": (
+                room_url(room_id, slug=slug)
+                if isinstance(room_id, str) and room_id.strip()
+                else None
+            ),
             "title": room.get("title"),
             "room_code": room.get("translationRoomCode"),
+            "room_type": room.get("translationRoomType") or draft.translation_room_type,
             "scheduled_at": room.get("scheduledAt"),
             "recurring": bool(created.get("series")),
             "invited_count": len(draft.invited_emails),
@@ -1338,6 +1567,596 @@ async def _create_meeting(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             "external_calendar_event_id": room.get("externalCalendarEventId"),
             "external_calendar_event_url": room.get("externalCalendarEventUrl"),
         }
+    )
+
+
+#: Offered only on the meeting-chat surface (see tools_for_origin): in the widget there is nowhere
+#: to move to, and a tool the model can call to no effect is a tool it will call.
+CONTINUE_IN_WIDGET_TOOL = "continue_in_widget"
+
+#: Page types whose entity id IS a translation room. Kept in step with chat_templates'
+#: _PAGE_TEMPLATES entries that carry the meeting binding.
+MEETING_PAGE_TYPES = frozenset(
+    {"meeting_chat", "in_meeting", "room_detail", "external_meeting_widget"}
+)
+
+#: create_action_item's `owner` values. NONE is a real member, not an omission: the chat model
+#: fills every property it is given (see meeting_draft.draft_from_arguments), so an enum with no
+#: way to say "nobody" forces it to pick somebody.
+ACTION_ITEM_OWNERS = ("ME", "NAMED", "NONE")
+
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _text_arg(arguments: dict[str, Any] | None, key: str) -> str:
+    """One string argument, trimmed, with the model's filler ("", None, 0) read as absent."""
+    value = (arguments or {}).get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _meeting_id_for(ctx: ToolContext, arguments: dict[str, Any] | None) -> str:
+    """The meeting a quick action is about: the one named, else the one on screen, else ""."""
+    named = _text_arg(arguments, "meeting_id")
+    if named:
+        return named
+    if (ctx.page_type or "").strip().lower() in MEETING_PAGE_TYPES and ctx.page_entity_id:
+        return str(ctx.page_entity_id).strip()
+    return ""
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def _error_reason(response: Any) -> str:
+    """The service's own words for a refusal, whichever of its three shapes it answered in.
+
+    ApiErrorResponse ({"error"/"message"}), a bare JSON string (the glossary controller returns
+    NotFound(error)), or plain text. The reason is what lets the model tell the user something
+    they can act on; "the tool failed" is not.
+    """
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        return str(body.get("error") or body.get("message") or body.get("title") or "")
+    if isinstance(body, str):
+        return body
+    try:
+        return str(response.text or "")[:300]
+    except Exception:
+        return ""
+
+
+async def _workspace_slug(ctx: ToolContext) -> str | None:
+    """The workspace's URL slug, fetched once per turn with the caller's own token.
+
+    Every workspace page lives under /{slug}/…, and nothing on the chat request carries the slug,
+    so without this a created task could only be described, never linked. None when it cannot be
+    read — the caller then leaves the link out rather than printing /None/rooms/….
+    """
+    if ctx.workspace_slug:
+        return ctx.workspace_slug
+    try:
+        response = await ctx.workspace_client.get(
+            f"/api/v1/workspaces/{ctx.workspace_id}",
+            headers=_auth_headers(ctx),
+        )
+        if response.status_code != 200:
+            logger.warning("workspace_slug_lookup_failed", status=response.status_code)
+            return None
+        body = response.json()
+        slug = body.get("slug") if isinstance(body, dict) else None
+    except Exception:
+        logger.exception("workspace_slug_lookup_error")
+        return None
+    if isinstance(slug, str) and slug.strip():
+        ctx.workspace_slug = slug.strip()
+        return ctx.workspace_slug
+    return None
+
+
+async def _continue_in_widget(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Hand this meeting's WarpBot thread to the asker's WarpBot widget.
+
+    Nothing is moved here. The worker publishes a `handoff` event when this returns, the meeting
+    service relays it addressed to whoever asked, and THAT person's browser opens the widget on a
+    new conversation that starts with the thread. Everybody else in the room sees only the one
+    sentence the model writes next.
+    """
+    if (ctx.origin or "").strip().lower() != "meeting_chat":
+        return json.dumps(
+            {
+                "status": "not_applicable",
+                "instruction": (
+                    "You are already in the WarpBot widget, so there is nothing to move. "
+                    "Just carry on with the user's request."
+                ),
+            }
+        )
+    return json.dumps(
+        {
+            "status": "handoff_requested",
+            "instruction": (
+                "The asker's WarpBot widget is opening with this thread in it. Reply with ONE "
+                "short sentence, in the language they wrote in, saying the conversation continues "
+                "in the widget (bottom-right). Do not repeat or summarise the thread, and do not "
+                "call another tool."
+            ),
+        }
+    )
+
+
+async def _create_action_item(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Save a task to a meeting — for real, with a link, instead of acknowledging it in prose.
+
+    Written because WarpBot answered a dictated action item with "Đã ghi nhận" and a bullet list,
+    and when asked where it was saved admitted it was saved nowhere. The contract now is: a task
+    exists only once this has returned status "created", and the answer links to it.
+
+    Owner resolution is the SERVICE's job (ActionItemOwnerResolver, the same matcher approval
+    uses), not the model's: the model reports "me" or the name it heard, and a name that does not
+    match exactly one participant comes back refused so the model can ask who was meant.
+    """
+    task = _text_arg(arguments, "task")
+    if not task:
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": ["task"],
+                "instruction": "Ask the user what the action item is, then call this again.",
+            }
+        )
+
+    owner = _text_arg(arguments, "owner").upper() or "NONE"
+    if owner not in ACTION_ITEM_OWNERS:
+        owner = "NONE"
+    owner_name = _text_arg(arguments, "owner_name")
+    if owner == "NAMED" and not owner_name:
+        # NAMED with no name is the filler case; the honest reading is that nobody was named.
+        owner = "NONE"
+
+    due_date = _text_arg(arguments, "due_date")
+    if due_date and not _ISO_DATE.match(due_date):
+        return json.dumps(
+            {
+                "status": "invalid",
+                "problems": ["due_date must be yyyy-MM-dd, or empty when no deadline was given."],
+            }
+        )
+    if due_date:
+        try:
+            datetime.strptime(due_date, "%Y-%m-%d")
+        except ValueError:
+            return json.dumps(
+                {"status": "invalid", "problems": [f"{due_date} is not a real date."]}
+            )
+
+    meeting_id = _meeting_id_for(ctx, arguments)
+    if not meeting_id:
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": ["meeting"],
+                "instruction": (
+                    "An action item belongs to a meeting and none is open. Find it with "
+                    "list_recent_meetings, or ask the user which meeting with ask_user — do NOT "
+                    "tell the user it was saved."
+                ),
+            }
+        )
+    if not _is_uuid(meeting_id):
+        return json.dumps({"status": "invalid", "problems": ["meeting_id is not a meeting id."]})
+
+    payload: dict[str, Any] = {
+        "task": task,
+        "assignToSelf": owner == "ME",
+        "ownerName": owner_name if owner == "NAMED" else None,
+        "dueDate": due_date or None,
+    }
+
+    try:
+        response = await ctx.translation_room_client.post(
+            f"/api/v1/rooms/{meeting_id}/action-items",
+            json=payload,
+            headers=_auth_headers(ctx),
+        )
+    except Exception:
+        logger.exception("create_action_item_request_error")
+        return json.dumps(
+            {
+                "status": "failed",
+                "reason": "Could not reach the meeting service. Nothing was saved.",
+            }
+        )
+
+    if response.status_code not in (200, 201):
+        reason = _error_reason(response)
+        logger.warning("create_action_item_failed", status=response.status_code)
+        if response.status_code == 400 and owner == "NAMED":
+            return json.dumps(
+                {
+                    "status": "owner_not_found",
+                    "owner_name": owner_name,
+                    "reason": reason,
+                    "instruction": (
+                        "Nothing was saved. Ask the user who they meant (ask_user), or offer to "
+                        "assign it to them or leave it unassigned."
+                    ),
+                }
+            )
+        return json.dumps(
+            {
+                "status": "failed",
+                "http_status": response.status_code,
+                "reason": reason or "The meeting service refused the request. Nothing was saved.",
+            }
+        )
+
+    try:
+        created = response.json()
+    except Exception:
+        created = {}
+    if not isinstance(created, dict):
+        created = {}
+
+    slug = await _workspace_slug(ctx)
+    result: dict[str, Any] = {
+        "status": "created",
+        "id": created.get("id"),
+        "task": created.get("task") or task,
+        "owner": created.get("ownerName"),
+        "assigned_to_you": bool(created.get("assigneeUserId"))
+        and str(created.get("assigneeUserId")).lower() == (ctx.user_id or "").lower(),
+        "assigned": bool(created.get("assigneeUserId")),
+        "due_date": created.get("dueDate"),
+        "meeting_title": created.get("roomTitle"),
+        "instruction": (
+            "It is saved. Confirm in one or two lines — the task, the owner, the deadline or "
+            "'no deadline' — and give the link. Do not restate it as a list of notes."
+        ),
+    }
+    # The meeting's own page is where its action items are listed. There is no workspace-wide
+    # task page to link to (web#551 removed it), and a link that lands on home is a broken promise.
+    if slug:
+        result["meeting_link"] = f"/{slug}/rooms/{meeting_id}"
+    return json.dumps(result, ensure_ascii=False)
+
+
+async def _add_glossary_term(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Add a term to one of this workspace's glossaries — the one named, or the only one there is.
+
+    Glossaries are listed for ctx.workspace_id, which comes from the chat request, never from the
+    model, so a term can only ever land in this workspace.
+    """
+    source_term = _text_arg(arguments, "source_term")
+    target_term = _text_arg(arguments, "target_term")
+    missing = [
+        name
+        for name, value in (("source_term", source_term), ("target_term", target_term))
+        if not value
+    ]
+    if missing:
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": missing,
+                "instruction": "Ask the user for the term and its preferred translation.",
+            }
+        )
+
+    try:
+        listed = await ctx.transcript_client.get(
+            f"/api/v1/glossaries/workspace/{ctx.workspace_id}",
+            headers=_auth_headers(ctx),
+        )
+    except Exception:
+        logger.exception("add_glossary_term_list_error")
+        return json.dumps({"status": "failed", "reason": "Could not reach the glossary service."})
+    if listed.status_code != 200:
+        logger.warning("add_glossary_term_list_failed", status=listed.status_code)
+        return json.dumps(
+            {"status": "failed", "http_status": listed.status_code, "reason": _error_reason(listed)}
+        )
+
+    try:
+        glossaries = [
+            g for g in (listed.json() or []) if isinstance(g, dict) and g.get("isActive", True)
+        ]
+    except Exception:
+        glossaries = []
+
+    if not glossaries:
+        return json.dumps(
+            {
+                "status": "no_glossary",
+                "instruction": (
+                    "This workspace has no glossary yet, so nothing was saved. Offer to create "
+                    "one with create_glossary — ask the user for its name and its two languages "
+                    "— then add the term to it."
+                ),
+            }
+        )
+
+    wanted = _text_arg(arguments, "glossary_name").casefold()
+    chosen: list[dict[str, Any]]
+    if wanted:
+        chosen = [g for g in glossaries if str(g.get("name") or "").casefold() == wanted]
+        if not chosen:
+            chosen = [g for g in glossaries if wanted in str(g.get("name") or "").casefold()]
+    else:
+        chosen = glossaries
+
+    if len(chosen) != 1:
+        return json.dumps(
+            {
+                "status": "choose_glossary",
+                "glossaries": [
+                    {
+                        "name": g.get("name"),
+                        "source_language": g.get("sourceLanguage"),
+                        "target_language": g.get("targetLanguage"),
+                    }
+                    for g in glossaries
+                ],
+                "instruction": (
+                    "Nothing was saved. Ask the user which glossary with ask_user, then call "
+                    "this again with its exact name as glossary_name."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    glossary = chosen[0]
+    context = _text_arg(arguments, "context")
+    try:
+        response = await ctx.transcript_client.post(
+            f"/api/v1/glossaries/{glossary.get('id')}/terms",
+            json={
+                "sourceTerm": source_term[:200],
+                "targetTerm": target_term[:200],
+                "context": context[:1000] or None,
+                "domain": None,
+                "definition": None,
+                "usageNote": None,
+                "partOfSpeech": None,
+                "priority": 0,
+            },
+            headers=_auth_headers(ctx),
+        )
+    except Exception:
+        logger.exception("add_glossary_term_request_error")
+        return json.dumps({"status": "failed", "reason": "Could not reach the glossary service."})
+
+    if response.status_code == 409:
+        return json.dumps(
+            {
+                "status": "already_exists",
+                "glossary": glossary.get("name"),
+                "reason": _error_reason(response),
+                "instruction": "Tell the user the term is already in that glossary.",
+            },
+            ensure_ascii=False,
+        )
+    if response.status_code not in (200, 201):
+        logger.warning("add_glossary_term_failed", status=response.status_code)
+        return json.dumps(
+            {
+                "status": "failed",
+                "http_status": response.status_code,
+                "reason": _error_reason(response),
+            }
+        )
+
+    slug = await _workspace_slug(ctx)
+    result: dict[str, Any] = {
+        "status": "created",
+        "glossary": glossary.get("name"),
+        "source_term": source_term,
+        "target_term": target_term,
+    }
+    if slug:
+        result["glossary_link"] = f"/{slug}/glossary"
+    return json.dumps(result, ensure_ascii=False)
+
+
+#: A language code as the glossary stores it — "vi", "en", "zh-CN" — and never a language NAME.
+#: The column is VARCHAR(10) (CreateGlossaryDto), and "Vietnamese" would be saved as a glossary
+#: whose language matches nothing the translation pipeline ever asks for.
+_LANGUAGE_CODE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,4})?$")
+
+
+async def _create_glossary(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Create a glossary in this workspace, and hand back its name so terms can go straight in.
+
+    POSTs the same body the Glossary page sends (WorkspaceService.createGlossary), as the caller:
+    the transcript service decides who may create one (Owner/Admin) and its refusal is passed
+    through in its own words. workspaceId comes from ctx, never from the model.
+
+    The languages are never defaulted. A glossary is a (source → target) pair and every term in
+    it is read that way, so a guessed pair is a glossary that silently never applies.
+    """
+    name = _text_arg(arguments, "name")
+    source_language = _text_arg(arguments, "source_language")
+    target_language = _text_arg(arguments, "target_language")
+    missing = [
+        key
+        for key, value in (
+            ("name", name),
+            ("source_language", source_language),
+            ("target_language", target_language),
+        )
+        if not value
+    ]
+    if missing:
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": missing,
+                "instruction": (
+                    "Nothing was created. Ask the user (ask_user) for what is missing — the "
+                    "glossary's name, the language its terms are spoken in and the language they "
+                    "are translated into. Never guess a language."
+                ),
+            }
+        )
+
+    problems = [
+        f"{key} '{value}' is not a language code — pass a code such as 'vi', 'en' or 'ja'."
+        for key, value in (
+            ("source_language", source_language),
+            ("target_language", target_language),
+        )
+        if not _LANGUAGE_CODE.match(value)
+    ]
+    if len(name) > 100:
+        problems.append("name is longer than 100 characters.")
+    if problems:
+        return json.dumps({"status": "invalid", "problems": problems}, ensure_ascii=False)
+
+    description = _text_arg(arguments, "description")
+    try:
+        response = await ctx.transcript_client.post(
+            "/api/v1/glossaries",
+            json={
+                "workspaceId": ctx.workspace_id,
+                "name": name,
+                "description": description[:500] or None,
+                "sourceLanguage": source_language,
+                "targetLanguage": target_language,
+            },
+            headers=_auth_headers(ctx),
+        )
+    except Exception:
+        logger.exception("create_glossary_request_error")
+        return json.dumps(
+            {
+                "status": "failed",
+                "reason": "Could not reach the glossary service. Nothing was created.",
+            }
+        )
+
+    if response.status_code == 409:
+        return json.dumps(
+            {
+                "status": "already_exists",
+                "glossary": name,
+                "reason": _error_reason(response),
+                "instruction": (
+                    "Nothing was created: this workspace already has a glossary with that name. "
+                    "Tell the user, and offer to add the terms to it with add_glossary_term "
+                    "(glossary_name set to this name) or to pick another name."
+                ),
+            },
+            ensure_ascii=False,
+        )
+    if response.status_code not in (200, 201):
+        logger.warning("create_glossary_failed", status=response.status_code)
+        return json.dumps(
+            {
+                "status": "failed",
+                "http_status": response.status_code,
+                "reason": _error_reason(response)
+                or "The glossary service refused the request. Nothing was created.",
+                "instruction": "Nothing was created. Tell the user why, in the service's words.",
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        created = response.json()
+    except Exception:
+        created = {}
+    if not isinstance(created, dict):
+        created = {}
+
+    created_name = created.get("name") or name
+    slug = await _workspace_slug(ctx)
+    result: dict[str, Any] = {
+        "status": "created",
+        "glossary_id": created.get("id"),
+        "glossary": created_name,
+        "source_language": created.get("sourceLanguage") or source_language,
+        "target_language": created.get("targetLanguage") or target_language,
+        "instruction": (
+            "It is created and empty. To put terms in it, call add_glossary_term once per term "
+            f"with glossary_name '{created_name}'. Confirm in one line with the link."
+        ),
+    }
+    if slug:
+        result["glossary_link"] = f"/{slug}/glossary"
+    return json.dumps(result, ensure_ascii=False)
+
+
+async def _share_meeting_minutes(ctx: ToolContext, arguments: dict[str, Any]) -> str:
+    """Give an email address access to a meeting's minutes, and hand back the link to send.
+
+    WarpTalk sends no email for this — the grant makes the minutes readable by that address
+    through the share link — so the result says so, and the model must not claim it was "sent".
+    Only the meeting's host can share; the service's refusal is passed through in its own words.
+    """
+    email = _text_arg(arguments, "email")
+    if "@" not in email or " " in email:
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": ["email"],
+                "instruction": "Ask the user for the email address to share the minutes with.",
+            }
+        )
+    meeting_id = _meeting_id_for(ctx, arguments)
+    if not meeting_id or not _is_uuid(meeting_id):
+        return json.dumps(
+            {
+                "status": "needs_more_information",
+                "missing": ["meeting"],
+                "instruction": (
+                    "Find the meeting with list_recent_meetings or ask the user which one."
+                ),
+            }
+        )
+
+    try:
+        response = await ctx.translation_room_client.post(
+            f"/api/v1/rooms/{meeting_id}/minutes/share/people",
+            json={"email": email},
+            headers=_auth_headers(ctx),
+        )
+    except Exception:
+        logger.exception("share_meeting_minutes_request_error")
+        return json.dumps({"status": "failed", "reason": "Could not reach the meeting service."})
+
+    if response.status_code != 200:
+        logger.warning("share_meeting_minutes_failed", status=response.status_code)
+        return json.dumps(
+            {
+                "status": "failed",
+                "http_status": response.status_code,
+                "reason": _error_reason(response)
+                or "The meeting's minutes could not be shared. Only the host can share them.",
+            }
+        )
+
+    try:
+        body = response.json()
+    except Exception:
+        body = {}
+    return json.dumps(
+        {
+            "status": "shared",
+            "email": email,
+            "share_url": body.get("url") if isinstance(body, dict) else None,
+            "instruction": (
+                "Access is granted, but WarpTalk does not email anyone. Give the user the "
+                "share_url to send, and do not say the minutes were sent."
+            ),
+        },
+        ensure_ascii=False,
     )
 
 
@@ -1607,8 +2426,10 @@ TOOLS: list[ChatTool] = [
         name="ask_user",
         description=(
             "Ask the user one or more multiple-choice questions and STOP. Use this the moment "
-            "you need a detail you do not have — never guess a meeting's title, languages, type "
-            "or time. The questions appear as a card the user picks from; their answer arrives "
+            "you need a detail you do not have — never guess a WarpTalk room's title, languages "
+            "or type. (A Google Meet meeting is the exception: it needs no questions, see the "
+            "meetings rules.) The questions appear as a card the user picks from; their answer "
+            "arrives "
             "as a normal message on your next turn. Ask everything you need in ONE call: three "
             "questions in one card is a form, three cards in a row is an interrogation."
         ),
@@ -1666,11 +2487,16 @@ TOOLS: list[ChatTool] = [
     ChatTool(
         name="create_meeting",
         description=(
-            "Create a translation room in the current workspace. Call this ONLY once you know "
-            "the title, meeting type, source language and target languages — if any of those is "
-            "missing, call ask_user first. Supports a one-off time (scheduled_at) OR a repeating "
-            "rule (recurrence_*), never both. Invited people receive an email, so only pass "
-            "addresses the user actually gave you."
+            "Create a WarpTalk room (a translation room hosted in WarpTalk itself - NOT a Google "
+            "Meet meeting) in the current workspace — including a FOLLOW-UP to the meeting in "
+            "progress (reuse its languages, and title it after it). This is the default when the "
+            "user asks for a meeting and does not mention Google Meet. When it succeeds, call it "
+            "a WarpTalk room; WarpBot shows a card with the room's link under your answer, so do "
+            "not paste the link. Call this ONLY "
+            "once you know the title, meeting type, source language and target languages — if "
+            "any of those is missing, call ask_user first. Supports a one-off time "
+            "(scheduled_at) OR a repeating rule (recurrence_*), never both. Invited people "
+            "receive an email, so only pass addresses the user actually gave you."
         ),
         parameters={
             "type": "object",
@@ -1792,6 +2618,153 @@ TOOLS: list[ChatTool] = [
             "required": ["title", "translation_room_type", "source_language", "target_languages"],
         },
         handler=_create_meeting,
+    ),
+    ChatTool(
+        name="create_action_item",
+        description=(
+            "SAVE an action item (a task) to a meeting. Call this whenever the user states a "
+            "task, commitment or to-do — 'Action: …', 'ghi lại việc này', 'add a task', "
+            "'người thực hiện: tôi', 'deadline: …' — instead of acknowledging it in your reply. "
+            "Writing 'noted' or a bullet list saves NOTHING: the task exists only once this "
+            "returns status 'created', and only then may you say it is saved, with the link it "
+            "returns. It is listed on the meeting's page with its owner and deadline."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The task itself, as one clear sentence in the user's language.",
+                },
+                "owner": {
+                    "type": "string",
+                    "enum": list(ACTION_ITEM_OWNERS),
+                    "description": (
+                        "ME when the user will do it themselves ('tôi', 'mình', 'em', 'me', "
+                        "'I'). NAMED when they named somebody else (put the name in "
+                        "owner_name). NONE when nobody was named."
+                    ),
+                },
+                "owner_name": {
+                    "type": "string",
+                    "description": (
+                        "Only for owner NAMED: the name as the user said it, e.g. 'chị Nhi'. "
+                        "Empty otherwise. It is matched against the meeting's participants."
+                    ),
+                },
+                "due_date": {
+                    "type": "string",
+                    "description": (
+                        "yyyy-MM-dd, resolved from what the user said against today's date. "
+                        "EMPTY when no deadline was given or it is 'not decided' — never "
+                        "invent one."
+                    ),
+                },
+                "meeting_id": {
+                    "type": "string",
+                    "description": (
+                        "The meeting the task belongs to. Leave EMPTY when you are in or on a "
+                        "meeting — the one on screen is used. Otherwise an id from "
+                        "list_recent_meetings; never invent one."
+                    ),
+                },
+            },
+            "required": ["task", "owner"],
+        },
+        handler=_create_action_item,
+    ),
+    ChatTool(
+        name="create_glossary",
+        description=(
+            "CREATE a new glossary in this workspace — a named (source → target) language pair "
+            "that terms are added to. Call this when the user asks to create, make or start a "
+            "glossary. It needs a name and BOTH languages: if the user did not say them, ask "
+            "(ask_user) — never guess a language. It is created empty; to fill it, call "
+            "add_glossary_term with the name this returns."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The glossary's name, as the user gave it. At most 100 chars.",
+                },
+                "source_language": {
+                    "type": "string",
+                    "description": (
+                        "Language code the terms are spoken in, e.g. 'vi', 'en', 'ja'. A code, "
+                        "not a name. Only what the user said — ask if they did not say."
+                    ),
+                },
+                "target_language": {
+                    "type": "string",
+                    "description": (
+                        "Language code the terms are translated into, e.g. 'en'. A code, not a "
+                        "name. Only what the user said — ask if they did not say."
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional one-line description. Empty if none.",
+                },
+            },
+            "required": ["name", "source_language", "target_language"],
+        },
+        handler=_create_glossary,
+    ),
+    ChatTool(
+        name="add_glossary_term",
+        description=(
+            "SAVE a term and its preferred translation to this workspace's glossary, so live "
+            "translation uses it from now on. Call this when the user asks to add, save or fix "
+            "how a term is translated — do not just promise to remember it."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "source_term": {"type": "string", "description": "The term as spoken."},
+                "target_term": {
+                    "type": "string",
+                    "description": "How it must be translated.",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional one-line note on meaning or usage. Empty if none.",
+                },
+                "glossary_name": {
+                    "type": "string",
+                    "description": (
+                        "Which glossary, when the workspace has several. Empty to use the only "
+                        "one; if there are several you will be told their names."
+                    ),
+                },
+            },
+            "required": ["source_term", "target_term"],
+        },
+        handler=_add_glossary_term,
+    ),
+    ChatTool(
+        name="share_meeting_minutes",
+        description=(
+            "Give someone access to a meeting's minutes (biên bản) by email and get the share "
+            "link. Host only. WarpTalk does not email them — hand the user the link to send, "
+            "and never say it was sent."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "email": {"type": "string", "description": "The address to grant access to."},
+                "meeting_id": {
+                    "type": "string",
+                    "description": (
+                        "Empty for the meeting on screen; otherwise an id from "
+                        "list_recent_meetings."
+                    ),
+                },
+            },
+            "required": ["email"],
+        },
+        handler=_share_meeting_minutes,
     ),
     ChatTool(
         name="search_workspace_members",
@@ -1965,7 +2938,14 @@ TOOLS: list[ChatTool] = [
             "Get the transcribed segments (speaker, language, text) for a specific "
             "meeting's transcript. Use this when the user asks what was said, wants a "
             "quote, or wants something found within the meeting's transcript. Call "
-            "list_recent_meetings first to find the meeting's id if you don't have one."
+            "list_recent_meetings first to find the meeting's id if you don't have one. "
+            f"Returns at most {TRANSCRIPT_SEGMENT_LIMIT} segments per call, and BY DEFAULT "
+            "THE MOST RECENT ONES — the right window for 'what did they just say'. The result "
+            "reports totalSegments, the returnedFrom/returnedTo sequence numbers, and "
+            "omittedEarlier/omittedLater. When omittedEarlier is true and the question is "
+            "about an earlier part of the meeting, call again with "
+            "before_sequence=<returnedFrom> to page backwards, or range='beginning' to read "
+            "how the meeting opened."
         ),
         parameters={
             "type": "object",
@@ -1975,6 +2955,24 @@ TOOLS: list[ChatTool] = [
                     "description": (
                         "The meeting/room's id, from page context or a prior "
                         "list_recent_meetings call."
+                    ),
+                },
+                "range": {
+                    "type": "string",
+                    "enum": list(TRANSCRIPT_RANGES),
+                    "description": (
+                        "Which end of the transcript to read: 'latest' (default) returns the "
+                        "most recent segments, 'beginning' the first ones. Ignored when "
+                        "before_sequence is given."
+                    ),
+                },
+                "before_sequence": {
+                    "type": "integer",
+                    "description": (
+                        "Page backwards: return the segments immediately before this sequence "
+                        "number (those with a smaller one), ending right before it. A positive "
+                        "integer — pass the returnedFrom of the previous call to read the part "
+                        "before it."
                     ),
                 },
             },
@@ -2080,6 +3078,40 @@ TOOLS: list[ChatTool] = [
         },
         handler=_get_platform_analytics,
     ),
+    ChatTool(
+        name=CONTINUE_IN_WIDGET_TOOL,
+        description=(
+            "Move this conversation to the asker's private WarpBot widget so they can keep "
+            "discussing there. Call it when the user asks to continue, move or switch the chat "
+            "to the widget or to a private chat — 'chuyển qua widget', 'bàn tiếp ở widget', "
+            "'move this to chat', 'continue in the widget'. Their widget opens with this thread "
+            "already in it."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": (
+                        "A few words on what they want to keep discussing. Empty if unclear."
+                    ),
+                },
+            },
+            "required": [],
+        },
+        handler=_continue_in_widget,
+    ),
 ]
 
 TOOLS_BY_NAME: dict[str, ChatTool] = {t.name: t for t in TOOLS}
+
+
+def offered_on(tool_name: str, origin: str | None) -> bool:
+    """Whether a built-in tool is offered to a turn asked from this surface.
+
+    Every tool everywhere, except the handoff, which means something only when the question came
+    from a meeting's chat.
+    """
+    if tool_name != CONTINUE_IN_WIDGET_TOOL:
+        return True
+    return (origin or "").strip().lower() == "meeting_chat"
