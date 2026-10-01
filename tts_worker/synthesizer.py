@@ -30,6 +30,49 @@ logger = get_logger(__name__)
 WARM_CONNECTION_MAX_IDLE_SECONDS = 90.0
 
 
+class GenerationLease:
+    """One sentence's claim on a Cartesia generation slot, which it gives back as soon as
+    Cartesia has finished SENDING the audio — not when the listener has finished hearing it.
+
+    WHY NOT `async with generation_slot()`
+        With streaming on (WT-397) the sentence goes onto the LiveKit track as it is generated,
+        and the track back-pressures to real time, so the call that streams a sentence does not
+        return until the sentence has finished PLAYING. A slot held around that call was held
+        for the whole spoken length of the dub. Two slots, so a third speaker, language or voice
+        waited for somebody else's sentence to finish playing before Cartesia was even asked —
+        overlapping speakers queued behind each other by seconds.
+
+        What the plan limits is generations in flight at Cartesia, and a sentence stops being
+        one the moment its `flush_done` (or the one-shot response) has arrived. So the holder
+        releases there, explicitly, and the playout that follows runs outside the slot.
+
+    Idempotent both ways: `acquire` on a held lease and `release` on a free one are no-ops. A
+    sentence that falls back to the one-shot path re-acquires through the same lease, so it is
+    still one claim at a time — never a nested second acquire, which is how a gate this shape
+    deadlocks itself under load.
+    """
+
+    def __init__(self, slots: asyncio.Semaphore) -> None:
+        self._slots = slots
+        self._held = False
+
+    @property
+    def held(self) -> bool:
+        return self._held
+
+    async def acquire(self) -> None:
+        if self._held:
+            return
+        await self._slots.acquire()
+        self._held = True
+
+    def release(self) -> None:
+        if not self._held:
+            return
+        self._held = False
+        self._slots.release()
+
+
 class CartesiaSynthesizer:
     """Cartesia Sonic Turbo synthesizer with voice cloning.
 
@@ -72,11 +115,13 @@ class CartesiaSynthesizer:
         self._generation_slots = asyncio.Semaphore(max(1, max_concurrency))
 
     def generation_slot(self) -> asyncio.Semaphore:
-        """Hold for the whole of one sentence's generation, fallback included.
+        """The gate on generations in flight at Cartesia. Hold it while Cartesia is generating.
 
         Held by the caller rather than inside `synthesize`, so a prosody-context sentence and
-        the one-shot fallback it drops into count as ONE generation, not as a second request
-        queued behind the first one's own slot.
+        the one-shot fallback it drops into are never two claims at once. A live dub takes it
+        through a `GenerationLease`, which gives it back when the audio has ARRIVED rather than
+        when it has finished playing — see that class. One-shot callers that do not stream
+        (the voice preview) can simply hold it with `async with`.
         """
         return self._generation_slots
 
