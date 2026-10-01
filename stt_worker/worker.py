@@ -201,6 +201,10 @@ class STTWorker(BaseWorker):
     worker_name = "stt"
     input_stream = "audio:chunks"
     consumer_group = "stt-workers"
+    # Chunks dispatched and not yet finished. Most of them, at any moment, are simply waiting
+    # for their own speaker's previous commit; the bound is on unacknowledged work, not on
+    # transcription concurrency (which is one commit per speaker by construction).
+    _MAX_IN_FLIGHT = 32
 
     def __init__(
         self,
@@ -720,7 +724,7 @@ class STTWorker(BaseWorker):
         session concurrently would interleave the transcription stream. Locking keeps
         that path exactly as ordered as before; only cross-speaker work is now parallel.
 
-        RedisStreamClient.consume_concurrent ties XACK to successful handler
+        RedisStreamClient.consume_pipelined ties XACK to successful handler
         completion. Failed work remains pending for BaseWorker's reclaim/DLQ path.
         """
         self.logger.info(
@@ -730,29 +734,58 @@ class STTWorker(BaseWorker):
             consumer=self._consumer_name,
         )
 
-        async def _run(message_id: bytes, data: dict[bytes, bytes]) -> None:
-            key = _extract_speaker_key(data)
-            lock = self._speaker_locks.setdefault(key, asyncio.Lock())
-            async with lock:
-                await self._process_and_log_errors(message_id, data)
-
+        # READS WHILE A SPEAKER IS BUSY (see RedisStreamClient.consume_pipelined). This read a
+        # batch and waited for EVERY chunk in it before reading again, so one slow commit held up
+        # every other speaker's chunk that arrived after the batch was read. Measured in
+        # tools/meeting_sim: a backchannel's commit that took 7.1s kept the next speaker's chunk
+        # unread for 7s, and while it waited that speaker's next turn started streaming, found the
+        # previous turn still uncommitted and threw its buffer away
+        # (`previous_turn_never_committed`) — so the queued chunk then had to be re-sent and
+        # transcribed from scratch, slower again. Different speakers share nothing here; only
+        # the per-speaker lock below orders anything, and it is taken in stream order.
         while not self._shutdown_event.is_set():
             try:
-                await self._recover_stale_messages()
-                await self.redis.consume_concurrent(
+                await self.redis.consume_pipelined(
                     stream=self.input_stream,
                     group=self.consumer_group,
-                    handler=_run,
+                    handler=self._run_in_speaker_order,
+                    keep_running=lambda: not self._shutdown_event.is_set(),
                     consumer=self._consumer_name,
                     block_ms=2000,
                     count=8,
-                    concurrency=8,
+                    max_in_flight=self._MAX_IN_FLIGHT,
+                    in_flight_ids=self._in_flight_message_ids(),
+                    between_reads=self._recover_stale_messages,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger.exception("consume_loop_error")
                 await asyncio.sleep(1.0)
+
+    async def _run_in_speaker_order(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        key = _extract_speaker_key(data)
+        lock = self._speaker_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            await self._process_and_log_errors(message_id, data)
+
+    def _in_flight_message_ids(self) -> set[bytes]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        ids: set[bytes] | None = getattr(self, "_in_flight_ids", None)
+        if ids is None:
+            ids = set()
+            self._in_flight_ids = ids
+        return ids
+
+    def _is_in_flight(self, message_id: bytes) -> bool:
+        # A chunk queued behind its own speaker's commit is pending in Redis exactly like an
+        # abandoned one; the reclaim pass must not run it a second time.
+        return message_id in self._in_flight_message_ids()
+
+    async def _process_reclaimed(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        # Through the speaker's lock like any other chunk: two commits on one speaker's session
+        # at once would interleave its transcription stream.
+        await self._run_in_speaker_order(message_id, data)
 
     def _cleanup_room(self, room_id: str) -> None:
         super()._cleanup_room(room_id)
