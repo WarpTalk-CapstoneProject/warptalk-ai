@@ -27,6 +27,7 @@ from shared.integration_status import OPENAI, IntegrationReport, credential_repo
 from shared.lang import is_same_language
 from shared.languages import known_language_code
 from shared.schemas import (
+    STT_UNKNOWN_CONFIDENCE,
     ProsodyEnvelope,
     STTResultMessage,
     TranslationResultMessage,
@@ -619,7 +620,17 @@ class TranslationWorker(BaseWorker):
                 for target_lang in target_langs
             )
         )
-        if any(publish_results) and stt_result.confidence >= self._CONTEXT_MIN_CONFIDENCE:
+        # UNKNOWN IS NOT LOW. Production STT (gpt-live-transcribe) returns no logprobs, so every
+        # segment carries STT_UNKNOWN_CONFIDENCE (-1.0), which this floor (-0.35) read as "bad" —
+        # and the rolling context of what was just said stayed EMPTY in every production meeting.
+        # Each line, a fragment like "If you're" included, was translated with nothing before
+        # it. The same sentinel misreading starved the suggestion worker (see
+        # suggestion_worker's `confidence != STT_UNKNOWN_CONFIDENCE and ...`). A line that is
+        # here has already passed STT's script, blocklist and dub-echo filters.
+        if any(publish_results) and (
+            stt_result.confidence == STT_UNKNOWN_CONFIDENCE
+            or stt_result.confidence >= self._CONTEXT_MIN_CONFIDENCE
+        ):
             # The clean line, for the same reason it is what was translated: this context is fed
             # back to the model as "what has been said in this meeting", and a history of
             # "um, so, uh" teaches it nothing except to expect more of them.
