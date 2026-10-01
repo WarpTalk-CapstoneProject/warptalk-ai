@@ -55,6 +55,7 @@ def completion_options(
     model: str,
     token_limit: int | None = None,
     temperature: float | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     """Return the generation controls `model` actually accepts.
 
@@ -67,6 +68,18 @@ def completion_options(
     does NOT honour `temperature`, because there is no way to send it. Treat such a
     model as non-deterministic rather than assuming 0.0 took effect — translation
     caching learned this the expensive way (see translator.py's TTS-cache comment).
+
+    `reasoning_effort` is sent to the gpt-5 family only — a non-reasoning model answers
+    it with a 400 — and only when the caller asks. It matters because a gpt-5 model's
+    `max_completion_tokens` budget covers its hidden reasoning AS WELL AS the visible
+    answer: a cap sized for a short answer can be spent entirely on reasoning, and with
+    `response_format=json_object` that comes back as
+
+        400 Could not finish the message because max_tokens or model output limit was reached
+
+    rather than as a truncated reply. Which values exist is per model (gpt-5.6-luna takes
+    none/low/medium/high/xhigh and rejects `minimal`), so this passes the value through
+    unchecked instead of guessing.
     """
     options: dict[str, Any] = {}
 
@@ -75,6 +88,8 @@ def completion_options(
         # legacy pair is dropped rather than translated.
         if token_limit is not None:
             options["max_completion_tokens"] = token_limit
+        if reasoning_effort is not None:
+            options["reasoning_effort"] = reasoning_effort
         return options
 
     if token_limit is not None:

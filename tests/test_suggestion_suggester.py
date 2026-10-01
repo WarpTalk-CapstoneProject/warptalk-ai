@@ -41,17 +41,23 @@ class StubCompletions:
 
 
 def build_suggester(
-    payload: Any, total_tokens: int = 50
+    payload: Any,
+    total_tokens: int = 50,
+    *,
+    decide_model: str = "decide-model",
+    generate_model: str = "generate-model",
+    reasoning_effort: str | None = None,
 ) -> tuple[OpenAISuggester, StubCompletions]:
     suggester = OpenAISuggester(
         api_key="test-key",
-        decide_model="decide-model",
-        generate_model="generate-model",
+        decide_model=decide_model,
+        generate_model=generate_model,
         decide_max_tokens=64,
         generate_max_tokens=200,
         temperature=0.2,
         max_suggestion_chars=140,
         request_timeout_seconds=8.0,
+        reasoning_effort=reasoning_effort,
     )
     completions = StubCompletions(payload, total_tokens)
     suggester._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))  # type: ignore[assignment]
@@ -276,6 +282,83 @@ class TestGenerate:
         assert request["model"] == "generate-model"
         assert request["max_tokens"] == 200
         assert "140 characters" in request["messages"][0]["content"]
+
+
+class TestReasoningModelBudget:
+    """Production generates on gpt-5.6-luna, a reasoning model.
+
+    Its `max_completion_tokens` is shared between hidden reasoning and the visible answer. At
+    the default effort the 200-token cap was sometimes spent on reasoning alone, which OpenAI
+    reports as 400 "max_tokens or model output limit was reached" (prod, 1 Oct 2026).
+    """
+
+    APPROVED = TestGenerate.APPROVED
+
+    @pytest.mark.asyncio
+    async def test_generate_on_a_reasoning_model_sends_the_configured_effort(self) -> None:
+        suggester, completions = build_suggester(
+            {"content": "x"}, generate_model="gpt-5.6-luna", reasoning_effort="none"
+        )
+
+        await suggester.generate(WINDOW, SEGMENT, self.APPROVED)
+
+        request = completions.requests[0]
+        assert request["reasoning_effort"] == "none"
+        assert request["max_completion_tokens"] == 200
+        assert "max_tokens" not in request
+        assert "temperature" not in request
+
+    @pytest.mark.asyncio
+    async def test_decide_on_a_reasoning_model_sends_the_configured_effort(self) -> None:
+        suggester, completions = build_suggester(
+            {"should_suggest": False}, decide_model="gpt-5.6-luna", reasoning_effort="low"
+        )
+
+        await suggester.decide(WINDOW, SEGMENT)
+
+        assert completions.requests[0]["reasoning_effort"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_a_non_reasoning_model_never_receives_an_effort(self) -> None:
+        """gpt-4o-mini (prod's decide model) answers reasoning_effort with a 400."""
+        suggester, completions = build_suggester(
+            {"should_suggest": False}, decide_model="gpt-4o-mini", reasoning_effort="none"
+        )
+
+        await suggester.decide(WINDOW, SEGMENT)
+
+        assert "reasoning_effort" not in completions.requests[0]
+
+    def test_production_settings_turn_reasoning_off(self) -> None:
+        from shared.config import SuggestionSettings
+        from suggestion_worker.__main__ import build_suggester as build_from_settings
+
+        settings = SuggestionSettings(
+            enabled=True, api_key="test-key", generate_model="gpt-5.6-luna"
+        )
+        suggester = build_from_settings(settings)
+
+        assert settings.reasoning_effort == "none"
+        assert isinstance(suggester, OpenAISuggester)
+        assert suggester.reasoning_effort == "none"
+
+    @pytest.mark.asyncio
+    async def test_the_client_does_not_retry(self) -> None:
+        """The SDK default re-sent a timed-out hint twice: ~27s of a stalled consumer each."""
+        suggester = OpenAISuggester(
+            api_key="test-key",
+            decide_model="m",
+            generate_model="m",
+            decide_max_tokens=64,
+            generate_max_tokens=200,
+            temperature=0.2,
+            max_suggestion_chars=140,
+            request_timeout_seconds=8.0,
+        )
+
+        await suggester.load()
+
+        assert suggester._require_client().max_retries == 0
 
 
 class TestNullSuggester:
