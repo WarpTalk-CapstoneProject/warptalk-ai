@@ -30,6 +30,7 @@ def build_suggester(settings: SuggestionSettings) -> Suggester:
         temperature=settings.temperature,
         max_suggestion_chars=settings.max_suggestion_chars,
         request_timeout_seconds=settings.request_timeout_seconds,
+        reasoning_effort=settings.reasoning_effort,
     )
 
 

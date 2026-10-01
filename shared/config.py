@@ -786,6 +786,16 @@ class SuggestionSettings(BaseSettings):
     decide_max_tokens: int = 64  # a {should_suggest, category, confidence, reason} object
     generate_max_tokens: int = 200
     temperature: float = 0.2
+    # Reasoning effort for either stage when it runs on a gpt-5 model (ignored otherwise).
+    # Production generates on gpt-5.6-luna, whose token cap is shared between hidden
+    # reasoning and the visible answer. At its default effort a ~5.5k-token prompt spent
+    # 35-85 reasoning tokens per call in a probe (1 Oct 2026), so some draws exhaust the
+    # 200-token cap and OpenAI answers 400 "max_tokens or model output limit was reached"
+    # with nothing to show: 2 of 15 generate calls in prod that morning, with 3 more lost to
+    # the 8s timeout. "none" spent 0 reasoning tokens and answered in ~1.6s instead of
+    # 2-4s. The judgement this hint needs was already made by the decide stage.
+    # Supported values are per model: luna rejects "minimal".
+    reasoning_effort: str | None = "none"
     # A hung request would stall this consumer's whole loop, and a suggestion that arrives
     # after the conversation has moved on is worse than none — fail fast and stay quiet.
     request_timeout_seconds: float = 8.0
