@@ -64,6 +64,30 @@ class TestMatchesRecentDub:
         recent = [_normalize_overheard_text("Yeah.")]
         assert not _matches_recent_dub(_normalize_overheard_text("Yeah."), recent)
 
+    def test_a_one_word_dub_line_never_vetoes_a_sentence_that_contains_it(self) -> None:
+        # tools/meeting_sim, incident post-mortem: the room dubbed "Right." as "Đúng." and, 20 s
+        # later, a Vietnamese speaker's own 19-word sentence ending in "đúng" was dropped as
+        # echo. Same for a one-word dub "Mà" and the opening of another sentence.
+        for dub, heard in (
+            (
+                "Đúng.",
+                "Tám con cùng giành một đống backlog, con nào cũng OOM, 5xx, lên cao nhất là đúng.",
+            ),
+            (
+                "Mà",
+                "Rule consumer lag trong Prometheus á anh, nó filter theo label consumer_group mà",
+            ),
+            ("Yes.", "Yes, the rollback finished at oh two thirty-eight."),
+        ):
+            recent = [_normalize_overheard_text(dub)]
+            assert not _matches_recent_dub(_normalize_overheard_text(heard), recent), heard
+
+    def test_a_real_dub_line_inside_a_longer_segment_still_matches(self) -> None:
+        # The case containment exists for: the microphone caught a whole dubbed sentence plus
+        # a little more. A dub line of real length still vetoes.
+        heard = _normalize_overheard_text(f"{_DUB_LINE} Okay.")
+        assert _matches_recent_dub(heard, _DUB_RECENT)
+
     def test_unrelated_speech_does_not_match(self) -> None:
         heard = _normalize_overheard_text("Let's review the deployment plan for tomorrow.")
         assert not _matches_recent_dub(heard, _DUB_RECENT)
