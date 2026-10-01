@@ -17,7 +17,7 @@ import json
 import re
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from shared.base_worker import BaseWorker
@@ -141,17 +141,27 @@ _PUBLISHED_TTL_SECONDS = 2 * 60 * 60
 #
 # Translation still runs concurrently. Only the PUBLISH waits: B's first publish waits until A's
 # message has finished. The wait is bounded: a stalled A must not silence everyone after it. When
-# the bound is hit, the wait is logged and B goes out. A is still published when it lands.
-# Nothing is dropped either way.
+# the bound is hit, the wait is logged and B goes out; A is still published when it lands, because
+# the transcript needs its text. A is then NOT dubbed: tts_worker refuses to speak a line once a
+# later line of the same speaker has been spoken (TTSWorker._run_in_key_order), so the listener
+# hears a gap instead of an inversion. `translation_published_after_successor` marks that case here
+# and `tts_dub_skipped_out_of_order` on the TTS side.
 _PUBLISH_ORDER_WAIT_SECONDS = 10.0
 
 
-@dataclass
+@dataclass(eq=False)
 class _PublishTurn:
-    """The previous message from the same speaker, which this one must not overtake."""
+    """One message's place in its speaker's publish order."""
 
-    predecessor: asyncio.Event | None
+    # The same speaker's previous message, which this one must not overtake. Cleared once this
+    # message finishes, so a long meeting does not hold a chain of every turn it ever had.
+    predecessor: _PublishTurn | None
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    # This message gave up waiting for its predecessor (the bound was hit).
     waived: bool = False
+    # A LATER message gave up waiting for this one and has already published.
+    overtaken: bool = False
+    overtaken_logged: bool = False
 
 
 # Set by _consume_loop before process() starts. Copied into process()'s own task (wait_for) and
@@ -428,26 +438,26 @@ class TranslationWorker(BaseWorker):
             consumer=self._consumer_name,
         )
 
-        # (meeting, speaker) -> the done-event of that speaker's most recently started message.
-        tails: dict[tuple[str, str], asyncio.Event] = {}
+        # (meeting, speaker) -> that speaker's most recently started message.
+        tails: dict[tuple[str, str], _PublishTurn] = {}
 
         async def _run(message_id: bytes, data: dict[bytes, bytes]) -> None:
             # Taken BEFORE the first await. consume_concurrent starts handlers in stream order and
             # each one runs to its first suspension before the next begins, so the ticket order
             # is the order the speaker spoke in.
             key = _speaker_key(data)
-            done = asyncio.Event()
-            predecessor = tails.get(key)
-            tails[key] = done
-            token = _publish_turn.set(_PublishTurn(predecessor))
+            turn = _PublishTurn(tails.get(key))
+            tails[key] = turn
+            token = _publish_turn.set(turn)
             try:
                 await self._process_and_log_errors(message_id, data)
             finally:
                 # Always, a failure included: the next sentence must not wait on one that will
                 # only come back through the reclaim path minutes from now.
-                done.set()
+                turn.done.set()
+                turn.predecessor = None
                 _publish_turn.reset(token)
-                if tails.get(key) is done:
+                if tails.get(key) is turn:
                     del tails[key]
 
         while not self._shutdown_event.is_set():
@@ -631,17 +641,30 @@ class TranslationWorker(BaseWorker):
         """Hold this publish until the same speaker's previous message is out. See
         _PUBLISH_ORDER_WAIT_SECONDS."""
         turn = _publish_turn.get()
-        if turn is None or turn.waived or turn.predecessor is None:
+        if turn is None:
             return
-        if turn.predecessor.is_set():
+        if turn.overtaken and not turn.overtaken_logged:
+            # Published anyway (the transcript needs it), but a later line of this speaker went
+            # out first, so tts_worker will not dub this one. Once per message.
+            turn.overtaken_logged = True
+            self.logger.warning(
+                "translation_published_after_successor",
+                meeting_id=meeting_id,
+                speaker_id=result.speaker_id,
+                segment_id=result.segment_id,
+                start_ms=result.start_ms,
+            )
+        predecessor = turn.predecessor
+        if turn.waived or predecessor is None or predecessor.done.is_set():
             return
         started = time.monotonic()
         try:
-            await asyncio.wait_for(turn.predecessor.wait(), _PUBLISH_ORDER_WAIT_SECONDS)
+            await asyncio.wait_for(predecessor.done.wait(), _PUBLISH_ORDER_WAIT_SECONDS)
         except TimeoutError:
             # Waived for the rest of this message, so its other sentences and languages do not
-            # each wait out the bound again.
+            # each wait out the bound again. The predecessor learns it was overtaken.
             turn.waived = True
+            predecessor.overtaken = True
             self.logger.warning(
                 "translation_publish_order_wait_timeout",
                 meeting_id=meeting_id,

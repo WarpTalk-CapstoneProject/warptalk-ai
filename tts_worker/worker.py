@@ -491,6 +491,26 @@ class SynthesizedSentence:
     first_audio_at: float | None = None
 
 
+@dataclass(slots=True)
+class _DubMark:
+    """The furthest-along sentence a (meeting, speaker, language) key has started dubbing.
+
+    `position` is where the sentence sits on the meeting clock, `(start_ms, chunk_index)`.
+    `published_ms` is the wall-clock instant ingress published the audio chunk it came from
+    (`timestamp_ms`, carried unchanged STT -> translation -> here).
+
+    Both, because each alone can lie in one rare case. `start_ms` is measured from the room's
+    transcript anchor, and if that Redis key is lost mid-meeting (allkeys-lru, a worker restart)
+    the clock restarts near zero: judged on `start_ms` alone, every later sentence would read as
+    "older" and the speaker would fall silent for the rest of the meeting. `published_ms` cannot
+    restart, but every sentence of one STT chunk shares it. So a line is overtaken only when its
+    position is earlier AND its chunk was not published later than the mark's.
+    """
+
+    position: tuple[int, int]
+    published_ms: int
+
+
 def _extract_tts_key(
     data: Mapping[Any, Any],
 ) -> tuple[str, str, str]:
@@ -569,10 +589,10 @@ class TTSWorker(BaseWorker):
         # speaker's own timeline. Read and written only while that key's lock is held, so a
         # plain dict is safe for the same reason `_turns` below is.
         self._spoken_start_ms: dict[tuple[str, str, str], int] = {}
-        # (start_ms, chunk_index) of the furthest sentence each key has started dubbing — what a
-        # reclaimed message is checked against so it cannot play after newer lines. Same lock
-        # discipline as _spoken_start_ms. See _process_reclaimed.
-        self._dub_position_by_key: dict[tuple[str, str, str], tuple[int, int]] = {}
+        # The furthest sentence each key has started dubbing — what every message, live or
+        # reclaimed, is checked against so it cannot play after newer lines. Same lock
+        # discipline as _spoken_start_ms. See _run_in_key_order and _DubMark.
+        self._dub_position_by_key: dict[tuple[str, str, str], _DubMark] = {}
         # One in-flight spoken turn per (meeting, speaker, language, voice). The per-key lock
         # above is what makes a plain dict safe here: a key's sentences are processed one at a
         # time, so a turn can never be pushed into concurrently.
@@ -724,7 +744,56 @@ class TTSWorker(BaseWorker):
 
     async def _run_in_key_order(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         async with self._key_lock(data):
+            # NEVER A LATER SENTENCE BEFORE AN EARLIER ONE. The key lock plays this key's lines in
+            # the order they ARRIVED, and arrival is not always speech order: translation_worker
+            # holds a sentence for its predecessor only up to a bound (and publishes it anyway
+            # once the bound is hit), and a message can come back through a retry. A line that
+            # arrives after a later line of the same speaker has already been spoken is not
+            # spoken: a gap is the lesser failure — an inversion reads as a different
+            # conversation. It is still persisted (transcript-service reads translate:results,
+            # not this), so only the audio is missing.
+            newer = self._newer_dub_already_started(data)
+            if newer is not None and await self._skip_overtaken_dub(data, newer):
+                return
             await self._process_and_log_errors(message_id, data)
+
+    async def _skip_overtaken_dub(self, data: Mapping[Any, Any], newer: tuple[int, int]) -> bool:
+        """Account for a line that will not be spoken because a later one already was.
+
+        Returns False (and lets process() run) for a message that would not have been spoken
+        anyway — an empty final-chunk marker, a same-language or text-only line — because
+        process() owns their bookkeeping and nothing about them can be out of order.
+        """
+        try:
+            translation = TranslationResultMessage.from_redis(dict(data))
+        except Exception:
+            return False
+        if not translation.translated_text.strip() or is_same_language(
+            translation.source_lang, translation.target_lang
+        ):
+            return False
+        self.logger.warning(
+            "tts_dub_skipped_out_of_order",
+            meeting_id=translation.meeting_id,
+            speaker_id=translation.speaker_id,
+            target_lang=translation.target_lang,
+            segment_id=translation.segment_id,
+            source_segment_id=translation.source_segment_id,
+            start_ms=translation.start_ms,
+            chunk_index=translation.chunk_index,
+            overtaken_by_position=f"{newer[0]}:{newer[1]}",
+            behind_ms=max(0, newer[0] - translation.start_ms),
+        )
+        await self._record_outcome("out_of_order")
+        # Same bookkeeping a spoken line ends with: billing_worker and the transcript consumer
+        # wait for this event, and a turn whose last line was skipped must still close.
+        if translation.is_final_chunk:
+            await self.redis.publish_system_event(
+                room_id=translation.meeting_id,
+                event_type="final_chunk_processed",
+                payload={"segmentId": translation.segment_id},
+            )
+        return True
 
     def _in_flight_message_ids(self) -> set[bytes]:
         # getattr + assign back: the tests build workers with __new__ and never run __init__.
@@ -762,9 +831,9 @@ class TTSWorker(BaseWorker):
                 return
             await self._process_and_log_errors(message_id, data)
 
-    def _dub_positions(self) -> dict[tuple[str, str, str], tuple[int, int]]:
+    def _dub_positions(self) -> dict[tuple[str, str, str], _DubMark]:
         # getattr + assign back: the tests build workers with __new__ and never run __init__.
-        positions: dict[tuple[str, str, str], tuple[int, int]] | None = getattr(
+        positions: dict[tuple[str, str, str], _DubMark] | None = getattr(
             self, "_dub_position_by_key", None
         )
         if positions is None:
@@ -783,13 +852,23 @@ class TTSWorker(BaseWorker):
         positions = self._dub_positions()
         key = self._fit_key(translation)
         position = self._dub_position(translation)
-        if position > positions.get(key, (-1, -1)):
-            positions[key] = position
+        published_ms = translation.timestamp_ms
+        mark = positions.get(key)
+        if mark is None:
+            positions[key] = _DubMark(position, published_ms)
+        elif published_ms > mark.published_ms and position < mark.position:
+            # A NEWER chunk with an EARLIER clock: the meeting clock restarted (see _DubMark).
+            # Measure from the restarted clock from now on, or everything after this reads as old.
+            positions[key] = _DubMark(position, published_ms)
+        else:
+            positions[key] = _DubMark(
+                max(position, mark.position), max(published_ms, mark.published_ms)
+            )
 
     def _newer_dub_already_started(self, data: Mapping[Any, Any]) -> tuple[int, int] | None:
         """The position of a LATER sentence of this key that has already been dubbed, or None.
 
-        Only knows what this process has seen: after a restart the map is empty and a reclaimed
+        Only knows what this process has seen: after a restart the map is empty and a late
         message is dubbed as before. A malformed payload answers None and is left to process(),
         which fails it the way it always has.
         """
@@ -797,13 +876,13 @@ class TTSWorker(BaseWorker):
             translation = TranslationResultMessage.from_redis(dict(data))
         except Exception:
             return None
-        if translation.start_ms <= 0:
-            # No timeline position (an older producer, or a test message): chunk_index alone
-            # restarts every turn, so it cannot say what is newer. Not judged, not parked.
+        mark = self._dub_positions().get(self._fit_key(translation))
+        if mark is None:
             return None
-        newest = self._dub_positions().get(self._fit_key(translation))
-        if newest is not None and newest > self._dub_position(translation):
-            return newest
+        if self._dub_position(translation) < mark.position and (
+            translation.timestamp_ms <= mark.published_ms
+        ):
+            return mark.position
         return None
 
     async def _cleanup(self) -> None:
