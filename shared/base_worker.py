@@ -16,7 +16,7 @@ import signal
 import socket
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -902,44 +902,15 @@ class BaseWorker(ABC):
                     message_id,
                 )
                 if attempts >= self.max_delivery_attempts:
-                    original_payload = {
-                        (
-                            key.decode("utf-8", errors="replace")
-                            if isinstance(key, bytes)
-                            else str(key)
-                        ): (
-                            value.decode("utf-8", errors="replace")
-                            if isinstance(value, bytes)
-                            else str(value)
-                        )
-                        for key, value in data.items()
-                    }
-                    await self.redis.publish(
-                        f"{self.input_stream}:dead-letter",
-                        {
-                            "original_message_id": message_id.decode(
-                                "utf-8",
-                                errors="replace",
-                            ),
-                            "consumer_group": self.consumer_group,
-                            "worker": self.worker_name,
-                            "delivery_attempts": attempts,
-                            "failed_at_unix_ms": int(time.time() * 1000),
-                            "payload": json.dumps(original_payload),
-                        },
+                    await self._dead_letter(
+                        message_id, data, attempts=attempts, reason="delivery_attempts_exhausted"
                     )
                     await self.redis.redis.xack(
                         self.input_stream,
                         self.consumer_group,
                         message_id,
                     )
-                    await self._record_outcome("dead_letter")
-                    self.logger.error(
-                        "message_dead_lettered",
-                        message_id=message_id,
-                        stream=self.input_stream,
-                        attempts=attempts,
-                    )
+                    continue
                 # Under the limit, keep it pending. XAUTOCLAIM resets idle time,
                 # preventing a hot loop while scheduling another bounded retry.
                 continue
@@ -952,6 +923,53 @@ class BaseWorker(ABC):
         # live one first, or it still holds them and is (correctly) skipped.
         if self._housekeeping_due(self.input_stream, self.consumer_group):
             await self._prune_idle_consumers(self.input_stream, self.consumer_group)
+
+    async def _dead_letter(
+        self,
+        message_id: bytes,
+        data: Mapping[Any, Any],
+        *,
+        attempts: int,
+        reason: str,
+        details: Mapping[str, str] | None = None,
+    ) -> None:
+        """Park a message on `<input_stream>:dead-letter`, with why. Does NOT acknowledge it.
+
+        The one writer of the dead-letter convention, so every parked entry carries the same
+        fields: the original id and payload (replayable as-is), who parked it, how many attempts
+        it had, and — new with the TTS retry policy — a `reason`, because "it failed five times"
+        and "the vendor refused it on the first try" are different things to do something about.
+
+        Acknowledging stays with the caller: the reclaim path acks the parked entry itself, while
+        a worker that dead-letters ONE PART of a message from inside `process()` (a voice variant
+        Cartesia refused) lets the message's normal completion ack it.
+        """
+        original_payload = {
+            (key.decode("utf-8", errors="replace") if isinstance(key, bytes) else str(key)): (
+                value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+            )
+            for key, value in data.items()
+        }
+        entry: dict[str, Any] = {
+            "original_message_id": message_id.decode("utf-8", errors="replace"),
+            "consumer_group": self.consumer_group,
+            "worker": self.worker_name,
+            "delivery_attempts": attempts,
+            "reason": reason,
+            "failed_at_unix_ms": int(time.time() * 1000),
+            "payload": json.dumps(original_payload),
+        }
+        if details:
+            entry.update(details)
+        await self.redis.publish(f"{self.input_stream}:dead-letter", entry)
+        await self._record_outcome("dead_letter")
+        self.logger.error(
+            "message_dead_lettered",
+            message_id=message_id,
+            stream=self.input_stream,
+            attempts=attempts,
+            reason=reason,
+        )
 
     def _is_in_flight(self, message_id: bytes) -> bool:
         """Whether this process has already dispatched `message_id` and not yet finished it.

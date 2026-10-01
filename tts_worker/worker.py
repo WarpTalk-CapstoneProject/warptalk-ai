@@ -429,6 +429,27 @@ def _resolve_clone_language(hint: str) -> str | None:
     return _clone_language(normalized)
 
 
+class SentencePartiallySpokenError(RuntimeError):
+    """Synthesis failed after part of the sentence had already reached the listener.
+
+    Never retried: whatever comes back would start from the sentence's first word again. The
+    vendor's own error is the `__cause__`, and that is what gets classified and reported.
+    """
+
+
+# Failures about the moment rather than the request — worth one more try. Everything else,
+# notably every 4xx (`quota` 402, `auth` 401/403, `rate_limited` 429, `client_error`), answers the
+# same way next time, and an unclassifiable `error` is more likely a bug than a blip.
+_RETRYABLE_SYNTHESIS_OUTCOMES = frozenset({"network_error", "server_error", "timeout"})
+
+
+def _vendor_error(error: BaseException) -> BaseException:
+    """The provider's own exception, unwrapped from the partially-spoken marker if present."""
+    if isinstance(error, SentencePartiallySpokenError) and error.__cause__ is not None:
+        return error.__cause__
+    return error
+
+
 def _release(lease: GenerationLease | None) -> None:
     """Give the sentence's Cartesia slot back, if the caller is gating on one."""
     if lease is not None:
@@ -548,6 +569,10 @@ class TTSWorker(BaseWorker):
         # speaker's own timeline. Read and written only while that key's lock is held, so a
         # plain dict is safe for the same reason `_turns` below is.
         self._spoken_start_ms: dict[tuple[str, str, str], int] = {}
+        # (start_ms, chunk_index) of the furthest sentence each key has started dubbing — what a
+        # reclaimed message is checked against so it cannot play after newer lines. Same lock
+        # discipline as _spoken_start_ms. See _process_reclaimed.
+        self._dub_position_by_key: dict[tuple[str, str, str], tuple[int, int]] = {}
         # One in-flight spoken turn per (meeting, speaker, language, voice). The per-key lock
         # above is what makes a plain dict safe here: a key's sentences are processed one at a
         # time, so a turn can never be pushed into concurrently.
@@ -717,7 +742,69 @@ class TTSWorker(BaseWorker):
         # messages are still running, and a reclaimed sentence must not be pushed onto a track
         # in the middle of another sentence for the same key.
         async with self._key_lock(data):
+            newer = self._newer_dub_already_started(data)
+            if newer is not None:
+                # A LATE RETRY MUST NOT PLAY OUT OF ORDER. A reclaimed message is at least
+                # _reclaim_min_idle_ms old — minutes, in a live meeting — and if this speaker has
+                # been dubbed past it since, speaking it now would drop a stale line into the
+                # middle of the conversation. Parked instead (returning acks it), so it is
+                # recorded and replayable rather than spoken in the wrong place.
+                attempts = await self.redis.pending_delivery_count(
+                    self.input_stream, self.consumer_group, message_id
+                )
+                await self._dead_letter(
+                    message_id,
+                    data,
+                    attempts=attempts,
+                    reason="superseded",
+                    details={"superseded_by_position": f"{newer[0]}:{newer[1]}"},
+                )
+                return
             await self._process_and_log_errors(message_id, data)
+
+    def _dub_positions(self) -> dict[tuple[str, str, str], tuple[int, int]]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        positions: dict[tuple[str, str, str], tuple[int, int]] | None = getattr(
+            self, "_dub_position_by_key", None
+        )
+        if positions is None:
+            positions = {}
+            self._dub_position_by_key = positions
+        return positions
+
+    @staticmethod
+    def _dub_position(translation: TranslationResultMessage) -> tuple[int, int]:
+        """Where a sentence sits in its speaker's own timeline: the turn's start, then which
+        sentence of that turn. start_ms alone is shared by every sentence of one turn."""
+        return translation.start_ms, translation.chunk_index
+
+    def _note_dub_started(self, translation: TranslationResultMessage) -> None:
+        """Record the furthest-along sentence this key has started dubbing. Under the key lock."""
+        positions = self._dub_positions()
+        key = self._fit_key(translation)
+        position = self._dub_position(translation)
+        if position > positions.get(key, (-1, -1)):
+            positions[key] = position
+
+    def _newer_dub_already_started(self, data: Mapping[Any, Any]) -> tuple[int, int] | None:
+        """The position of a LATER sentence of this key that has already been dubbed, or None.
+
+        Only knows what this process has seen: after a restart the map is empty and a reclaimed
+        message is dubbed as before. A malformed payload answers None and is left to process(),
+        which fails it the way it always has.
+        """
+        try:
+            translation = TranslationResultMessage.from_redis(dict(data))
+        except Exception:
+            return None
+        if translation.start_ms <= 0:
+            # No timeline position (an older producer, or a test message): chunk_index alone
+            # restarts every turn, so it cannot say what is newer. Not judged, not parked.
+            return None
+        newest = self._dub_positions().get(self._fit_key(translation))
+        if newest is not None and newest > self._dub_position(translation):
+            return newest
+        return None
 
     async def _cleanup(self) -> None:
         """Drain the Cartesia connection pool on shutdown.
@@ -743,6 +830,9 @@ class TTSWorker(BaseWorker):
         spoken: dict[tuple[str, str, str], int] = getattr(self, "_spoken_start_ms", {})
         for key in [key for key in spoken if key[0] == room_id]:
             spoken.pop(key, None)
+        positions = self._dub_positions()
+        for key in [key for key in positions if key[0] == room_id]:
+            positions.pop(key, None)
         # getattr, because the tests build workers with __new__ and never run __init__ — the
         # same guard the rest of this codebase uses for that pattern. A worker with no turns
         # dict has no turns to abandon.
@@ -902,6 +992,16 @@ class TTSWorker(BaseWorker):
                     voice_id=voice_id,
                     generation_config=generation_config,
                 )
+            except Exception as fallback_error:
+                if already_spoken:
+                    # The listener has heard the opening and nothing will complete it. Marked so
+                    # the caller does not RETRY it either: a retry would speak the opening twice,
+                    # the exact outcome the suppression below exists to prevent.
+                    raise SentencePartiallySpokenError(
+                        f"fallback failed after {track.spoken_bytes if track else 0} bytes "
+                        "of the sentence had already been spoken"
+                    ) from fallback_error
+                raise
             finally:
                 _release(lease)
             if already_spoken:
@@ -1026,6 +1126,7 @@ class TTSWorker(BaseWorker):
         # rendered in different voices, so the second one must not be judged as arriving after
         # the first and read faster for it.
         lag_ms = self._catch_up_lag_ms(translation)
+        self._note_dub_started(translation)
         if lag_ms > 0:
             self.logger.info(
                 "dub_running_behind",
@@ -1040,7 +1141,14 @@ class TTSWorker(BaseWorker):
 
         for voice_id, voice_type, voice_key in variants:
             await self._synthesize_and_publish(
-                translation, text, voice_id, voice_type, voice_key, lag_ms=lag_ms
+                translation,
+                text,
+                voice_id,
+                voice_type,
+                voice_key,
+                lag_ms=lag_ms,
+                message_id=message_id,
+                raw=data,
             )
 
         # Exactly once per message regardless of how many voice variants rendered —
@@ -1386,6 +1494,8 @@ class TTSWorker(BaseWorker):
         voice_type: str,
         voice_key: str,
         lag_ms: int = 0,
+        message_id: bytes | None = None,
+        raw: Mapping[Any, Any] | None = None,
     ) -> None:
         # Catch-up is folded in HERE rather than inside _generation_config, because that method
         # answers "what did we measure about this speaker's delivery" and the answer is often
@@ -1463,58 +1573,99 @@ class TTSWorker(BaseWorker):
                     )
                 return
 
+        # From the FIRST attempt: a retried sentence kept the listener waiting through every try,
+        # so tts_synthesis and tts_first_audio below are measured from here, not from the retry.
         t0 = time.monotonic()
-        # One Cartesia slot per sentence, fallback included — see
-        # TTSSettings.cartesia_max_concurrency. Held while Cartesia GENERATES, and handed back by
-        # _synthesize_sentence the moment the audio has arrived, so this sentence's playout does
-        # not hold up anyone else's generation. Waiting for it is counted in the latency on
-        # purpose: it is time the listener spends waiting too.
-        lease = GenerationLease(self._require_cartesia().generation_slot())
-        try:
-            await lease.acquire()
-            sentence = await self._synthesize_sentence(
-                translation=translation,
-                text=text,
-                voice_id=voice_id,
-                voice_key=voice_key,
-                generation_config=generation_config,
-                lease=lease,
-            )
-        except Exception as e:
-            # Swallowed so the next sentence still plays; counted so a Cartesia outage (402 quota,
-            # 5xx) shows as a TTS success rate falling rather than as silence.
-            self.note_attempt_outcome("vendor_error")
-            await record_provider_call(
-                "cartesia",
-                "tts",
-                classify_exception(e),
-                int((time.monotonic() - t0) * 1000),
-                self.tts_settings.model,
-            )
-            # Carried the error and the voice and nothing else, so a failure could not be tied
-            # to the sentence that failed: the one question worth asking of this line — WHICH
-            # line went silent — was the one it could not answer.
-            self.logger.error(
-                "cartesia_synthesis_failed",
-                error=str(e),
-                meeting_id=translation.meeting_id,
-                speaker_id=translation.speaker_id,
-                segment_id=translation.segment_id,
-                target_lang=translation.target_lang,
-                text=text[:60],
-                voice_type=voice_type,
-            )
-            await self.redis.publish_system_event(
-                room_id=translation.meeting_id,
-                event_type="tts_unavailable",
-                payload={"error": str(e)},
-            )
-            return
-        finally:
-            # Normally already back — _synthesize_sentence releases it when the audio has
-            # arrived. This covers every way out that skipped that: a cancellation (the
-            # processing timeout cancels a wedged attempt), or a raise before generation began.
-            lease.release()
+        failures = 0
+        while True:
+            attempt_t0 = time.monotonic()
+            # One Cartesia slot per attempt, fallback included — see
+            # TTSSettings.cartesia_max_concurrency. Held while Cartesia GENERATES, and handed back
+            # by _synthesize_sentence the moment the audio has arrived, so this sentence's playout
+            # does not hold up anyone else's generation. Waiting for it is counted in the latency
+            # on purpose: it is time the listener spends waiting too.
+            lease = GenerationLease(self._require_cartesia().generation_slot())
+            try:
+                await lease.acquire()
+                sentence = await self._synthesize_sentence(
+                    translation=translation,
+                    text=text,
+                    voice_id=voice_id,
+                    voice_key=voice_key,
+                    generation_config=generation_config,
+                    lease=lease,
+                )
+                break
+            except Exception as e:
+                # Never hold a slot through the backoff, the dead-letter write or the event.
+                lease.release()
+                failures += 1
+                vendor_error = _vendor_error(e)
+                outcome = classify_exception(vendor_error)
+                await record_provider_call(
+                    "cartesia",
+                    "tts",
+                    outcome,
+                    int((time.monotonic() - attempt_t0) * 1000),
+                    self.tts_settings.model,
+                )
+                give_up_reason = self._synthesis_give_up_reason(e, outcome, failures, t0)
+                # Carried the error and the voice and nothing else, so a failure could not be
+                # tied to the sentence that failed: the one question worth asking of this line —
+                # WHICH line went silent — was the one it could not answer. Logged per ATTEMPT,
+                # with whether another follows, so a retried-then-spoken line is visible too.
+                self.logger.error(
+                    "cartesia_synthesis_failed",
+                    error=str(vendor_error),
+                    outcome=outcome,
+                    attempt=failures,
+                    will_retry=give_up_reason is None,
+                    meeting_id=translation.meeting_id,
+                    speaker_id=translation.speaker_id,
+                    segment_id=translation.segment_id,
+                    target_lang=translation.target_lang,
+                    text=text[:60],
+                    voice_type=voice_type,
+                    voice_key=voice_key,
+                )
+                if give_up_reason is None:
+                    # Inside the key's lock, deliberately: nothing newer for this speaker and
+                    # language can be spoken while this one is retried, so a retry can make the
+                    # line late but never out of order. TTSSettings.synthesis_retry_window_seconds
+                    # bounds how long that holds the next line back.
+                    await asyncio.sleep(
+                        self.tts_settings.synthesis_retry_backoff_seconds * (2 ** (failures - 1))
+                    )
+                    continue
+
+                # Given up. Counted so a Cartesia outage (402 quota, 5xx) shows as a TTS success
+                # rate falling rather than as silence; parked so the line is not simply gone —
+                # this used to log and return, the message was acked, and nothing anywhere
+                # recorded which sentence had been lost or let anyone replay it.
+                self.note_attempt_outcome("vendor_error")
+                await self._dead_letter(
+                    message_id or b"",
+                    raw if raw is not None else translation.to_redis(),
+                    attempts=failures,
+                    reason=give_up_reason,
+                    details={
+                        "segment_id": translation.segment_id,
+                        "voice_type": voice_type,
+                        "voice_key": voice_key,
+                        "error": str(vendor_error)[:300],
+                    },
+                )
+                await self.redis.publish_system_event(
+                    room_id=translation.meeting_id,
+                    event_type="tts_unavailable",
+                    payload={"error": str(vendor_error)},
+                )
+                return
+            finally:
+                # Normally already back — _synthesize_sentence releases it when the audio has
+                # arrived. This covers every way out that skipped that: a cancellation (the
+                # processing timeout cancels a wedged attempt), or a raise before generation began.
+                lease.release()
 
         audio_bytes = sentence.audio
         duration_ms = sentence.duration_ms
@@ -1539,9 +1690,9 @@ class TTSWorker(BaseWorker):
             "cartesia",
             "tts",
             "ok",
-            int((sentence.first_audio_at - t0) * 1000)
+            int((sentence.first_audio_at - attempt_t0) * 1000)
             if sentence.first_audio_at is not None
-            else synthesis_latency_ms,
+            else int((time.monotonic() - attempt_t0) * 1000),
             self.tts_settings.model,
         )
         if sentence.first_audio_at is not None:
@@ -1609,6 +1760,25 @@ class TTSWorker(BaseWorker):
             # instead of by inspection.
             generation_config=generation_config or None,
         )
+
+    def _synthesis_give_up_reason(
+        self, error: BaseException, outcome: str, failures: int, first_attempt_at: float
+    ) -> str | None:
+        """Why a failed sentence is NOT retried, or None to try it again.
+
+        In this order, because the first reason that applies is the one worth reading in the
+        dead-letter entry: a line that was half-spoken or a request the vendor refused is never
+        retried however much budget is left.
+        """
+        if isinstance(error, SentencePartiallySpokenError):
+            return f"partially_spoken:{outcome}"
+        if outcome not in _RETRYABLE_SYNTHESIS_OUTCOMES:
+            return f"not_retryable:{outcome}"
+        if failures > self.tts_settings.synthesis_max_retries:
+            return f"retries_exhausted:{outcome}"
+        if time.monotonic() - first_attempt_at >= self.tts_settings.synthesis_retry_window_seconds:
+            return f"retry_window_exceeded:{outcome}"
+        return None
 
     async def _publish_result(
         self,
