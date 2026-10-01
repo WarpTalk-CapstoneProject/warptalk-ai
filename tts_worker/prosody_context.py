@@ -38,6 +38,26 @@ HOW A SENTENCE IS SEPARATED FROM THE NEXT
     matched, and the turn timed out into the one-shot fallback. Prosody continuity was switched
     on in v81 and had not run once. The timeout is now the only bound on a wrong id AND it
     reports which ids it actually saw — a mismatch should cost one glance, not an afternoon.
+
+AN OPEN CONTEXT OCCUPIES A CARTESIA CONCURRENCY SLOT, IDLE OR NOT
+    Measured 2026-10-01 with the production key, from the tts-worker pod. The plan (Pro) allows
+    three concurrent generations and queues anything over that SILENTLY: no 429, no log, only
+    added latency.
+
+        3 parallel /tts/bytes, nothing else open                       TTFB ~0.7s
+        same, with 3 contexts left open and idle after flush_done      TTFB ~4.0s
+        same, with those 3 contexts ended right after flush_done       TTFB ~0.7s
+
+    In the second run the server retired the idle contexts by itself ~4.7–5.2s after their last
+    flush_done (a `done` event) and the queued requests started right after. In the third, the
+    server answered the close (`aclose`: empty transcript, continue=false) with `done` within
+    ~0.2s. So a context counts against the plan from its first push until its `done`, and
+    "idle between two sentences" is not "outside the limit".
+
+    Hence the worker never leaves a context idle on purpose: it ends it right after a sentence's
+    flush_done unless the next sentence for the same speaker and language is already in hand,
+    and its concurrency gate holds a slot for a context's whole life — see
+    TTSWorker._synthesize_sentence and synthesizer.GenerationLease.
 """
 
 from __future__ import annotations
@@ -74,7 +94,24 @@ SENTENCE_TIMEOUT_SECONDS = 6.0
 # listener heard sentence 1 and 3 dubbed and sentence 2 as the original only. There is no
 # documented number to tune against; 4s sits below the shortest gap seen to fail, and retiring a
 # live context early costs one fresh context, while trusting a dead one costs a sentence.
+#
+# Measured 2026-10-01: the server retires an idle context ~4.7–5.2s after its last flush_done.
+# The worker now keeps a context open past a sentence only when the next one is already queued,
+# and ends it ITSELF at this age if that sentence has not reached it yet (TTSWorker's idle
+# expiry), so under the measured timing a push can no longer land on a context the server has
+# retired. `is_closed` below and `_collect`'s no-audio check stay as the guards for the cases
+# that timing does not cover: a stalled event loop that runs the expiry late, and a server that
+# starts retiring sooner than it did on the day it was measured.
 CONTEXT_IDLE_EXPIRY_SECONDS = 4.0
+
+# How long ending a context may wait for Cartesia to confirm it.
+#
+# The server counts a context against the plan's concurrency until it sends `done`, and answered
+# a close with `done` within ~0.2s when measured (2026-10-01). The worker holds the context's
+# concurrency slot until then, so this bounds how long a lost confirmation can keep a slot that
+# Cartesia has very likely already freed. Five times the measured answer; nothing waits on it
+# but the slot, because the close runs off the sentence's path.
+CONTEXT_CLOSE_ACK_SECONDS = 1.0
 
 
 class ContextTransport(Protocol):
@@ -159,7 +196,9 @@ class ProsodyContext:
 
         `continue_=True` on every push: this sentence is never the last word of the turn as far
         as the model is concerned, which is what stops it from applying a final-sentence cadence
-        to a clause that has more coming. The turn is ended by `aclose`, not by a push.
+        to a clause that has more coming. The context is ended by `aclose`, not by a push — and
+        the worker calls it right after this returns unless the next sentence is already queued,
+        because an open context holds a Cartesia concurrency slot (see the module docstring).
 
         `on_pcm` (WT-397) receives each raw chunk as it lands, so the listener can start hearing
         the sentence before it has finished generating. THE RETURN VALUE IS UNCHANGED — the
@@ -280,24 +319,56 @@ class ProsodyContext:
         duration_ms = int(len(pcm) / 2 / self._sample_rate * 1000) if self._sample_rate else 0
         return bytes(wav_header(len(pcm), self._sample_rate) + pcm), duration_ms
 
-    async def aclose(self) -> None:
-        """End the turn. Idempotent — the caller closes on the final sentence AND on teardown,
-        and a turn whose final sentence never arrives is closed by the sweep instead."""
+    async def aclose(self) -> bool:
+        """End the context and wait, briefly, for Cartesia to confirm it.
+
+        Sends the close (empty transcript, continue=false) and then reads until the server's
+        `done`, because that — not the close being sent — is when Cartesia stops counting the
+        context against the plan's concurrency limit (see the module docstring). The caller
+        holds the context's slot until this returns, so the slot is given back when the vendor's
+        is, not before.
+
+        Bounded by CONTEXT_CLOSE_ACK_SECONDS, send included: the SDK re-dials a connection it
+        finds closed before sending, and nothing about ending a context is worth a hang. Returns
+        True when the end is confirmed — `done` (or `error`) arrived, the SDK has already
+        dropped the context, or it had ended before this was called — and False when the bound
+        ran out first. The caller closes the connection either way.
+
+        Idempotent: a context can be ended by the drain, by the final sentence, by its idle
+        expiry and by teardown, and more than one of those can land on it.
+        """
         if self._closed:
-            return
+            return True
         self._closed = True
         try:
-            await self._transport.no_more_inputs()
+            async with asyncio.timeout(CONTEXT_CLOSE_ACK_SECONDS):
+                await self._transport.no_more_inputs()
+                async for event in self._transport.receive():
+                    if getattr(event, "type", None) in ("done", "error"):
+                        break
+        except TimeoutError:
+            logger.warning(
+                "prosody_context_close_unacknowledged",
+                timeout_seconds=CONTEXT_CLOSE_ACK_SECONDS,
+                sentences_spoken=self._flushes,
+            )
+            return False
         except Exception:
             logger.debug("prosody_context_close_failed", exc_info=True)
+            return False
+        return True
 
     async def abandon(self) -> None:
-        """Drop the turn without waiting for it to finish speaking — used when the room ends or
-        the speaker's voice is replaced mid-turn."""
+        """Drop the context without waiting for it to finish speaking — used when a sentence on
+        it failed or was cancelled, when the room ends, and on shutdown.
+
+        No `done` is awaited: the SDK forgets the context the moment the cancel is sent, so none
+        could be read. Bounded like `aclose` for the same reason."""
         if self._closed:
             return
         self._closed = True
         try:
-            await self._transport.cancel()
+            async with asyncio.timeout(CONTEXT_CLOSE_ACK_SECONDS):
+                await self._transport.cancel()
         except Exception:
             logger.debug("prosody_context_cancel_failed", exc_info=True)

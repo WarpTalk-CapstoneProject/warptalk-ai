@@ -10,8 +10,11 @@ Two things made a dub wait for an unrelated one to be heard, not merely generate
   * The consume loop read 8 messages and waited for all 8 before reading again, so a new
     sentence from speaker B sat unread behind speaker A's whole batch, playout included.
 
-The slot now bounds generations at Cartesia, and the reader keeps reading while earlier
-messages play. Per-key order — the reason the per-key lock exists — must survive both.
+The slot now bounds what Cartesia counts — a one-shot request in flight, or a context from its
+first push until its `done` — and never playout; with nothing queued behind it, a sentence's
+context is ended at its flush_done (see test_tts_context_closes_on_drain.py). The reader keeps
+reading while earlier messages play. Per-key order — the reason the per-key lock exists — must
+survive both.
 """
 
 from __future__ import annotations
@@ -48,6 +51,9 @@ class _Turn:
     async def aclose(self) -> None:
         self.is_closed = True
 
+    async def abandon(self) -> None:
+        self.is_closed = True
+
 
 class _Connection:
     async def close(self) -> None:
@@ -55,7 +61,7 @@ class _Connection:
 
 
 class _Synth:
-    """One slot only — stricter than production's two, so a slot held across playout shows."""
+    """One slot only — stricter than production's three, so a slot held across playout shows."""
 
     def __init__(self, log: list[str]) -> None:
         self._log = log
@@ -132,8 +138,7 @@ def _streaming_worker(redis: RedisStreamClient) -> tuple[TTSWorker, list[str], _
     )
     worker.logger = MagicMock()
     worker.redis = redis
-    worker._turns = {}
-    worker._turn_connections = {}
+    worker._contexts = {}
     publisher = _SlowPublisher(log)
     worker.livekit_publisher = publisher  # type: ignore[assignment]
     worker.cartesia = _Synth(log)  # type: ignore[assignment]
@@ -204,7 +209,10 @@ async def test_the_slot_is_free_while_a_sentence_plays_and_taken_while_it_genera
     await _until(lambda: "playing:s1" in log)
 
     assert held_during_generation == [True]
-    assert not slot.locked(), "the slot must be back before the sentence finishes playing"
+    # Back before the sentence finishes playing: nothing is queued behind it, so its context is
+    # ended at flush_done and the slot follows once the close is confirmed — off this path.
+    await _until(lambda: not slot.locked())
+    assert "played:s1" not in log, "the slot must be back before the sentence finishes playing"
 
     publisher.playing["s1"].set()
     await task

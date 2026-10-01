@@ -30,6 +30,14 @@ logger = get_logger(__name__)
 
 FRAME_MS = 20
 
+# How much audio an AudioSource buffers ahead of real time. capture_frame() returns once a frame
+# is in this buffer and back-pressures when it is full, so a sentence's last capture returns with
+# at most this much of it still to be heard. LiveKit's own default, passed explicitly because
+# tts_worker reasons from it: a sentence of N ms cannot finish handing over sooner than
+# N - AUDIO_SOURCE_QUEUE_MS after its hand-over began, which bounds how soon the next sentence
+# of the same track can start (TTSWorker._after_flush).
+AUDIO_SOURCE_QUEUE_MS = 1000
+
 # A short pause after publish_track() before the first capture_frame(), as a safety
 # margin — isolated testing (see session notes) did not reproduce any failure with or
 # without this delay, but it's cheap insurance against a slow WebRTC negotiation.
@@ -522,7 +530,9 @@ class LiveKitTTSPublisher:
         room = rtc.Room()
         await room.connect(self.settings.url, token)
 
-        source = rtc.AudioSource(sample_rate=sample_rate, num_channels=1)
+        source = rtc.AudioSource(
+            sample_rate=sample_rate, num_channels=1, queue_size_ms=AUDIO_SOURCE_QUEUE_MS
+        )
         track = rtc.LocalAudioTrack.create_audio_track("tts-audio", source)
         await room.local_participant.publish_track(
             track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)

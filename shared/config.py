@@ -715,10 +715,18 @@ class TTSSettings(BaseSettings):
     # roughly three quarters of what a listener waits for on the FIRST sentence of every turn —
     # 0.669s cold against 0.180s warm, confirmed end to end at 0.721s -> 0.251s.
     #
-    # Two rather than STT's four: a connection is claimed per spoken TURN, not per utterance, and
-    # a turn lasts seconds. Two covers two speakers starting at once, which is already the
-    # uncommon case, and the pool refills in the background the moment one is taken.
-    tts_warm_pool_size: int = 2
+    # A connection is claimed per prosody CONTEXT and closed with it, and a context now ends as
+    # soon as no sentence is waiting for it — so most sentences take one. At most
+    # `cartesia_max_concurrency` contexts can be open at once (each holds a concurrency slot), so
+    # the pool matches that: a burst on every slot at once is served warm, and the pool refills
+    # in the background the moment one is taken.
+    #
+    # Pooled connections do NOT hold concurrency slots — verified with the production key
+    # (2026-10-01, PR #220 review): with 4 websocket connections open that never created a
+    # context, 3 parallel /tts/bytes requests still got TTFB ~1.2s, not blocked. What counts
+    # against the plan is an open CONTEXT (see cartesia_max_concurrency), not a socket, so a
+    # pool this size costs no slot.
+    tts_warm_pool_size: int = 3
 
     # How many Cartesia generations this process may have in flight at once. The account's plan
     # caps concurrency, and the consume loop dispatches up to 8 keys at a time, so without a gate
@@ -732,12 +740,27 @@ class TTSSettings(BaseSettings):
     # outright with `429 concurrency_limited`. Either way a slot the gate does not hand out is
     # pure delay, and a gate above the plan buys nothing: the vendor queues it, out of our sight.
     #
-    # A slot covers GENERATION, not playout: it is taken before Cartesia is asked and given back
-    # when the sentence's audio has arrived (flush_done, or the one-shot response) — see
-    # tts_worker.synthesizer.GenerationLease. It used to be held until the streamed sentence had
-    # finished PLAYING, which made a third speaker wait out somebody else's dub. What Cartesia
-    # counts is requests generating; an open-but-idle prosody context between two sentences of a
-    # turn was never inside the slot either, and that design has been running since #189.
+    # A slot covers what Cartesia COUNTS, which is not only generation. Measured 2026-10-01 with
+    # the production key: three websocket contexts that had each spoken a sentence and were then
+    # left open and idle pushed three parallel /tts/bytes requests from ~0.7s to ~4.0s to first
+    # byte, and those requests started only when the server retired the idle contexts by itself,
+    # ~4.7-5.2s after their last flush_done. Ending the contexts right after flush_done (empty
+    # transcript, continue=false) got `done` back within ~0.2s and the next three requests ran at
+    # ~0.7s again. An open prosody context holds a vendor slot from its first push until `done`,
+    # idle or not.
+    #
+    # So a slot is held for a one-shot request's flight, or for a prosody context's WHOLE life —
+    # taken before its first push, given back when its end is confirmed — and never for playout
+    # (that made a third speaker wait out somebody else's dub). The worker does not leave a
+    # context open between sentences unless the next sentence for that speaker and language is
+    # already queued, so that whole life is normally one sentence's generation plus ~0.2s. See
+    # tts_worker.synthesizer.GenerationLease and TTSWorker._synthesize_sentence. The previous
+    # version of this comment said an idle context "was never inside the slot"; the measurement
+    # above is what showed it was, invisibly, since #189.
+    #
+    # How long a sentence waited for a slot is logged (`cartesia_slot_waited`, and `slot_wait_ms`
+    # on `audio_synthesized`) and recorded as the `tts_slot_wait` stage, because the vendor's own
+    # queueing makes no noise at all and this gate's is the only queueing we can see.
     cartesia_max_concurrency: int = 3
 
     # What happens to a sentence Cartesia failed. It used to be logged and acknowledged — the

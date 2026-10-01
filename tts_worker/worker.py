@@ -20,7 +20,9 @@ import functools
 import hashlib
 import json
 import time
-from collections.abc import Mapping
+import uuid
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -44,8 +46,14 @@ from shared.platform_settings import (
 from shared.prosody import SPEED_MAX, Arousal, Delivery, Valence, to_generation_config
 from shared.provider_calls import classify_exception, record_provider_call
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
+from tts_worker import prosody_context
 from tts_worker.clone_sample_quality import MAX_SAMPLE_SCORE, assess_clone_sample
-from tts_worker.livekit_publisher import LiveKitTTSPublisher, TrackStream
+from tts_worker.livekit_publisher import (
+    AUDIO_SOURCE_QUEUE_MS,
+    FRAME_MS,
+    LiveKitTTSPublisher,
+    TrackStream,
+)
 from tts_worker.prosody_context import ProsodyContext, wav_header
 from tts_worker.synthesizer import CartesiaSynthesizer, GenerationLease
 
@@ -450,10 +458,34 @@ def _vendor_error(error: BaseException) -> BaseException:
     return error
 
 
-def _release(lease: GenerationLease | None) -> None:
-    """Give the sentence's Cartesia slot back, if the caller is gating on one."""
-    if lease is not None:
-        lease.release()
+# A wait for a Cartesia slot shorter than this is the event loop, not the gate, and is not logged.
+# One audio frame: nothing below it is audible. Every wait is still recorded as `tts_slot_wait`.
+_SLOT_WAIT_LOG_MS = 20
+
+
+@dataclass(slots=True, eq=False)
+class _OpenContext:
+    """A Cartesia prosody context this worker holds open, and what has to end with it.
+
+    `slot` is the context's claim on the plan's concurrency: taken just before its first push and
+    given back only when its end is confirmed (`_end_context`). Cartesia counts an open context
+    whether it is generating or sitting idle between two sentences (measured 2026-10-01, see
+    tts_worker/prosody_context.py), so the claim lives exactly as long as the context does — one
+    per context, never one per sentence.
+    """
+
+    prosody: ProsodyContext
+    connection: Any
+    slot: GenerationLease
+    #: Pending while the context waits, idle, for a sentence already queued; see _after_flush.
+    idle_timer: asyncio.TimerHandle | None = None
+    #: Taken out of service. Ending is idempotent, and a retired context is never spoken on.
+    retired: bool = False
+
+    def cancel_idle_timer(self) -> None:
+        if self.idle_timer is not None:
+            self.idle_timer.cancel()
+            self.idle_timer = None
 
 
 def _decode_field(data: Mapping[Any, Any], key: str) -> str:
@@ -489,6 +521,14 @@ class SynthesizedSentence:
     voice_id: str
     already_spoken: bool = False
     first_audio_at: float | None = None
+    #: How long this sentence waited for a Cartesia concurrency slot. Zero for a sentence spoken
+    #: on a context that was already open (it holds that context's slot) and whenever a slot was
+    #: free. Non-zero is queueing in this process — the one kind of Cartesia queueing that can
+    #: be seen at all, since the vendor's own makes no noise.
+    slot_wait_ms: int = 0
+    #: Spoken on a context that was already open — a prosodic continuation of the sentence
+    #: before it, rather than a fresh context.
+    continued: bool = False
 
 
 def _extract_tts_key(
@@ -567,17 +607,24 @@ class TTSWorker(BaseWorker):
         self._in_flight_ids: set[bytes] = set()
         # The furthest-along sentence this key has already SPOKEN, by its position in the
         # speaker's own timeline. Read and written only while that key's lock is held, so a
-        # plain dict is safe for the same reason `_turns` below is.
+        # plain dict is safe for the same reason `_contexts` below is.
         self._spoken_start_ms: dict[tuple[str, str, str], int] = {}
         # (start_ms, chunk_index) of the furthest sentence each key has started dubbing — what a
         # reclaimed message is checked against so it cannot play after newer lines. Same lock
         # discipline as _spoken_start_ms. See _process_reclaimed.
         self._dub_position_by_key: dict[tuple[str, str, str], tuple[int, int]] = {}
-        # One in-flight spoken turn per (meeting, speaker, language, voice). The per-key lock
-        # above is what makes a plain dict safe here: a key's sentences are processed one at a
-        # time, so a turn can never be pushed into concurrently.
-        self._turns: dict[tuple[str, ...], ProsodyContext] = {}
-        self._turn_connections: dict[tuple[str, ...], Any] = {}
+        # At most one open Cartesia context per (meeting, speaker, language, voice key, voice).
+        # Normally empty between sentences: a context is ended at its sentence's flush_done
+        # unless the next sentence for the same key is already queued — see _after_flush. The
+        # per-key lock above is what makes a plain dict safe here: a key's sentences are
+        # processed one at a time, so a context can never be pushed into concurrently.
+        self._contexts: dict[tuple[str, ...], _OpenContext] = {}
+        # Messages per (meeting, speaker, target_lang) that this process has in hand: dispatched
+        # and not yet finished, the one holding the key's lock included. More than one means the
+        # next sentence is already queued behind the current one. See _sentence_waiting.
+        self._key_backlog: dict[tuple[str, str, str], int] = {}
+        # Contexts being ended off the sentence path: close, wait for `done`, release the slot.
+        self._retiring: set[asyncio.Task[None]] = set()
         # Isochrony state, per (meeting, speaker, target language): how this speaker's dubs have
         # been running against the clock, and the turn currently being accumulated.
         self._dub_fits: dict[tuple[str, str, str], isochrony.DubFit] = {}
@@ -685,6 +732,11 @@ class TTSWorker(BaseWorker):
         (generation_slot), so this bound is only about how much unacknowledged work one
         process may hold.
 
+        WHAT IS QUEUED BEHIND A KEY IS ALSO WHAT DECIDES ITS CARTESIA CONTEXT. A message that is
+        dispatched and waiting for its key's lock is the next sentence "already in hand", and
+        only then is the key's context left open past a sentence (see _after_flush): an open
+        context holds a Cartesia concurrency slot whether or not it is generating.
+
         XACK is still tied to each handler's own successful completion; failed work remains
         pending for BaseWorker's reclaim/dead-letter path, which runs between reads and puts a
         reclaimed message through the same per-key lock (_process_reclaimed) and skips one that
@@ -723,8 +775,64 @@ class TTSWorker(BaseWorker):
         return self._key_locks.setdefault(key, asyncio.Lock())
 
     async def _run_in_key_order(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
-        async with self._key_lock(data):
-            await self._process_and_log_errors(message_id, data)
+        key = _extract_tts_key(data)
+        # Counted BEFORE waiting for the lock: a message queued behind the one speaking is
+        # exactly the "next sentence already in hand" that may keep a context open.
+        with self._in_hand(key):
+            async with self._key_lock(data):
+                try:
+                    await self._process_and_log_errors(message_id, data)
+                finally:
+                    self._close_drained_contexts(key)
+
+    def _key_backlog_counts(self) -> dict[tuple[str, str, str], int]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        backlog: dict[tuple[str, str, str], int] | None = getattr(self, "_key_backlog", None)
+        if backlog is None:
+            backlog = {}
+            self._key_backlog = backlog
+        return backlog
+
+    @contextmanager
+    def _in_hand(self, key: tuple[str, str, str]) -> Iterator[None]:
+        """Count one message for `key` from dispatch until it has finished."""
+        backlog = self._key_backlog_counts()
+        backlog[key] = backlog.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = backlog.get(key, 1) - 1
+            if remaining > 0:
+                backlog[key] = remaining
+            else:
+                backlog.pop(key, None)
+
+    def _sentence_waiting(self, key: tuple[str, str, str]) -> bool:
+        """Whether another message for this (meeting, speaker, target_lang) is already in hand
+        behind the one being processed.
+
+        "In hand" is precise and deliberately narrow: dispatched by the consume loop and waiting
+        for this key's lock (or a reclaimed one doing the same). Not "likely to arrive soon" — a
+        guess would mean holding a Cartesia slot on spec, and that is the bug this replaces. A
+        message read from Redis in the same instant as the check, whose task has not taken its
+        first step yet, is missed; that costs one continuation, never a sentence.
+        """
+        return self._key_backlog_counts().get(key, 0) > 1
+
+    def _close_drained_contexts(self, key: tuple[str, str, str]) -> None:
+        """End every context of this key once nothing more is queued for it.
+
+        Runs as each message finishes, still under the key's lock. The flush_done decision
+        (_after_flush) already ends a context the moment its sentence has been generated; this
+        catches what that cannot see — a context kept open for a queued message that then never
+        spoke on it (a cache hit, a skip, a voice variant that changed, a failure before
+        synthesis), which would otherwise sit holding a slot until its idle expiry.
+        """
+        if self._sentence_waiting(key):
+            return
+        for context_key, context in list(self._open_contexts().items()):
+            if context_key[:3] == key:
+                self._retire_context(context_key, context)
 
     def _in_flight_message_ids(self) -> set[bytes]:
         # getattr + assign back: the tests build workers with __new__ and never run __init__.
@@ -741,26 +849,37 @@ class TTSWorker(BaseWorker):
         # Through the key's lock like any other message: reclaiming now happens while other
         # messages are still running, and a reclaimed sentence must not be pushed onto a track
         # in the middle of another sentence for the same key.
-        async with self._key_lock(data):
-            newer = self._newer_dub_already_started(data)
-            if newer is not None:
-                # A LATE RETRY MUST NOT PLAY OUT OF ORDER. A reclaimed message is at least
-                # _reclaim_min_idle_ms old — minutes, in a live meeting — and if this speaker has
-                # been dubbed past it since, speaking it now would drop a stale line into the
-                # middle of the conversation. Parked instead (returning acks it), so it is
-                # recorded and replayable rather than spoken in the wrong place.
-                attempts = await self.redis.pending_delivery_count(
-                    self.input_stream, self.consumer_group, message_id
-                )
-                await self._dead_letter(
-                    message_id,
-                    data,
-                    attempts=attempts,
-                    reason="superseded",
-                    details={"superseded_by_position": f"{newer[0]}:{newer[1]}"},
-                )
-                return
-            await self._process_and_log_errors(message_id, data)
+        key = _extract_tts_key(data)
+        with self._in_hand(key):
+            async with self._key_lock(data):
+                try:
+                    await self._process_reclaimed_in_order(message_id, data)
+                finally:
+                    self._close_drained_contexts(key)
+
+    async def _process_reclaimed_in_order(
+        self, message_id: bytes, data: dict[bytes, bytes]
+    ) -> None:
+        """_process_reclaimed's body, under the key's lock."""
+        newer = self._newer_dub_already_started(data)
+        if newer is not None:
+            # A LATE RETRY MUST NOT PLAY OUT OF ORDER. A reclaimed message is at least
+            # _reclaim_min_idle_ms old — minutes, in a live meeting — and if this speaker has
+            # been dubbed past it since, speaking it now would drop a stale line into the
+            # middle of the conversation. Parked instead (returning acks it), so it is
+            # recorded and replayable rather than spoken in the wrong place.
+            attempts = await self.redis.pending_delivery_count(
+                self.input_stream, self.consumer_group, message_id
+            )
+            await self._dead_letter(
+                message_id,
+                data,
+                attempts=attempts,
+                reason="superseded",
+                details={"superseded_by_position": f"{newer[0]}:{newer[1]}"},
+            )
+            return
+        await self._process_and_log_errors(message_id, data)
 
     def _dub_positions(self) -> dict[tuple[str, str, str], tuple[int, int]]:
         # getattr + assign back: the tests build workers with __new__ and never run __init__.
@@ -807,12 +926,18 @@ class TTSWorker(BaseWorker):
         return None
 
     async def _cleanup(self) -> None:
-        """Drain the Cartesia connection pool on shutdown.
+        """End every open Cartesia context, then drain the connection pool, on shutdown.
 
         Without this a redeploy leaves however many sockets the pool held open on the vendor's
         side until they time out — small, but it is the kind of leak this worker has already
-        been caught doing once with cloned voices.
+        been caught doing once with cloned voices. Contexts first, because each holds a socket
+        of its own that the pool knows nothing about.
         """
+        for key, context in list(self._open_contexts().items()):
+            self._retire_context(key, context, abandon=True)
+        retiring = set(self._retiring_contexts())
+        if retiring:
+            await asyncio.wait(retiring, timeout=prosody_context.CONTEXT_CLOSE_ACK_SECONDS * 2)
         cartesia = getattr(self, "cartesia", None)
         if cartesia is not None:
             await cartesia.close()
@@ -825,7 +950,7 @@ class TTSWorker(BaseWorker):
         # Same lifetime as the locks. A room that ends and is somehow seen again must not judge
         # its first sentence as late against a timeline from the previous meeting.
         #
-        # getattr for the same reason `_turns` below uses it: the tests build workers with
+        # getattr for the same reason _open_contexts uses it: the tests build workers with
         # __new__ and never run __init__.
         spoken: dict[tuple[str, str, str], int] = getattr(self, "_spoken_start_ms", {})
         for key in [key for key in spoken if key[0] == room_id]:
@@ -833,16 +958,261 @@ class TTSWorker(BaseWorker):
         positions = self._dub_positions()
         for key in [key for key in positions if key[0] == room_id]:
             positions.pop(key, None)
-        # getattr, because the tests build workers with __new__ and never run __init__ — the
-        # same guard the rest of this codebase uses for that pattern. A worker with no turns
-        # dict has no turns to abandon.
-        turns: dict[tuple[str, ...], ProsodyContext] = getattr(self, "_turns", {})
-        for turn_key in [k for k in turns if k[0] == room_id]:
-            turn = turns.pop(turn_key, None)
-            if turn is not None:
-                # Fire-and-forget: _cleanup_room is sync (it is called from the route-state
-                # broadcast handler), and a room that has ended is not waiting on a socket.
-                asyncio.create_task(turn.abandon())
+        # Abandoned, not closed: a room that has ended is not waiting on a socket. Ending runs in
+        # the background (_cleanup_room is sync — it is called from the route-state broadcast
+        # handler) and gives the context's slot back and closes its connection, which the old
+        # fire-and-forget abandon() here never did.
+        contexts = self._open_contexts()
+        for context_key, context in [(k, c) for k, c in contexts.items() if k[0] == room_id]:
+            self._retire_context(context_key, context, abandon=True)
+
+    # ------------------------------------------------------------------
+    # Cartesia contexts: open only while a sentence needs one
+    # ------------------------------------------------------------------
+
+    def _open_contexts(self) -> dict[tuple[str, ...], _OpenContext]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        contexts: dict[tuple[str, ...], _OpenContext] | None = getattr(self, "_contexts", None)
+        if contexts is None:
+            contexts = {}
+            self._contexts = contexts
+        return contexts
+
+    def _retiring_contexts(self) -> set[asyncio.Task[None]]:
+        retiring: set[asyncio.Task[None]] | None = getattr(self, "_retiring", None)
+        if retiring is None:
+            retiring = set()
+            self._retiring = retiring
+        return retiring
+
+    def _claim_context(self, key: tuple[str, ...]) -> _OpenContext | None:
+        """The open context a sentence for `key` may continue, or None to open a fresh one.
+
+        Claiming cancels the context's idle expiry in the same step — there is no await between
+        the lookup and the cancel — so a context cannot be ended under a sentence that has
+        already taken it.
+        """
+        contexts = self._open_contexts()
+        context = contexts.get(key)
+        if context is None:
+            return None
+        context.cancel_idle_timer()
+        # A context can retire itself without ever raising. `_collect` treats Cartesia's `done`
+        # as an ordinary end of stream: it marks the context closed, breaks, and returns the
+        # audio it collected — so `speak()` SUCCEEDS. WT-405: production 15 Aug, meeting
+        # 01a0033f, a spent context stayed in this map and the next sentence for the same key
+        # called `speak()` on it, which raised "ProsodyContext is closed" and cost a full
+        # one-shot re-synthesis — 12 of 47 sentences, up to 10.2s each.
+        #
+        # _after_flush now ends such a context the moment its sentence returns, so it should
+        # never be found here; the check stays at acquisition because this is the one place
+        # every reuse passes through, and it also covers the idle-expiry guard in `is_closed`
+        # for an expiry that a stalled event loop ran late.
+        if context.prosody.is_closed:
+            self._retire_context(key, context)
+            return None
+        return context
+
+    def _retire_context(
+        self, key: tuple[str, ...], context: _OpenContext, *, abandon: bool = False
+    ) -> None:
+        """Take a context out of service now, and end it in the background.
+
+        Synchronous on purpose: removing it from the map is what stops the next sentence from
+        claiming it, and that must not wait on the network. Ending it — close and wait for
+        `done`, or cancel — and giving its slot back run in `_end_context`, OFF the sentence's
+        path: the ~0.2s Cartesia takes to confirm a close is time the slot stays honestly held,
+        not time anybody waits to hear a dub.
+
+        `abandon` cancels instead of closing: for a context a sentence failed or was cancelled
+        on, the room ending, and shutdown. Idempotent.
+        """
+        contexts = self._open_contexts()
+        if contexts.get(key) is context:
+            del contexts[key]
+        if context.retired:
+            return
+        context.retired = True
+        context.cancel_idle_timer()
+        task = asyncio.create_task(self._end_context(context, abandon=abandon))
+        retiring = self._retiring_contexts()
+        retiring.add(task)
+        task.add_done_callback(retiring.discard)
+
+    async def _end_context(self, context: _OpenContext, *, abandon: bool) -> None:
+        """End a retired context; give its concurrency slot back once Cartesia has let go.
+
+        The slot is released after the close is confirmed (`aclose` waits for `done`, bounded by
+        CONTEXT_CLOSE_ACK_SECONDS) and BEFORE the connection is closed, whose closing handshake
+        has nothing to do with the plan's concurrency and has no bound of ours.
+        """
+        try:
+            if abandon:
+                await context.prosody.abandon()
+            else:
+                await context.prosody.aclose()
+        except Exception:
+            self.logger.debug("prosody_context_end_failed", exc_info=True)
+        finally:
+            context.slot.release()
+            try:
+                await context.connection.close()
+            except Exception:
+                self.logger.debug("prosody_connection_close_failed", exc_info=True)
+
+    def _expire_idle_context(self, key: tuple[str, ...], context: _OpenContext) -> None:
+        """A context kept open for a queued sentence that did not reach it in time.
+
+        Ended by us at CONTEXT_IDLE_EXPIRY_SECONDS, before the server would retire it on its own
+        (~4.7-5.2s, measured), so no sentence is ever pushed onto a context Cartesia has already
+        ended — the WT-874 stale-`done` drop — and its slot goes back when the vendor's does
+        rather than whenever the next sentence happens to look.
+        """
+        context.idle_timer = None
+        if context.retired:
+            return
+        self.logger.info(
+            "prosody_context_idle_expired",
+            meeting_id=key[0],
+            speaker_id=key[1],
+            target_lang=key[2],
+            idle_seconds=prosody_context.CONTEXT_IDLE_EXPIRY_SECONDS,
+        )
+        self._retire_context(key, context)
+
+    def _after_flush(
+        self,
+        key: tuple[str, ...],
+        context: _OpenContext,
+        translation: TranslationResultMessage,
+        *,
+        next_push_not_before: float | None,
+    ) -> None:
+        """At a sentence's flush_done: keep the context open for the next sentence, or end it.
+
+        Kept open ONLY when a continuation can actually happen:
+          * this is not the turn's final chunk — the turn ends where the SPEAKER stopped;
+          * the context is still alive — Cartesia did not end it with this sentence;
+          * the next sentence for this speaker and language is already in hand
+            (_sentence_waiting). Not expected, not likely: queued. An open context holds a
+            Cartesia concurrency slot whether or not it is generating (measured 2026-10-01), so
+            keeping one open on spec is exactly how a third speaker came to wait ~4s for a slot
+            the vendor never showed us was taken;
+          * that sentence can reach the context before its idle expiry. It cannot be pushed
+            until this one has been handed over to its track, which takes real time.
+
+        Kept, it gets an idle expiry (_expire_idle_context) in case the queued sentence never
+        speaks on it, and its slot stays held across the gap — Cartesia counts the context the
+        whole time, so the gate does too. Not kept, it is ended now, and the next sentence opens
+        a fresh one from the warm connection pool.
+
+        There is no grace period, deliberately: waiting "in case" a sentence arrives would hold a
+        slot that another speaker may be waiting for. A sentence that arrives a moment after this
+        decision gets a fresh context — the one continuation this gives up.
+        """
+        reason = self._context_end_reason(context, translation, next_push_not_before)
+        if reason is None:
+            context.idle_timer = asyncio.get_running_loop().call_later(
+                prosody_context.CONTEXT_IDLE_EXPIRY_SECONDS,
+                self._expire_idle_context,
+                key,
+                context,
+            )
+            return
+        self.logger.debug(
+            "prosody_context_ending",
+            reason=reason,
+            meeting_id=translation.meeting_id,
+            speaker_id=translation.speaker_id,
+            target_lang=translation.target_lang,
+        )
+        self._retire_context(key, context)
+
+    def _context_end_reason(
+        self,
+        context: _OpenContext,
+        translation: TranslationResultMessage,
+        next_push_not_before: float | None,
+    ) -> str | None:
+        """Why a context ends at this flush_done, or None to keep it for the queued sentence."""
+        if translation.is_final_chunk:
+            return "final_chunk"
+        if context.prosody.is_closed:
+            return "ended_by_server"
+        if not self._sentence_waiting(self._fit_key(translation)):
+            return "drained"
+        if (
+            next_push_not_before is not None
+            and next_push_not_before - time.monotonic()
+            >= prosody_context.CONTEXT_IDLE_EXPIRY_SECONDS
+        ):
+            # Provably idle past expiry before the next sentence could use it, so keeping it
+            # would only hold the slot for the expiry to release later.
+            return "next_sentence_out_of_reach"
+        return None
+
+    @staticmethod
+    def _earliest_next_push(handover_started_at: float, duration_ms: int) -> float:
+        """The soonest the next sentence of this key can be pushed onto the same context.
+
+        Not before this sentence has been handed over to its track: the key's lock covers the
+        hand-over, and the hand-over back-pressures to real time. A track buffers at most
+        AUDIO_SOURCE_QUEUE_MS ahead (plus the frame being captured), and no frame of this
+        sentence was captured before the stream opened, so the hand-over cannot end sooner than
+        `duration - buffer` after that. A LOWER bound by construction — anything that slows the
+        hand-over only makes the real push later — so a context closed on it could not have been
+        continued anyway.
+        """
+        return handover_started_at + max(0, duration_ms - AUDIO_SOURCE_QUEUE_MS - FRAME_MS) / 1000
+
+    async def _take_slot(
+        self, lease: GenerationLease, translation: TranslationResultMessage, *, purpose: str
+    ) -> int:
+        """Take a Cartesia concurrency slot, and say so when that meant waiting for one.
+
+        This is where in-process queueing for Cartesia becomes visible. Cartesia's own queueing
+        is silent — no 429, no log — so before this the only evidence of a gate that did not
+        match the plan was dubs that were late for no reason anyone could find.
+        """
+        await lease.acquire()
+        waited_ms = lease.waited_ms
+        if waited_ms >= _SLOT_WAIT_LOG_MS:
+            self.logger.info(
+                "cartesia_slot_waited",
+                waited_ms=waited_ms,
+                purpose=purpose,
+                meeting_id=translation.meeting_id,
+                speaker_id=translation.speaker_id,
+                segment_id=translation.segment_id,
+                target_lang=translation.target_lang,
+                open_contexts=len(self._open_contexts()),
+            )
+        return waited_ms
+
+    async def _one_shot(
+        self,
+        translation: TranslationResultMessage,
+        text: str,
+        voice_id: str | None,
+        generation_config: dict[str, float | str] | None,
+    ) -> tuple[bytes, int, str, int]:
+        """One HTTP generation, holding a slot for exactly its flight.
+
+        Returns (wav_bytes, duration_ms, resolved_voice_id, slot_wait_ms).
+        """
+        synthesizer = self._require_cartesia()
+        lease = GenerationLease(synthesizer.generation_slot())
+        try:
+            waited_ms = await self._take_slot(lease, translation, purpose="one_shot")
+            audio_bytes, duration_ms, resolved_voice_id = await synthesizer.synthesize(
+                text=text,
+                language=translation.target_lang,
+                voice_id=voice_id,
+                generation_config=generation_config,
+            )
+        finally:
+            lease.release()
+        return audio_bytes, duration_ms, resolved_voice_id, waited_ms
 
     async def _synthesize_sentence(
         self,
@@ -852,9 +1222,9 @@ class TTSWorker(BaseWorker):
         voice_id: str | None,
         voice_key: str,
         generation_config: dict[str, float | str] | None,
-        lease: GenerationLease | None = None,
     ) -> SynthesizedSentence:
-        """One sentence of a turn, spoken in prosodic continuity with the ones before it.
+        """One sentence, spoken in prosodic continuity with the one before it when that one is
+        still open, as a fresh context otherwise.
 
         WT-371 follow-up / Level 4. A spoken turn is routinely split into several sentences
         (chunk_index > 0), and each used to be an independent one-shot generation with no memory
@@ -862,17 +1232,18 @@ class TTSWorker(BaseWorker):
         the dub came back as a list of separately-read sentences. Cartesia's contexts exist for
         exactly this; see tts_worker/prosody_context.py.
 
+        A context is open only while a sentence needs it: from just before its first push until
+        its flush_done, and past that only for a sentence already queued (see _after_flush). It
+        holds a Cartesia concurrency slot for exactly that life, taken here before the first
+        push and given back when its end is confirmed — not per sentence, and not across the
+        sentence's playout. Measured 2026-10-01: an idle open context occupies a vendor slot as
+        surely as a generating one, and the vendor queues the excess silently.
+
         Falls back to the proven one-shot path on ANY failure, and when the feature is off. That
-        is not defensive padding: this WebSocket path has never run against the real API from
-        this codebase, and a dub that fails is silence in a live meeting.
+        is not defensive padding: a dub that fails is silence in a live meeting. The failed
+        context is ended first, so the fallback never holds two slots at once.
 
         See SynthesizedSentence for what comes back and why it is no longer just the audio.
-
-        `lease` is the caller's Cartesia slot. It is released here, the moment Cartesia has
-        finished sending this sentence, and NOT when the sentence has finished playing — with
-        streaming on, those are seconds apart, and holding the slot across the playout made every
-        other track wait for this one to be heard. See GenerationLease. The one-shot fallback
-        re-acquires it. None (some tests) means the caller is not gating.
         """
         synthesizer = self._require_cartesia()
         resolved_voice_id = voice_id or CartesiaSynthesizer._default_voice_id(
@@ -880,16 +1251,12 @@ class TTSWorker(BaseWorker):
         )
 
         if not self.tts_settings.prosody_continuity:
-            try:
-                audio_bytes, duration_ms, one_shot_voice_id = await synthesizer.synthesize(
-                    text=text,
-                    language=translation.target_lang,
-                    voice_id=voice_id,
-                    generation_config=generation_config,
-                )
-            finally:
-                _release(lease)
-            return SynthesizedSentence(audio_bytes, duration_ms, one_shot_voice_id)
+            audio_bytes, duration_ms, one_shot_voice_id, waited_ms = await self._one_shot(
+                translation, text, voice_id, generation_config
+            )
+            return SynthesizedSentence(
+                audio_bytes, duration_ms, one_shot_voice_id, slot_wait_ms=waited_ms
+            )
 
         # Keyed by voice as well as by speaker and language: a clone upgrade replaces the voice
         # mid-meeting (voice_clone_max_upgrades), and continuing a turn into a different voice
@@ -903,45 +1270,63 @@ class TTSWorker(BaseWorker):
         )
 
         track: TrackStream | None = None
+        context: _OpenContext | None = None
+        slot_wait_ms = 0
+        continued = False
         try:
-            turn = self._turns.get(key)
-            # A context can retire itself without ever raising. `_collect` treats Cartesia's
-            # `done` as an ordinary end of stream: it marks the context closed, breaks, and
-            # returns the audio it collected — so `speak()` SUCCEEDS and the caller never
-            # reaches the except branch that would have called `_end_turn`. The spent context
-            # stayed in this map, and the next sentence for the same key fetched it, found it
-            # not-None, and called `speak()` on it, which raised "ProsodyContext is closed".
-            #
-            # One wasted sentence per `done`, every time — no streaming and a full one-shot
-            # re-synthesis, which is the p95 tail. Production 15 Aug, meeting 01a0033f: 12 of 47
-            # sentences, up to 10.2s each, clustered exactly where the two speakers alternated.
-            # Cartesia ends a context that has been idle, and with two people talking each
-            # speaker's context idles while the other one speaks — so the more natural the
-            # conversation, the more often this fired.
-            #
-            # Checked at acquisition rather than after `speak()` returns, because this is the
-            # one place every reuse passes through: it covers the `done` path and any other
-            # route to a closed context equally, instead of guarding the single case we know
-            # about today.
-            if turn is not None and turn.is_closed:
-                await self._end_turn(key)
-                turn = None
-            if turn is None:
-                turn, connection = await synthesizer.open_prosody_context(
-                    context_id=f"{translation.speaker_id}:{translation.target_lang}:{voice_key}",
+            context = self._claim_context(key)
+            continued = context is not None
+            if context is None:
+                prosody, connection = await synthesizer.open_prosody_context(
+                    # Unique per context, not per key: the previous context of this key may
+                    # still be waiting for its `done` on another socket when this one starts.
+                    context_id=(
+                        f"{translation.speaker_id}:{translation.target_lang}:{voice_key}:"
+                        f"{uuid.uuid4().hex[:12]}"
+                    ),
                     language=translation.target_lang,
                     voice_id=voice_id,
                 )
-                self._turns[key] = turn
-                self._turn_connections[key] = connection
+                context = _OpenContext(
+                    prosody, connection, GenerationLease(synthesizer.generation_slot())
+                )
+                self._open_contexts()[key] = context
+                # After the dial, before the first push: Cartesia counts the context from that
+                # push, and a cold dial is not worth holding a slot through.
+                try:
+                    slot_wait_ms = await self._take_slot(
+                        context.slot, translation, purpose="context"
+                    )
+                except BaseException:
+                    # Cancelled while waiting (the processing timeout). The context is mapped
+                    # but the gate never counted it, so it leaves the map HERE, before the next
+                    # sentence for this key can claim it as a continuation and speak on a
+                    # context with no slot behind it. The handler at the end of this method
+                    # does the same; this keeps the guard where the hazard is.
+                    if not context.slot.held:
+                        self._retire_context(key, context, abandon=True)
+                    raise
+                if context.retired:
+                    # Ended while it waited for the slot (the room closed). Its _end_context may
+                    # already have run its release, before this claim existed.
+                    context.slot.release()
+                    raise RuntimeError("prosody context was retired before its first sentence")
 
             # getattr, because some tests build workers with __new__ and never run __init__ —
             # the same guard the rest of this codebase uses for that pattern.
             publisher = getattr(self, "livekit_publisher", None)
             if publisher is None or not self.tts_settings.stream_to_livekit:
-                audio_bytes, duration_ms = await turn.speak(text, generation_config)
-                _release(lease)
-                return SynthesizedSentence(audio_bytes, duration_ms, resolved_voice_id)
+                audio_bytes, duration_ms = await context.prosody.speak(text, generation_config)
+                # Nothing here says how soon the caller will publish, so no reach bound: a
+                # context kept open on this path is left to its idle expiry.
+                self._after_flush(key, context, translation, next_push_not_before=None)
+                return SynthesizedSentence(
+                    audio_bytes,
+                    duration_ms,
+                    resolved_voice_id,
+                    slot_wait_ms=slot_wait_ms,
+                    continued=continued,
+                )
 
             async with publisher.stream(
                 translation.meeting_id,
@@ -950,19 +1335,29 @@ class TTSWorker(BaseWorker):
                 self.tts_settings.sample_rate,
                 voice_key=voice_key,
             ) as track:
+                handover_started_at = time.monotonic()
                 try:
-                    audio_bytes, duration_ms = await turn.speak(
+                    audio_bytes, duration_ms = await context.prosody.speak(
                         text, generation_config, on_pcm=track.feed
                     )
-                finally:
-                    # THE POINT WHERE GENERATION ENDS AND PLAYOUT BEGINS. speak() returns on
-                    # Cartesia's flush_done — every chunk of this sentence has arrived and been
-                    # queued on the track — but the track is still playing it, and leaving this
-                    # block waits for that in real time. The slot bounds generations at Cartesia,
-                    # so it goes back now; the playout that follows must not hold up another
-                    # speaker's, language's or voice's generation. On failure too: the partial
-                    # audio drains below without the slot, and the fallback takes it again.
-                    _release(lease)
+                except BaseException:
+                    # Ended here, not after leaving this block: leaving it waits for whatever
+                    # partial audio reached the track to finish playing, and a failed or
+                    # cancelled context must not hold its slot through that.
+                    self._retire_context(key, context, abandon=True)
+                    raise
+                # THE POINT WHERE GENERATION ENDS AND PLAYOUT BEGINS. speak() returns on
+                # Cartesia's flush_done — every chunk of this sentence has arrived and been
+                # queued on the track — but the track is still playing it, and leaving this
+                # block waits for that in real time. So the context's fate is decided now: ended
+                # (and its slot on the way back) unless the next sentence is already queued, and
+                # either way nothing here holds a slot because of the playout.
+                self._after_flush(
+                    key,
+                    context,
+                    translation,
+                    next_push_not_before=self._earliest_next_push(handover_started_at, duration_ms),
+                )
             # Read AFTER the stream closed: the pump is still draining while speak() returns,
             # so asking inside the block would undercount what the listener actually heard.
             return SynthesizedSentence(
@@ -971,6 +1366,8 @@ class TTSWorker(BaseWorker):
                 resolved_voice_id,
                 already_spoken=track.spoken_bytes > 0,
                 first_audio_at=track.first_audio_at,
+                slot_wait_ms=slot_wait_ms,
+                continued=continued,
             )
         except Exception:
             already_spoken = track is not None and track.spoken_bytes > 0
@@ -980,18 +1377,18 @@ class TTSWorker(BaseWorker):
                 already_spoken=already_spoken,
                 exc_info=True,
             )
-            await self._end_turn(key)
-            # Still the same sentence's one claim: re-taken through the same lease if the context
-            # path already gave it back, a no-op if it never did (the dial itself failed).
-            if lease is not None:
-                await lease.acquire()
+            # Before the fallback asks for a slot of its own: ending the context is what gives
+            # its slot back, so this sentence never holds two at once. Idempotent if the stream
+            # block above already did it.
+            if context is not None:
+                self._retire_context(key, context, abandon=True)
             try:
-                audio_bytes, duration_ms, one_shot_voice_id = await synthesizer.synthesize(
-                    text=text,
-                    language=translation.target_lang,
-                    voice_id=voice_id,
-                    generation_config=generation_config,
-                )
+                (
+                    audio_bytes,
+                    duration_ms,
+                    one_shot_voice_id,
+                    fallback_wait_ms,
+                ) = await self._one_shot(translation, text, voice_id, generation_config)
             except Exception as fallback_error:
                 if already_spoken:
                     # The listener has heard the opening and nothing will complete it. Marked so
@@ -1002,8 +1399,6 @@ class TTSWorker(BaseWorker):
                         "of the sentence had already been spoken"
                     ) from fallback_error
                 raise
-            finally:
-                _release(lease)
             if already_spoken:
                 # THE ONE DECISION THIS FEATURE TURNS ON, recorded here rather than in a ticket.
                 #
@@ -1034,23 +1429,15 @@ class TTSWorker(BaseWorker):
                 one_shot_voice_id,
                 already_spoken=already_spoken,
                 first_audio_at=track.first_audio_at if track else None,
+                slot_wait_ms=slot_wait_ms + fallback_wait_ms,
+                continued=continued,
             )
-        finally:
-            # The turn ends where the SPEAKER stopped, not where a chunk boundary fell —
-            # is_final_chunk is the only signal that carries that.
-            if translation.is_final_chunk:
-                await self._end_turn(key)
-
-    async def _end_turn(self, key: tuple[str, ...]) -> None:
-        turn = self._turns.pop(key, None)
-        connection = self._turn_connections.pop(key, None)
-        if turn is not None:
-            await turn.aclose()
-        if connection is not None:
-            try:
-                await connection.close()
-            except Exception:
-                self.logger.debug("prosody_connection_close_failed", exc_info=True)
+        except BaseException:
+            # Cancelled — the processing timeout cancels a wedged attempt. The context is in an
+            # unknown state mid-sentence, so it is abandoned, which also gives its slot back.
+            if context is not None:
+                self._retire_context(key, context, abandon=True)
+            raise
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Synthesize one translated text segment — into every DISTINCT voice this
@@ -1595,26 +1982,25 @@ class TTSWorker(BaseWorker):
         failures = 0
         while True:
             attempt_t0 = time.monotonic()
-            # One Cartesia slot per attempt, fallback included — see
-            # TTSSettings.cartesia_max_concurrency. Held while Cartesia GENERATES, and handed back
-            # by _synthesize_sentence the moment the audio has arrived, so this sentence's playout
-            # does not hold up anyone else's generation. Waiting for it is counted in the latency
-            # on purpose: it is time the listener spends waiting too.
-            lease = GenerationLease(self._require_cartesia().generation_slot())
             try:
-                await lease.acquire()
+                # The Cartesia concurrency slot is taken INSIDE the attempt, by whatever it holds
+                # open at the vendor: a fresh context for that context's whole life, a one-shot
+                # request for its flight, nothing at all for a sentence continuing a context that
+                # already holds one. Never across this sentence's playout. See
+                # TTSSettings.cartesia_max_concurrency. Waiting for it is counted in the latency on
+                # purpose — the listener waits too — and reported on its own as `slot_wait_ms`.
                 sentence = await self._synthesize_sentence(
                     translation=translation,
                     text=text,
                     voice_id=voice_id,
                     voice_key=voice_key,
                     generation_config=generation_config,
-                    lease=lease,
                 )
                 break
             except Exception as e:
-                # Never hold a slot through the backoff, the dead-letter write or the event.
-                lease.release()
+                # Nothing is held here through the backoff, the dead-letter write or the event: a
+                # failed attempt has already ended its context, which gives that slot back, and
+                # released any one-shot claim.
                 failures += 1
                 vendor_error = _vendor_error(e)
                 outcome = classify_exception(vendor_error)
@@ -1677,11 +2063,6 @@ class TTSWorker(BaseWorker):
                     payload={"error": str(vendor_error)},
                 )
                 return
-            finally:
-                # Normally already back — _synthesize_sentence releases it when the audio has
-                # arrived. This covers every way out that skipped that: a cancellation (the
-                # processing timeout cancels a wedged attempt), or a raise before generation began.
-                lease.release()
 
         audio_bytes = sentence.audio
         duration_ms = sentence.duration_ms
@@ -1700,6 +2081,11 @@ class TTSWorker(BaseWorker):
         # rise. It is still the right measure of "how long the worker was busy with this
         # sentence"; it is no longer a measure of how long anyone waited to hear it.
         await self.redis.record_latency("tts_synthesis", synthesis_latency_ms)
+        # How long this sentence waited for a Cartesia concurrency slot, recorded for EVERY
+        # sentence, zeros included, so the stage's count is the sentence count and its p95 is a
+        # real answer to "how often does the gate make anyone wait". Cartesia queues the excess
+        # silently, so this gate's wait is the only queueing for Cartesia that can be seen.
+        await self.redis.record_latency("tts_slot_wait", sentence.slot_wait_ms)
         # Cartesia's latency is its time to first audio; with streaming on, the whole synthesis
         # time also contains playback (see above) and would make the vendor look 5x slower.
         await record_provider_call(
@@ -1769,6 +2155,11 @@ class TTSWorker(BaseWorker):
             already_spoken=already_spoken,
             duration_ms=duration_ms,
             synthesis_latency_ms=synthesis_latency_ms,
+            # Time spent waiting for a Cartesia concurrency slot, inside synthesis_latency_ms.
+            slot_wait_ms=sentence.slot_wait_ms,
+            # Spoken on a context left open for it — a prosodic continuation of the sentence
+            # before — rather than a fresh context.
+            continued=sentence.continued,
             text=text[:60],
             is_final=translation.is_final_chunk,
             # Empty when the speaker's delivery was not measured — which is what makes
@@ -2981,8 +3372,8 @@ class TTSWorker(BaseWorker):
 
         Zero is the normal answer and it means "make no adjustment".
         """
-        # getattr + assign back, matching `_turns`: the tests build workers with __new__ and
-        # never run __init__, and this one is written to as well as read.
+        # getattr + assign back, matching `_open_contexts`: the tests build workers with __new__
+        # and never run __init__, and this one is written to as well as read.
         timeline: dict[tuple[str, str, str], int] = getattr(self, "_spoken_start_ms", None) or {}
         self._spoken_start_ms = timeline
 
