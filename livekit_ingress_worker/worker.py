@@ -21,6 +21,11 @@ from livekit import api, rtc
 from redis.exceptions import RedisError
 
 from livekit_ingress_worker.audio_archive import MeetingAudioArchive, describe
+from livekit_ingress_worker.far_side_gate import (
+    FarSideGateConfig,
+    FarSideOverlapGate,
+    zero_frames,
+)
 from livekit_ingress_worker.near_field_gate import NearFieldGate
 from shared.base_worker import BaseWorker
 from shared.control_markers import is_external_bridge_speaker
@@ -63,6 +68,11 @@ VAD_WINDOW_SAMPLES = VAD_FRAME_SAMPLES * VAD_WINDOW_FRAMES
 VAD_WINDOW_MS = VAD_WINDOW_SAMPLES * 1000 // 16000
 # 2 bytes per sample. The unit the hangover is now counted and trimmed in.
 VAD_FRAME_BYTES = VAD_FRAME_SAMPLES * 2
+
+
+def _frames_to_ms(frames: int) -> int:
+    """Silero frames (512 samples at 16kHz) -> milliseconds."""
+    return frames * VAD_FRAME_SAMPLES * 1000 // 16000
 
 
 def _hangover_frames(hangover_samples: int) -> int:
@@ -323,6 +333,8 @@ class LiveKitIngressWorker(BaseWorker):
     # default would turn "archiving is off" into an AttributeError raised from the middle of
     # the audio path — the one place that must not raise.
     _archive: MeetingAudioArchive | None = None
+    # Built lazily (see _far_side_overlap_gate) for the same __new__-in-tests reason as above.
+    _far_side_gate: FarSideOverlapGate | None = None
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -986,6 +998,8 @@ class LiveKitIngressWorker(BaseWorker):
         LiveKit evicting that stale identity, one more avoidable reconnect.
         """
         super()._cleanup_room(room_id)
+        if self._far_side_gate is not None:
+            self._far_side_gate.forget_room(room_id)
         self._cancel_room_audio_tasks(room_id)
         self._connect_failures.pop(room_id, None)
         self._connect_not_before.pop(room_id, None)
@@ -1564,6 +1578,13 @@ class LiveKitIngressWorker(BaseWorker):
                 room=room_name,
                 speaker_id=speaker_id,
             )
+        # FAR-SIDE OVERLAP GATE (far_side_gate.py). Human tracks FEED it their per-frame VAD
+        # verdicts; the stand-in track ASKS it which of its frames are a WarpTalk participant
+        # coming back through Meet, and zeroes those before VAD and STT ever see them.
+        far_side_gate = self._far_side_overlap_gate()
+        # Frames zeroed since the current turn began — reported on the chunk as
+        # suppressed_overlap_ms so the STT side and the logs can see the gate working.
+        suppressed_frames = 0
         # Silero VAD carries recurrent state. Sharing one model across concurrently
         # iterated participant tracks interleaves unrelated audio histories and causes
         # missed/fragmented speech. Each track owns an independent cloned state machine.
@@ -1671,6 +1692,17 @@ class LiveKitIngressWorker(BaseWorker):
                     window_data = bytes(raw_buffer[:window_bytes])
                     raw_buffer = raw_buffer[window_bytes:]
 
+                    if bridge_speaker and far_side_gate is not None:
+                        mask = far_side_gate.suppression_mask(
+                            room_name,
+                            far_side_gate.now(),
+                            VAD_WINDOW_FRAMES,
+                            exclude=(speaker_id,),
+                        )
+                        if any(mask):
+                            window_data = zero_frames(window_data, mask, VAD_FRAME_BYTES)
+                            suppressed_frames += sum(mask)
+
                     # Score every frame in this ~96ms window once. Both questions below are
                     # answered from that one pass — whether the window is speech, and how many
                     # frames have gone by since the last one that was.
@@ -1688,6 +1720,15 @@ class LiveKitIngressWorker(BaseWorker):
                     active_threshold = release_threshold if is_speaking else vad_threshold
                     vad_prob = self._window_verdict(frame_probabilities, active_threshold)
 
+                    if far_side_gate is not None and not bridge_speaker:
+                        far_side_gate.note_frames(
+                            room_name,
+                            speaker_id,
+                            far_side_gate.now(),
+                            frame_probabilities,
+                            active_threshold,
+                        )
+
                     if vad_prob >= active_threshold:
                         # Speech detected
                         if not is_speaking:
@@ -1695,6 +1736,9 @@ class LiveKitIngressWorker(BaseWorker):
                             is_speaking = True
                             speech_buffer = bytearray()
                             speech_samples = 0
+                            # Frames zeroed while the stand-in was silent belong to no chunk;
+                            # count this turn's afresh.
+                            suppressed_frames = 0
                             streaming = await self._flash_mode_enabled(room_name)
                             # Re-read per onset, like flash mode: a console change to the chunk cap
                             # applies to the next utterance, not to the next track that opens.
@@ -1753,7 +1797,9 @@ class LiveKitIngressWorker(BaseWorker):
                                 near_field_gate=near_field_gate,
                                 turn_id=turn_id,
                                 speech_samples=speech_samples,
+                                suppressed_overlap_ms=_frames_to_ms(suppressed_frames),
                             )
+                            suppressed_frames = 0
                             chunk_index += 1
                             published_this_turn = True
                             # The SPEAKER has not stopped, but the commit boundary has moved:
@@ -1830,6 +1876,7 @@ class LiveKitIngressWorker(BaseWorker):
                                         near_field_gate=near_field_gate,
                                         turn_id=turn_id,
                                         speech_samples=speech_samples,
+                                        suppressed_overlap_ms=_frames_to_ms(suppressed_frames),
                                     )
                                     chunk_index += 1
                                 else:
@@ -1856,6 +1903,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 speech_buffer = bytearray()
                                 speech_samples = 0
                                 silence_frames = 0
+                                suppressed_frames = 0
                                 # WT-371 #7: the VAD state is NOT reset here any more.
                                 #
                                 # Silero is recurrent. Resetting it discards everything it has
@@ -1896,7 +1944,12 @@ class LiveKitIngressWorker(BaseWorker):
                     sample_rate,
                     near_field_gate=near_field_gate,
                     speech_samples=speech_samples,
+                    suppressed_overlap_ms=_frames_to_ms(suppressed_frames),
                 )
+            # The gate's intervals for this speaker are deliberately NOT forgotten here: a
+            # republished track replaces this reader while the new one is already recording, and
+            # anything older than lag_max can no longer suppress a frame anyway. The room's
+            # memory goes in _cleanup_room.
             if cancelled:
                 self.logger.info("stopped_audio_stream_processing", track_sid=track.sid)
             else:
@@ -1917,6 +1970,19 @@ class LiveKitIngressWorker(BaseWorker):
                     detail="the reader stopped without being cancelled; "
                     "the idle sweep re-attaches if the track is still published",
                 )
+
+    def _far_side_overlap_gate(self) -> FarSideOverlapGate | None:
+        """The per-process overlap gate, or None when FAR_SIDE_GATE_ENABLED is off.
+
+        One per process because one process owns a room (see _claim_room_ownership): every
+        track of the room is read here, so their arrival times share one monotonic clock.
+        """
+        if self._far_side_gate is None:
+            config = FarSideGateConfig.from_settings(getattr(self, "settings", None))
+            if not config.enabled:
+                return None
+            self._far_side_gate = FarSideOverlapGate(config)
+        return self._far_side_gate
 
     def _require_vad_model(self) -> Any:
         if self._vad_model is None:
@@ -2083,6 +2149,7 @@ class LiveKitIngressWorker(BaseWorker):
         near_field_gate: NearFieldGate | None = None,
         turn_id: str = "",
         speech_samples: int | None = None,
+        suppressed_overlap_ms: int = 0,
     ) -> None:
         # Transcription is NOT translation, and this gate used to conflate them.
         #
@@ -2186,7 +2253,17 @@ class LiveKitIngressWorker(BaseWorker):
             # rolling deploy, and the STT side reads it as unknown rather than as silence.
             speech_ms=(speech_samples * 1000 // sample_rate) if speech_samples else 0,
             timestamp_ms=int(time.time() * 1000),
+            suppressed_overlap_ms=max(0, int(suppressed_overlap_ms)),
         )
+        if suppressed_overlap_ms > 0:
+            self.logger.info(
+                "far_side_overlap_suppressed",
+                room=room_name,
+                speaker_id=speaker_id,
+                chunk_index=chunk_index,
+                suppressed_overlap_ms=int(suppressed_overlap_ms),
+                duration_ms=duration_ms,
+            )
 
         # Tapped here, from the bytes this message carries, so a second pass is handed
         # exactly what the first pass was handed. Archiving from anywhere else would make a

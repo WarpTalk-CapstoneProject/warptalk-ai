@@ -329,6 +329,27 @@ class WorkerSettings(BaseSettings):
     near_field_gate_min_baseline_chunks: int = 2
     near_field_gate_baseline_ema_alpha: float = 0.3
 
+    # FAR-SIDE OVERLAP GATE (ingress worker only, see livekit_ingress_worker/far_side_gate.py).
+    #
+    # In a Meet-bridged room a WarpTalk user who is ALSO in the Meet is heard twice: their own
+    # mic under their own identity, and again inside the stand-in's mixed Meet feed a few hundred
+    # ms later. While any non-stand-in participant's VAD says they are speaking, stand-in frames
+    # that arrive `lag_min..lag_max` ms later are zeroed before VAD/STT — per 32ms frame, never a
+    # whole turn. A room with no such participant speaking is untouched by construction.
+    #
+    # Env: FAR_SIDE_GATE_ENABLED, FAR_SIDE_GATE_LAG_MIN_MS, FAR_SIDE_GATE_LAG_MAX_MS,
+    #      FAR_SIDE_GATE_MIN_OVERLAP_MS, FAR_SIDE_GATE_HISTORY_MS.
+    far_side_gate_enabled: bool = True
+    # Meet's mic -> loopback -> LiveKit path is slower than the participant's direct publish by
+    # roughly this much. NOT MEASURED across networks yet — the first values to sweep.
+    far_side_gate_lag_min_ms: int = 300
+    far_side_gate_lag_max_ms: int = 600
+    # A stand-in frame is suppressed only when the lag-shifted human speech covers MORE than
+    # this many ms of it. 0 = any overlap at all.
+    far_side_gate_min_overlap_ms: float = 0.0
+    # How long a participant's speech intervals are remembered. Must exceed lag_max.
+    far_side_gate_history_ms: int = 5000
+
     # Keep the speech forwarded to STT, so a meeting can be transcribed a second time after
     # it ends — see livekit_ingress_worker/audio_archive.py for why the existing recording
     # cannot serve that purpose. Off by default because it writes files and uploads them;
@@ -441,6 +462,29 @@ class STTSettings(BaseSettings):
     # on purpose — a different room means a different microphone, and a baseline built in one is
     # not a description of how they sound in the other.
     prosody_baseline_ttl_seconds: int = 21600  # 6h
+
+    # FAR-SIDE TEXT DEDUPE (stt_worker/far_side_dedupe.py). The second line of defence behind
+    # the ingress overlap gate: a bridge stand-in segment whose text matches a line a NAMED
+    # WarpTalk speaker in the same room just said is that speaker heard back through Meet, and
+    # is dropped. Env: STT_FAR_SIDE_DEDUPE_*.
+    far_side_dedupe_enabled: bool = True
+    # How far apart (by chunk timestamp) the two copies may be. Meet's path delay is sub-second;
+    # the slack is for the named speaker's chunk closing on a different pause than the stand-in's.
+    far_side_dedupe_window_ms: int = 15_000
+    # SequenceMatcher ratio at or above which two normalized lines are the same line.
+    far_side_dedupe_min_ratio: float = 0.8
+    # Shorter stand-in lines are never dropped — "ok", "yeah" are said by real far-side people.
+    far_side_dedupe_min_chars: int = 8
+    # Require the two segments' languages to agree when both are known.
+    far_side_dedupe_same_language: bool = True
+
+    # FAR-SPEAKER HINTS (shared/far_speaker.py): names read from Meet captions by the desktop,
+    # attached to stand-in segments as far_speaker_name/source/confidence. Env: STT_FAR_SPEAKER_*.
+    far_speaker_hints_enabled: bool = True
+    # How long after the words a caption is observed. Hints are shifted back by this much.
+    far_speaker_hint_lag_ms: int = 500
+    # A hint outside the segment window but within this gap still names it, at reduced confidence.
+    far_speaker_hint_max_gap_ms: int = 1500
 
 
 class TranslationSettings(BaseSettings):
