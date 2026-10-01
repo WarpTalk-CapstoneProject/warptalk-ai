@@ -181,6 +181,9 @@ class TranslationWorker(BaseWorker):
 
     # Bounds concurrent process() dispatch in _consume_loop — see its docstring.
     _CONCURRENCY_LIMIT = 8
+    # Messages dispatched and not yet finished, including those only waiting to publish behind
+    # their own speaker's previous line.
+    _MAX_IN_FLIGHT = 32
     _CONTEXT_MIN_CONFIDENCE = -0.35
     _CONTEXT_SEGMENTS = 4
     _SPECULATIVE_TTL_SECONDS = 15.0
@@ -419,7 +422,7 @@ class TranslationWorker(BaseWorker):
         concurrently (bounded by _CONCURRENCY_LIMIT) so sentence 2's translation can
         start while sentence 1's is still in flight.
 
-        RedisStreamClient.consume_concurrent ties XACK to successful handler
+        RedisStreamClient.consume_pipelined ties XACK to successful handler
         completion. Failed work remains pending for BaseWorker's reclaim/DLQ path.
         """
         self.logger.info(
@@ -433,7 +436,7 @@ class TranslationWorker(BaseWorker):
         tails: dict[tuple[str, str], asyncio.Event] = {}
 
         async def _run(message_id: bytes, data: dict[bytes, bytes]) -> None:
-            # Taken BEFORE the first await. consume_concurrent starts handlers in stream order and
+            # Taken BEFORE the first await. consume_pipelined starts handlers in stream order and
             # each one runs to its first suspension before the next begins, so the ticket order
             # is the order the speaker spoke in.
             key = _speaker_key(data)
@@ -451,23 +454,40 @@ class TranslationWorker(BaseWorker):
                 if tails.get(key) is done:
                     del tails[key]
 
+        # Keeps reading while earlier messages run (see RedisStreamClient.consume_pipelined): a
+        # batch read waited for its slowest translation — or for one held back for its own
+        # speaker's predecessor — before another speaker's next line was even read. Handlers
+        # still START in stream order, which is what the ticket order above relies on.
         while not self._shutdown_event.is_set():
             try:
-                await self._recover_stale_messages()
-                await self.redis.consume_concurrent(
+                await self.redis.consume_pipelined(
                     stream=self.input_stream,
                     group=self.consumer_group,
                     handler=_run,
+                    keep_running=lambda: not self._shutdown_event.is_set(),
                     consumer=self._consumer_name,
                     block_ms=2000,
                     count=self._CONCURRENCY_LIMIT,
-                    concurrency=self._CONCURRENCY_LIMIT,
+                    max_in_flight=self._MAX_IN_FLIGHT,
+                    in_flight_ids=self._in_flight_message_ids(),
+                    between_reads=self._recover_stale_messages,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger.exception("consume_loop_error")
                 await asyncio.sleep(1.0)
+
+    def _in_flight_message_ids(self) -> set[bytes]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        ids: set[bytes] | None = getattr(self, "_in_flight_ids", None)
+        if ids is None:
+            ids = set()
+            self._in_flight_ids = ids
+        return ids
+
+    def _is_in_flight(self, message_id: bytes) -> bool:
+        return message_id in self._in_flight_message_ids()
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Translate one STT result segment by chunking into sentences.
