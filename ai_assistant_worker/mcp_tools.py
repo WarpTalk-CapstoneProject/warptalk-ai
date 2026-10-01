@@ -359,9 +359,7 @@ def build_mcp_confirmation_questions(
     options: list[dict[str, str]] = [
         {
             "label": "Yes",
-            "value": (
-                f"Yes\n\nConfirm the {tool_name} plugin action. confirmationToken: {token}"
-            ),
+            "value": (f"Yes\n\nConfirm the {tool_name} plugin action. confirmationToken: {token}"),
         },
     ]
     # WT-687. Runs this call and stops asking for this tool. The token still has to validate
