@@ -15,6 +15,8 @@ lightweight Redis-stream consumers with no need for a separate container.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable
@@ -84,6 +86,7 @@ from ai_assistant_worker.tool_targets import (
     describe_web_search_target,
     split_reasoning_summary,
 )
+from ai_assistant_worker.tools_manifest import run_manifest_publisher
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
 from shared.integration_status import OPENAI, IntegrationReport, credential_report
@@ -565,6 +568,8 @@ class ChatAssistantWorker(BaseWorker):
         # every path behind them is gated by the platform admin policy server-side.
         self._billing_client: httpx.AsyncClient | None = None
         self._auth_client: httpx.AsyncClient | None = None
+        # Publishes the built-in tool manifest for AssistantService (tools_manifest.py).
+        self._manifest_task: asyncio.Task[None] | None = None
 
     async def load_model(self) -> None:
         api_key = resolve_openai_api_key(self.chat_settings.api_key)
@@ -601,6 +606,11 @@ class ChatAssistantWorker(BaseWorker):
             timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
         )
         self.logger.info("chat_assistant_ready", model=self.chat_settings.model)
+        # Redis is connected before load_model runs (BaseWorker.start), so the first write lands
+        # at startup. The loop never raises on a failed write; see tools_manifest.
+        self._manifest_task = asyncio.create_task(
+            run_manifest_publisher(self.redis, self.chat_settings, self.logger)
+        )
 
     def integration_reports(self) -> dict[str, IntegrationReport]:
         return {
@@ -611,6 +621,11 @@ class ChatAssistantWorker(BaseWorker):
         }
 
     async def _cleanup(self) -> None:
+        if self._manifest_task is not None:
+            self._manifest_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._manifest_task
+            self._manifest_task = None
         for client in (
             self._workspace_client,
             self._assistant_client,
