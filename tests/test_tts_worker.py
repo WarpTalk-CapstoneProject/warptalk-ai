@@ -44,6 +44,10 @@ def _make_worker(mock_redis_client, worker_settings, tts_settings=None, consente
     worker._consumer_name = "test-consumer"
     worker.worker_name = "tts"
     worker.cartesia = MagicMock()
+    # A real semaphore, wide open: the slot is taken and released through GenerationLease, which
+    # awaits acquire() — a bare MagicMock is not awaitable. How many fit through the gate is
+    # tests/test_tts_cartesia_concurrency.py's job, not this file's.
+    worker.cartesia.generation_slot = MagicMock(return_value=asyncio.Semaphore(64))
     worker.cartesia.synthesize = AsyncMock(return_value=(b"audio_bytes", 1000, "resolved-voice-id"))
     worker.cartesia.clone_voice = AsyncMock(return_value="test-voice-id")
     # Empty catalog by default (no Cartesia list_voices call was made) — makes
@@ -458,14 +462,14 @@ class TestConsumeLoopConcurrency:
 
         worker.process = fake_process
 
-        async def fake_consume_concurrent(*, handler, **kwargs):
+        async def fake_consume_pipelined(*, handler, **kwargs):
             await asyncio.gather(
                 handler(b"msg-1", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}),
                 handler(b"msg-2", {"meeting_id": "m1", "speaker_id": "s2", "target_lang": "ja"}),
             )
             worker._shutdown_event.set()
 
-        worker.redis.consume_concurrent = fake_consume_concurrent
+        worker.redis.consume_pipelined = fake_consume_pipelined
 
         await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
 
@@ -484,7 +488,7 @@ class TestConsumeLoopConcurrency:
 
         worker.process = fake_process
 
-        async def fake_consume_concurrent(*, handler, **kwargs):
+        async def fake_consume_pipelined(*, handler, **kwargs):
             # Same speaker AND same target_lang — same LiveKit track, must stay ordered
             # even though this is sentence 1 and 2 of one utterance.
             await asyncio.gather(
@@ -493,7 +497,7 @@ class TestConsumeLoopConcurrency:
             )
             worker._shutdown_event.set()
 
-        worker.redis.consume_concurrent = fake_consume_concurrent
+        worker.redis.consume_pipelined = fake_consume_pipelined
 
         await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
 
@@ -523,14 +527,14 @@ class TestConsumeLoopConcurrency:
 
         worker.process = fake_process
 
-        async def fake_consume_concurrent(*, handler, **kwargs):
+        async def fake_consume_pipelined(*, handler, **kwargs):
             await asyncio.gather(
                 handler(b"msg-1", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "vi"}),
                 handler(b"msg-2", {"meeting_id": "m1", "speaker_id": "s1", "target_lang": "ja"}),
             )
             worker._shutdown_event.set()
 
-        worker.redis.consume_concurrent = fake_consume_concurrent
+        worker.redis.consume_pipelined = fake_consume_pipelined
 
         await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
 

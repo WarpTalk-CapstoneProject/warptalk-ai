@@ -47,7 +47,7 @@ from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResul
 from tts_worker.clone_sample_quality import MAX_SAMPLE_SCORE, assess_clone_sample
 from tts_worker.livekit_publisher import LiveKitTTSPublisher, TrackStream
 from tts_worker.prosody_context import ProsodyContext, wav_header
-from tts_worker.synthesizer import CartesiaSynthesizer
+from tts_worker.synthesizer import CartesiaSynthesizer, GenerationLease
 
 # Standard WAV header size for the pcm_s16le format CartesiaSynthesizer requests —
 # used to strip the header before feeding audio into the LiveKit track (which wants
@@ -429,6 +429,12 @@ def _resolve_clone_language(hint: str) -> str | None:
     return _clone_language(normalized)
 
 
+def _release(lease: GenerationLease | None) -> None:
+    """Give the sentence's Cartesia slot back, if the caller is gating on one."""
+    if lease is not None:
+        lease.release()
+
+
 def _decode_field(data: Mapping[Any, Any], key: str) -> str:
     raw = data.get(key)
     if raw is None:
@@ -520,6 +526,9 @@ class TTSWorker(BaseWorker):
     # a clone, a preview, or a meeting's audio.
     _voice_delete_group = "tts-voice-delete-workers"
     _running = True
+    # How many translate:results messages one process may hold dispatched-and-unacknowledged.
+    # See _consume_loop for why this is not the Cartesia limit and not small.
+    _MAX_IN_FLIGHT = 32
 
     def __init__(
         self,
@@ -533,6 +542,8 @@ class TTSWorker(BaseWorker):
         # (meeting_id, speaker_id, target_lang) -> lock serializing that key's own
         # messages — see _consume_loop for why.
         self._key_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        # Message ids consume_pipelined has dispatched and not yet finished; see _is_in_flight.
+        self._in_flight_ids: set[bytes] = set()
         # The furthest-along sentence this key has already SPOKEN, by its position in the
         # speaker's own timeline. Read and written only while that key's lock is held, so a
         # plain dict is safe for the same reason `_turns` below is.
@@ -632,41 +643,81 @@ class TTSWorker(BaseWorker):
         little same-key pipelining (sentence 2 can't start synthesizing until sentence
         1's audio has fully been pushed to the track) for guaranteed in-order playback —
         the right trade-off, since real speech itself paces how fast new same-key
-        sentences even arrive.
+        sentences even arrive. asyncio.Lock is FIFO and consume_pipelined starts handlers
+        in stream order, so a key's sentences take the lock in the order they arrived.
 
-        RedisStreamClient.consume_concurrent ties XACK to successful handler
-        completion. Failed work remains pending for BaseWorker's reclaim/DLQ path.
+        KEEPS READING WHILE DUBS PLAY. This used consume_concurrent(), which reads 8 and
+        waits for all 8 before reading again — and a TTS message lasts as long as its dub
+        takes to PLAY, because the audio is streamed onto the track in real time. Speaker B's
+        new sentence therefore waited, unread, behind the last sentence of speaker A's whole
+        batch. consume_pipelined() reads again as soon as a place frees up.
+
+        `_MAX_IN_FLIGHT` is larger than the old batch on purpose: most in-flight messages are
+        not doing anything — they are queued behind their own key's lock while that key's
+        previous sentence plays. Counting those against a small bound would let one fast
+        speaker's backlog fill every place and block a different speaker's first sentence
+        from being read at all. Cartesia itself is bounded separately and much more tightly
+        (generation_slot), so this bound is only about how much unacknowledged work one
+        process may hold.
+
+        XACK is still tied to each handler's own successful completion; failed work remains
+        pending for BaseWorker's reclaim/dead-letter path, which runs between reads and puts a
+        reclaimed message through the same per-key lock (_process_reclaimed) and skips one that
+        is merely queued here (_is_in_flight).
         """
         self.logger.info(
             "consume_loop_started",
             stream=self.input_stream,
             group=self.consumer_group,
             consumer=self._consumer_name,
+            max_in_flight=self._MAX_IN_FLIGHT,
         )
-
-        async def _run(message_id: bytes, data: dict[bytes, bytes]) -> None:
-            key = _extract_tts_key(data)
-            lock = self._key_locks.setdefault(key, asyncio.Lock())
-            async with lock:
-                await self._process_and_log_errors(message_id, data)
 
         while not self._shutdown_event.is_set():
             try:
-                await self._recover_stale_messages()
-                await self.redis.consume_concurrent(
+                await self.redis.consume_pipelined(
                     stream=self.input_stream,
                     group=self.consumer_group,
-                    handler=_run,
+                    handler=self._run_in_key_order,
+                    keep_running=lambda: not self._shutdown_event.is_set(),
                     consumer=self._consumer_name,
                     block_ms=2000,
                     count=8,
-                    concurrency=8,
+                    max_in_flight=self._MAX_IN_FLIGHT,
+                    in_flight_ids=self._in_flight_message_ids(),
+                    between_reads=self._recover_stale_messages,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger.exception("consume_loop_error")
                 await asyncio.sleep(1.0)
+
+    def _key_lock(self, data: Mapping[Any, Any]) -> asyncio.Lock:
+        key = _extract_tts_key(data)
+        return self._key_locks.setdefault(key, asyncio.Lock())
+
+    async def _run_in_key_order(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        async with self._key_lock(data):
+            await self._process_and_log_errors(message_id, data)
+
+    def _in_flight_message_ids(self) -> set[bytes]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        ids: set[bytes] | None = getattr(self, "_in_flight_ids", None)
+        if ids is None:
+            ids = set()
+            self._in_flight_ids = ids
+        return ids
+
+    def _is_in_flight(self, message_id: bytes) -> bool:
+        return message_id in self._in_flight_message_ids()
+
+    async def _process_reclaimed(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        # Through the key's lock like any other message: reclaiming now happens while other
+        # messages are still running, and a reclaimed sentence must not be pushed onto a track
+        # in the middle of another sentence for the same key.
+        async with self._key_lock(data):
+            await self._process_and_log_errors(message_id, data)
 
     async def _cleanup(self) -> None:
         """Drain the Cartesia connection pool on shutdown.
@@ -711,6 +762,7 @@ class TTSWorker(BaseWorker):
         voice_id: str | None,
         voice_key: str,
         generation_config: dict[str, float | str] | None,
+        lease: GenerationLease | None = None,
     ) -> SynthesizedSentence:
         """One sentence of a turn, spoken in prosodic continuity with the ones before it.
 
@@ -725,6 +777,12 @@ class TTSWorker(BaseWorker):
         this codebase, and a dub that fails is silence in a live meeting.
 
         See SynthesizedSentence for what comes back and why it is no longer just the audio.
+
+        `lease` is the caller's Cartesia slot. It is released here, the moment Cartesia has
+        finished sending this sentence, and NOT when the sentence has finished playing — with
+        streaming on, those are seconds apart, and holding the slot across the playout made every
+        other track wait for this one to be heard. See GenerationLease. The one-shot fallback
+        re-acquires it. None (some tests) means the caller is not gating.
         """
         synthesizer = self._require_cartesia()
         resolved_voice_id = voice_id or CartesiaSynthesizer._default_voice_id(
@@ -732,12 +790,15 @@ class TTSWorker(BaseWorker):
         )
 
         if not self.tts_settings.prosody_continuity:
-            audio_bytes, duration_ms, one_shot_voice_id = await synthesizer.synthesize(
-                text=text,
-                language=translation.target_lang,
-                voice_id=voice_id,
-                generation_config=generation_config,
-            )
+            try:
+                audio_bytes, duration_ms, one_shot_voice_id = await synthesizer.synthesize(
+                    text=text,
+                    language=translation.target_lang,
+                    voice_id=voice_id,
+                    generation_config=generation_config,
+                )
+            finally:
+                _release(lease)
             return SynthesizedSentence(audio_bytes, duration_ms, one_shot_voice_id)
 
         # Keyed by voice as well as by speaker and language: a clone upgrade replaces the voice
@@ -789,6 +850,7 @@ class TTSWorker(BaseWorker):
             publisher = getattr(self, "livekit_publisher", None)
             if publisher is None or not self.tts_settings.stream_to_livekit:
                 audio_bytes, duration_ms = await turn.speak(text, generation_config)
+                _release(lease)
                 return SynthesizedSentence(audio_bytes, duration_ms, resolved_voice_id)
 
             async with publisher.stream(
@@ -798,9 +860,19 @@ class TTSWorker(BaseWorker):
                 self.tts_settings.sample_rate,
                 voice_key=voice_key,
             ) as track:
-                audio_bytes, duration_ms = await turn.speak(
-                    text, generation_config, on_pcm=track.feed
-                )
+                try:
+                    audio_bytes, duration_ms = await turn.speak(
+                        text, generation_config, on_pcm=track.feed
+                    )
+                finally:
+                    # THE POINT WHERE GENERATION ENDS AND PLAYOUT BEGINS. speak() returns on
+                    # Cartesia's flush_done — every chunk of this sentence has arrived and been
+                    # queued on the track — but the track is still playing it, and leaving this
+                    # block waits for that in real time. The slot bounds generations at Cartesia,
+                    # so it goes back now; the playout that follows must not hold up another
+                    # speaker's, language's or voice's generation. On failure too: the partial
+                    # audio drains below without the slot, and the fallback takes it again.
+                    _release(lease)
             # Read AFTER the stream closed: the pump is still draining while speak() returns,
             # so asking inside the block would undercount what the listener actually heard.
             return SynthesizedSentence(
@@ -819,12 +891,19 @@ class TTSWorker(BaseWorker):
                 exc_info=True,
             )
             await self._end_turn(key)
-            audio_bytes, duration_ms, one_shot_voice_id = await synthesizer.synthesize(
-                text=text,
-                language=translation.target_lang,
-                voice_id=voice_id,
-                generation_config=generation_config,
-            )
+            # Still the same sentence's one claim: re-taken through the same lease if the context
+            # path already gave it back, a no-op if it never did (the dial itself failed).
+            if lease is not None:
+                await lease.acquire()
+            try:
+                audio_bytes, duration_ms, one_shot_voice_id = await synthesizer.synthesize(
+                    text=text,
+                    language=translation.target_lang,
+                    voice_id=voice_id,
+                    generation_config=generation_config,
+                )
+            finally:
+                _release(lease)
             if already_spoken:
                 # THE ONE DECISION THIS FEATURE TURNS ON, recorded here rather than in a ticket.
                 #
@@ -1385,18 +1464,22 @@ class TTSWorker(BaseWorker):
                 return
 
         t0 = time.monotonic()
+        # One Cartesia slot per sentence, fallback included — see
+        # TTSSettings.cartesia_max_concurrency. Held while Cartesia GENERATES, and handed back by
+        # _synthesize_sentence the moment the audio has arrived, so this sentence's playout does
+        # not hold up anyone else's generation. Waiting for it is counted in the latency on
+        # purpose: it is time the listener spends waiting too.
+        lease = GenerationLease(self._require_cartesia().generation_slot())
         try:
-            # One Cartesia slot for the whole sentence, fallback included — see
-            # TTSSettings.cartesia_max_concurrency. Waiting here is counted in the latency on
-            # purpose: it is time the listener spends waiting too.
-            async with self._require_cartesia().generation_slot():
-                sentence = await self._synthesize_sentence(
-                    translation=translation,
-                    text=text,
-                    voice_id=voice_id,
-                    voice_key=voice_key,
-                    generation_config=generation_config,
-                )
+            await lease.acquire()
+            sentence = await self._synthesize_sentence(
+                translation=translation,
+                text=text,
+                voice_id=voice_id,
+                voice_key=voice_key,
+                generation_config=generation_config,
+                lease=lease,
+            )
         except Exception as e:
             # Swallowed so the next sentence still plays; counted so a Cartesia outage (402 quota,
             # 5xx) shows as a TTS success rate falling rather than as silence.
@@ -1427,6 +1510,11 @@ class TTSWorker(BaseWorker):
                 payload={"error": str(e)},
             )
             return
+        finally:
+            # Normally already back — _synthesize_sentence releases it when the audio has
+            # arrived. This covers every way out that skipped that: a cancellation (the
+            # processing timeout cancels a wedged attempt), or a raise before generation began.
+            lease.release()
 
         audio_bytes = sentence.audio
         duration_ms = sentence.duration_ms

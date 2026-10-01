@@ -654,6 +654,130 @@ class RedisStreamClient:
             ]
             await asyncio.gather(*tasks)
 
+    async def consume_pipelined(
+        self,
+        stream: str,
+        group: str,
+        handler: Callable[[bytes, dict[bytes, bytes]], Awaitable[None]],
+        *,
+        keep_running: Callable[[], bool],
+        consumer: str | None = None,
+        block_ms: int = 2000,
+        count: int = 8,
+        max_in_flight: int = 8,
+        in_flight_ids: set[bytes] | None = None,
+        between_reads: Callable[[], Awaitable[None]] | None = None,
+        between_reads_interval_s: float = 2.0,
+    ) -> None:
+        """Like consume_concurrent(), but keeps READING while earlier messages are still running.
+
+        WHY NOT consume_concurrent()
+            consume_concurrent() reads a batch and waits for EVERY message in it before reading
+            again. That is fine when a message takes milliseconds. A TTS message takes as long as
+            its dub takes to PLAY — the sentence is streamed onto a LiveKit track in real time —
+            so a new sentence from speaker B, arriving while speaker A's batch was playing, sat
+            unread in Redis until A's last sentence had been heard. Overlapping speakers queued
+            behind each other's playout even though their tracks share nothing.
+
+            Here a finished message frees its place immediately and the next read happens as soon
+            as there is room, so a new message waits for capacity, never for a whole batch.
+
+        WHAT IS THE SAME
+            * XACK is tied to the handler's own successful completion, exactly as in
+              consume_concurrent() — a handler that raises leaves its message pending for the
+              reclaim/retry/dead-letter path, and a crash loses nothing.
+            * Handlers are started in the order the stream delivered them. Ordering between
+              messages is the HANDLER's job (TTSWorker serialises each key with a FIFO lock that
+              tasks reach in creation order); this method only promises not to reorder starts.
+
+        BOUNDED. At most `max_in_flight` handlers run at once; at capacity the loop waits for one
+        to finish instead of reading. `in_flight_ids`, when given, is kept equal to the set of
+        message ids currently dispatched and not yet finished, so a reclaim pass can tell a
+        message that is merely QUEUED here from one that was abandoned.
+
+        `between_reads` runs on the reading side at most once per `between_reads_interval_s` — the
+        hook for reclaiming stale entries, which the old batch loop ran between batches. Runs
+        until `keep_running()` is false, then waits for everything in flight and returns. A read
+        error also drains first and then propagates, so the caller's retry loop never leaves
+        orphaned handlers behind; a cancellation cancels them (their messages stay pending).
+        """
+        if count <= 0 or max_in_flight <= 0:
+            raise ValueError("count and max_in_flight must be positive")
+
+        consumer = consumer or f"worker-{socket.gethostname()}"
+        await self.ensure_consumer_group(stream, group)
+
+        in_flight: set[asyncio.Task[None]] = set()
+        ids = in_flight_ids if in_flight_ids is not None else set()
+
+        async def _run_one(message_id: bytes, data: dict[bytes, bytes]) -> None:
+            try:
+                await handler(message_id, data)
+            except Exception:
+                logger.exception(
+                    "consume_pipelined_handler_error", message_id=message_id, stream=stream
+                )
+                return
+            try:
+                await self.redis.xack(stream, group, message_id)
+            except Exception:
+                # Left pending: the reclaim pass sees it later and the handler runs again, which
+                # every consumer of this path must already tolerate (at-least-once).
+                logger.exception("consume_pipelined_ack_failed", message_id=message_id)
+
+        def _dispatch(message_id: bytes, data: dict[bytes, bytes]) -> None:
+            ids.add(message_id)
+            task = asyncio.create_task(_run_one(message_id, data))
+            in_flight.add(task)
+
+            def _done(finished: asyncio.Task[None]) -> None:
+                in_flight.discard(finished)
+                ids.discard(message_id)
+
+            task.add_done_callback(_done)
+
+        last_between: float | None = None
+        try:
+            while keep_running():
+                if between_reads is not None:
+                    now = time.monotonic()
+                    if last_between is None or now - last_between >= between_reads_interval_s:
+                        last_between = now
+                        await between_reads()
+
+                capacity = max_in_flight - len(in_flight)
+                if capacity <= 0:
+                    await asyncio.wait(
+                        set(in_flight),
+                        timeout=block_ms / 1000,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    continue
+
+                messages_raw = await self._retry(
+                    self.redis.xreadgroup,
+                    groupname=group,
+                    consumername=consumer,
+                    streams={stream: ">"},
+                    count=min(count, capacity),
+                    block=block_ms,
+                )
+                messages = cast(
+                    list[tuple[bytes, list[tuple[bytes, dict[bytes, bytes]]]]],
+                    messages_raw,
+                )
+                for _stream_name, stream_messages in messages or []:
+                    for message_id, data in stream_messages:
+                        _dispatch(message_id, data)
+        except asyncio.CancelledError:
+            for task in in_flight:
+                task.cancel()
+            await asyncio.gather(*in_flight, return_exceptions=True)
+            raise
+        finally:
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
+
     async def reclaim_stale(
         self,
         stream: str,

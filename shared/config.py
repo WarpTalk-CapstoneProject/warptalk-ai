@@ -621,6 +621,13 @@ class TTSSettings(BaseSettings):
     # speakers and target languages overruns the plan and every excess sentence fails outright.
     # Waiting for a slot costs a fraction of a sentence; a 429 costs the whole one. Keep this at
     # the plan's limit divided by the number of TTS replicas (tts-worker is a singleton).
+    #
+    # A slot covers GENERATION, not playout: it is taken before Cartesia is asked and given back
+    # when the sentence's audio has arrived (flush_done, or the one-shot response) — see
+    # tts_worker.synthesizer.GenerationLease. It used to be held until the streamed sentence had
+    # finished PLAYING, which made a third speaker wait out somebody else's dub. What Cartesia
+    # counts is requests generating; an open-but-idle prosody context between two sentences of a
+    # turn was never inside the slot either, and that design has been running since #189.
     cartesia_max_concurrency: int = 2
 
     # Delete in-meeting clones from the Cartesia account once nothing can reach them.

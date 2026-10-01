@@ -889,8 +889,12 @@ class BaseWorker(ABC):
             min_idle_ms=self._reclaim_min_idle_ms(),
         )
         for message_id, data in messages:
+            if self._is_in_flight(message_id):
+                # Still being handled by this process — only queued long enough to look idle.
+                # Running it again would run it twice; acking it would ack unfinished work.
+                continue
             try:
-                await self._process_and_log_errors(message_id, data)
+                await self._process_reclaimed(message_id, data)
             except Exception:
                 attempts = await self.redis.pending_delivery_count(
                     self.input_stream,
@@ -948,6 +952,24 @@ class BaseWorker(ABC):
         # live one first, or it still holds them and is (correctly) skipped.
         if self._housekeeping_due(self.input_stream, self.consumer_group):
             await self._prune_idle_consumers(self.input_stream, self.consumer_group)
+
+    def _is_in_flight(self, message_id: bytes) -> bool:
+        """Whether this process has already dispatched `message_id` and not yet finished it.
+
+        Always False for the default one-at-a-time loop, which never reclaims while anything is
+        running. A worker that keeps reading while earlier messages run (TTSWorker) overrides it:
+        a message queued behind a long-running one for its key sits in the pending list looking
+        exactly like an abandoned one, and XAUTOCLAIM cannot tell the difference.
+        """
+        return False
+
+    async def _process_reclaimed(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        """Run one reclaimed message. Raise to leave it pending (and count toward dead-letter).
+
+        A hook so a worker whose normal path wraps processing — TTSWorker's per-key ordering
+        lock — can put a reclaimed message through the same wrapper instead of around it.
+        """
+        await self._process_and_log_errors(message_id, data)
 
     def note_attempt_outcome(self, outcome: str) -> None:
         """Mark the message being processed as failed even though `process()` will return.
