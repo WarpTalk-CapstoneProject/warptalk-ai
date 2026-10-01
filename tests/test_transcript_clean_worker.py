@@ -15,6 +15,7 @@ import asyncio
 import json
 import uuid
 from typing import Any
+from unittest.mock import MagicMock
 
 from shared.config import WorkerSettings
 from shared.control_markers import MEETING_END_MARKER, SYSTEM_SPEAKER_ID
@@ -69,6 +70,10 @@ class FakeCleaner:
     async def close(self) -> None:
         return None
 
+    def record_skipped_call(self, reason: str) -> None:
+        """See LLMCleaner.record_skipped_call: a call the worker decided not to make at all."""
+        self.rejections[reason] = self.rejections.get(reason, 0) + 1
+
     async def clean(
         self,
         raw: str,
@@ -76,6 +81,7 @@ class FakeCleaner:
         *,
         prepass_text: str | None = None,
         previous_line: str = "",
+        meeting_id: str = "",
     ) -> CleanedSentence | None:
         self.calls.append((raw, language, prepass_text, previous_line))
         if self.hang:
@@ -140,7 +146,11 @@ class TestTheWireContract:
                 )
             ]
         )
-        worker, redis, _ = build_worker(cleaner)
+        # This sentence is exactly what WT-830's uncertainty gate now skips by default (tier 1
+        # removes "um" with nothing left to escalate) -- disabled here because this test is
+        # about the revision 0 -> revision 1 wire contract, not about which sentences earn a
+        # call. See TestTheUncertaintyGate below for the predicate itself.
+        worker, redis, _ = build_worker(cleaner, llm_only_when_uncertain=False)
         first, second = str(uuid.uuid4()), str(uuid.uuid4())
 
         await worker.process(b"1-0", stt("um we should ship it", segment_id=first, end_ms=1000))
@@ -183,15 +193,32 @@ class TestTheWireContract:
 
     async def test_a_non_guid_segment_id_is_dropped_rather_than_breaking_the_row(self):
         worker, redis, _ = build_worker()
+        valid = str(uuid.uuid4())
+        await worker.process(b"1-0", stt("We should ship it", segment_id="not-a-guid", end_ms=500))
+        await worker.process(b"1-1", stt("today.", segment_id=valid, start_ms=500, end_ms=1000))
+        await worker._flush_meeting(MEETING_ID, reason="meeting_end")
+
+        assert json.loads(clean_messages(redis)[0]["segment_ids"]) == [valid]
+
+    async def test_a_sentence_with_no_valid_segment_ids_is_not_published(self):
+        # If EVERY id in the sentence fails the GUID check, publishing would send
+        # segment_ids: [] -- the transcript service rejects that and dead-letters the message
+        # after retries, which is worse than publishing nothing here.
+        worker, redis, _ = build_worker()
+        worker.logger = MagicMock()
         await worker.process(b"1-0", stt("We should ship it today.", segment_id="not-a-guid"))
         await worker._flush_meeting(MEETING_ID, reason="meeting_end")
 
-        assert json.loads(clean_messages(redis)[0]["segment_ids"]) == []
+        assert clean_messages(redis) == []
+        warnings = [c.args[0] for c in worker.logger.warning.call_args_list]
+        assert "transcript_clean_no_valid_segment_ids" in warnings
 
 
 class TestWhenTheModelDoesNotAnswer:
     async def test_a_hanging_llm_leaves_only_revision_zero(self):
-        worker, redis, _ = build_worker(FakeCleaner(hang=True))
+        # llm_only_when_uncertain=False: this input does not escalate, and the point of this
+        # test is what happens when a CALL hangs, not whether one is placed.
+        worker, redis, _ = build_worker(FakeCleaner(hang=True), llm_only_when_uncertain=False)
         await worker.process(b"1-0", stt("um we should ship it today"))
         await worker._flush_meeting(MEETING_ID, reason="meeting_end")
         await settle()
@@ -200,7 +227,7 @@ class TestWhenTheModelDoesNotAnswer:
         assert clean_messages(redis)[0]["clean_text"] == "We should ship it today."
 
     async def test_a_refused_answer_leaves_only_revision_zero(self):
-        worker, redis, _ = build_worker(FakeCleaner([None]))
+        worker, redis, _ = build_worker(FakeCleaner([None]), llm_only_when_uncertain=False)
         await worker.process(b"1-0", stt("um we should ship it today"))
         await worker._flush_meeting(MEETING_ID, reason="meeting_end")
         await settle()
@@ -323,3 +350,141 @@ class TestThePrepassTier:
             (message["speaker_id"], message["clean_text"]) for message in clean_messages(redis)
         ]
         assert texts == [(other, "Yeah."), (SPEAKER, "I think that we should ship it.")]
+
+
+def suspended_key(meeting_id: str = MEETING_ID) -> str:
+    """The exact key translation_worker/billing_worker own — see worker._credits_suspended."""
+    return f"translationRoom:{meeting_id}:ai_service_suspended"
+
+
+class RaisingRedis(FakeRedis):
+    """A redis whose GET always raises, for the fail-open path."""
+
+    async def get(self, key: str) -> str | None:
+        raise RuntimeError("redis is down")
+
+
+class TestTheCreditGate:
+    """WT-830: billing_worker's refusal flag stops the LLM call, never revision 0."""
+
+    async def test_a_suspended_meeting_skips_the_llm_but_still_publishes_revision_zero(self):
+        # A self-repair candidate: it escalates, so absent the credit gate it would reach the
+        # model every time. Suspending the room must still stop it -- credits outrank uncertainty.
+        cleaner = FakeCleaner(
+            [CleanedSentence(text="Họp thứ ba.", self_repair=True, deleted_indices=(1, 2, 3, 4))]
+        )
+        worker, redis, _ = build_worker(cleaner)
+        redis.values[suspended_key()] = "true"
+
+        await worker.process(b"1-0", stt("họp thứ hai, à không, thứ ba", language="vi"))
+        await worker._flush_meeting(MEETING_ID, reason="meeting_end")
+        await settle()
+
+        messages = clean_messages(redis)
+        assert [message["revision"] for message in messages] == ["0"]
+        assert cleaner.calls == []
+        assert cleaner.rejections == {"skipped_credits_suspended": 1}
+
+    async def test_an_unsuspended_meeting_still_calls_the_llm(self):
+        cleaner = FakeCleaner(
+            [CleanedSentence(text="Họp thứ ba.", self_repair=True, deleted_indices=(1, 2, 3, 4))]
+        )
+        worker, redis, _ = build_worker(cleaner)
+        # No key at all -- the common case (nobody has ever been suspended in this room).
+
+        await worker.process(b"1-0", stt("họp thứ hai, à không, thứ ba", language="vi"))
+        await worker._flush_meeting(MEETING_ID, reason="meeting_end")
+        await settle()
+
+        assert len(cleaner.calls) == 1
+        assert [message["revision"] for message in clean_messages(redis)] == ["0", "1"]
+
+    async def test_a_redis_error_checking_credits_fails_open(self):
+        # Matches translation_worker._credits_suspended: a Redis blip must cost a few unbilled
+        # calls, never stop a paying room's clean transcript outright.
+        cleaner = FakeCleaner(
+            [CleanedSentence(text="Họp thứ ba.", self_repair=True, deleted_indices=(1, 2, 3, 4))]
+        )
+        worker, _, _ = build_worker(cleaner)
+        worker.redis = RaisingRedis()  # type: ignore[assignment]
+
+        await worker.process(b"1-0", stt("họp thứ hai, à không, thứ ba", language="vi"))
+        await worker._flush_meeting(MEETING_ID, reason="meeting_end")
+        await settle()
+
+        assert len(cleaner.calls) == 1
+
+
+class TestTheUncertaintyGate:
+    """WT-830: only a sentence tier 1 could not finish on its own is worth a model call."""
+
+    async def test_a_confidently_clean_sentence_skips_the_llm(self):
+        # "um" is an ordinary A1 filler tier 1 removes without a moment's doubt -- nothing here
+        # is escalated, so by default this should never reach the model.
+        cleaner = FakeCleaner([CleanedSentence(text="x", self_repair=False, deleted_indices=())])
+        worker, redis, _ = build_worker(cleaner)
+
+        await worker.process(b"1-0", stt("um we should ship it today"))
+        await worker._flush_meeting(MEETING_ID, reason="meeting_end")
+        await settle()
+
+        assert cleaner.calls == []
+        assert cleaner.rejections == {"skipped_confident": 1}
+        assert [message["revision"] for message in clean_messages(redis)] == ["0"]
+
+    async def test_an_english_self_repair_candidate_is_not_skipped(self):
+        # The ticket's own example: tier 1 can only escalate "Monday, I mean Tuesday", never
+        # resolve it, so this MUST still reach the model with the gate on.
+        cleaner = FakeCleaner(
+            [
+                CleanedSentence(
+                    text="We ship on Tuesday.", self_repair=True, deleted_indices=(3, 4, 5)
+                )
+            ]
+        )
+        worker, redis, _ = build_worker(cleaner)
+
+        await worker.process(b"1-0", stt("We ship on Monday, I mean Tuesday."))
+        await worker._flush_meeting(MEETING_ID, reason="meeting_end")
+        await settle()
+
+        assert len(cleaner.calls) == 1
+        assert [message["revision"] for message in clean_messages(redis)] == ["0", "1"]
+
+    async def test_a_vietnamese_self_repair_candidate_is_not_skipped(self):
+        cleaner = FakeCleaner(
+            [CleanedSentence(text="Họp thứ ba.", self_repair=True, deleted_indices=(1, 2, 3, 4))]
+        )
+        worker, redis, _ = build_worker(cleaner)
+
+        await worker.process(b"1-0", stt("họp thứ hai, à không, thứ ba", language="vi"))
+        await worker._flush_meeting(MEETING_ID, reason="meeting_end")
+        await settle()
+
+        assert len(cleaner.calls) == 1
+        assert [message["revision"] for message in clean_messages(redis)] == ["0", "1"]
+
+    async def test_an_escalated_but_not_self_repair_sentence_is_not_skipped(self):
+        # "so" as a discourse marker in a suspicious position escalates without being a repair --
+        # the gate has to key on `escalate`, not on the self_repair flag specifically.
+        cleaner = FakeCleaner([CleanedSentence(text="x", self_repair=False, deleted_indices=())])
+        worker, redis, _ = build_worker(cleaner)
+
+        await worker.process(b"1-0", stt("um so we we should ship it"))
+        await worker._flush_meeting(MEETING_ID, reason="meeting_end")
+        await settle()
+
+        assert len(cleaner.calls) == 1
+
+    async def test_the_setting_off_restores_always_call(self):
+        cleaner = FakeCleaner([CleanedSentence(text="x", self_repair=False, deleted_indices=())])
+        worker, redis, _ = build_worker(cleaner, llm_only_when_uncertain=False)
+
+        # No filler, no escalation, nothing at all for tier 1 to flag -- and it is still called
+        # because the gate is off.
+        await worker.process(b"1-0", stt("We should ship it today."))
+        await worker._flush_meeting(MEETING_ID, reason="meeting_end")
+        await settle()
+
+        assert len(cleaner.calls) == 1
+        assert cleaner.rejections == {}

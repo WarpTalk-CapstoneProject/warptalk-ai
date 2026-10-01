@@ -36,7 +36,11 @@ from shared.control_markers import is_control_marker, is_system_speaker
 from shared.disfluency import FLAG_ESCALATE, normalize_terminal_punctuation, prepass
 from shared.schemas import TRANSCRIPT_CLEAN_STREAM, CleanSentenceMessage, STTResultMessage
 from transcript_clean_worker.config import TranscriptCleanSettings
-from transcript_clean_worker.llm_cleaner import LLMCleaner
+from transcript_clean_worker.llm_cleaner import (
+    REJECT_SKIPPED_CONFIDENT,
+    REJECT_SKIPPED_CREDITS_SUSPENDED,
+    LLMCleaner,
+)
 from transcript_clean_worker.segmenter import CleanSegment, CleanSentence, SentenceSegmenter
 
 # The wire flag vocabulary (see CleanSentenceMessage). Anything else the prepass reports stays
@@ -52,6 +56,30 @@ def _is_guid(value: str) -> bool:
     except (ValueError, AttributeError, TypeError):
         return False
     return True
+
+
+def _worth_llm_call(sentence: CleanSentence) -> bool:
+    """Whether tier 1 left something uncertain that only a model can adjudicate (WT-830).
+
+    Before this ticket, EVERY sentence reached the model, including one tier 1 was confident
+    about front to back ("we should ship it today" — nothing removed, nothing escalated). That
+    call answers a question nobody asked.
+
+    `FLAG_ESCALATE` is tier 1's own signal for the opposite case: every reason it sets that flag
+    for (see `shared.disfluency.prepass`) — a self-repair candidate, a discourse marker in a
+    suspicious position, an unlisted Vietnamese repeat, two discourse markers in a row, the
+    Japanese fallback tokenizer, or an invariant violation that forced a fall back to raw text —
+    is a case tier 1 could not resolve on a lexicon alone. Both cases this LLM tier was built for
+    escalate: "We ship on Monday, I mean Tuesday" (English self-repair-after-comma) and "họp thứ
+    hai, à không, thứ ba" (the Vietnamese self-repair marker), so gating on this flag alone still
+    sends both to the model. A sentence with only `fillers_removed`/`stutter_removed`, or no flags
+    at all, is one tier 1 already finished; asking again buys nothing but a bill.
+
+    `sentence.flags` is the union of every constituent segment's flags (see
+    `SentenceSegmenter._make`), so a multi-segment sentence counts as escalated the moment ANY of
+    its segments did — the merged line is exactly what would be sent to the model either way.
+    """
+    return FLAG_ESCALATE in sentence.flags
 
 
 class TranscriptCleanWorker(BaseWorker):
@@ -278,6 +306,18 @@ class TranscriptCleanWorker(BaseWorker):
                 segment_ids=sentence.segment_ids,
             )
 
+        if not segment_ids:
+            # Every id in this sentence failed the GUID check above. Publishing anyway would
+            # send segment_ids: [] — the transcript service rejects that, and after its retries
+            # dead-letters the message, which is worse than saying nothing here: there is no
+            # segment left to attach a clean line to, so there is nothing faithful to publish.
+            self.logger.warning(
+                "transcript_clean_no_valid_segment_ids",
+                meeting_id=meeting_id,
+                raw_segment_ids=sentence.segment_ids,
+            )
+            return
+
         text = normalize_terminal_punctuation(sentence.prepass_text, sentence.language)
         message = CleanSentenceMessage(
             meeting_id=meeting_id,
@@ -305,11 +345,56 @@ class TranscriptCleanWorker(BaseWorker):
         cleaner = self.cleaner
         if cleaner is None or not cleaner.is_available:
             return
+
+        # WT-830 / WT-699 / TC3705. Revision 0 is unconditional — it is already on the wire above
+        # and costs nothing — but the paid LLM polish stops the moment billing_worker has refused
+        # a charge for this room, exactly the way translation_worker's `_credits_suspended` stops
+        # spending on translation and dubbing. This stage has no charge_type of its own yet (see
+        # `LLMCleaner._record_usage`), so it cannot be billed or blocked on ITS OWN spend — but a
+        # room billing has suspended cannot pay for more OpenAI calls of any kind, and this is the
+        # one key that already exists for that fact. Mirrored byte for byte from
+        # translation_worker.worker.TranslationWorker._credits_suspended, including failing OPEN
+        # on a Redis error: a blip here costs a few unbilled LLM polishes, never a paying room its
+        # clean transcript.
+        if await self._credits_suspended(meeting_id):
+            cleaner.record_skipped_call(REJECT_SKIPPED_CREDITS_SUSPENDED)
+            self.logger.info(
+                "transcript_clean_llm_skipped_credits_suspended", meeting_id=meeting_id
+            )
+            return
+
+        # WT-830. Skip the model when tier 1 already finished the line with nothing left to
+        # adjudicate — see `_worth_llm_call`. The setting exists so this predicate can be turned
+        # off in production, without a deploy, if it is ever found to have skipped a case it
+        # should not have.
+        if self.clean_settings.llm_only_when_uncertain and not _worth_llm_call(sentence):
+            cleaner.record_skipped_call(REJECT_SKIPPED_CONFIDENT)
+            return
+
         task = asyncio.create_task(
             self._refine(meeting_id, message, sentence, previous_line),
         )
         self._refine_tasks.add(task)
         task.add_done_callback(self._refine_tasks.discard)
+
+    async def _credits_suspended(self, room_id: str) -> bool:
+        """Whether billing_worker has stopped this room for a refused charge (WT-699 / TC3705).
+
+        Mirrors `translation_worker.worker.TranslationWorker._credits_suspended` exactly — same
+        key, same TTL discipline (billing_worker refreshes it, this worker only reads it), same
+        failure direction. Two readers of the same suspension flag with two different opinions
+        about what a Redis error means would be a worse bug than the one WT-830 exists to fix.
+
+        Fails OPEN on a Redis error: the charge itself is still refused by the settlement
+        function, so a blip here costs a few unbilled LLM calls, never a paying room its meeting.
+        """
+        try:
+            raw = await self.redis.get(f"translationRoom:{room_id}:ai_service_suspended")
+        except Exception:
+            return False
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return raw == "true"
 
     async def _refine(
         self,
@@ -332,6 +417,7 @@ class TranscriptCleanWorker(BaseWorker):
                 sentence.language,
                 prepass_text=sentence.prepass_text,
                 previous_line=previous_line,
+                meeting_id=meeting_id,
             )
         except asyncio.CancelledError:
             raise

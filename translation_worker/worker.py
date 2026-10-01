@@ -554,7 +554,7 @@ class TranslationWorker(BaseWorker):
         # WHAT GETS TRANSLATED IS THE CLEAN LINE, NOT THE RAW ONE (WT-716).
         #
         # `display_text` is `clean_text` when the STT worker's deterministic prepass produced
-        # one and the raw `text` otherwise, so a deployment with TRANSCRIPT_CLEAN_ENABLED off —
+        # one and the raw `text` otherwise, so a deployment with STT_CLEAN_PREPASS_ENABLED off —
         # or a message from a replica that predates the field — translates exactly what it
         # always did. Nothing here reads the flag: the presence of the field is the contract.
         #

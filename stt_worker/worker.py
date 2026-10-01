@@ -691,7 +691,7 @@ class STTWorker(BaseWorker):
     def _clean_enabled(self) -> bool:
         # getattr: the test suites build workers with __new__, so `settings` may not exist.
         settings = getattr(self, "settings", None)
-        return bool(getattr(settings, "transcript_clean_enabled", True))
+        return bool(getattr(settings, "stt_clean_prepass_enabled", True))
 
     def _with_clean_text(self, result: STTResultMessage) -> STTResultMessage:
         """`result` with the WT-716 clean-transcript fields filled in, or `result` unchanged.

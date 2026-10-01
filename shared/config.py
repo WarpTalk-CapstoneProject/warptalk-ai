@@ -134,9 +134,10 @@ class WorkerSettings(BaseSettings):
     #
     # WHY IT IS ON THE LIVE PATH AT ALL
     #   "um so we uh we need to finalize the budget" is what STT hears and what a subtitle,
-    #   a dub and a translation should NOT say. The prepass is pure CPU, rule-based and
-    #   sub-millisecond on a sentence, so it can sit in front of translation without costing
-    #   the meeting any latency — which the LLM tier (transcript_clean_worker) cannot.
+    #   a dub and a translation should NOT say. The prepass is pure CPU, rule-based, and measured
+    #   at about 1ms (en), 2ms (vi) and 5ms (ja) per segment on an M-series Mac, synchronously on
+    #   the STT event loop -- cheap enough to sit in front of translation without a meaningful
+    #   latency cost, which the LLM tier (transcript_clean_worker) cannot promise.
     #
     # WHY A KILL SWITCH
     #   The rules delete words. A rule that is wrong for some real room deletes the wrong
@@ -145,10 +146,19 @@ class WorkerSettings(BaseSettings):
     #   `display_text` == raw `text`, i.e. exactly what the pipeline did before WT-716 — no
     #   deploy of any other worker needed to get back there.
     #
-    # Env TRANSCRIPT_CLEAN_ENABLED. Read by the STT worker only (the producer); consumers key
+    # WHY THIS IS A SEPARATE SWITCH FROM TRANSCRIPT_CLEAN_ENABLED (WT-716 review)
+    #   That flag now governs only transcript_clean_worker's tier-2 view
+    #   (TranscriptCleanSettings.enabled): flipping it changes a stored `transcript:clean`
+    #   stream that nothing downstream of the room depends on for what gets said. This flag
+    #   changes what is TRANSLATED and DUBBED, live, for every listener in the room. An
+    #   operator has to be able to turn tier 2 off (e.g. to stop LLM spend) without silently
+    #   losing tier-1 cleaning on the live path, and vice versa -- one variable could not
+    #   express that.
+    #
+    # Env STT_CLEAN_PREPASS_ENABLED. Read by the STT worker only (the producer); consumers key
     # off the presence of the fields, never off this flag, so replicas that disagree during a
     # rollout cannot produce a message that means two things.
-    transcript_clean_enabled: bool = True
+    stt_clean_prepass_enabled: bool = True
 
     # Max only for uninterrupted speech; ordinary short turns still flush on VAD silence.
     # Six seconds gives the model enough lexical context for natural Vietnamese sentences

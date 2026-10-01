@@ -81,3 +81,17 @@ class TranscriptCleanSettings(BaseSettings):
     # Bound on concurrent LLM calls in flight for this worker. The calls are independent and
     # nothing waits on them, so this is a spend/rate-limit bound rather than an ordering one.
     llm_concurrency: int = 4
+
+    # WT-830. Every sentence used to reach the model, even one tier 1 was fully confident about
+    # front to back ("we should ship it today" -- nothing removed, nothing escalated). That is a
+    # call spent adjudicating a question nobody asked: `escalate` is tier 1's own signal that it
+    # left something in place it could not resolve on a lexicon alone (a self-repair candidate,
+    # a discourse marker in a suspicious position, an unlisted repeat, an invariant violation that
+    # forced a fall back to raw text) -- see `shared.disfluency.prepass` and
+    # `transcript_clean_worker.worker._worth_llm_call`. ON by default because the saving costs
+    # nothing this stage was built to protect: revision 0 already stands on its own, and the two
+    # cases the LLM tier exists for ("Monday, I mean Tuesday", "họp thứ hai, à không, thứ ba")
+    # both escalate, so both still reach the model with this flag on. An env var, not a constant,
+    # so the predicate can be turned off in production without a deploy if it is ever found to
+    # skip a case it should not have.
+    llm_only_when_uncertain: bool = True
