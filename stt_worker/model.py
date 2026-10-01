@@ -1425,6 +1425,7 @@ class OpenAISTT:
         streamed_epoch: int | None = None,
         recent_dub_texts: Sequence[str] | None = None,
         speech_ms: int = 0,
+        on_committed: Callable[[], Awaitable[None]] | None = None,
     ) -> list[TranscribedSegment]:
         """Transcribe raw audio bytes via the OpenAI Realtime API.
 
@@ -1574,6 +1575,7 @@ class OpenAISTT:
                 exclude_emitted_from_final=exclude_emitted_from_final,
                 noise_reduction=noise_reduction,
                 streamed_epoch=streamed_epoch,
+                on_committed=on_committed,
             )
         except Exception as first_error:
             # A capability the API rejected ASYNCHRONOUSLY has to be learned here, because the
@@ -1798,6 +1800,7 @@ class OpenAISTT:
         noise_reduction: str | None = None,
         exclude_emitted_from_final: bool = True,
         streamed_epoch: int | None = None,
+        on_committed: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[str, float]:
         session = await self._get_or_create_session(
             key,
@@ -1838,6 +1841,11 @@ class OpenAISTT:
 
         await conn.input_audio_buffer.commit()
         session["last_used"] = time.monotonic()
+        if on_committed is not None:
+            # The buffer this commit took is gone; the session's next buffer belongs to the next
+            # turn, and whatever audio of it the caller has been holding can go in now. Its
+            # deltas carry another item id, which _collect below keeps aside for that turn.
+            await on_committed()
 
         # DELTAS BELONG TO AN ITEM, AND NOT EVERY ITEM ON THIS SOCKET IS THIS COMMIT'S.
         #

@@ -142,6 +142,11 @@ _CLEAN_ERROR_LOG_INTERVAL_S = 60.0
 # its own. Matches the horizon the other per-room keys use.
 _TRANSCRIPT_ANCHOR_TTL_S = 6 * 60 * 60
 _CONTEXT_MIN_CONFIDENCE = -0.35
+# How many of a speaker's next-turn frames may wait for their previous chunk's commit to be SENT
+# (see STTWorker._append_speech_frame): ~10 s of 96 ms frames. A commit is sent within
+# milliseconds of its chunk being read, so this bound is only ever reached by a chunk stuck
+# behind something broken, and then the turn simply falls back to its own audio.
+_MAX_HELD_FRAMES = 100
 
 
 def _language_hint_for_stt(language: str) -> str | None:
@@ -355,6 +360,79 @@ class STTWorker(BaseWorker):
             return
 
         key = (frame.meeting_id, frame.speaker_id)
+        # THE SPEAKER'S PREVIOUS CHUNK IS BEING TRANSCRIBED. This frame is the opening of their
+        # next turn, and it used to be thrown away together with the rest of that turn
+        # (`commit_in_flight` — 99 of 205 chunks in tools/meeting_sim's product-launch meeting),
+        # so the next chunk had to be uploaded whole at its commit and decoded from scratch:
+        # the latency flash mode exists to remove, paid on every other sentence of a
+        # conversation. Worse, while that chunk was still before its commit, the new turn's
+        # frame cleared the buffer that held it (`previous_turn_never_committed`).
+        #
+        # Appending now would put it inside the commit about to be sent. So it is HELD, in
+        # order, and handed to the session the moment that commit has been sent — into the
+        # fresh buffer the commit leaves behind (see _release_held_frames). The commit's own
+        # transcript is unaffected: it reads only its own item (OpenAISTT._transcribe_via_session).
+        lock = self._speaker_locks.setdefault(key, asyncio.Lock())
+        mode = self._frame_modes().get(key)
+        if lock.locked() and mode != "direct":
+            held = self._held_frames().setdefault(key, [])
+            if len(held) < _MAX_HELD_FRAMES:
+                held.append(frame)
+                return
+            # A commit not even SENT after this long is not a commit in flight: stop holding, and
+            # let the next chunk carry its own audio as it always could.
+            held.clear()
+            self.logger.info("stt_held_frames_overflow", meeting_id=key[0], speaker_id=key[1])
+        await self._append_frame(frame, locked_by_commit=mode == "direct")
+
+    def _frame_modes(self) -> dict[tuple[str, str], str]:
+        modes: dict[tuple[str, str], str] | None = getattr(self, "_frame_mode", None)
+        if modes is None:
+            modes = {}
+            self._frame_mode = modes
+        return modes
+
+    def _held_frames(self) -> dict[tuple[str, str], list[AudioFrameMessage]]:
+        held: dict[tuple[str, str], list[AudioFrameMessage]] | None = getattr(
+            self, "_held_frame_lists", None
+        )
+        if held is None:
+            held = {}
+            self._held_frame_lists = held
+        return held
+
+    async def _release_held_frames(self, key: tuple[str, str]) -> None:
+        """The commit in flight has been SENT: the session's buffer is empty and belongs to the
+        next turn. Hand it the frames held meanwhile, in order, then let new ones straight in.
+
+        Called from inside the commit (OpenAISTT's `on_committed`) while `process` still holds
+        this speaker's lock. Frames that land during the hand-over join the queue rather than
+        overtaking it: the mode only turns "direct" once the queue is empty, with no await in
+        between.
+        """
+        modes = self._frame_modes()
+        modes[key] = "draining"
+        held = self._held_frames().get(key, [])
+        while held:
+            await self._append_frame(held.pop(0), locked_by_commit=True)
+        modes[key] = "direct"
+
+    def _end_commit_window(self, key: tuple[str, str]) -> None:
+        """`process` is done with this speaker. Frames still held were never handed over — the
+        chunk ended before its commit was sent — so they start no clean turn: dropped, and the
+        rest of that turn falls back to its own chunk's audio (the `frame_gap` path)."""
+        self._frame_modes().pop(key, None)
+        held = self._held_frames().pop(key, None)
+        if held:
+            self.logger.info(
+                "stt_held_frames_dropped_no_commit",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                frames=len(held),
+            )
+
+    async def _append_frame(self, frame: AudioFrameMessage, *, locked_by_commit: bool) -> None:
+        key = (frame.meeting_id, frame.speaker_id)
         streaming: dict[tuple[str, str], tuple[str, int, int]] | None = getattr(
             self, "_streamed_turns", None
         )
@@ -447,23 +525,25 @@ class STTWorker(BaseWorker):
             await abandon("frame_gap", expected_seq=expected_seq, got_seq=frame.seq)
             return
 
-        # A COMMIT FOR THIS SPEAKER IS IN FLIGHT. `_consume_loop`'s own docstring says why this
-        # lock exists: two things using one reused WebSocket session at once interleave the
-        # transcription stream. Appending mid-commit would put this frame — which belongs to the
-        # NEXT turn — inside the one being committed.
-        #
-        # Skipped rather than awaited: this loop serves every speaker in every room, and blocking
-        # it behind one speaker's commit (bounded by TRANSCRIBE_EVENT_TIMEOUT_S = 15s) would stall
-        # the frames of all the others.
+        # A COMMIT FOR THIS SPEAKER IS IN FLIGHT and has not been sent: this frame must not go
+        # into the buffer that commit is about to take. _append_speech_frame holds such frames;
+        # reaching here with the lock taken means either the commit HAS been sent
+        # (`locked_by_commit`: the buffer is the next turn's) or holding overflowed, in which case
+        # this turn falls back to its own chunk's audio, as it always did.
         lock = self._speaker_locks.setdefault(key, asyncio.Lock())
-        if lock.locked():
+        if lock.locked() and not locked_by_commit:
             await abandon("commit_in_flight")
             return
 
-        async with lock:
+        if locked_by_commit:
             epoch = await self._require_model().append_streamed_audio(
                 key, frame.audio_data, frame.sample_rate
             )
+        else:
+            async with lock:
+                epoch = await self._require_model().append_streamed_audio(
+                    key, frame.audio_data, frame.sample_rate
+                )
         if epoch is None:
             # No session yet (the prewarm has not opened one), or the append was refused.
             # Either way this turn is no longer whole.
@@ -817,6 +897,14 @@ class STTWorker(BaseWorker):
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Process one audio chunk: transcribe and publish results."""
+        try:
+            await self._process_chunk(message_id, data)
+        finally:
+            # Whatever path the chunk took, the window in which this speaker's next frames were
+            # held or sent straight in closes with it (see _append_speech_frame).
+            self._end_commit_window(_extract_speaker_key(data))
+
+    async def _process_chunk(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         chunk = AudioChunkMessage.from_redis(data)
 
         if not await self._room_state_allows_stt(chunk.meeting_id):
@@ -1094,6 +1182,10 @@ class STTWorker(BaseWorker):
                 # and hangover padding every chunk carries, which is enough to make the
                 # "too much text for this little audio" guard unable to fire at all.
                 speech_ms=chunk.speech_ms,
+                # The moment the commit has been SENT, the next turn's held frames go in.
+                on_committed=lambda: self._release_held_frames(
+                    (chunk.meeting_id, chunk.speaker_id)
+                ),
             )
         except Exception as exc:
             # Swallowed so the meeting keeps going, which is exactly why it must be counted:

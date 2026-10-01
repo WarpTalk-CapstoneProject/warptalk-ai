@@ -274,7 +274,10 @@ async def test_a_gap_in_the_sequence_stops_the_turn_being_trusted() -> None:
 async def test_a_frame_arriving_during_a_commit_is_not_appended() -> None:
     """_consume_loop's own docstring: two things using one reused WebSocket session at once
     interleave the transcription stream. A frame appended mid-commit belongs to the NEXT turn
-    and would land inside the one being committed."""
+    and would land inside the one being committed.
+
+    It is HELD rather than thrown away (with the rest of its turn, as it used to be): see
+    tests/test_stt_next_turn_streams_during_commit.py for what happens to it next."""
     import asyncio as _asyncio
 
     model = _Model()
@@ -290,7 +293,7 @@ async def test_a_frame_arriving_during_a_commit_is_not_appended() -> None:
         lock.release()
 
     assert len(model.appended) == appended_before, "nothing was appended mid-commit"
-    assert worker._streamed_turns == {}, "and the turn is no longer trusted"
+    assert [f.seq for f in worker._held_frames()[(MEETING, SPEAKER)]] == [1], "it waits instead"
     assert isinstance(lock, _asyncio.Lock)
 
 
