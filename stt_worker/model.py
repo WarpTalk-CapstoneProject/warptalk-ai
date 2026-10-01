@@ -766,6 +766,29 @@ def _is_keyword_enumeration_echo(text: str, keywords: list[str] | None) -> bool:
     return matched >= _MIN_KEYWORD_ECHO_TERMS and matched / len(items) >= _MIN_KEYWORD_ECHO_RATIO
 
 
+def _after_flushed_prefix(final_text: str, flushed: str) -> str | None:
+    """What `final_text` says after the sentences already flushed early, or None when those
+    sentences are not its prefix.
+
+    BLIND TO WHITESPACE, AND ONLY TO WHITESPACE. Early sentences are re-joined with a space,
+    and the completed transcript does not always have one there: Japanese puts none between
+    sentences (flushed `すみません。 それは…`, completed `すみません。それは…`), and a number
+    the sentence splitter cut at each period comes back whole (flushed `0. 2. 27`, completed
+    `0.2.27`). A plain startswith() called those a revision, and the answer to a revision is
+    to drop the rest of the turn: `それともミンさんがその場で…` and every word after it, lost
+    in tools/meeting_sim on the same item where deltas and final agreed character for
+    character. Any difference other than whitespace is still a revision.
+    """
+    i = 0
+    for ch in "".join(flushed.split()):
+        while i < len(final_text) and final_text[i].isspace():
+            i += 1
+        if i >= len(final_text) or final_text[i] != ch:
+            return None
+        i += 1
+    return final_text[i:].strip()
+
+
 def _normalize_overheard_text(text: str) -> str:
     """One spelling for comparing what STT heard against what the room's TTS was told to say.
 
@@ -1896,8 +1919,9 @@ class OpenAISTT:
                     flushed_stripped = flushed.strip()
                     if not flushed_stripped:
                         return final_text, avg_logprob
-                    if final_text.startswith(flushed_stripped):
-                        return final_text[len(flushed_stripped) :].strip(), avg_logprob
+                    rest = _after_flushed_prefix(final_text, flushed_stripped)
+                    if rest is not None:
+                        return rest, avg_logprob
                     # Model revised something inside the already-flushed prefix — we
                     # can't safely recompute the diff (would risk re-publishing text
                     # that was already billed/translated). Drop the trailing part
