@@ -29,6 +29,7 @@ from shared.integration_status import (
     IntegrationReport,
     publish_integration_status,
 )
+from shared.lang import is_same_language
 from shared.logger import get_logger
 from shared.platform_settings import PlatformSettings, reader_for
 from shared.provider_calls import bind_provider_calls
@@ -586,6 +587,41 @@ class BaseWorker(ABC):
                     score = None
             return str(voice_id), score
         return None, None
+
+    def is_text_only_dub(self, room_id: str, speaker_user_id: str, target_lang: str) -> bool:
+        """Whether a dub of this speaker into `target_lang` would be played into nothing.
+
+        TEXT-ONLY GOOGLE MEET BRIDGE (PO 2026-10-01)
+            A bridge participant in text-only mode sits in the Meet call with their REAL mic and
+            speakers. Their dub into the far side's language exists only to be played into Meet
+            through a virtual cable, and there is no cable — Meet already hears their own voice.
+            The backend marks exactly those routes (speaker -> far-side stand-in) `TextOnly`.
+
+        PER ROUTE, AND ONLY WHEN EVERY ROUTE AGREES
+            tts_worker renders one track per (speaker, target language) and every listener in
+            that language shares it. So the dub is skipped only when ALL of this speaker's routes
+            into this language are text-only: another WarpTalk participant who listens in the far
+            side's language still needs the track. The room-level TEXT_ONLY_MODE status is not
+            used for this — it would also silence the inbound side and every other speaker.
+
+        Fails open (False -> synthesize) on an unknown room, a speaker with no route into this
+        language, or a backend that does not send the field yet: a wrong False costs credits, a
+        wrong True silences someone whose cable is there.
+        """
+        matching = [
+            route
+            for route in self._room_routes.get(room_id, [])
+            if str(route.get("SourceUserId") or "").lower() == speaker_user_id.lower()
+            and is_same_language(str(route.get("TargetLanguage") or ""), target_lang)
+        ]
+        return bool(matching) and all(route.get("TextOnly") is True for route in matching)
+
+    async def text_only_dub_for(self, room_id: str, speaker_user_id: str, target_lang: str) -> bool:
+        """`is_text_only_dub`, recovering the route snapshot first when this worker has never been
+        told about the room (it restarted mid-meeting; pub/sub has no replay)."""
+        if room_id not in self._room_routes:
+            await self._load_route_snapshot(room_id)
+        return self.is_text_only_dub(room_id, speaker_user_id, target_lang)
 
     async def voice_clone_consent_state(
         self, room_id: str, speaker_user_id: str

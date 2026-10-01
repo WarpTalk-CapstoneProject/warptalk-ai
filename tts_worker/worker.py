@@ -1099,7 +1099,23 @@ class TTSWorker(BaseWorker):
                 )
             return
 
-        if route_status == "TEXT_ONLY_MODE" or not text.strip():
+        # Text-only Google Meet bridge: the speaker is in Meet with their real mic, so their dub
+        # into the far side's language has no cable to be played into. Skipped per route (see
+        # BaseWorker.is_text_only_dub), never room-wide — the inbound side and every other
+        # speaker keep their dub. Same bookkeeping as the empty-text skip below.
+        text_only_dub = bool(text.strip()) and await self.text_only_dub_for(
+            translation.meeting_id, translation.speaker_id, translation.target_lang
+        )
+        if text_only_dub:
+            self.logger.info(
+                "text_only_bridge_synthesis_skipped",
+                meeting_id=translation.meeting_id,
+                speaker_id=translation.speaker_id,
+                segment_id=translation.segment_id,
+                lang=translation.target_lang,
+            )
+
+        if route_status == "TEXT_ONLY_MODE" or text_only_dub or not text.strip():
             if translation.is_final_chunk:
                 await self.redis.publish_system_event(
                     room_id=translation.meeting_id,
