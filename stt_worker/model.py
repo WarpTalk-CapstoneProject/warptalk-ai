@@ -853,8 +853,15 @@ def _matches_recent_dub(
             continue
         if len(normalized_text) >= _DUB_ECHO_MIN_EXACT_CHARS and normalized_text == dub_text:
             return True
+        # The floor applies to BOTH sides of the containment. With it on the segment alone, a
+        # one-word dub line vetoed every longer sentence that merely contained it as a
+        # substring: tools/meeting_sim lost "Tám con cùng giành một đống backlog, con nào cũng
+        # OOM. 5xx lên cao nhất là đúng lúc đó." — 19 words of a Vietnamese speaker's own
+        # speech — because the room had dubbed "Right." as "Đúng." 20 s earlier; the opening
+        # of another sentence went the same way to a one-word dub, "Mà".
         if len(normalized_text) >= _DUB_ECHO_MIN_PARTIAL_CHARS and (
-            normalized_text in dub_text or dub_text in normalized_text
+            normalized_text in dub_text
+            or (len(dub_text) >= _DUB_ECHO_MIN_PARTIAL_CHARS and dub_text in normalized_text)
         ):
             return True
         if (
