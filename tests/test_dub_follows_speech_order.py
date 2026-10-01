@@ -5,7 +5,7 @@ it used to publish each one the moment its own translation landed. So a long A s
 short B lost the race, B reached tts:results first, and tts_worker (strictly FIFO per speaker and
 language) spoke B before A. The owner heard this as "if A has not been dubbed when B is, A is lost".
 
-These tests drive the worker's real consume loop and the real consume_concurrent dispatch. Only
+These tests drive the worker's real consume loop and the real consume_pipelined dispatch. Only
 the model call and Redis are faked.
 """
 

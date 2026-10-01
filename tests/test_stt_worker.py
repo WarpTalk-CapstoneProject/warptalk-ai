@@ -2117,14 +2117,14 @@ class TestConsumeLoopConcurrency:
 
         worker.process = fake_process
 
-        async def fake_consume_concurrent(*, handler, **kwargs):
+        async def fake_consume_pipelined(*, handler, **kwargs):
             await asyncio.gather(
                 handler(b"msg-1", {"meeting_id": "m1", "speaker_id": "speaker-A"}),
                 handler(b"msg-2", {"meeting_id": "m1", "speaker_id": "speaker-B"}),
             )
             worker._shutdown_event.set()
 
-        worker.redis.consume_concurrent = fake_consume_concurrent
+        worker.redis.consume_pipelined = fake_consume_pipelined
 
         await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
 
@@ -2143,14 +2143,14 @@ class TestConsumeLoopConcurrency:
 
         worker.process = fake_process
 
-        async def fake_consume_concurrent(*, handler, **kwargs):
+        async def fake_consume_pipelined(*, handler, **kwargs):
             await asyncio.gather(
                 handler(b"msg-1", {"meeting_id": "m1", "speaker_id": "speaker-A"}),
                 handler(b"msg-2", {"meeting_id": "m1", "speaker_id": "speaker-A"}),
             )
             worker._shutdown_event.set()
 
-        worker.redis.consume_concurrent = fake_consume_concurrent
+        worker.redis.consume_pipelined = fake_consume_pipelined
 
         await asyncio.wait_for(worker._consume_loop(), timeout=2.0)
 
