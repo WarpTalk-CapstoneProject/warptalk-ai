@@ -229,6 +229,42 @@ def _is_ai_bot_identity(identity: str) -> bool:
     return identity.startswith(_AI_BOT_IDENTITY_PREFIXES)
 
 
+# WT-631 — the declared track sources that mean "a person talking into this".
+#
+# An allow-list on the source the publisher DECLARED, not a blocklist of the sources seen so
+# far: a blocklist is only as current as the last producer somebody remembered.
+#
+# SOURCE_UNKNOWN is on it deliberately, and it is not a hole. It is the external bridge:
+# warptalk-web's bridge-inbound-connection.ts publishes the far side of a Google Meet call as
+# `publishTrack(new LocalAudioTrack(...))` with no `source`, which LiveKit records as unknown.
+# A strict microphone-only rule would deafen the bridge — the far side would talk for a whole
+# meeting and never produce one line of transcript, with nothing logged to say why. What has
+# to be strict is refusing a source the publisher explicitly says is NOT a microphone.
+_SPEECH_TRACK_SOURCES = frozenset(
+    {
+        rtc.TrackSource.SOURCE_MICROPHONE,
+        rtc.TrackSource.SOURCE_UNKNOWN,
+    }
+)
+
+
+def _carries_speech(publication: rtc.TrackPublication) -> bool:
+    """Whether this audio publication is somebody talking, as opposed to something playing.
+
+    WT-631 — reported as "the native meeting may transcribe audio from other browser tabs".
+    This worker attached a reader to every human audio track it could see and asked only
+    whether the kind was audio, so anything a participant PLAYED became that participant's
+    speech: a screen share's audio, a shared browser tab. STT transcribed it, translation
+    translated it, TTS dubbed it in their voice and billing charged for all three, attributed to
+    somebody who had not said a word.
+
+    It also cost them their real voice. Readers are keyed per (room, participant), so a screen
+    share's audio subscribed after the microphone REPLACED the microphone's reader as a "stale"
+    track, and muting the share's audio cancelled the microphone's reader until the next sweep.
+    """
+    return publication.source in _SPEECH_TRACK_SOURCES
+
+
 def _is_rate_limited_error(error: BaseException) -> bool:
     """Whether LiveKit refused this connect because we are being rate-limited.
 
@@ -911,6 +947,11 @@ class LiveKitIngressWorker(BaseWorker):
                 # muted one, and the hallucinations resume one sweep later.
                 if pub.muted:
                     continue
+                # WT-631. The sweep re-attaches anything without a live reader, so leaving the
+                # source check out here would quietly undo the one on_track_subscribed makes,
+                # one sweep later — the same shape as the WT-542 mute bug directly above.
+                if not _carries_speech(pub):
+                    continue
                 self._remember_speaker_name(room_name, participant)
                 if self._start_audio_task(room_name, participant.identity, track):
                     self.logger.info(
@@ -1352,6 +1393,19 @@ class LiveKitIngressWorker(BaseWorker):
                         track=track.sid,
                     )
                     return
+                if not _carries_speech(publication):
+                    # WT-631. A screen share's audio, a shared tab — audio the participant is
+                    # PLAYING, not speech they are producing. Read as speech it is transcribed,
+                    # translated, dubbed and billed under their name, and it replaces the reader
+                    # on their real microphone. Logged once here, not on every sweep.
+                    self.logger.info(
+                        "audio_track_ignored_not_speech",
+                        room=room_name,
+                        participant=participant.identity,
+                        track=track.sid,
+                        source=int(publication.source),
+                    )
+                    return
                 self.logger.info(
                     "audio_track_subscribed", participant=participant.identity, track=track.sid
                 )
@@ -1381,6 +1435,11 @@ class LiveKitIngressWorker(BaseWorker):
                 participant.identity
             ):
                 return
+            # WT-631. Readers are keyed per participant, not per track, so without this the
+            # participant pausing their screen share's audio would stop the reader on their
+            # MICROPHONE — a track that is still live and still unmuted.
+            if not _carries_speech(publication):
+                return
             if self._cancel_audio_task(room_name, participant.identity):
                 self.logger.info(
                     "audio_reader_stopped_on_mute",
@@ -1407,6 +1466,9 @@ class LiveKitIngressWorker(BaseWorker):
                 return
             track = publication.track
             if track is None:
+                return
+            # WT-631. Unmuting a screen share's audio is still not somebody speaking.
+            if not _carries_speech(publication):
                 return
             if self._start_audio_task(room_name, participant.identity, track):
                 self.logger.info(

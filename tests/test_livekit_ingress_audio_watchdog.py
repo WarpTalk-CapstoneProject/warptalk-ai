@@ -52,6 +52,8 @@ def _audio_track(sid: str = "TR_audio_1") -> MagicMock:
 
 
 def _room_with_speaker(track: MagicMock | None, identity: str = SPEAKER) -> MagicMock:
+    import livekit.rtc as rtc
+
     participant = MagicMock()
     participant.identity = identity
     publication = MagicMock()
@@ -60,6 +62,9 @@ def _room_with_speaker(track: MagicMock | None, identity: str = SPEAKER) -> Magi
     # sweep skip muted publications — so an unset `muted` would silently mean "muted" here and
     # this test would assert the watchdog is broken.
     publication.muted = False
+    # Same reason as `muted`, for WT-631's source check: an auto-attribute matches no
+    # TrackSource, so leaving it unset would mean "not speech" and the watchdog would look broken.
+    publication.source = rtc.TrackSource.SOURCE_MICROPHONE
     participant.track_publications = {"pub-1": publication}
 
     room = MagicMock()
