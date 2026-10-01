@@ -142,6 +142,11 @@ _CLEAN_ERROR_LOG_INTERVAL_S = 60.0
 # its own. Matches the horizon the other per-room keys use.
 _TRANSCRIPT_ANCHOR_TTL_S = 6 * 60 * 60
 _CONTEXT_MIN_CONFIDENCE = -0.35
+# How long a speaker's next-turn frames may wait for their previous item to COMPLETE (see
+# STTWorker._append_speech_frame). commit -> completed is ~0.85 s at p50 and under 2.2 s at p99
+# in the meeting simulator; past this the turn falls back to its own chunk's audio, so a lost
+# completion can never stall a speaker.
+_HOLD_FOR_COMPLETION_S = 3.0
 
 
 def _language_hint_for_stt(language: str) -> str | None:
@@ -196,6 +201,10 @@ class STTWorker(BaseWorker):
     worker_name = "stt"
     input_stream = "audio:chunks"
     consumer_group = "stt-workers"
+    # Chunks dispatched and not yet finished. Most of them, at any moment, are simply waiting
+    # for their own speaker's previous commit; the bound is on unacknowledged work, not on
+    # transcription concurrency (which is one commit per speaker by construction).
+    _MAX_IN_FLIGHT = 32
 
     def __init__(
         self,
@@ -355,6 +364,112 @@ class STTWorker(BaseWorker):
             return
 
         key = (frame.meeting_id, frame.speaker_id)
+        # THE SPEAKER'S PREVIOUS CHUNK IS BEING TRANSCRIBED. This frame is the opening of their
+        # next turn, and it used to be thrown away together with the rest of that turn
+        # (`commit_in_flight` — 99 of 205 chunks in tools/meeting_sim's product-launch meeting),
+        # so the next chunk had to be uploaded whole at its commit and decoded from scratch:
+        # the latency flash mode exists to remove, paid on every other sentence of a
+        # conversation. Worse, while that chunk was still before its commit, the new turn's
+        # frame cleared the buffer that held it (`previous_turn_never_committed`).
+        #
+        # Appending now would put it inside the commit about to be sent. So it is HELD, in
+        # order, and handed to the session the moment the committed item has COMPLETED — into
+        # the fresh buffer the commit left behind (see _release_held_frames), for at most
+        # _HOLD_FOR_COMPLETION_S. The commit's own transcript is unaffected: it reads only its
+        # own item (OpenAISTT._transcribe_via_session).
+        lock = self._speaker_locks.setdefault(key, asyncio.Lock())
+        mode = self._frame_modes().get(key)
+        if lock.locked() and mode != "direct":
+            if mode == "gave_up":
+                # This turn already waited out the bound below and fell back to its own chunk.
+                return
+            held = self._held_frames().setdefault(key, [])
+            since = self._held_since().setdefault(key, time.monotonic())
+            if time.monotonic() - since <= _HOLD_FOR_COMPLETION_S:
+                held.append(frame)
+                return
+            # BOUNDED. The previous item has not completed in this long — a lost completion must
+            # never stall a speaker. Stop holding: this turn goes the way every turn went before
+            # (its chunk carries its own audio and is uploaded whole at commit), and its remaining
+            # frames are dropped as a closed turn's would be.
+            dropped = len(held)
+            held.clear()
+            self._frame_modes()[key] = "gave_up"
+            self._close_turn(key, frame.turn_id)
+            self.logger.info(
+                "stt_held_frames_timed_out",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                frames=dropped + 1,
+                waited_ms=int((time.monotonic() - since) * 1000),
+            )
+            return
+        await self._append_frame(frame, locked_by_commit=mode == "direct")
+
+    def _held_since(self) -> dict[tuple[str, str], float]:
+        since: dict[tuple[str, str], float] | None = getattr(self, "_held_since_by_key", None)
+        if since is None:
+            since = {}
+            self._held_since_by_key = since
+        return since
+
+    def _frame_modes(self) -> dict[tuple[str, str], str]:
+        modes: dict[tuple[str, str], str] | None = getattr(self, "_frame_mode", None)
+        if modes is None:
+            modes = {}
+            self._frame_mode = modes
+        return modes
+
+    def _held_frames(self) -> dict[tuple[str, str], list[AudioFrameMessage]]:
+        held: dict[tuple[str, str], list[AudioFrameMessage]] | None = getattr(
+            self, "_held_frame_lists", None
+        )
+        if held is None:
+            held = {}
+            self._held_frame_lists = held
+        return held
+
+    async def _release_held_frames(self, key: tuple[str, str]) -> None:
+        """The previous item has COMPLETED: hand the session the next turn's frames held
+        meanwhile, in order, then let new ones straight in.
+
+        After completion, not merely after the commit was sent. The meeting simulator caught
+        gpt-live-transcribe stalling a committed item for 12 s — and returning it truncated —
+        when the next turn's audio was appended while that item was still being transcribed.
+        Waiting for `completed` costs the held audio ~0.85 s (commit -> completed, p50) of
+        streaming, which the live model then catches up on in one burst.
+
+        Called by `process` while it still holds this speaker's lock. Frames that land during
+        the hand-over join the queue rather than overtaking it: the mode only turns "direct"
+        once the queue is empty, with no await in between.
+        """
+        modes = self._frame_modes()
+        if modes.get(key) == "gave_up":
+            return
+        modes[key] = "draining"
+        held = self._held_frames().get(key, [])
+        while held:
+            await self._append_frame(held.pop(0), locked_by_commit=True)
+        modes[key] = "direct"
+
+    def _end_commit_window(self, key: tuple[str, str]) -> None:
+        """`process` is done with this speaker. Frames still held were never handed over — the
+        chunk ended without its item completing (no commit was sent, or the transcription
+        failed) — so they start no clean turn: dropped, and the rest of that turn falls back to
+        its own chunk's audio (the `frame_gap` path)."""
+        self._frame_modes().pop(key, None)
+        self._held_since().pop(key, None)
+        held = self._held_frames().pop(key, None)
+        if held:
+            self.logger.info(
+                "stt_held_frames_dropped_no_commit",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                frames=len(held),
+            )
+
+    async def _append_frame(self, frame: AudioFrameMessage, *, locked_by_commit: bool) -> None:
+        key = (frame.meeting_id, frame.speaker_id)
         streaming: dict[tuple[str, str], tuple[str, int, int]] | None = getattr(
             self, "_streamed_turns", None
         )
@@ -447,23 +562,25 @@ class STTWorker(BaseWorker):
             await abandon("frame_gap", expected_seq=expected_seq, got_seq=frame.seq)
             return
 
-        # A COMMIT FOR THIS SPEAKER IS IN FLIGHT. `_consume_loop`'s own docstring says why this
-        # lock exists: two things using one reused WebSocket session at once interleave the
-        # transcription stream. Appending mid-commit would put this frame — which belongs to the
-        # NEXT turn — inside the one being committed.
-        #
-        # Skipped rather than awaited: this loop serves every speaker in every room, and blocking
-        # it behind one speaker's commit (bounded by TRANSCRIBE_EVENT_TIMEOUT_S = 15s) would stall
-        # the frames of all the others.
+        # A COMMIT FOR THIS SPEAKER IS IN FLIGHT: this frame must not go into the buffer that
+        # commit is about to take. _append_speech_frame holds such frames; reaching here with the
+        # lock taken means either the committed item HAS completed (`locked_by_commit`: the
+        # buffer is the next turn's), or the frame was not held, in which case this turn falls
+        # back to its own chunk's audio, as it always did.
         lock = self._speaker_locks.setdefault(key, asyncio.Lock())
-        if lock.locked():
+        if lock.locked() and not locked_by_commit:
             await abandon("commit_in_flight")
             return
 
-        async with lock:
+        if locked_by_commit:
             epoch = await self._require_model().append_streamed_audio(
                 key, frame.audio_data, frame.sample_rate
             )
+        else:
+            async with lock:
+                epoch = await self._require_model().append_streamed_audio(
+                    key, frame.audio_data, frame.sample_rate
+                )
         if epoch is None:
             # No session yet (the prewarm has not opened one), or the append was refused.
             # Either way this turn is no longer whole.
@@ -607,7 +724,7 @@ class STTWorker(BaseWorker):
         session concurrently would interleave the transcription stream. Locking keeps
         that path exactly as ordered as before; only cross-speaker work is now parallel.
 
-        RedisStreamClient.consume_concurrent ties XACK to successful handler
+        RedisStreamClient.consume_pipelined ties XACK to successful handler
         completion. Failed work remains pending for BaseWorker's reclaim/DLQ path.
         """
         self.logger.info(
@@ -617,29 +734,58 @@ class STTWorker(BaseWorker):
             consumer=self._consumer_name,
         )
 
-        async def _run(message_id: bytes, data: dict[bytes, bytes]) -> None:
-            key = _extract_speaker_key(data)
-            lock = self._speaker_locks.setdefault(key, asyncio.Lock())
-            async with lock:
-                await self._process_and_log_errors(message_id, data)
-
+        # READS WHILE A SPEAKER IS BUSY (see RedisStreamClient.consume_pipelined). This read a
+        # batch and waited for EVERY chunk in it before reading again, so one slow commit held up
+        # every other speaker's chunk that arrived after the batch was read. Measured in
+        # tools/meeting_sim: a backchannel's commit that took 7.1s kept the next speaker's chunk
+        # unread for 7s, and while it waited that speaker's next turn started streaming, found the
+        # previous turn still uncommitted and threw its buffer away
+        # (`previous_turn_never_committed`) — so the queued chunk then had to be re-sent and
+        # transcribed from scratch, slower again. Different speakers share nothing here; only
+        # the per-speaker lock below orders anything, and it is taken in stream order.
         while not self._shutdown_event.is_set():
             try:
-                await self._recover_stale_messages()
-                await self.redis.consume_concurrent(
+                await self.redis.consume_pipelined(
                     stream=self.input_stream,
                     group=self.consumer_group,
-                    handler=_run,
+                    handler=self._run_in_speaker_order,
+                    keep_running=lambda: not self._shutdown_event.is_set(),
                     consumer=self._consumer_name,
                     block_ms=2000,
                     count=8,
-                    concurrency=8,
+                    max_in_flight=self._MAX_IN_FLIGHT,
+                    in_flight_ids=self._in_flight_message_ids(),
+                    between_reads=self._recover_stale_messages,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger.exception("consume_loop_error")
                 await asyncio.sleep(1.0)
+
+    async def _run_in_speaker_order(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        key = _extract_speaker_key(data)
+        lock = self._speaker_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            await self._process_and_log_errors(message_id, data)
+
+    def _in_flight_message_ids(self) -> set[bytes]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        ids: set[bytes] | None = getattr(self, "_in_flight_ids", None)
+        if ids is None:
+            ids = set()
+            self._in_flight_ids = ids
+        return ids
+
+    def _is_in_flight(self, message_id: bytes) -> bool:
+        # A chunk queued behind its own speaker's commit is pending in Redis exactly like an
+        # abandoned one; the reclaim pass must not run it a second time.
+        return message_id in self._in_flight_message_ids()
+
+    async def _process_reclaimed(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        # Through the speaker's lock like any other chunk: two commits on one speaker's session
+        # at once would interleave its transcription stream.
+        await self._run_in_speaker_order(message_id, data)
 
     def _cleanup_room(self, room_id: str) -> None:
         super()._cleanup_room(room_id)
@@ -817,6 +963,14 @@ class STTWorker(BaseWorker):
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Process one audio chunk: transcribe and publish results."""
+        try:
+            await self._process_chunk(message_id, data)
+        finally:
+            # Whatever path the chunk took, the window in which this speaker's next frames were
+            # held or sent straight in closes with it (see _append_speech_frame).
+            self._end_commit_window(_extract_speaker_key(data))
+
+    async def _process_chunk(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         chunk = AudioChunkMessage.from_redis(data)
 
         if not await self._room_state_allows_stt(chunk.meeting_id):
@@ -1095,6 +1249,8 @@ class STTWorker(BaseWorker):
                 # "too much text for this little audio" guard unable to fire at all.
                 speech_ms=chunk.speech_ms,
             )
+            # The item is complete: the next turn's held frames can go in now.
+            await self._release_held_frames((chunk.meeting_id, chunk.speaker_id))
         except Exception as exc:
             # Swallowed so the meeting keeps going, which is exactly why it must be counted:
             # this attempt produced no transcript. See BaseWorker.note_attempt_outcome.
