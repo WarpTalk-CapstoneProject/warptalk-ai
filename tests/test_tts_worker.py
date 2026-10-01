@@ -891,3 +891,114 @@ class TestProsodyAwareCache:
 
         assert with_argument == legacy
         assert legacy == "tts:cache:" + hashlib.sha256(b"s1|en|okay|cloned:v1").hexdigest()
+
+
+STAND_IN = "00000000-0000-0000-0000-00000000b21d"
+
+
+def _route(source: str, target: str, lang: str, text_only: bool | None) -> dict:
+    route = {"SourceUserId": source, "TargetUserId": target, "TargetLanguage": lang}
+    if text_only is not None:
+        route["TextOnly"] = text_only
+    return route
+
+
+class TestTextOnlyBridgeIsNeverDubbedIntoMeet:
+    """Text-only Google Meet bridge (PO 2026-10-01): the speaker uses their real mic in Meet,
+    so their dub into the far side's language has no cable to be played into. The backend
+    marks those routes TextOnly; this worker must spend nothing on them — and only on them."""
+
+    def _worker(self, mock_redis_client, worker_settings, routes):
+        worker = _make_worker(mock_redis_client, worker_settings)
+        worker._room_routes = {"m1": routes}
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.return_value = None
+        return worker
+
+    async def test_text_only_outbound_route_is_not_synthesized(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = self._worker(
+            mock_redis_client, worker_settings, [_route("s1", STAND_IN, "vi", True)]
+        )
+
+        await worker.process(b"msg-1", _make_msg(target_lang="vi").to_redis())
+
+        worker.cartesia.synthesize.assert_not_called()
+        worker.livekit_publisher.publish_pcm.assert_not_awaited()
+
+    async def test_final_chunk_bookkeeping_still_fires(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = self._worker(
+            mock_redis_client, worker_settings, [_route("s1", STAND_IN, "vi", True)]
+        )
+
+        await worker.process(b"msg-1", _make_msg(target_lang="vi", is_final=True).to_redis())
+
+        system_events = [
+            call.args[1]
+            for call in mock_redis_client._redis.xadd.call_args_list
+            if "system_events" in str(call.args[0])
+        ]
+        assert [event["event_type"] for event in system_events] == ["final_chunk_processed"]
+
+    async def test_another_listener_in_the_same_language_keeps_the_dub(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        # One track per (speaker, language) is shared by every listener in that language: a
+        # WarpTalk member listening in the far side's language still needs it.
+        worker = self._worker(
+            mock_redis_client,
+            worker_settings,
+            [_route("s1", STAND_IN, "vi", True), _route("s1", "member-2", "vi", False)],
+        )
+
+        await worker.process(b"msg-1", _make_msg(target_lang="vi").to_redis())
+
+        worker.cartesia.synthesize.assert_called_once()
+
+    async def test_inbound_and_other_speakers_are_untouched(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        # The host (s1) is text-only towards Meet; the far side's dub INTO the host's language
+        # is a different speaker's route and must still be rendered.
+        worker = self._worker(
+            mock_redis_client,
+            worker_settings,
+            [_route("s1", STAND_IN, "en", True), _route(STAND_IN, "s1", "vi", False)],
+        )
+        inbound = _make_msg(target_lang="vi").model_copy(update={"speaker_id": STAND_IN})
+
+        await worker.process(b"msg-1", inbound.to_redis())
+
+        worker.cartesia.synthesize.assert_called_once()
+
+    async def test_a_backend_without_the_field_keeps_dubbing(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = self._worker(
+            mock_redis_client, worker_settings, [_route("s1", STAND_IN, "vi", None)]
+        )
+
+        await worker.process(b"msg-1", _make_msg(target_lang="vi").to_redis())
+
+        worker.cartesia.synthesize.assert_called_once()
+
+    async def test_a_restarted_worker_recovers_the_flag_from_the_snapshot(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        # Pub/sub has no replay: a worker that came up mid-meeting has no routes in memory and
+        # must read translationRoom:{id}:audio_routes before deciding.
+        worker = _make_worker(mock_redis_client, worker_settings, consented=False)
+        snapshot = json.dumps(
+            {"routes": [_route("s1", STAND_IN, "vi-VN", True)], "room_status": "IN_PROGRESS"}
+        ).encode()
+        mock_redis_client._redis.hget.return_value = None
+        mock_redis_client._redis.get.side_effect = lambda key: (
+            snapshot if str(key).endswith(":audio_routes") else None
+        )
+
+        await worker.process(b"msg-1", _make_msg(target_lang="vi").to_redis())
+
+        worker.cartesia.synthesize.assert_not_called()
