@@ -132,8 +132,12 @@ async def test_load_model_gives_the_chat_client_the_explicit_timeout() -> None:
         "_translation_room_client",
         "_billing_client",
         "_auth_client",
+        "_manifest_task",
     ):
         setattr(worker, name, None)
+    # load_model also starts the tool-manifest publisher on the worker's Redis client.
+    worker.redis = MagicMock()
+    worker.redis.set_with_ttl = AsyncMock()
 
     await worker.load_model()
     try:
