@@ -4,6 +4,8 @@ Production 2026-09-27..29: `429 concurrency_limited ... Current limit: 2`. The c
 dispatches up to 8 (speaker, language) keys at once and nothing bounded how many of them reached
 Cartesia together, so a meeting with a few speakers and target languages overran the plan and
 every excess sentence failed outright instead of waiting a fraction of a second for a slot.
+
+The plan is Pro since 2026-10 (limit 3, measured with the production key); the default follows it.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from tts_worker.synthesizer import CartesiaSynthesizer
 
 
 def test_default_matches_the_cartesia_plan_limit() -> None:
-    assert TTSSettings().cartesia_max_concurrency == 2
+    assert TTSSettings().cartesia_max_concurrency == 3
 
 
 @pytest.mark.asyncio

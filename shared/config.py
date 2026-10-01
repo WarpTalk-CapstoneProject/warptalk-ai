@@ -721,11 +721,16 @@ class TTSSettings(BaseSettings):
     tts_warm_pool_size: int = 2
 
     # How many Cartesia generations this process may have in flight at once. The account's plan
-    # caps concurrency (currently 2: `429 concurrency_limited ... Current limit: 2`), and the
-    # consume loop dispatches up to 8 keys at a time, so without a gate a meeting with a few
-    # speakers and target languages overruns the plan and every excess sentence fails outright.
-    # Waiting for a slot costs a fraction of a sentence; a 429 costs the whole one. Keep this at
-    # the plan's limit divided by the number of TTS replicas (tts-worker is a singleton).
+    # caps concurrency, and the consume loop dispatches up to 8 keys at a time, so without a gate
+    # a meeting with a few speakers and target languages overruns the plan. Keep this at the
+    # plan's limit divided by the number of TTS replicas (tts-worker is a singleton).
+    #
+    # The plan is Pro since 2026-10: 3 concurrent generations. Measured from the tts-worker pod
+    # with the production key on 2026-10-01 — eight parallel /tts/bytes requests all returned 200
+    # and finished in waves of three (~5s, ~10s, ~13.5s): Cartesia queued the excess requests
+    # instead of answering 429. Under the old plan (limit 2, Sept 27-29) the excess failed
+    # outright with `429 concurrency_limited`. Either way a slot the gate does not hand out is
+    # pure delay, and a gate above the plan buys nothing: the vendor queues it, out of our sight.
     #
     # A slot covers GENERATION, not playout: it is taken before Cartesia is asked and given back
     # when the sentence's audio has arrived (flush_done, or the one-shot response) — see
@@ -733,7 +738,7 @@ class TTSSettings(BaseSettings):
     # finished PLAYING, which made a third speaker wait out somebody else's dub. What Cartesia
     # counts is requests generating; an open-but-idle prosody context between two sentences of a
     # turn was never inside the slot either, and that design has been running since #189.
-    cartesia_max_concurrency: int = 2
+    cartesia_max_concurrency: int = 3
 
     # What happens to a sentence Cartesia failed. It used to be logged and acknowledged — the
     # sentence was gone, silently, with no retry and no record anywhere to replay it from.
