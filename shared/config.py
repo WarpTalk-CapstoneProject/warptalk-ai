@@ -621,7 +621,36 @@ class TTSSettings(BaseSettings):
     # speakers and target languages overruns the plan and every excess sentence fails outright.
     # Waiting for a slot costs a fraction of a sentence; a 429 costs the whole one. Keep this at
     # the plan's limit divided by the number of TTS replicas (tts-worker is a singleton).
+    #
+    # A slot covers GENERATION, not playout: it is taken before Cartesia is asked and given back
+    # when the sentence's audio has arrived (flush_done, or the one-shot response) — see
+    # tts_worker.synthesizer.GenerationLease. It used to be held until the streamed sentence had
+    # finished PLAYING, which made a third speaker wait out somebody else's dub. What Cartesia
+    # counts is requests generating; an open-but-idle prosody context between two sentences of a
+    # turn was never inside the slot either, and that design has been running since #189.
     cartesia_max_concurrency: int = 2
+
+    # What happens to a sentence Cartesia failed. It used to be logged and acknowledged — the
+    # sentence was gone, silently, with no retry and no record anywhere to replay it from.
+    #
+    # Retried ONLY for failures that are about the moment, not the request: a dropped
+    # connection, a 5xx, a timeout. Never a 4xx — 402 (out of credits), 401/403 (key) and 429
+    # (concurrency) answer the same way the next time, and retrying them only multiplies the load
+    # the vendor is already refusing (see the 429 logout storm). Those go straight to
+    # `translate:results:dead-letter` with the reason, as does a sentence whose retries ran out.
+    #
+    # ONE retry by default, because the Cartesia SDK (max_retries=2) has already retried a 5xx,
+    # 408, 409 or timeout on the one-shot HTTP call before it surfaces here. What it cannot retry
+    # is a stream that broke after it started, and a prosody-context failure followed by a failed
+    # fallback — those are what this catches.
+    #
+    # The retry runs inside the sentence's per-key lock, so nothing newer from the same speaker
+    # and language can play in between: a retried line is late, never out of order. That is also
+    # why the window exists — every second spent retrying holds that speaker's next line back —
+    # and why a failure that already took longer than the window is not retried at all.
+    synthesis_max_retries: int = 1
+    synthesis_retry_backoff_seconds: float = 0.5
+    synthesis_retry_window_seconds: float = 10.0
 
     # Delete in-meeting clones from the Cartesia account once nothing can reach them.
     #
