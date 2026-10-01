@@ -20,16 +20,25 @@ WHY A MARKER IN THE TEXT AND NOT A NEW FIELD
 TWO KINDS, NEVER CONFUSED
     A Google Meet meeting is hosted by Google; a WarpTalk room is hosted here. They are told apart
     by what the tool returned, not by which tool name the model picked.
+
+ONE MEETING, ONE CARD (GMCAL1001)
+    Each Google plugin calls only its own API. The Meet tool creates the meeting (Meet REST, no
+    Calendar event); when Calendar is connected the model chains Calendar's create_event with the
+    Meet link. Those are two tool results about ONE meeting, so the Calendar result is folded onto
+    the Meet card - its "Open in Calendar" link and its time - instead of becoming a second card.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 GOOGLE_MEET_URL_PREFIX = "https://meet.google.com/"
+
+#: A Meet card's title when the tool returned no summary.
+MEET_FALLBACK_TITLE = "Google Meet"
 
 #: Google's meeting code shape: three letter groups, e.g. abc-defg-hij.
 _MEET_CODE = re.compile(r"^[a-z]{3,4}-[a-z]{3,4}-[a-z]{3,4}$")
@@ -62,6 +71,9 @@ class MeetingLink:
     calendar_url: str | None = None
     #: WarpTalk room only: EXTERNAL_BRIDGE is the room that translates a Google Meet meeting.
     room_type: str | None = None
+    #: Google Meet only, NOT in the marker: the Calendar event id, kept so the WarpTalk room the
+    #: worker files for this meeting can point back at it (externalCalendarEventId).
+    calendar_event_id: str | None = None
 
     def marker(self) -> str:
         fields = {
@@ -109,22 +121,24 @@ def meeting_link_from_tool_result(result_json: str) -> MeetingLink | None:
         return None
 
     # AssistantService's plugin envelope: {isSuccess, data: {provider: "google_meet", ...}}.
+    # GMCAL1001: the Meet tool now answers from the Meet REST API - link and code, with start, end
+    # and summary only echoed when the model sent them - and no Calendar event. A card is still
+    # owed for that: the link is the meeting. calendarEventLink / eventId are read only for a
+    # service still on the old Calendar-backed shape.
     data = payload.get("data")
     if payload.get("isSuccess") is True and isinstance(data, dict):
         if data.get("provider") == "google_meet":
             link = _text(data.get("meetLink"))
             if link and link.startswith(GOOGLE_MEET_URL_PREFIX):
-                calendar_url = _text(data.get("calendarEventLink"))
                 return MeetingLink(
                     kind="google_meet",
                     url=link,
-                    title=_text(data.get("summary")) or "Google Meet",
+                    title=_text(data.get("summary")) or MEET_FALLBACK_TITLE,
                     code=_text(data.get("meetingCode")) or meet_code_from_url(link),
                     start=_text(data.get("start")) or None,
                     end=_text(data.get("end")) or None,
-                    calendar_url=calendar_url
-                    if calendar_url.startswith(_CALENDAR_URL_PREFIXES)
-                    else None,
+                    calendar_url=_calendar_url(data.get("calendarEventLink")),
+                    calendar_event_id=_text(data.get("eventId")) or None,
                 )
         return None
 
@@ -141,6 +155,124 @@ def meeting_link_from_tool_result(result_json: str) -> MeetingLink | None:
                 room_type=_text(payload.get("room_type")) or None,
             )
     return None
+
+
+@dataclass(frozen=True)
+class CalendarEvent:
+    """A Google Calendar event the Calendar plugin created this turn for a Google Meet meeting."""
+
+    meet_url: str
+    meet_code: str | None
+    event_id: str | None = None
+    #: The event's htmlLink, already checked against the Calendar host allow-list.
+    html_link: str | None = None
+    start: str | None = None
+    end: str | None = None
+
+
+def calendar_event_from_tool_result(result_json: str) -> CalendarEvent | None:
+    """The Calendar event a successful google_calendar create_event made FOR a Meet link.
+
+    An event with no Meet link on it is not about a meeting WarpBot created, so it is None here:
+    it gets no card, and nothing to fold into one.
+    """
+    try:
+        payload = json.loads(result_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("isSuccess") is not True:
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict) or data.get("provider") != "google_calendar":
+        return None
+
+    meet_url = ""
+    for key in ("meetLink", "hangoutLink"):
+        candidate = _text(data.get(key))
+        if candidate.startswith(GOOGLE_MEET_URL_PREFIX):
+            meet_url = candidate
+            break
+    if not meet_url:
+        return None
+    return CalendarEvent(
+        meet_url=meet_url,
+        meet_code=meet_code_from_url(meet_url),
+        event_id=_text(data.get("eventId")) or None,
+        html_link=_calendar_url(data.get("htmlLink")),
+        start=_event_time(data.get("start")),
+        end=_event_time(data.get("end")),
+    )
+
+
+def bridged_meet_code_from_tool_result(result_json: str) -> str | None:
+    """The Meet code of an EXTERNAL_BRIDGE room create_meeting made this turn, if any.
+
+    The worker files a WarpTalk room for every Meet it creates; when the model already did it
+    through create_meeting, filing another would put the same meeting on the calendar twice.
+    """
+    try:
+        payload = json.loads(result_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("status") != "created":
+        return None
+    return meet_code_from_url(_text(payload.get("external_meeting_url")))
+
+
+def merge_calendar_events(
+    links: list[MeetingLink], events: list[CalendarEvent]
+) -> list[MeetingLink]:
+    """Fold each Calendar event onto the Meet card it was made for, matched by Meet code or URL.
+
+    The Calendar's own time wins over the Meet tool's echo: it is what Google stored, with an
+    offset, where the echo is whatever the model typed. An event that matches no card this turn
+    is dropped rather than drawn - a card is a meeting WarpBot just created.
+    """
+    if not events:
+        return list(links)
+    merged: list[MeetingLink] = []
+    for link in links:
+        event = (
+            next((e for e in events if _same_meeting(link, e)), None)
+            if link.kind == "google_meet"
+            else None
+        )
+        if event is None:
+            merged.append(link)
+            continue
+        merged.append(
+            replace(
+                link,
+                calendar_url=event.html_link or link.calendar_url,
+                calendar_event_id=event.event_id or link.calendar_event_id,
+                start=event.start or link.start,
+                end=event.end or link.end,
+            )
+        )
+    return merged
+
+
+def _same_meeting(link: MeetingLink, event: CalendarEvent) -> bool:
+    link_code = link.code or meet_code_from_url(link.url)
+    if link_code and event.meet_code:
+        return link_code.lower() == event.meet_code.lower()
+    return _bare_url(link.url) == _bare_url(event.meet_url)
+
+
+def _bare_url(url: str) -> str:
+    return url.split("?", 1)[0].split("#", 1)[0].rstrip("/").lower()
+
+
+def _calendar_url(value: Any) -> str | None:
+    url = _text(value)
+    return url if url.startswith(_CALENDAR_URL_PREFIXES) else None
+
+
+def _event_time(value: Any) -> str | None:
+    """A Calendar time as sent: a string, or Google's own {dateTime, timeZone} object."""
+    if isinstance(value, dict):
+        value = value.get("dateTime") or value.get("date")
+    return _text(value) or None
 
 
 def ensure_meeting_links(answer: str, links: list[MeetingLink]) -> str:
