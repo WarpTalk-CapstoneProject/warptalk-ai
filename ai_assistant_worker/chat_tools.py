@@ -2595,14 +2595,15 @@ TOOLS: list[ChatTool] = [
                     "enum": list(EXTERNAL_PROVIDER_CHOICES),
                     "description": (
                         "NONE for an ordinary WarpTalk meeting - which is nearly always the "
-                        "answer. GOOGLE_MEET only when a Google Meet link was just created "
-                        "by a plugin tool and this room should bridge to it."
+                        "answer. GOOGLE_MEET only to bridge an existing Google Meet link the "
+                        "user gave you. Never for a Google Meet you just created with the "
+                        "plugin tool - WarpBot already puts that one on the WarpTalk calendar."
                     ),
                 },
                 "external_meeting_url": {
                     "type": "string",
                     "description": (
-                        "Exact Google Meet URL returned by the plugin tool. Must start with "
+                        "Exact Google Meet URL, as the user or a tool gave it. Must start with "
                         "https://meet.google.com/ - never compose or guess one."
                     ),
                 },
