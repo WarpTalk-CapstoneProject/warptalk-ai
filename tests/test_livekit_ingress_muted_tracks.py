@@ -20,6 +20,7 @@ import asyncio
 from unittest.mock import MagicMock
 
 import pytest
+from livekit import rtc
 
 from livekit_ingress_worker.worker import LiveKitIngressWorker
 from shared.config import LiveKitSettings, WorkerSettings
@@ -52,6 +53,11 @@ def _publication(sid: str, *, muted: bool) -> MagicMock:
     pub.sid = sid
     pub.muted = muted
     pub.kind = 1
+    # Explicitly a microphone, not left to MagicMock: WT-631 made the sweep skip publications
+    # whose declared source is something the participant is PLAYING rather than saying, and an
+    # auto-attribute matches no source at all — so an unset `source` would silently mean "not
+    # speech" here and these tests would assert the sweep is broken.
+    pub.source = rtc.TrackSource.SOURCE_MICROPHONE
     pub.track = _track(sid)
     return pub
 
