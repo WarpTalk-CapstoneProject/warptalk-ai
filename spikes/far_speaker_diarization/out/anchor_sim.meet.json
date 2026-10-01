@@ -1,0 +1,64 @@
+{
+ "caption_cadence": {
+  "available": true,
+  "polls": 19,
+  "poll_s_median": 0.6599999999962165,
+  "poll_s_p90": 1.2555999999996856,
+  "longest_gap_s": 54.65899999999965,
+  "chars_per_poll_median": 7.0,
+  "note": "full text is re-emitted every poll; earlier blocks get rewritten"
+ },
+ "nemotron_offline": {
+  "p10": {
+   "correct": 0.12172915870313099,
+   "speaker_n": 0.5690308232268825,
+   "wrong": 0.08760468429648678,
+   "no_cluster": 0.22163533377349967,
+   "anchors": 11.666666666666666,
+   "named_frac": 0.3333333333333333,
+   "ttfn_median_s": 298.71500000000003,
+   "ttfn_p90_s": 377.79400000000004
+  },
+  "p25": {
+   "correct": 0.23171282621538036,
+   "speaker_n": 0.4720436459672655,
+   "wrong": 0.07460819404385448,
+   "no_cluster": 0.22163533377349967,
+   "anchors": 26.666666666666668,
+   "named_frac": 0.5,
+   "ttfn_median_s": 253.995,
+   "ttfn_p90_s": 425.275
+  },
+  "p50": {
+   "correct": 0.4712907298652859,
+   "speaker_n": 0.2078048441463669,
+   "wrong": 0.09926909221484752,
+   "no_cluster": 0.22163533377349967,
+   "anchors": 56.666666666666664,
+   "named_frac": 1.0,
+   "ttfn_median_s": 256.245,
+   "ttfn_p90_s": 468.09400000000005
+  },
+  "p25_gap55": {
+   "correct": 0.2241952485202303,
+   "speaker_n": 0.4795612236624156,
+   "wrong": 0.07460819404385448,
+   "no_cluster": 0.22163533377349967,
+   "anchors": 26.0,
+   "named_frac": 0.4166666666666667,
+   "gap_correct": 0.3877380681387055,
+   "ttfn_median_s": 298.25,
+   "ttfn_p90_s": 445.358
+  },
+  "p25_wrong5": {
+   "correct": 0.15174155286050203,
+   "speaker_n": 0.3911920399393034,
+   "wrong": 0.23543107342669492,
+   "no_cluster": 0.22163533377349967,
+   "anchors": 24.666666666666668,
+   "named_frac": 0.6666666666666666,
+   "ttfn_median_s": 285.40999999999997,
+   "ttfn_p90_s": 495.52700000000004
+  }
+ }
+}

@@ -1,0 +1,29 @@
+{
+ "nemotron_offline": {
+  "files": 1,
+  "audio_min": 10.0,
+  "DER_collar": 0.3627086221723035,
+  "DER_nocollar": 0.37359538183580815,
+  "flip_rate": 0.03389830508474576,
+  "primary_share": 0.9897326132108827,
+  "rtf": 0.4519446608333334,
+  "cpu_s_per_audio_s": 0.5866145833333334,
+  "buffer_latency_ms": null,
+  "chunk_compute_ms_mean": 265781.44680000003,
+  "rows": [
+   {
+    "uri": "ami00",
+    "der": 0.3627086221723035,
+    "miss": 0.3527316122918171,
+    "fa": 0.005159614608378319,
+    "conf": 0.004817395272108097,
+    "n_ref": 4,
+    "n_hyp": 4,
+    "flips": 2,
+    "transitions": 59,
+    "primary_share": 0.9897326132108827,
+    "rtf": 0.4519446608333334
+   }
+  ]
+ }
+}
