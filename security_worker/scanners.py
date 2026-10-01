@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 
+from security_worker.regex_scanners import scan_and_mask_regex_pii
 from shared.config import SecuritySettings
 from shared.openai_options import completion_options
 
@@ -164,19 +165,27 @@ class OpenAISecurityScanner:
         if not text:
             return SecurityScanReport(pii_detected=False, masked_content=text, dlp_terms_claimed=())
 
+        regex_pii_detected = False
+        text_to_process = text
+        if pii_enabled:
+            regex_result = scan_and_mask_regex_pii(text)
+            regex_pii_detected = regex_result.detected
+            text_to_process = regex_result.masked_text
+
         max_total = self.settings.max_total_analyze_length or MAX_TOTAL_ANALYZE_LENGTH
-        if len(text) > max_total:
+        if len(text_to_process) > max_total:
             # Fail rather than cover part of it. A guardrail that quietly inspects a prefix is
             # worse than one that says it could not cope: the first produces a document that looks
             # scanned, and only the second can be acted on.
             raise ValueError(
-                f"Document is {len(text)} characters, beyond the {max_total} this scan will read. "
-                "Raise SECURITY_MAX_TOTAL_ANALYZE_LENGTH (and SecurityScanBudget."
-                "MaxScannedCharacters on the backend with it) or split the document."
+                f"Document is {len(text_to_process)} characters, beyond the {max_total} "
+                "this scan will read. Raise SECURITY_MAX_TOTAL_ANALYZE_LENGTH (and "
+                "SecurityScanBudget.MaxScannedCharacters on the backend with it) or split "
+                "the document."
             )
 
         chunk_size = self.settings.max_analyze_length or MAX_ANALYZE_LENGTH
-        chunks = split_for_analysis(text, chunk_size)
+        chunks = split_for_analysis(text_to_process, chunk_size)
         limit = asyncio.Semaphore(self.settings.scan_concurrency or SCAN_CONCURRENCY)
 
         async def scan_one(chunk: str) -> SecurityScanReport:
@@ -186,8 +195,8 @@ class OpenAISecurityScanner:
         reports = await asyncio.gather(*(scan_one(chunk) for chunk in chunks))
 
         return SecurityScanReport(
-            # Any chunk is enough. The whole point of reading the tail is that a hit there counts.
-            pii_detected=any(report.pii_detected for report in reports),
+            # Any hit (from fast local regex or LLM chunks) counts.
+            pii_detected=regex_pii_detected or any(report.pii_detected for report in reports),
             # Concatenation, because `split_for_analysis` guarantees the pieces reassemble into the
             # original. This is what the backend indexes when PII was found.
             masked_content="".join(report.masked_content for report in reports),
@@ -211,15 +220,20 @@ class OpenAISecurityScanner:
         system_prompt = (
             "You are a multi-language document security scanner supporting all "
             "languages (English, Japanese, Vietnamese, etc.).\n"
-            "Analyze the provided text for PII (emails, phone numbers, SSN, My "
-            "Number, CCCD/ID numbers, credit cards, full names, addresses) and "
-            "DLP keyword violations.\n\n"
+            "Analyze the provided text for PII (emails, phone numbers, SSN, My Number, "
+            "CCCD/CMND numbers, tax identification numbers / mã số thuế, credit cards, "
+            "full names, addresses) and DLP keyword violations.\n\n"
             "Instructions:\n"
             "1. If PII Detection is enabled (pii_enabled is true), detect any PII "
-            "in the text. Mask detected PII using [PII_REDACTED], "
-            "[EMAIL_REDACTED], [PHONE_REDACTED], [ID_REDACTED], "
-            "[CARD_REDACTED]. Set piiDetected to true if PII is found, otherwise "
-            "false.\n"
+            "in the text. Pay special attention to Vietnamese full names (e.g. Nguyễn Văn A), "
+            "Vietnamese CCCD (12 digits) or CMND (9 digits), "
+            "phone numbers (+84, 03x/05x/07x/08x/09x), tax IDs (mã số thuế), and addresses; "
+            "as well as Japanese My Number (12 digits), Japanese full names, addresses, "
+            "and phone numbers. "
+            "Mask detected PII using [PII_REDACTED], [EMAIL_REDACTED], [PHONE_REDACTED], "
+            "[ID_REDACTED], [CARD_REDACTED]. If the text already contains these redaction "
+            "markers, preserve them exactly. Set piiDetected to true if PII is found, "
+            "otherwise false.\n"
             "2. If DLP Detection is enabled (dlp_enabled is true), look for the blacklisted "
             "keywords (case-insensitive). In dlpMatches, list the matching substrings copied "
             "VERBATIM out of the text, character for character. Return an empty list if there "
