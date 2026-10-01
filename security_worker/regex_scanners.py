@@ -8,15 +8,11 @@ import unicodedata
 from dataclasses import dataclass
 
 # Email pattern matching standard email formats
-EMAIL_REGEX = re.compile(
-    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
-)
+EMAIL_REGEX = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 
 # Vietnam Phone Numbers: +84 or 0 followed by 3, 5, 7, 8, 9 and 8 digits
 # (with optional spaces, dots, or dashes)
-VN_PHONE_REGEX = re.compile(
-    r"(?<!\d)(?:\+84|0)[-. ]?(?:3|5|7|8|9)(?:[-. ]?\d){8}(?!\d)"
-)
+VN_PHONE_REGEX = re.compile(r"(?<!\d)(?:\+84|0)[-. ]?(?:3|5|7|8|9)(?:[-. ]?\d){8}(?!\d)")
 
 # Vietnam CCCD (12 digits starting with 0, optionally separated by spaces, dots, dashes)
 VN_CCCD_REGEX = re.compile(
@@ -28,14 +24,10 @@ VN_CCCD_REGEX = re.compile(
 )
 
 # Vietnam CMND (9 digits)
-VN_CMND_REGEX = re.compile(
-    r"(?<!\d)\d{9}(?!\d)"
-)
+VN_CMND_REGEX = re.compile(r"(?<!\d)\d{9}(?!\d)")
 
 # Potential Credit Card numbers: 13-19 digits (with optional spaces or dashes)
-CREDIT_CARD_REGEX = re.compile(
-    r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)"
-)
+CREDIT_CARD_REGEX = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
 
 
 def _is_luhn_valid(number_str: str) -> bool:

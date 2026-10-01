@@ -32,8 +32,7 @@ def test_scan_and_mask_regex_pii_vn_phone() -> None:
 
 def test_scan_and_mask_regex_pii_vn_phone_formatted() -> None:
     text = (
-        "CSKH 1: 0988 123 456, CSKH 2: +84 903 456 789, "
-        "CSKH 3: 0912.345.678, CSKH 4: 0977-654-321."
+        "CSKH 1: 0988 123 456, CSKH 2: +84 903 456 789, CSKH 3: 0912.345.678, CSKH 4: 0977-654-321."
     )
     res = scan_and_mask_regex_pii(text)
     assert res.detected
@@ -55,17 +54,11 @@ def test_scan_and_mask_regex_pii_cccd() -> None:
 
 
 def test_scan_and_mask_regex_pii_cccd_formatted() -> None:
-    text = (
-        "Hồ sơ gồm CCCD 1: 079 198 001234 và "
-        "CCCD 2: 001-098-001234 và CCCD 3: 079 198 001 234."
-    )
+    text = "Hồ sơ gồm CCCD 1: 079 198 001234 và CCCD 2: 001-098-001234 và CCCD 3: 079 198 001 234."
     res = scan_and_mask_regex_pii(text)
     assert res.detected
     assert res.matches_count == 3
-    expected = (
-        "Hồ sơ gồm CCCD 1: [ID_REDACTED] và "
-        "CCCD 2: [ID_REDACTED] và CCCD 3: [ID_REDACTED]."
-    )
+    expected = "Hồ sơ gồm CCCD 1: [ID_REDACTED] và CCCD 2: [ID_REDACTED] và CCCD 3: [ID_REDACTED]."
     assert res.masked_text == expected
 
 
