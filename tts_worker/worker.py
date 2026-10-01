@@ -1293,7 +1293,19 @@ class TTSWorker(BaseWorker):
                 self._open_contexts()[key] = context
                 # After the dial, before the first push: Cartesia counts the context from that
                 # push, and a cold dial is not worth holding a slot through.
-                slot_wait_ms = await self._take_slot(context.slot, translation, purpose="context")
+                try:
+                    slot_wait_ms = await self._take_slot(
+                        context.slot, translation, purpose="context"
+                    )
+                except BaseException:
+                    # Cancelled while waiting (the processing timeout). The context is mapped
+                    # but the gate never counted it, so it leaves the map HERE, before the next
+                    # sentence for this key can claim it as a continuation and speak on a
+                    # context with no slot behind it. The handler at the end of this method
+                    # does the same; this keeps the guard where the hazard is.
+                    if not context.slot.held:
+                        self._retire_context(key, context, abandon=True)
+                    raise
                 if context.retired:
                     # Ended while it waited for the slot (the room closed). Its _end_context may
                     # already have run its release, before this claim existed.

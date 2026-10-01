@@ -545,6 +545,51 @@ async def test_a_context_kept_for_a_message_that_never_spoke_on_it_is_ended_with
     assert vendor.violations == []
 
 
+async def test_a_sentence_cancelled_while_waiting_for_a_slot_leaves_no_uncounted_context() -> None:
+    """The processing timeout can cancel a sentence while it waits for a slot — after its
+    context was opened and mapped, before any slot was held. If that context stayed mapped, the
+    next sentence for the key would claim it as a continuation and speak on a context the gate
+    never counted: the exact undercount this exists to remove.
+
+    The next sentence is QUEUED here on purpose. With nothing queued, the end-of-message drain
+    would retire the context anyway and hide a missing guard."""
+    vendor, playout = _Vendor(plan_limit=1), _Playout()
+    worker = _worker(vendor, playout)
+    playout.finish.set()
+    await vendor.slots.acquire()  # the gate is full — somebody else's context
+
+    cancelled = _dispatch(worker, b"1-0", _msg("s1", "Một.", chunk=0))
+    await _until(lambda: len(vendor.contexts) == 1)  # opened, mapped, waiting for the slot
+    following = _dispatch(worker, b"2-0", _msg("s1", "Hai.", chunk=1))
+    await asyncio.sleep(0.02)
+    [(key, waiting)] = worker._open_contexts().items()
+    assert not waiting.slot.held and vendor.contexts[0].pushes == [], "spoke without a slot"
+
+    cancelled.cancel()
+    await asyncio.gather(cancelled, return_exceptions=True)
+    # The queued sentence takes the key's lock straight away and maps a context of its OWN
+    # (also waiting for the slot), so the map need not be empty — it must not hold this one.
+    assert worker._open_contexts().get(key) is not waiting, (
+        "a context with no slot behind it is still claimable"
+    )
+    assert waiting.retired
+
+    vendor.slots.release()  # the other holder finishes
+    await following
+    await asyncio.gather(*worker._retiring_contexts())
+
+    assert vendor.contexts[0].pushes == [], "the cancelled sentence's context was spoken on"
+    assert vendor.connections[0].closed, "the cancelled sentence's socket leaked"
+    assert len(vendor.contexts) == 2, "the next sentence did not open a context of its own"
+    assert [push["transcript"] for push in vendor.contexts[1].pushes] == ["Hai."]
+    [line] = _logged(worker, "audio_synthesized")
+    assert line["continued"] is False
+    assert line["slot_wait_ms"] >= 0
+    assert vendor.slots.held == 0, "a slot was lost or double-released"
+    assert vendor.counted == 0
+    assert vendor.violations == []
+
+
 # ---------------------------------------------------------------------------
 # The lease
 # ---------------------------------------------------------------------------

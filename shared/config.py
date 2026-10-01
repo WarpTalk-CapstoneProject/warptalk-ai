@@ -719,9 +719,13 @@ class TTSSettings(BaseSettings):
     # soon as no sentence is waiting for it — so most sentences take one. At most
     # `cartesia_max_concurrency` contexts can be open at once (each holds a concurrency slot), so
     # the pool matches that: a burst on every slot at once is served warm, and the pool refills
-    # in the background the moment one is taken. A pooled connection has no context on it yet,
-    # so it has nothing to generate; what the 2026-10-01 measurement found counted against the
-    # plan was open contexts (see cartesia_max_concurrency), not sockets.
+    # in the background the moment one is taken.
+    #
+    # Pooled connections do NOT hold concurrency slots — verified with the production key
+    # (2026-10-01, PR #220 review): with 4 websocket connections open that never created a
+    # context, 3 parallel /tts/bytes requests still got TTFB ~1.2s, not blocked. What counts
+    # against the plan is an open CONTEXT (see cartesia_max_concurrency), not a socket, so a
+    # pool this size costs no slot.
     tts_warm_pool_size: int = 3
 
     # How many Cartesia generations this process may have in flight at once. The account's plan
