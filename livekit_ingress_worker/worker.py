@@ -1578,9 +1578,10 @@ class LiveKitIngressWorker(BaseWorker):
                 room=room_name,
                 speaker_id=speaker_id,
             )
-        # FAR-SIDE OVERLAP GATE (far_side_gate.py). Human tracks FEED it their per-frame VAD
-        # verdicts; the stand-in track ASKS it which of its frames are a WarpTalk participant
-        # coming back through Meet, and zeroes those before VAD and STT ever see them.
+        # FAR-SIDE SAME-SOURCE GATE (far_side_gate.py). Human tracks FEED it their raw 16kHz
+        # windows; the stand-in track ASKS it which of its frames are a WarpTalk participant's
+        # own voice coming back through Meet — and only those, never a Meet-side person talking
+        # at the same time — and zeroes them before VAD and STT ever see them.
         far_side_gate = self._far_side_overlap_gate()
         # Frames zeroed since the current turn began — reported on the chunk as
         # suppressed_overlap_ms so the STT side and the logs can see the gate working.
@@ -1692,16 +1693,25 @@ class LiveKitIngressWorker(BaseWorker):
                     window_data = bytes(raw_buffer[:window_bytes])
                     raw_buffer = raw_buffer[window_bytes:]
 
-                    if bridge_speaker and far_side_gate is not None:
-                        mask = far_side_gate.suppression_mask(
-                            room_name,
-                            far_side_gate.now(),
-                            VAD_WINDOW_FRAMES,
-                            exclude=(speaker_id,),
-                        )
-                        if any(mask):
-                            window_data = zero_frames(window_data, mask, VAD_FRAME_BYTES)
-                            suppressed_frames += sum(mask)
+                    if far_side_gate is not None:
+                        # This window's last sample arrived before whatever is still queued
+                        # behind it in raw_buffer.
+                        window_end_s = far_side_gate.now() - len(raw_buffer) / 2 / sample_rate
+                        if bridge_speaker:
+                            mask = far_side_gate.process_standin(
+                                room_name,
+                                window_data,
+                                window_end_s,
+                                frame_samples=VAD_FRAME_SAMPLES,
+                                exclude=(speaker_id,),
+                            )
+                            if any(mask):
+                                window_data = zero_frames(window_data, mask, VAD_FRAME_BYTES)
+                                suppressed_frames += sum(mask)
+                        else:
+                            far_side_gate.push_reference(
+                                room_name, speaker_id, window_data, window_end_s
+                            )
 
                     # Score every frame in this ~96ms window once. Both questions below are
                     # answered from that one pass — whether the window is speech, and how many
@@ -1719,15 +1729,6 @@ class LiveKitIngressWorker(BaseWorker):
                     # countdown while the speaker is still saying the word.
                     active_threshold = release_threshold if is_speaking else vad_threshold
                     vad_prob = self._window_verdict(frame_probabilities, active_threshold)
-
-                    if far_side_gate is not None and not bridge_speaker:
-                        far_side_gate.note_frames(
-                            room_name,
-                            speaker_id,
-                            far_side_gate.now(),
-                            frame_probabilities,
-                            active_threshold,
-                        )
 
                     if vad_prob >= active_threshold:
                         # Speech detected
@@ -1946,10 +1947,10 @@ class LiveKitIngressWorker(BaseWorker):
                     speech_samples=speech_samples,
                     suppressed_overlap_ms=_frames_to_ms(suppressed_frames),
                 )
-            # The gate's intervals for this speaker are deliberately NOT forgotten here: a
-            # republished track replaces this reader while the new one is already recording, and
-            # anything older than lag_max can no longer suppress a frame anyway. The room's
-            # memory goes in _cleanup_room.
+            # The gate's reference for this speaker is deliberately NOT forgotten here: a
+            # republished track replaces this reader while the new one is already feeding it,
+            # and its history ages out of the ring anyway. The room's memory goes in
+            # _cleanup_room.
             if cancelled:
                 self.logger.info("stopped_audio_stream_processing", track_sid=track.sid)
             else:
@@ -1972,7 +1973,7 @@ class LiveKitIngressWorker(BaseWorker):
                 )
 
     def _far_side_overlap_gate(self) -> FarSideOverlapGate | None:
-        """The per-process overlap gate, or None when FAR_SIDE_GATE_ENABLED is off.
+        """The per-process same-source gate, or None when FAR_SIDE_GATE_ENABLED is off.
 
         One per process because one process owns a room (see _claim_room_ownership): every
         track of the room is read here, so their arrival times share one monotonic clock.

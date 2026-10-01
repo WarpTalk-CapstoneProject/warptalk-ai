@@ -329,26 +329,53 @@ class WorkerSettings(BaseSettings):
     near_field_gate_min_baseline_chunks: int = 2
     near_field_gate_baseline_ema_alpha: float = 0.3
 
-    # FAR-SIDE OVERLAP GATE (ingress worker only, see livekit_ingress_worker/far_side_gate.py).
+    # FAR-SIDE SAME-SOURCE GATE (ingress worker only, see livekit_ingress_worker/far_side_gate.py).
     #
     # In a Meet-bridged room a WarpTalk user who is ALSO in the Meet is heard twice: their own
     # mic under their own identity, and again inside the stand-in's mixed Meet feed a few hundred
-    # ms later. While any non-stand-in participant's VAD says they are speaking, stand-in frames
-    # that arrive `lag_min..lag_max` ms later are zeroed before VAD/STT — per 32ms frame, never a
-    # whole turn. A room with no such participant speaking is untouched by construction.
+    # ms later. The gate zeroes a stand-in frame (32ms, never a whole turn) only when its content
+    # is explained by a real participant's own track, delayed and gain/EQ-shaped; a Meet-side
+    # person talking over a WarpTalk user is kept, as a native room would keep them. Unsure ->
+    # keep. The STT text dedupe (STT_FAR_SIDE_DEDUPE_*) remains the second layer.
     #
-    # Env: FAR_SIDE_GATE_ENABLED, FAR_SIDE_GATE_LAG_MIN_MS, FAR_SIDE_GATE_LAG_MAX_MS,
-    #      FAR_SIDE_GATE_MIN_OVERLAP_MS, FAR_SIDE_GATE_HISTORY_MS.
-    far_side_gate_enabled: bool = True
-    # Meet's mic -> loopback -> LiveKit path is slower than the participant's direct publish by
-    # roughly this much. NOT MEASURED across networks yet — the first values to sweep.
-    far_side_gate_lag_min_ms: int = 300
-    far_side_gate_lag_max_ms: int = 600
-    # A stand-in frame is suppressed only when the lag-shifted human speech covers MORE than
-    # this many ms of it. 0 = any overlap at all.
-    far_side_gate_min_overlap_ms: float = 0.0
-    # How long a participant's speech intervals are remembered. Must exceed lag_max.
-    far_side_gate_history_ms: int = 5000
+    # OFF BY DEFAULT. Synthetic evaluation (scripts/far_side_gate_eval: TTS speech through a
+    # simulated Meet chain with real libopus at ~31kbps, 3 seeds) at these defaults: ~1% of a
+    # Meet-side speaker's overlapped speech time is wrongly zeroed (worst case ~4% when they are
+    # 12dB quieter than the duplicate), 0% when only the Meet side talks — but only ~20% of the
+    # duplicate's frames are removed (~4% during crosstalk), as scattered frames that may leave
+    # the duplicate's text harder for the text dedupe to match. The speech is synthetic and the
+    # Meet path simulated: turn on only after checking a real bridged Meet recording.
+    #
+    # Env: FAR_SIDE_GATE_<NAME> for every field below.
+    far_side_gate_enabled: bool = False
+    # Where to look for a participant's copy, relative to their own track (arrival clock).
+    # Meet's path is expected around 300-600ms+ but not measured across networks, so the range is
+    # wide and the lag is tracked, not assumed. A peak on the range's edge is ignored.
+    far_side_gate_lag_min_ms: int = 150
+    far_side_gate_lag_max_ms: int = 1200
+    # Feature history kept per track. Raised to lag_max + 1500 if set lower.
+    far_side_gate_history_ms: int = 4000
+    # Lag lock: the ~1s band-envelope correlation peak needed to (re)confirm a participant's lag,
+    # and how long a lock lives without re-confirmation (no lock -> nothing is zeroed).
+    far_side_gate_lock_min_corr: float = 0.5
+    far_side_gate_lock_hold_ms: int = 8000
+    # Per-hop duplicate test: the ~64ms spectro-temporal patch similarity required (0..1) ...
+    far_side_gate_frame_min_corr: float = 0.7
+    # ... and at most this share of the stand-in's power may sit more than residual_margin_db
+    # above what the reference predicts.
+    far_side_gate_residual_margin_db: float = 6.0
+    far_side_gate_residual_max_ratio: float = 0.15
+    # A reference hop counts as speech this many dB above that track's own noise floor.
+    far_side_gate_ref_active_db: float = 15.0
+    # Second voice: when 3 of the last 5 hops put >= second_voice_ratio of the stand-in's power
+    # more than second_voice_margin_db above the prediction, somebody else is talking and
+    # nothing is zeroed for second_voice_hold_ms. This hangover is the main crosstalk guard:
+    # shorter holds remove more of the duplicate and more of the Meet-side speaker (300ms with
+    # second_voice_ratio 0.3 / frame_min_corr 0.6: ~50% of the duplicate, ~12% of overlapped
+    # crosstalk in the same evaluation).
+    far_side_gate_second_voice_margin_db: float = 12.0
+    far_side_gate_second_voice_ratio: float = 0.15
+    far_side_gate_second_voice_hold_ms: int = 1500
 
     # Keep the speech forwarded to STT, so a meeting can be transcribed a second time after
     # it ends — see livekit_ingress_worker/audio_archive.py for why the existing recording
