@@ -450,6 +450,11 @@ def _vendor_error(error: BaseException) -> BaseException:
     return error
 
 
+def _pcm_of(wav: bytes) -> bytes:
+    """The PCM samples of a WAV from the synthesizer (header stripped), b"" if there are none."""
+    return wav[_WAV_HEADER_BYTES:] if len(wav) > _WAV_HEADER_BYTES else b""
+
+
 def _release(lease: GenerationLease | None) -> None:
     """Give the sentence's Cartesia slot back, if the caller is gating on one."""
     if lease is not None:
@@ -489,6 +494,11 @@ class SynthesizedSentence:
     voice_id: str
     already_spoken: bool = False
     first_audio_at: float | None = None
+    # Prefetch mode (TTS_PREFETCH_WHILE_PLAYING) only. The sentence is queued on its track
+    # rather than heard by the time synthesis returns: `playout` finishes when it has been, and
+    # `track` says when it got the track and when the first frame went out.
+    playout: asyncio.Task[None] | None = None
+    track: TrackStream | None = None
 
 
 def _extract_tts_key(
@@ -943,7 +953,11 @@ class TTSWorker(BaseWorker):
                 _release(lease)
                 return SynthesizedSentence(audio_bytes, duration_ms, resolved_voice_id)
 
-            async with publisher.stream(
+            prefetch = self.tts_settings.prefetch_while_playing and hasattr(
+                publisher, "stream_ahead"
+            )
+            open_stream = publisher.stream_ahead if prefetch else publisher.stream
+            async with open_stream(
                 translation.meeting_id,
                 translation.speaker_id,
                 translation.target_lang,
@@ -954,6 +968,11 @@ class TTSWorker(BaseWorker):
                     audio_bytes, duration_ms = await turn.speak(
                         text, generation_config, on_pcm=track.feed
                     )
+                    if prefetch:
+                        # Played by the playout itself if the track turns out to have spoken
+                        # none of the sentence — the decision this method used to make after the
+                        # drain, which it no longer waits for. See stream_ahead.
+                        track.fallback_audio = _pcm_of(audio_bytes)
                 finally:
                     # THE POINT WHERE GENERATION ENDS AND PLAYOUT BEGINS. speak() returns on
                     # Cartesia's flush_done — every chunk of this sentence has arrived and been
@@ -963,6 +982,17 @@ class TTSWorker(BaseWorker):
                     # speaker's, language's or voice's generation. On failure too: the partial
                     # audio drains below without the slot, and the fallback takes it again.
                     _release(lease)
+            if prefetch:
+                # The track owns this sentence now — its playout plays what was fed, or the
+                # whole sentence if nothing was heard — so the caller must not publish it again.
+                return SynthesizedSentence(
+                    audio_bytes,
+                    duration_ms,
+                    resolved_voice_id,
+                    already_spoken=True,
+                    playout=track.playout,
+                    track=track,
+                )
             # Read AFTER the stream closed: the pump is still draining while speak() returns,
             # so asking inside the block would undercount what the listener actually heard.
             return SynthesizedSentence(
@@ -973,7 +1003,13 @@ class TTSWorker(BaseWorker):
                 first_audio_at=track.first_audio_at,
             )
         except Exception:
-            already_spoken = track is not None and track.spoken_bytes > 0
+            # Prefetch: what was FED will be played (the playout is queued and nothing waits for
+            # it), so "fed" is the honest "the listener will hear part of this". Otherwise the
+            # drain has run and `spoken_bytes` is exact.
+            prefetched = track is not None and getattr(track, "playout", None) is not None
+            already_spoken = track is not None and (
+                track.fed_bytes > 0 if prefetched else track.spoken_bytes > 0
+            )
             self.logger.warning(
                 "prosody_context_failed_falling_back",
                 meeting_id=translation.meeting_id,
@@ -1033,7 +1069,9 @@ class TTSWorker(BaseWorker):
                 duration_ms,
                 one_shot_voice_id,
                 already_spoken=already_spoken,
-                first_audio_at=track.first_audio_at if track else None,
+                first_audio_at=None if prefetched else (track.first_audio_at if track else None),
+                playout=getattr(track, "playout", None) if prefetched else None,
+                track=track if prefetched else None,
             )
         finally:
             # The turn ends where the SPEAKER stopped, not where a chunk boundary fell —
@@ -1686,15 +1724,22 @@ class TTSWorker(BaseWorker):
         await self.redis.record_latency("tts_synthesis", synthesis_latency_ms)
         # Cartesia's latency is its time to first audio; with streaming on, the whole synthesis
         # time also contains playback (see above) and would make the vendor look 5x slower.
+        vendor_first_audio = sentence.first_audio_at
+        if sentence.track is not None:
+            # Prefetch: the sentence may still be queued behind the previous one, so the frame
+            # that reached the track says nothing about Cartesia. The first chunk handed over does.
+            vendor_first_audio = sentence.track.first_fed_at
         await record_provider_call(
             "cartesia",
             "tts",
             "ok",
-            int((sentence.first_audio_at - attempt_t0) * 1000)
-            if sentence.first_audio_at is not None
+            int((vendor_first_audio - attempt_t0) * 1000)
+            if vendor_first_audio is not None
             else int((time.monotonic() - attempt_t0) * 1000),
             self.tts_settings.model,
         )
+        if sentence.playout is not None and sentence.track is not None:
+            self._record_first_audio_after_playout(sentence.playout, sentence.track, t0)
         if sentence.first_audio_at is not None:
             # What the listener actually experiences, and the only number that answers the
             # complaint this work came from. Same t0 as above, so the two are comparable.
@@ -2955,6 +3000,32 @@ class TTSWorker(BaseWorker):
             # genuinely slowed down still sounds like they slowed down, inside a slot that fits.
             speed_center=isochrony.speed_center(self._dub_fit(translation)),
         )
+
+    def _record_first_audio_after_playout(
+        self, playout: asyncio.Task[None], track: TrackStream, t0: float
+    ) -> None:
+        """`tts_first_audio` for a prefetched sentence, recorded once it has actually played.
+
+        Measured from whichever came LATER: the sentence's own start (t0), or the moment it got
+        the track because the previous sentence had finished. The second is what a listener
+        waits through — the time before it is the previous sentence playing, not a delay — and
+        it keeps this the same number it always was for a sentence nothing was queued behind.
+        """
+        tasks: set[asyncio.Task[None]] = getattr(self, "_metric_tasks", None) or set()
+        self._metric_tasks = tasks
+
+        async def record() -> None:
+            await asyncio.wait({playout})
+            if track.first_audio_at is None:
+                return
+            started = max(t0, track.pump_started_at or t0)
+            await self.redis.record_latency(
+                "tts_first_audio", int((track.first_audio_at - started) * 1000)
+            )
+
+        task = asyncio.create_task(record())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     def _catch_up_lag_ms(self, translation: TranslationResultMessage) -> int:
         """How far behind the conversation this sentence is, in milliseconds. WT-528.

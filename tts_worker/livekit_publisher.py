@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 
@@ -167,10 +167,35 @@ class TrackStream:
         self._spoken_bytes = 0
         self._broken = False
         self._first_audio_at: float | None = None
+        # Prefetch mode only (LiveKitTTSPublisher.stream_ahead). What was handed over, when the
+        # first chunk arrived from Cartesia, when this sentence got the track, and the audio to
+        # play instead if the track turns out to have spoken none of it.
+        self._fed_bytes = 0
+        self._first_fed_at: float | None = None
+        self._pump_started_at: float | None = None
+        self._finished = asyncio.Event()
+        self.fallback_audio: bytes = b""
+        # The queued playout task (stream_ahead only): done once this sentence has been heard.
+        self.playout: asyncio.Task[None] | None = None
 
     @property
     def spoken_bytes(self) -> int:
         return self._spoken_bytes
+
+    @property
+    def fed_bytes(self) -> int:
+        """Bytes handed to this stream so far: committed to the track, not necessarily heard yet."""
+        return self._fed_bytes
+
+    @property
+    def first_fed_at(self) -> float | None:
+        """`time.monotonic()` when the first Cartesia chunk was handed over: the vendor's TTFA."""
+        return self._first_fed_at
+
+    @property
+    def pump_started_at(self) -> float | None:
+        """When this sentence got the track (the previous one had finished playing)."""
+        return self._pump_started_at
 
     @property
     def first_audio_at(self) -> float | None:
@@ -185,11 +210,42 @@ class TrackStream:
     async def feed(self, pcm_s16le: bytes) -> None:
         """Hand one Cartesia chunk over. Never blocks, never raises — see the class docstring."""
         if pcm_s16le:
+            if self._first_fed_at is None:
+                self._first_fed_at = time.monotonic()
+            self._fed_bytes += len(pcm_s16le)
             self._queue.put_nowait(pcm_s16le)
 
     def start(self) -> None:
         if self._pump is None:
+            self._pump_started_at = time.monotonic()
             self._pump = asyncio.create_task(self._pump_loop())
+
+    def finish(self) -> None:
+        """Nothing more will be fed. Idempotent; does not wait for the audio to play."""
+        if not self._finished.is_set():
+            self._finished.set()
+            self._queue.put_nowait(None)
+
+    async def play_out(self) -> None:
+        """Prefetch mode: play everything fed once `finish()` is called. Bounded like close()."""
+        self.start()
+        await self._finished.wait()
+        assert self._pump is not None
+        try:
+            await asyncio.wait_for(self._pump, timeout=_DRAIN_TIMEOUT_S)
+        except TimeoutError:
+            self._pump.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._pump
+            logger.warning(
+                "livekit_tts_stream_drain_timeout",
+                meeting_id=self._key[0],
+                speaker_id=self._key[1],
+                target_lang=self._key[2],
+                spoken_bytes=self._spoken_bytes,
+            )
+        finally:
+            self._pump = None
 
     async def close(self) -> None:
         if self._pump is None:
@@ -331,6 +387,11 @@ class LiveKitTTSPublisher:
         # fully in parallel — this is what actually lets concurrent speakers be dubbed
         # in parallel end-to-end.
         self._locks: dict[_BotKey, asyncio.Lock] = {}
+        # Prefetch mode (stream_ahead): the last playout queued for each key. Every playout —
+        # streamed or one-shot — waits for the one before it, so lines leave a track in the
+        # order they were handed to this publisher even though they are no longer generated
+        # one-after-the-previous-has-PLAYED.
+        self._playout_tails: dict[_BotKey, asyncio.Task[None]] = {}
         # Started lazily by the first bot creation (see _ensure_reaper) rather than in
         # __init__, which runs outside any event loop.
         self._reaper: asyncio.Task[None] | None = None
@@ -360,6 +421,32 @@ class LiveKitTTSPublisher:
             return
 
         key: _BotKey = (meeting_id, speaker_id, target_lang, voice_key)
+        tails = self._tails()
+        if key in tails:
+            # A prefetched line of this key is queued or still playing: go behind it, in order.
+            await self._after_tail(
+                key,
+                lambda: self._publish_pcm_now(
+                    meeting_id, speaker_id, target_lang, pcm_s16le, sample_rate, voice_key
+                ),
+            )
+            return
+        await self._publish_pcm_now(
+            meeting_id, speaker_id, target_lang, pcm_s16le, sample_rate, voice_key
+        )
+
+    async def _publish_pcm_now(
+        self,
+        meeting_id: str,
+        speaker_id: str,
+        target_lang: str,
+        pcm_s16le: bytes,
+        sample_rate: int,
+        voice_key: str = "",
+        *,
+        locked: bool = False,
+    ) -> None:
+        key: _BotKey = (meeting_id, speaker_id, target_lang, voice_key)
         lock = self._locks.setdefault(key, asyncio.Lock())
         # Trimmed to whole frames before fading, not after. _capture_from cannot send a
         # trailing partial frame, so fading the raw buffer put the closing ramp into bytes that
@@ -374,46 +461,66 @@ class LiveKitTTSPublisher:
         # Faded once, here, rather than inside each attempt: a retry resumes partway through
         # this buffer, and re-fading a slice would put a fade-in in the middle of a word.
         pcm_s16le = _apply_fade(pcm_s16le, sample_rate)
-        sent = 0
+        if locked:
+            await self._capture_with_retry(
+                meeting_id, speaker_id, target_lang, voice_key, pcm_s16le, sample_rate
+            )
+            return
         async with lock:
-            for attempt in range(2):
-                try:
-                    bot = await self._get_or_create_bot(
-                        meeting_id, speaker_id, target_lang, voice_key, sample_rate
-                    )
-                    bot["last_used"] = time.monotonic()
-                except Exception:
-                    logger.exception(
-                        "livekit_tts_bot_connect_error",
-                        meeting_id=meeting_id,
-                        speaker_id=speaker_id,
-                        target_lang=target_lang,
-                        voice_key=voice_key,
-                    )
-                    return
+            await self._capture_with_retry(
+                meeting_id, speaker_id, target_lang, voice_key, pcm_s16le, sample_rate
+            )
 
-                sent += await self._capture_from(bot["source"], pcm_s16le[sent:], sample_rate)
-                if sent >= len(pcm_s16le):
-                    return
-
-                logger.warning(
-                    "livekit_tts_publish_retry",
+    async def _capture_with_retry(
+        self,
+        meeting_id: str,
+        speaker_id: str,
+        target_lang: str,
+        voice_key: str,
+        pcm_s16le: bytes,
+        sample_rate: int,
+    ) -> None:
+        """publish_pcm's body, under the key's lock (held by the caller)."""
+        key: _BotKey = (meeting_id, speaker_id, target_lang, voice_key)
+        sent = 0
+        for attempt in range(2):
+            try:
+                bot = await self._get_or_create_bot(
+                    meeting_id, speaker_id, target_lang, voice_key, sample_rate
+                )
+                bot["last_used"] = time.monotonic()
+            except Exception:
+                logger.exception(
+                    "livekit_tts_bot_connect_error",
                     meeting_id=meeting_id,
                     speaker_id=speaker_id,
                     target_lang=target_lang,
                     voice_key=voice_key,
-                    attempt=attempt,
-                    resume_byte=sent,
-                    total_bytes=len(pcm_s16le),
                 )
-                # Drop the connection, not just our handle on it. WT-269: a bot left
-                # connected here keeps holding this identity in the room, so the retry's
-                # connect() below can only be resolved by LiveKit evicting the old
-                # participant — an extra, invisible reconnect per failure on a project
-                # that is already rate-limit sensitive.
-                stale = self._bots.pop(key, None)
-                if stale is not None:
-                    await self._close_bot(stale)
+                return
+
+            sent += await self._capture_from(bot["source"], pcm_s16le[sent:], sample_rate)
+            if sent >= len(pcm_s16le):
+                return
+
+            logger.warning(
+                "livekit_tts_publish_retry",
+                meeting_id=meeting_id,
+                speaker_id=speaker_id,
+                target_lang=target_lang,
+                voice_key=voice_key,
+                attempt=attempt,
+                resume_byte=sent,
+                total_bytes=len(pcm_s16le),
+            )
+            # Drop the connection, not just our handle on it. WT-269: a bot left
+            # connected here keeps holding this identity in the room, so the retry's
+            # connect() below can only be resolved by LiveKit evicting the old
+            # participant — an extra, invisible reconnect per failure on a project
+            # that is already rate-limit sensitive.
+            stale = self._bots.pop(key, None)
+            if stale is not None:
+                await self._close_bot(stale)
 
     @asynccontextmanager
     async def stream(
@@ -445,6 +552,100 @@ class LiveKitTTSPublisher:
                 yield track
             finally:
                 await track.close()
+
+    def _tails(self) -> dict[_BotKey, asyncio.Task[None]]:
+        # getattr + assign back: tests build publishers without running __init__.
+        tails: dict[_BotKey, asyncio.Task[None]] | None = getattr(self, "_playout_tails", None)
+        if tails is None:
+            tails = {}
+            self._playout_tails = tails
+        return tails
+
+    def _enqueue_playout(
+        self, key: _BotKey, play: Callable[[], Awaitable[None]]
+    ) -> asyncio.Task[None]:
+        """Queue `play` behind whatever this key already has queued, and return its task."""
+        tails = self._tails()
+        previous = tails.get(key)
+
+        async def run() -> None:
+            if previous is not None and not previous.done():
+                # Its outcome is not ours: a line that failed to play must not stop the next.
+                await asyncio.wait({previous})
+            try:
+                await play()
+            finally:
+                if tails.get(key) is task:
+                    del tails[key]
+
+        task = asyncio.create_task(run())
+        tails[key] = task
+        return task
+
+    async def _after_tail(self, key: _BotKey, play: Callable[[], Awaitable[None]]) -> None:
+        await self._enqueue_playout(key, play)
+
+    @asynccontextmanager
+    async def stream_ahead(
+        self,
+        meeting_id: str,
+        speaker_id: str,
+        target_lang: str,
+        sample_rate: int,
+        voice_key: str = "",
+    ) -> AsyncIterator[TrackStream]:
+        """Like `stream`, but leaving the block does NOT wait for the sentence to be heard.
+
+        THE LATENCY THIS REMOVES. With `stream`, a key's next sentence could not even start
+        generating until the previous one had finished PLAYING (tts_worker holds the key's lock
+        for the whole call, and leaving `stream` waits for the drain). So every sentence that
+        queued behind another paid Cartesia's whole time-to-first-audio again AFTER the
+        previous one ended — an audible gap per sentence, and a backlog that grew with every
+        sentence in a long turn (prod p50 0.6 s, p90 1.8-3.7 s per sentence).
+
+        Here the sentence's playout is queued behind the previous one's (`_enqueue_playout`),
+        and the block returns as soon as generation has finished. The next sentence generates
+        while this one plays, and starts the instant it ends. Order is unchanged: a key's
+        playouts run strictly in the order their streams were opened, one at a time, under the
+        same per-key lock `stream`/`publish_pcm` use.
+
+        Because nobody waits for the drain any more, the caller cannot read `spoken_bytes` to
+        decide whether a fallback must be played. It sets `track.fallback_audio` instead, and
+        the playout itself plays it — still under the lock, still in order — only if the track
+        turned out to have spoken none of the sentence (a bot that never connected). Partial
+        audio is never followed by a fallback, the same rule as before.
+        """
+        key: _BotKey = (meeting_id, speaker_id, target_lang, voice_key)
+        track = TrackStream(self, key, sample_rate)
+
+        async def play() -> None:
+            lock = self._locks.setdefault(key, asyncio.Lock())
+            async with lock:
+                await track.play_out()
+                if track.spoken_bytes == 0 and track.fallback_audio:
+                    logger.info(
+                        "livekit_tts_stream_fallback_played",
+                        meeting_id=meeting_id,
+                        speaker_id=speaker_id,
+                        target_lang=target_lang,
+                        voice_key=voice_key,
+                        fed_bytes=track.fed_bytes,
+                    )
+                    await self._publish_pcm_now(
+                        meeting_id,
+                        speaker_id,
+                        target_lang,
+                        track.fallback_audio,
+                        sample_rate,
+                        voice_key,
+                        locked=True,
+                    )
+
+        track.playout = self._enqueue_playout(key, play)
+        try:
+            yield track
+        finally:
+            track.finish()
 
     async def _capture_from(
         self, source: rtc.AudioSource, pcm_s16le: bytes, sample_rate: int
