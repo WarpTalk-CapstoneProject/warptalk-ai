@@ -15,6 +15,8 @@ lightweight Redis-stream consumers with no need for a separate container.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable
@@ -68,10 +70,16 @@ from ai_assistant_worker.mcp_tools import split_mcp_tool_arguments as _split_mcp
 from ai_assistant_worker.mcp_tools import (
     with_mcp_confirmation_parameter as _with_mcp_confirmation_parameter,
 )
+from ai_assistant_worker.meet_rooms import file_meet_rooms
 from ai_assistant_worker.meeting_links import (
+    CalendarEvent,
     MeetingLink,
+    bridged_meet_code_from_tool_result,
+    calendar_event_from_tool_result,
     ensure_meeting_links,
+    meet_code_from_url,
     meeting_link_from_tool_result,
+    merge_calendar_events,
     strip_meeting_markers,
 )
 from ai_assistant_worker.platform_tools import (
@@ -84,6 +92,7 @@ from ai_assistant_worker.tool_targets import (
     describe_web_search_target,
     split_reasoning_summary,
 )
+from ai_assistant_worker.tools_manifest import run_manifest_publisher
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
 from shared.integration_status import OPENAI, IntegrationReport, credential_report
@@ -565,6 +574,8 @@ class ChatAssistantWorker(BaseWorker):
         # every path behind them is gated by the platform admin policy server-side.
         self._billing_client: httpx.AsyncClient | None = None
         self._auth_client: httpx.AsyncClient | None = None
+        # Publishes the built-in tool manifest for AssistantService (tools_manifest.py).
+        self._manifest_task: asyncio.Task[None] | None = None
 
     async def load_model(self) -> None:
         api_key = resolve_openai_api_key(self.chat_settings.api_key)
@@ -601,6 +612,11 @@ class ChatAssistantWorker(BaseWorker):
             timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
         )
         self.logger.info("chat_assistant_ready", model=self.chat_settings.model)
+        # Redis is connected before load_model runs (BaseWorker.start), so the first write lands
+        # at startup. The loop never raises on a failed write; see tools_manifest.
+        self._manifest_task = asyncio.create_task(
+            run_manifest_publisher(self.redis, self.chat_settings, self.logger)
+        )
 
     def integration_reports(self) -> dict[str, IntegrationReport]:
         return {
@@ -611,6 +627,11 @@ class ChatAssistantWorker(BaseWorker):
         }
 
     async def _cleanup(self) -> None:
+        if self._manifest_task is not None:
+            self._manifest_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._manifest_task
+            self._manifest_task = None
         for client in (
             self._workspace_client,
             self._assistant_client,
@@ -863,6 +884,12 @@ class ChatAssistantWorker(BaseWorker):
         # Meetings a tool created this turn. Their links are appended to the answer if the model
         # left them out - see meeting_links.
         created_meetings: list[MeetingLink] = []
+        # GMCAL1001: Calendar events chained onto a Meet this turn (folded onto its card), the Meet
+        # codes create_meeting already bridged (no second room), and the zone each Meet's time was
+        # given in (a bare date-time from the model is local, not UTC).
+        calendar_events: list[CalendarEvent] = []
+        bridged_meet_codes: set[str] = set()
+        meet_time_zones: dict[str, str] = {}
         final_text = ""
 
         for _ in range(self.chat_settings.max_tool_iterations):
@@ -1050,6 +1077,20 @@ class ChatAssistantWorker(BaseWorker):
                     created = meeting_link_from_tool_result(result_json)
                     if created is not None:
                         created_meetings.append(created)
+                    calendar_event = calendar_event_from_tool_result(result_json)
+                    if calendar_event is not None:
+                        calendar_events.append(calendar_event)
+                    bridged = bridged_meet_code_from_tool_result(result_json)
+                    if bridged:
+                        bridged_meet_codes.add(bridged)
+                    meet_code: str | None = None
+                    if created is not None and created.kind == "google_meet":
+                        meet_code = created.code or meet_code_from_url(created.url)
+                    elif calendar_event is not None:
+                        meet_code = calendar_event.meet_code
+                    time_zone = (arguments or {}).get("timeZone")
+                    if meet_code and isinstance(time_zone, str) and time_zone.strip():
+                        meet_time_zones.setdefault(meet_code.lower(), time_zone.strip())
 
                 if tool_name == "ask_user" and status == "completed":
                     await self._publish_result(
@@ -1111,6 +1152,20 @@ class ChatAssistantWorker(BaseWorker):
                 or "I wasn't able to finish looking that up — please try rephrasing your question."
             )
 
+        # One card per meeting: a Calendar event made for a Meet this turn lands on that Meet's
+        # card rather than beside it.
+        created_meetings = merge_calendar_events(created_meetings, calendar_events)
+        # Every Meet WarpBot created goes on WarpTalk's own calendar as an EXTERNAL_BRIDGE room,
+        # filed here rather than left to the model. Never raises - see meet_rooms.
+        try:
+            await file_meet_rooms(
+                tool_context,
+                created_meetings,
+                already_bridged=bridged_meet_codes,
+                time_zones=meet_time_zones,
+            )
+        except Exception:
+            self.logger.exception("meet_room_filing_failed")
         return ensure_meeting_links(final_text, created_meetings), tool_call_log
 
     async def _load_dynamic_mcp_tools(
