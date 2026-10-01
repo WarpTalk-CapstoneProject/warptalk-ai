@@ -369,9 +369,10 @@ class STTWorker(BaseWorker):
         # frame cleared the buffer that held it (`previous_turn_never_committed`).
         #
         # Appending now would put it inside the commit about to be sent. So it is HELD, in
-        # order, and handed to the session the moment that commit has been sent — into the
-        # fresh buffer the commit leaves behind (see _release_held_frames). The commit's own
-        # transcript is unaffected: it reads only its own item (OpenAISTT._transcribe_via_session).
+        # order, and handed to the session the moment the committed item has COMPLETED — into
+        # the fresh buffer the commit left behind (see _release_held_frames), for at most
+        # _HOLD_FOR_COMPLETION_S. The commit's own transcript is unaffected: it reads only its
+        # own item (OpenAISTT._transcribe_via_session).
         lock = self._speaker_locks.setdefault(key, asyncio.Lock())
         mode = self._frame_modes().get(key)
         if lock.locked() and mode != "direct":
@@ -449,8 +450,9 @@ class STTWorker(BaseWorker):
 
     def _end_commit_window(self, key: tuple[str, str]) -> None:
         """`process` is done with this speaker. Frames still held were never handed over — the
-        chunk ended before its commit was sent — so they start no clean turn: dropped, and the
-        rest of that turn falls back to its own chunk's audio (the `frame_gap` path)."""
+        chunk ended without its item completing (no commit was sent, or the transcription
+        failed) — so they start no clean turn: dropped, and the rest of that turn falls back to
+        its own chunk's audio (the `frame_gap` path)."""
         self._frame_modes().pop(key, None)
         self._held_since().pop(key, None)
         held = self._held_frames().pop(key, None)
@@ -556,11 +558,11 @@ class STTWorker(BaseWorker):
             await abandon("frame_gap", expected_seq=expected_seq, got_seq=frame.seq)
             return
 
-        # A COMMIT FOR THIS SPEAKER IS IN FLIGHT and has not been sent: this frame must not go
-        # into the buffer that commit is about to take. _append_speech_frame holds such frames;
-        # reaching here with the lock taken means either the commit HAS been sent
-        # (`locked_by_commit`: the buffer is the next turn's) or holding overflowed, in which case
-        # this turn falls back to its own chunk's audio, as it always did.
+        # A COMMIT FOR THIS SPEAKER IS IN FLIGHT: this frame must not go into the buffer that
+        # commit is about to take. _append_speech_frame holds such frames; reaching here with the
+        # lock taken means either the committed item HAS completed (`locked_by_commit`: the
+        # buffer is the next turn's), or the frame was not held, in which case this turn falls
+        # back to its own chunk's audio, as it always did.
         lock = self._speaker_locks.setdefault(key, asyncio.Lock())
         if lock.locked() and not locked_by_commit:
             await abandon("commit_in_flight")
