@@ -142,11 +142,11 @@ _CLEAN_ERROR_LOG_INTERVAL_S = 60.0
 # its own. Matches the horizon the other per-room keys use.
 _TRANSCRIPT_ANCHOR_TTL_S = 6 * 60 * 60
 _CONTEXT_MIN_CONFIDENCE = -0.35
-# How many of a speaker's next-turn frames may wait for their previous chunk's commit to be SENT
-# (see STTWorker._append_speech_frame): ~10 s of 96 ms frames. A commit is sent within
-# milliseconds of its chunk being read, so this bound is only ever reached by a chunk stuck
-# behind something broken, and then the turn simply falls back to its own audio.
-_MAX_HELD_FRAMES = 100
+# How long a speaker's next-turn frames may wait for their previous item to COMPLETE (see
+# STTWorker._append_speech_frame). commit -> completed is ~0.85 s at p50 and under 2.2 s at p99
+# in the meeting simulator; past this the turn falls back to its own chunk's audio, so a lost
+# completion can never stall a speaker.
+_HOLD_FOR_COMPLETION_S = 3.0
 
 
 def _language_hint_for_stt(language: str) -> str | None:
@@ -375,15 +375,38 @@ class STTWorker(BaseWorker):
         lock = self._speaker_locks.setdefault(key, asyncio.Lock())
         mode = self._frame_modes().get(key)
         if lock.locked() and mode != "direct":
+            if mode == "gave_up":
+                # This turn already waited out the bound below and fell back to its own chunk.
+                return
             held = self._held_frames().setdefault(key, [])
-            if len(held) < _MAX_HELD_FRAMES:
+            since = self._held_since().setdefault(key, time.monotonic())
+            if time.monotonic() - since <= _HOLD_FOR_COMPLETION_S:
                 held.append(frame)
                 return
-            # A commit not even SENT after this long is not a commit in flight: stop holding, and
-            # let the next chunk carry its own audio as it always could.
+            # BOUNDED. The previous item has not completed in this long — a lost completion must
+            # never stall a speaker. Stop holding: this turn goes the way every turn went before
+            # (its chunk carries its own audio and is uploaded whole at commit), and its remaining
+            # frames are dropped as a closed turn's would be.
+            dropped = len(held)
             held.clear()
-            self.logger.info("stt_held_frames_overflow", meeting_id=key[0], speaker_id=key[1])
+            self._frame_modes()[key] = "gave_up"
+            self._close_turn(key, frame.turn_id)
+            self.logger.info(
+                "stt_held_frames_timed_out",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                frames=dropped + 1,
+                waited_ms=int((time.monotonic() - since) * 1000),
+            )
+            return
         await self._append_frame(frame, locked_by_commit=mode == "direct")
+
+    def _held_since(self) -> dict[tuple[str, str], float]:
+        since: dict[tuple[str, str], float] | None = getattr(self, "_held_since_by_key", None)
+        if since is None:
+            since = {}
+            self._held_since_by_key = since
+        return since
 
     def _frame_modes(self) -> dict[tuple[str, str], str]:
         modes: dict[tuple[str, str], str] | None = getattr(self, "_frame_mode", None)
@@ -402,15 +425,22 @@ class STTWorker(BaseWorker):
         return held
 
     async def _release_held_frames(self, key: tuple[str, str]) -> None:
-        """The commit in flight has been SENT: the session's buffer is empty and belongs to the
-        next turn. Hand it the frames held meanwhile, in order, then let new ones straight in.
+        """The previous item has COMPLETED: hand the session the next turn's frames held
+        meanwhile, in order, then let new ones straight in.
 
-        Called from inside the commit (OpenAISTT's `on_committed`) while `process` still holds
-        this speaker's lock. Frames that land during the hand-over join the queue rather than
-        overtaking it: the mode only turns "direct" once the queue is empty, with no await in
-        between.
+        After completion, not merely after the commit was sent. The meeting simulator caught
+        gpt-live-transcribe stalling a committed item for 12 s — and returning it truncated —
+        when the next turn's audio was appended while that item was still being transcribed.
+        Waiting for `completed` costs the held audio ~0.85 s (commit -> completed, p50) of
+        streaming, which the live model then catches up on in one burst.
+
+        Called by `process` while it still holds this speaker's lock. Frames that land during
+        the hand-over join the queue rather than overtaking it: the mode only turns "direct"
+        once the queue is empty, with no await in between.
         """
         modes = self._frame_modes()
+        if modes.get(key) == "gave_up":
+            return
         modes[key] = "draining"
         held = self._held_frames().get(key, [])
         while held:
@@ -422,6 +452,7 @@ class STTWorker(BaseWorker):
         chunk ended before its commit was sent — so they start no clean turn: dropped, and the
         rest of that turn falls back to its own chunk's audio (the `frame_gap` path)."""
         self._frame_modes().pop(key, None)
+        self._held_since().pop(key, None)
         held = self._held_frames().pop(key, None)
         if held:
             self.logger.info(
@@ -1182,11 +1213,9 @@ class STTWorker(BaseWorker):
                 # and hangover padding every chunk carries, which is enough to make the
                 # "too much text for this little audio" guard unable to fire at all.
                 speech_ms=chunk.speech_ms,
-                # The moment the commit has been SENT, the next turn's held frames go in.
-                on_committed=lambda: self._release_held_frames(
-                    (chunk.meeting_id, chunk.speaker_id)
-                ),
             )
+            # The item is complete: the next turn's held frames can go in now.
+            await self._release_held_frames((chunk.meeting_id, chunk.speaker_id))
         except Exception as exc:
             # Swallowed so the meeting keeps going, which is exactly why it must be counted:
             # this attempt produced no transcript. See BaseWorker.note_attempt_outcome.
