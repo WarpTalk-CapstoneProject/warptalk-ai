@@ -18,9 +18,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -87,6 +88,7 @@ from ai_assistant_worker.platform_tools import (
     PLATFORM_TOOLS_BY_NAME,
     build_platform_system_prompt,
 )
+from ai_assistant_worker.tool_call_log import function_call_entry, web_search_entry
 from ai_assistant_worker.tool_targets import (
     describe_tool_target,
     describe_web_search_target,
@@ -899,6 +901,9 @@ class ChatAssistantWorker(BaseWorker):
             # Per ITERATION, not per turn: a second round of searching is a second target, and
             # carrying the first one over would label the new step with the old query.
             web_search_detail = ""
+            # When each hosted search item was first seen, for its log entry's startedAt. The
+            # search runs server-side, so this is the only moment the worker can put on it.
+            web_search_seen_at: dict[str, datetime] = {}
             # The reasoning summary the model is currently writing. Accumulated across deltas
             # and published whole, because half a sentence appearing and then being completed
             # under the reader is worse than the sentence arriving a moment later.
@@ -981,6 +986,9 @@ class ChatAssistantWorker(BaseWorker):
                 elif etype in ("response.output_item.added", "response.output_item.done"):
                     item = getattr(event, "item", None)
                     if getattr(item, "type", "") == "web_search_call":
+                        item_id = str(getattr(item, "id", "") or "")
+                        if item_id:
+                            web_search_seen_at.setdefault(item_id, datetime.now(UTC))
                         found = describe_web_search_target(getattr(item, "action", None))
                         if found:
                             web_search_detail = found
@@ -1008,6 +1016,19 @@ class ChatAssistantWorker(BaseWorker):
 
             if buffer:
                 await self._publish_result(request, type_="chunk", content=buffer)
+
+            # One entry per hosted search, with no query text. Logged from the completed output
+            # rather than the lifecycle events, so a search is counted once however many events
+            # it streamed.
+            for item in output_items:
+                if getattr(item, "type", "") == "web_search_call":
+                    item_id = str(getattr(item, "id", "") or "")
+                    tool_call_log.append(
+                        web_search_entry(
+                            item,
+                            started_at=web_search_seen_at.get(item_id) or datetime.now(UTC),
+                        )
+                    )
 
             function_calls = [
                 item for item in output_items if getattr(item, "type", "") == "function_call"
@@ -1044,17 +1065,23 @@ class ChatAssistantWorker(BaseWorker):
                 )
 
                 tool = tool_lookup.get(tool_name)
+                started_at = datetime.now(UTC)
+                started_clock = time.perf_counter()
+                error_code: str | None = None
                 if tool is None:
                     result_json = json.dumps({"error": f"Unknown tool '{tool_name}'."})
                     status = "failed"
+                    error_code = "unknown_tool"
                 else:
                     try:
                         result_json = await tool.handler(tool_context, arguments)
                         status = "completed"
-                    except Exception:
+                    except Exception as exc:
                         self.logger.exception("tool_execution_failed", tool=tool_name)
                         result_json = json.dumps({"error": "The tool failed to execute."})
                         status = "failed"
+                        error_code = type(exc).__name__
+                duration_seconds = time.perf_counter() - started_clock
 
                 await self._publish_result(
                     request,
@@ -1137,13 +1164,19 @@ class ChatAssistantWorker(BaseWorker):
                         "output": result_json,
                     }
                 )
+                plugin_key = tool.plugin_key if tool is not None else None
                 tool_call_log.append(
-                    {
-                        "tool": tool_name,
-                        "arguments": raw_arguments,
-                        "result": result_json,
-                        "status": status,
-                    }
+                    function_call_entry(
+                        tool=tool_name,
+                        arguments=raw_arguments,
+                        result=result_json,
+                        status=status,
+                        source="plugin" if plugin_key else "builtin",
+                        plugin_key=plugin_key,
+                        started_at=started_at,
+                        duration_seconds=duration_seconds,
+                        error_code=error_code,
+                    )
                 )
         else:
             # Hit max_tool_iterations while the model still wanted another tool.
@@ -1241,6 +1274,7 @@ class ChatAssistantWorker(BaseWorker):
                         policy=policy,
                     ),
                     handler=self._build_mcp_tool_handler(plugin_key, name, request, label),
+                    plugin_key=plugin_key,
                 )
             )
 
