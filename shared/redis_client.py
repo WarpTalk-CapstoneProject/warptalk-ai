@@ -43,7 +43,9 @@ LATENCY_KEY_TTL_SECONDS = 7 * 24 * 60 * 60
 OUTCOME_KEY_PREFIX = "warptalk:outcome:"
 # The outcomes a stage attempt can have. "ok" and the three failure kinds partition every attempt;
 # "dead_letter" is counted on top, once, when a message is parked after its retries are spent.
-STAGE_OUTCOMES = ("ok", "error", "timeout", "vendor_error", "dead_letter")
+# "out_of_order" is also counted on top: a dub tts_worker deliberately did not speak because a LATER
+# line from the same speaker had already been spoken (see TTSWorker._run_in_key_order).
+STAGE_OUTCOMES = ("ok", "error", "timeout", "vendor_error", "dead_letter", "out_of_order")
 # Billable work the billing worker did NOT bill, one hash: field = "{reason}:{charge_type}",
 # value = count. Read back by metrics_exporter as warptalk_billing_unbilled_events_total. Written by
 # billing_worker when a room's workspace has no subscription, or when a charge is refused.

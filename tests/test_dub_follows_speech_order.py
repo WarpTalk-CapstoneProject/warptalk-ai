@@ -123,6 +123,9 @@ async def test_a_stalled_earlier_sentence_holds_the_next_one_only_up_to_the_boun
     assert [r.original_text for r in published] == [FAST_B, SLOW_A]
     events = [c.args[0] for c in worker.logger.warning.call_args_list if c.args]
     assert "translation_publish_order_wait_timeout" in events
+    # A still reaches translate:results (the transcript needs it), and says it is late, because
+    # tts_worker will not dub it — see test_tts_never_speaks_out_of_order.py.
+    assert events.count("translation_published_after_successor") == 1
 
 
 async def test_an_earlier_sentence_that_fails_does_not_block_the_next(
@@ -143,15 +146,17 @@ async def test_an_earlier_sentence_that_fails_does_not_block_the_next(
     assert [r.original_text for r in published] == [FAST_B]
 
 
-@pytest.mark.parametrize("arrival", [["A", "B"], ["B", "A"]])
-async def test_tts_speaks_every_sentence_whatever_order_it_arrives_in(
-    mock_redis_client, worker_settings: WorkerSettings, arrival: list[str]
+@pytest.mark.parametrize(("arrival", "expected"), [(["A", "B"], ["A", "B"]), (["B", "A"], ["B"])])
+async def test_tts_never_speaks_a_sentence_after_a_later_one(
+    mock_redis_client, worker_settings: WorkerSettings, arrival: list[str], expected: list[str]
 ) -> None:
-    """The TTS half of the invariant: the spoken-position record only speeds a late line up.
-    It never skips one, so even an out-of-order arrival is spoken."""
+    """The TTS half of the invariant. In order, both are spoken. If B was spoken before A
+    arrived, A is NOT spoken: a gap, never an inversion. (It used to be spoken late and sped
+    up, which is exactly the "B then A" the owner reported.)"""
     from tests.test_tts_worker import _make_worker
 
     tts = _make_worker(mock_redis_client, worker_settings)
+    tts._key_locks = {}
     mock_redis_client._redis.get.return_value = None
     start = {"A": 1000, "B": 4000}
     for name in arrival:
@@ -164,8 +169,10 @@ async def test_tts_speaks_every_sentence_whatever_order_it_arrives_in(
             source_lang="en",
             target_lang="vi",
             start_ms=start[name],
+            # The chunk each sentence was published in, in speech order, whatever the arrival.
+            timestamp_ms=1_790_000_000_000 + start[name],
         )
-        await tts.process(f"{name}-0".encode(), msg.to_redis())
+        await tts._run_in_key_order(f"{name}-0".encode(), msg.to_redis())
 
     spoken = [c.kwargs["text"] for c in tts.cartesia.synthesize.await_args_list]
-    assert spoken == [f"câu {name}" for name in arrival]
+    assert spoken == [f"câu {name}" for name in expected]
