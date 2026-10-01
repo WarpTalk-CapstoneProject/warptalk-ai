@@ -504,6 +504,30 @@ class STTSettings(BaseSettings):
     far_side_dedupe_min_chars: int = 8
     # Require the two segments' languages to agree when both are known.
     far_side_dedupe_same_language: bool = True
+    # DIRECTION, by AUDIO start (anchor_ms + start_ms), never by publish order: the stand-in is
+    # dropped only when its audio starts this much LATER than the named line's. The floor
+    # matches FAR_SIDE_GATE_LAG_MIN_MS; a smaller lag (stand-in first or simultaneous) is the
+    # LEAK case below, where the stand-in is the true copy. Unknown timing on either side keeps
+    # both lines.
+    far_side_dedupe_min_lag_ms: int = 150
+    far_side_dedupe_max_lag_ms: int = 2_000
+
+    # FAR-SIDE LEAK DEDUPE (reverse). Host on laptop speakers: Meet audio played by Chrome leaks
+    # into the host's real mic (Electron's AEC has no cross-process reference), so the host's
+    # line repeats what the stand-in already carried first. With this on, a NAMED line whose
+    # audio starts between `far_side_dedupe_min_lag_ms` before and `far_side_leak_max_named_
+    # delay_ms` after an already-published stand-in line with the same text is dropped as the
+    # leak. Bridge rooms only (it needs a stand-in line to exist). Env: STT_FAR_SIDE_LEAK_*.
+    #
+    # OFF BY DEFAULT: audio start is chunk-granular (a sentence mid-chunk carries its chunk's
+    # start), so a forward echo whose two chunks were cut differently can land in the leak band
+    # and the WarpTalk user's line would be re-attributed to the stand-in. Turn on after
+    # measuring on real bridge sessions.
+    far_side_leak_dedupe_enabled: bool = False
+    # Stricter than the forward thresholds: what this drops is a WarpTalk user's line.
+    far_side_leak_min_ratio: float = 0.85
+    far_side_leak_min_chars: int = 12
+    far_side_leak_max_named_delay_ms: int = 1_000
 
     # FAR-SPEAKER HINTS (shared/far_speaker.py): names read from Meet captions by the desktop,
     # attached to stand-in segments as far_speaker_name/source/confidence. Env: STT_FAR_SPEAKER_*.

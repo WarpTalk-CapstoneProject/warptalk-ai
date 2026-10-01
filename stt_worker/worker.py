@@ -40,7 +40,14 @@ from shared.schemas import (
     STTResultMessage,
 )
 from shared.text_utils import split_into_sentences
-from stt_worker.far_side_dedupe import DedupeConfig, NamedSegmentRef, find_far_side_duplicate
+from stt_worker.far_side_dedupe import (
+    DedupeConfig,
+    LeakConfig,
+    NamedSegmentRef,
+    audio_start_epoch_ms,
+    find_far_side_duplicate,
+    find_far_side_leak,
+)
 from stt_worker.model import OpenAISTT, _normalize_language, _normalize_overheard_text
 
 
@@ -100,7 +107,8 @@ _DUB_ECHO_SCAN_COUNT = 48
 _DUB_ECHO_CACHE_TTL_S = 2.0
 
 # FAR-SIDE DEDUPE (stt_worker/far_side_dedupe.py). stt:results entries to look back through for
-# named speakers' recent lines. Only bridge stand-in chunks pay this read.
+# recent lines. Bridge stand-in chunks pay this read (forward dedupe); named chunks pay it only
+# when STT_FAR_SIDE_LEAK_DEDUPE_ENABLED is on (reverse/leak dedupe).
 _FAR_SIDE_SCAN_COUNT = 64
 # Short, unlike the dub-echo cache: the named copy of a sentence and its Meet echo are published
 # within about a second of each other, and a 2s-stale read would miss exactly that line.
@@ -856,12 +864,12 @@ class STTWorker(BaseWorker):
         keywords = await self._get_stt_keywords(chunk.meeting_id)
         noise_reduction = await self._get_noise_reduction(chunk.meeting_id, chunk.speaker_id)
         recent_dub_texts = await self._get_recent_dub_texts(chunk.meeting_id)
-        # BRIDGE STAND-IN ONLY: what named WarpTalk speakers in this room just said (for the
-        # far-side dedupe) and where this chunk sits on the epoch clock caption hints use.
+        # BRIDGE STAND-IN: where this chunk sits on the epoch clock caption hints use. The
+        # far-side reference lines are read per segment AFTER recognition (_review_far_side /
+        # _is_far_side_leak), not here: the other copy of a sentence is racing through a
+        # different STT session, and the later the read, the more likely it has landed.
         bridge_chunk = is_external_bridge_speaker(chunk.speaker_id)
-        far_side_refs: list[NamedSegmentRef] = (
-            await self._get_named_speaker_refs(chunk.meeting_id) if bridge_chunk else []
-        )
+        leak_review = not bridge_chunk and self.stt_settings.far_side_leak_dedupe_enabled
         # A streamed turn's chunk can carry no PCM of its own; its speech_ms still says how
         # long the speaker talked.
         chunk_epoch_start_ms = chunk.timestamp_ms - (
@@ -975,11 +983,13 @@ class STTWorker(BaseWorker):
                 )
                 if bridge_chunk:
                     reviewed = await self._review_far_side(
-                        result, chunk, chunk_epoch_start_ms, chunk_offset_ms, far_side_refs
+                        result, chunk, chunk_epoch_start_ms, chunk_offset_ms
                     )
                     if reviewed is None:
                         return
                     result = reviewed
+                elif leak_review and await self._is_far_side_leak(result):
+                    return
                 result = await self._publish_stt_result(result, message_id)
                 self.logger.info(
                     "stt_early_sentence",
@@ -1161,11 +1171,13 @@ class STTWorker(BaseWorker):
 
             if bridge_chunk:
                 reviewed = await self._review_far_side(
-                    result, chunk, chunk_epoch_start_ms, chunk_offset_ms, far_side_refs
+                    result, chunk, chunk_epoch_start_ms, chunk_offset_ms
                 )
                 if reviewed is None:
                     continue
                 result = reviewed
+            elif leak_review and await self._is_far_side_leak(result):
+                continue
 
             result = await self._publish_stt_result(result, message_id)
             published_segments += 1
@@ -1191,8 +1203,8 @@ class STTWorker(BaseWorker):
                 inference_ms=inference_ms,
             )
 
-        # On PUBLISHED segments, not recognised ones: a final stand-in chunk whose every line
-        # was a far-side duplicate still has to close its turn downstream.
+        # On PUBLISHED segments, not recognised ones: a final chunk whose every line was a
+        # far-side duplicate (stand-in) or a far-side leak (named) still has to close its turn.
         if not published_segments and chunk.is_final_chunk:
             result = STTResultMessage(
                 segment_id=_build_segment_id(
@@ -1706,19 +1718,48 @@ class STTWorker(BaseWorker):
             min_ratio=s.far_side_dedupe_min_ratio,
             min_chars=s.far_side_dedupe_min_chars,
             same_language=s.far_side_dedupe_same_language,
+            min_lag_ms=s.far_side_dedupe_min_lag_ms,
+            max_lag_ms=s.far_side_dedupe_max_lag_ms,
+        )
+
+    def _far_side_leak_config(self) -> LeakConfig:
+        s = self.stt_settings
+        return LeakConfig(
+            min_ratio=s.far_side_leak_min_ratio,
+            min_chars=s.far_side_leak_min_chars,
+            same_language=s.far_side_dedupe_same_language,
+            max_named_delay_ms=s.far_side_leak_max_named_delay_ms,
         )
 
     async def _get_named_speaker_refs(self, meeting_id: str) -> list[NamedSegmentRef]:
-        """Recent lines NAMED speakers in this room published, for the far-side dedupe.
-
-        Read from stt:results:{meeting} — every replica's output for the room, which an
-        in-memory list on this replica would not be. Fails open to [] like the dub-echo read.
-        """
+        """Recent lines NAMED speakers in this room published, for the forward dedupe."""
         if not self.stt_settings.far_side_dedupe_enabled:
             return []
-        cache: dict[str, tuple[list[NamedSegmentRef], float]] | None = getattr(
-            self, "_far_side_ref_cache", None
-        )
+        return (await self._get_far_side_refs(meeting_id))[0]
+
+    async def _get_stand_in_refs(self, meeting_id: str) -> list[NamedSegmentRef]:
+        """Recent lines the bridge STAND-IN published, for the reverse (leak) dedupe.
+
+        Empty in every room without a bridge - which is what limits the leak check to bridge
+        rooms: no stand-in line, nothing for a named line to be a leaked copy of.
+        """
+        if not self.stt_settings.far_side_leak_dedupe_enabled:
+            return []
+        return (await self._get_far_side_refs(meeting_id))[1]
+
+    async def _get_far_side_refs(
+        self, meeting_id: str
+    ) -> tuple[list[NamedSegmentRef], list[NamedSegmentRef]]:
+        """(named lines, stand-in lines) recently published in this room. One read, cached.
+
+        Read from stt:results:{meeting} - every replica's output for the room, which an
+        in-memory list on this replica would not be. Fails open to ([], []) like the dub-echo
+        read. Each ref carries its AUDIO start (anchor_ms + start_ms), which is what the
+        direction rule decides on; None when the line stated no usable origin.
+        """
+        cache: (
+            dict[str, tuple[tuple[list[NamedSegmentRef], list[NamedSegmentRef]], float]] | None
+        ) = getattr(self, "_far_side_ref_cache", None)
         if cache is None:
             cache = {}
             self._far_side_ref_cache = cache
@@ -1727,8 +1768,9 @@ class STTWorker(BaseWorker):
         if cached is not None and now - cached[1] < _FAR_SIDE_CACHE_TTL_S:
             return cached[0]
 
-        refs: list[NamedSegmentRef] = []
-        # Twice the match window: the dedupe compares chunk timestamps in both directions.
+        named: list[NamedSegmentRef] = []
+        standin: list[NamedSegmentRef] = []
+        # Twice the match window: the timestamp prefilter compares in both directions.
         horizon_ms = 2 * self.stt_settings.far_side_dedupe_window_ms
         try:
             entries = (
@@ -1754,24 +1796,73 @@ class STTWorker(BaseWorker):
                 if now_ms - ts > horizon_ms:
                     break
                 speaker = data.get("speaker_id", "")
-                if not speaker or is_external_bridge_speaker(speaker):
+                if not speaker:
                     continue
                 text = _normalize_overheard_text(data.get("text", ""))
                 if not text:
                     continue
-                refs.append(
-                    NamedSegmentRef(
-                        speaker_id=speaker,
-                        text=text,
-                        language=data.get("language", ""),
-                        timestamp_ms=ts,
+                try:
+                    audio_start = audio_start_epoch_ms(
+                        int(data.get("anchor_ms") or 0), int(data.get("start_ms") or 0)
                     )
+                except ValueError:
+                    audio_start = None
+                ref = NamedSegmentRef(
+                    speaker_id=speaker,
+                    text=text,
+                    language=data.get("language", ""),
+                    timestamp_ms=ts,
+                    audio_start_ms=audio_start,
                 )
+                (standin if is_external_bridge_speaker(speaker) else named).append(ref)
         except Exception:
             self.logger.warning("far_side_ref_lookup_failed", meeting_id=meeting_id, exc_info=True)
-            refs = []
-        cache[meeting_id] = (refs, now)
-        return refs
+            named, standin = [], []
+        cache[meeting_id] = ((named, standin), now)
+        return named, standin
+
+    async def _is_far_side_leak(self, result: STTResultMessage) -> bool:
+        """A NAMED line that is Meet audio leaking into this person's mic (reverse dedupe).
+
+        Checked only against stand-in lines ALREADY published: a named line recognised before
+        the stand-in's copy lands is kept, because stt:results has no retraction message to take
+        it back later. Fails open: any error keeps the line.
+        """
+        try:
+            refs = await self._get_stand_in_refs(result.meeting_id)
+            if not refs:
+                return False
+            audio_start = audio_start_epoch_ms(result.anchor_ms, result.start_ms)
+            match = find_far_side_leak(
+                _normalize_overheard_text(result.text),
+                result.language,
+                result.timestamp_ms,
+                refs,
+                self._far_side_dedupe_config(),
+                self._far_side_leak_config(),
+                audio_start_ms=audio_start,
+            )
+        except Exception:
+            self.logger.warning(
+                "far_side_leak_check_failed", meeting_id=result.meeting_id, exc_info=True
+            )
+            return False
+        if match is None:
+            return False
+        self._far_side_leaks_dropped = getattr(self, "_far_side_leaks_dropped", 0) + 1
+        self.logger.info(
+            "filtered_far_side_leak",
+            meeting_id=result.meeting_id,
+            speaker_id=result.speaker_id,
+            leak_of_speaker_id=match.speaker_id,
+            text=result.text[:80],
+            language=result.language,
+            is_early=result.is_early,
+            # Stand-in audio start minus this line's: <= 0 means the stand-in had it first.
+            lag_ms=(match.audio_start_ms or 0) - (audio_start or 0),
+            dropped_total=self._far_side_leaks_dropped,
+        )
+        return True
 
     def _far_speaker_tracker(self) -> FarSpeakerTracker | None:
         """Who-on-the-far-side source. Caption hints today; WT-677 swaps in diarization."""
@@ -1798,16 +1889,23 @@ class STTWorker(BaseWorker):
         chunk: AudioChunkMessage,
         chunk_epoch_start_ms: int,
         chunk_offset_ms: int,
-        refs: list[NamedSegmentRef],
     ) -> STTResultMessage | None:
-        """A bridge stand-in line: None when it duplicates a named speaker, else labelled."""
-        if refs and self.stt_settings.far_side_dedupe_enabled:
+        """A bridge stand-in line: None when it echoes a named speaker, else labelled.
+
+        Dropped only when its audio started `min_lag_ms`..`max_lag_ms` AFTER the matching named
+        line's - the Meet round trip. Stand-in first or simultaneous is the leak case, where the
+        stand-in is the true copy and is kept; unknown timing keeps it too.
+        """
+        refs = await self._get_named_speaker_refs(result.meeting_id)
+        audio_start = audio_start_epoch_ms(result.anchor_ms, result.start_ms)
+        if refs:
             match = find_far_side_duplicate(
                 _normalize_overheard_text(result.text),
                 result.language,
                 result.timestamp_ms,
                 refs,
                 self._far_side_dedupe_config(),
+                audio_start_ms=audio_start,
             )
             if match is not None:
                 self._far_side_duplicates_dropped = (
@@ -1821,7 +1919,8 @@ class STTWorker(BaseWorker):
                     text=result.text[:80],
                     language=result.language,
                     is_early=result.is_early,
-                    lag_ms=result.timestamp_ms - match.timestamp_ms,
+                    # Audio start of this stand-in line minus the named line's (both known).
+                    lag_ms=(audio_start or 0) - (match.audio_start_ms or 0),
                     dropped_total=self._far_side_duplicates_dropped,
                 )
                 return None
