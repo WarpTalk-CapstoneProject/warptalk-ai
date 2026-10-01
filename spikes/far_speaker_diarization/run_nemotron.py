@@ -1,4 +1,4 @@
-"""Run nvidia/Nemotron-3-Diarization (Streaming Sortformer + AOSC, 8 speakers) through 🤗 Transformers.
+"""Run nvidia/Nemotron-3-Diarization (Streaming Sortformer + AOSC, 8 speakers) via Transformers.
 
 Streaming mode feeds the audio chunk by chunk exactly as a live loopback would arrive, so the
 per-frame speaker channel is what a realtime consumer would see at emission time (Sortformer
@@ -7,6 +7,7 @@ forward over the whole file and serves as the same-model upper bound.
 
 Writes out/<system>/<uri>.<variant>.rttm, .npz (10 ms speaker probabilities) and .json (timing).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,6 +28,7 @@ MODES = ["ultra_low_latency", "very_low_latency", "low_latency", "offline"]
 
 def load(threads: int):
     from transformers import AutoModelForAudioFrameClassification, AutoProcessor
+
     torch.set_num_threads(threads)
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     model = AutoModelForAudioFrameClassification.from_pretrained(MODEL_ID).eval()
@@ -34,20 +36,31 @@ def load(threads: int):
 
 
 def stream(processor, model, audio: np.ndarray, sr: int):
-    """Returns (logits [T,8] at 10 ms, list of per-chunk compute seconds, list of chunk audio seconds)."""
+    """Returns (logits [T,8] at 10 ms, per-chunk compute seconds, per-chunk audio seconds)."""
     chunks, compute = [], []
 
     def gen():
-        yield processor(audio[: processor.num_samples_first_audio_chunk], sampling_rate=sr,
-                        is_streaming=True, is_first_audio_chunk=True)
+        yield processor(
+            audio[: processor.num_samples_first_audio_chunk],
+            sampling_rate=sr,
+            is_streaming=True,
+            is_first_audio_chunk=True,
+        )
         mel_idx = processor.num_mel_frames_per_step
         start = processor.audio_chunk_start(mel_idx)
         while (end := start + processor.num_samples_per_audio_chunk) <= audio.shape[0]:
-            yield processor(audio[start:end], sampling_rate=sr, is_streaming=True, is_first_audio_chunk=False)
+            yield processor(
+                audio[start:end], sampling_rate=sr, is_streaming=True, is_first_audio_chunk=False
+            )
             mel_idx += processor.num_mel_frames_per_step
             start = processor.audio_chunk_start(mel_idx)
-        yield processor(audio[start:], sampling_rate=sr, is_streaming=True, is_first_audio_chunk=False,
-                        is_last_audio_chunk=True)
+        yield processor(
+            audio[start:],
+            sampling_rate=sr,
+            is_streaming=True,
+            is_first_audio_chunk=False,
+            is_last_audio_chunk=True,
+        )
 
     cache = None
     with torch.inference_mode():
@@ -68,7 +81,9 @@ def offline(processor, model, audio, sr):
         return logits, [time.perf_counter() - t0]
 
 
-def probs_to_rttm(probs: np.ndarray, uri: str, frame_s: float, thr: float = 0.5, min_dur: float = 0.0):
+def probs_to_rttm(
+    probs: np.ndarray, uri: str, frame_s: float, thr: float = 0.5, min_dur: float = 0.0
+):
     lines = []
     active = probs > thr
     for k in range(active.shape[1]):
@@ -78,7 +93,9 @@ def probs_to_rttm(probs: np.ndarray, uri: str, frame_s: float, thr: float = 0.5,
             if (e - s) * frame_s >= min_dur:
                 lines.append((s * frame_s, (e - s) * frame_s, k))
     lines.sort()
-    return "".join(f"SPEAKER {uri} 1 {s:.3f} {d:.3f} <NA> <NA> spk{k} <NA> <NA>\n" for s, d, k in lines)
+    return "".join(
+        f"SPEAKER {uri} 1 {s:.3f} {d:.3f} <NA> <NA> spk{k} <NA> <NA>\n" for s, d, k in lines
+    )
 
 
 def main():
@@ -87,7 +104,9 @@ def main():
     ap.add_argument("--variants", default="meet")
     ap.add_argument("--uris", default="", help="comma list; default = all in manifest")
     ap.add_argument("--threads", type=int, default=4)
-    ap.add_argument("--max-seconds", type=float, default=0, help="crop audio (streaming on CPU is slow)")
+    ap.add_argument(
+        "--max-seconds", type=float, default=0, help="crop audio (streaming on CPU is slow)"
+    )
     args = ap.parse_args()
 
     manifest = json.loads((ROOT / "data/clips/manifest.json").read_text())
@@ -119,19 +138,37 @@ def main():
                 frame_s = 0.01
                 stem = f"{uri}.{variant}"
                 (out_dir / f"{stem}.rttm").write_text(probs_to_rttm(probs, uri, frame_s))
-                np.savez_compressed(out_dir / f"{stem}.npz", probs=probs.astype(np.float16), frame_s=frame_s)
+                np.savez_compressed(
+                    out_dir / f"{stem}.npz", probs=probs.astype(np.float16), frame_s=frame_s
+                )
                 c = np.array(compute)
                 info = {
-                    "system": system, "uri": uri, "variant": variant, "audio_s": dur, "threads": args.threads,
-                    "wall_s": wall, "rtf": wall / dur, "cpu_s_per_audio_s": cpu / dur,
+                    "system": system,
+                    "uri": uri,
+                    "variant": variant,
+                    "audio_s": dur,
+                    "threads": args.threads,
+                    "wall_s": wall,
+                    "rtf": wall / dur,
+                    "cpu_s_per_audio_s": cpu / dur,
                     "chunks": len(compute),
-                    "buffer_latency_ms": None if mode == "offline" else processor.streaming_latency_ms,
-                    "chunk_compute_ms_mean": float(c.mean() * 1000), "chunk_compute_ms_p95": float(np.percentile(c, 95) * 1000),
+                    "buffer_latency_ms": None
+                    if mode == "offline"
+                    else processor.streaming_latency_ms,
+                    "chunk_compute_ms_mean": float(c.mean() * 1000),
+                    "chunk_compute_ms_p95": float(np.percentile(c, 95) * 1000),
                     "chunk_compute_ms_max": float(c.max() * 1000),
-                    "chunk_step_ms": None if mode == "offline" else processor.num_mel_frames_per_step * 10,
+                    "chunk_step_ms": None
+                    if mode == "offline"
+                    else processor.num_mel_frames_per_step * 10,
                 }
                 (out_dir / f"{stem}.json").write_text(json.dumps(info, indent=1))
-                print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in info.items()}), flush=True)
+                print(
+                    json.dumps(
+                        {k: (round(v, 3) if isinstance(v, float) else v) for k, v in info.items()}
+                    ),
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ Mapper (causal, mirrors the approved design):
 Speech time is scored on single-speaker reference frames, labelled with the dominant emitted
 cluster and the mapping state at emission time (frame time + buffer latency).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -28,11 +29,13 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-
 from metrics import FRAME, dominant_cluster, read_rttm, ref_frames, ref_turns
 
 ROOT = Path(__file__).parent
-CAPTION_LOG = ROOT.parent.parent.parent / "cap1001-desktop/src/main/__tests__/fixtures/meet-captions-watch-vi-multi.log"
+CAPTION_LOG = (
+    ROOT.parent.parent.parent
+    / "cap1001-desktop/src/main/__tests__/fixtures/meet-captions-watch-vi-multi.log"
+)
 
 
 def caption_cadence(path: Path = CAPTION_LOG) -> dict:
@@ -49,14 +52,26 @@ def caption_cadence(path: Path = CAPTION_LOG) -> dict:
     d = np.diff(ts)
     growth = np.diff(lens)
     short = d[d < 5]
-    return {"available": True, "polls": len(ts), "poll_s_median": float(np.median(short)),
-            "poll_s_p90": float(np.percentile(short, 90)), "longest_gap_s": float(d.max()),
-            "chars_per_poll_median": float(np.median(growth[d < 5])),
-            "note": "full text is re-emitted every poll; earlier blocks get rewritten"}
+    return {
+        "available": True,
+        "polls": len(ts),
+        "poll_s_median": float(np.median(short)),
+        "poll_s_p90": float(np.percentile(short, 90)),
+        "longest_gap_s": float(d.max()),
+        "chars_per_poll_median": float(np.median(growth[d < 5])),
+        "note": "full text is re-emitted every poll; earlier blocks get rewritten",
+    }
 
 
-def make_anchors(turns, density: float, rng: np.random.Generator, poll: float, gap=None, wrong_rate=0.0,
-                 roster=None):
+def make_anchors(
+    turns,
+    density: float,
+    rng: np.random.Generator,
+    poll: float,
+    gap=None,
+    wrong_rate=0.0,
+    roster=None,
+):
     anchors = []
     for s, e, k in turns:
         if e - s < 0.6 or rng.random() > density:  # sub-0.6 s turns rarely get their own block
@@ -69,29 +84,46 @@ def make_anchors(turns, density: float, rng: np.random.Generator, poll: float, g
         name = k
         if wrong_rate and rng.random() < wrong_rate:
             name = rng.choice([r for r in roster if r != k])
-        # the consumer only sees poll times; it back-dates the block by a fixed 0.75 s ASR-delay guess
+        # the consumer only sees poll times; it back-dates the block by a fixed 0.75 s
+        # ASR-delay guess
         anchors.append((avail, t0 - 0.75, t1 - 0.75, name))
     anchors.sort()
     return anchors
 
 
 class Mapper:
-    def __init__(self, window_pad=1.5, min_votes=2, min_conflicts=2, min_share=0.5, min_act=0.3):
+    def __init__(
+        self, window_pad=1.5, min_votes=2, min_conflicts=2, min_share=0.5, min_act=0.3, tuned=False
+    ):
+        """tuned=False is the rule set exactly as briefed. tuned=True adds four cheap guards that
+        only use what a live consumer has: ignore caption blocks shorter than 1 s, weight activity
+        inside the caption span 2:1 over the +-1.5 s tolerance, need a 60 % share, and require
+        the winning name to lead the runner-up by >= 1 vote before the first assignment."""
         self.pad, self.min_votes, self.min_conf = window_pad, min_votes, min_conflicts
-        self.min_share, self.min_act = min_share, min_act
+        self.min_share, self.min_act = (0.6 if tuned else min_share), min_act
+        self.tuned = tuned
         self.votes = defaultdict(lambda: defaultdict(int))
         self.name = {}
         self.conflict = {}  # cluster -> (name, count)
         self.used = self.discarded = 0
 
     def feed(self, dom: np.ndarray, t0: float, t1: float, name: str):
+        if self.tuned and t1 - t0 < 1.0:
+            self.discarded += 1
+            return
         a, b = max(0, int((t0 - self.pad) / FRAME)), min(len(dom), int((t1 + self.pad) / FRAME))
         seg = dom[a:b]
-        seg = seg[seg >= 0]
+        w = np.ones(len(seg))
+        if self.tuned:  # frames inside the caption span count double
+            ia, ib = int(t0 / FRAME) - a, int(t1 / FRAME) - a
+            w[max(0, ia) : max(0, ib)] = 2.0
+        keep = seg >= 0
+        seg, w = seg[keep], w[keep]
         if len(seg) * FRAME < self.min_act:
             self.discarded += 1
             return
-        vals, cnt = np.unique(seg, return_counts=True)
+        vals = np.unique(seg)
+        cnt = np.array([w[seg == v].sum() for v in vals])
         c = int(vals[cnt.argmax()])
         if cnt.max() / cnt.sum() < self.min_share:
             self.discarded += 1
@@ -100,7 +132,13 @@ class Mapper:
         self.votes[c][name] += 1
         cur = self.name.get(c)
         if cur is None:
-            if self.votes[c][name] >= self.min_votes and self.votes[c][name] == max(self.votes[c].values()):
+            ranked = sorted(self.votes[c].values(), reverse=True)
+            lead = ranked[0] - (ranked[1] if len(ranked) > 1 else 0)
+            if (
+                self.votes[c][name] >= self.min_votes
+                and self.votes[c][name] == ranked[0]
+                and (not self.tuned or lead >= 1)
+            ):
                 self.name[c] = name
         elif name == cur:
             self.conflict.pop(c, None)
@@ -113,13 +151,13 @@ class Mapper:
                 self.conflict.pop(c, None)
 
 
-def simulate(ref, probs, anchors, latency_s: float, gap=None):
+def simulate(ref, probs, anchors, latency_s: float, gap=None, tuned=False):
     n = probs.shape[0]
     rf, names = ref_frames(ref, n)
     dom = dominant_cluster(probs)
     single = rf.sum(axis=1) == 1
     who = np.where(single, rf.argmax(axis=1), -1)
-    mapper = Mapper()
+    mapper = Mapper(tuned=tuned)
     labels = np.full(n, "", dtype=object)
     ai = 0
     # walk in 1 s steps; the frames emitted in that step are labelled with the state at emission
@@ -161,10 +199,19 @@ def simulate(ref, probs, anchors, latency_s: float, gap=None):
             gap_tot += 1
             gap_ok += ok
     ttfn = {r: (first[r] - first_speech[r]) if r in first else None for r in names}
-    return {"correct": correct / tot, "speaker_n": unnamed / tot, "wrong": wrong / tot, "no_cluster": missed / tot,
-            "ttfn": ttfn, "named_speakers": sum(v is not None for v in ttfn.values()), "speakers": len(names),
-            "anchors": len(anchors), "anchors_used": mapper.used, "anchors_discarded": mapper.discarded,
-            "gap_correct": (gap_ok / gap_tot) if gap_tot else None}
+    return {
+        "correct": correct / tot,
+        "speaker_n": unnamed / tot,
+        "wrong": wrong / tot,
+        "no_cluster": missed / tot,
+        "ttfn": ttfn,
+        "named_speakers": sum(v is not None for v in ttfn.values()),
+        "speakers": len(names),
+        "anchors": len(anchors),
+        "anchors_used": mapper.used,
+        "anchors_discarded": mapper.discarded,
+        "gap_correct": (gap_ok / gap_tot) if gap_tot else None,
+    }
 
 
 SCENARIOS = {
@@ -181,16 +228,36 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--systems", default="")
     ap.add_argument("--variant", default="meet")
+    ap.add_argument("--uris", default="", help="only these clips (paired comparison)")
+    ap.add_argument(
+        "--crop", type=float, default=0, help="score only the first N seconds (paired comparison)"
+    )
+    ap.add_argument("--tag", default="", help="suffix for the output json")
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--gap-start", type=float, default=150.0)
+    ap.add_argument(
+        "--compute-s", type=float, default=0.3, help="assumed per-chunk compute on the target host"
+    )
+    ap.add_argument(
+        "--tuned", action="store_true", help="mapper with the extra guards (see Mapper)"
+    )
     args = ap.parse_args()
     cad = caption_cadence()
     print("caption cadence:", cad)
-    poll = cad.get("poll_s_median", 0.6) if cad.get("available") else 0.6
-    systems = args.systems.split(",") if args.systems else sorted(p.name for p in (ROOT / "out").iterdir() if p.is_dir())
+    # 0.66 s = median poll of the real log, so results reproduce without the (local-only) log
+    poll = cad.get("poll_s_median", 0.66) if cad.get("available") else 0.66
+    systems = (
+        args.systems.split(",")
+        if args.systems
+        else sorted(p.name for p in (ROOT / "out").iterdir() if p.is_dir())
+    )
     out = {"caption_cadence": cad}
     for system in systems:
-        npzs = sorted((ROOT / "out" / system).glob(f"*.{args.variant}.npz"))
+        npzs = [
+            p
+            for p in sorted((ROOT / "out" / system).glob(f"*.{args.variant}.npz"))
+            if not args.uris or p.name.split(".")[0] in args.uris.split(",")
+        ]
         if not npzs:
             continue
         out[system] = {}
@@ -200,18 +267,34 @@ def main():
             for npz in npzs:
                 uri = npz.name.split(".")[0]
                 info = json.loads(npz.with_suffix(".json").read_text())
-                end = info["audio_s"]
-                ref = [(s, min(e, end), k) for s, e, k in read_rttm(ROOT / f"data/clips/{uri}.rttm") if s < end]
-                probs = np.load(npz)["probs"].astype(np.float32)
-                lat = (info.get("buffer_latency_ms") or 0) / 1000 + info.get("chunk_compute_ms_mean", 0) / 1000 * (info.get("buffer_latency_ms") is not None)
+                end = min(info["audio_s"], args.crop or 1e9)
+                ref = [
+                    (s, min(e, end), k)
+                    for s, e, k in read_rttm(ROOT / f"data/clips/{uri}.rttm")
+                    if s < end
+                ]
+                probs = np.load(npz)["probs"].astype(np.float32)[: int(round(end / FRAME))]
+                # emission latency = input buffer + an assumed realtime-capable compute budget. The
+                # compute measured on this (overloaded, CPU-only) laptop is far beyond realtime and
+                # would only measure the laptop; see the timing table instead.
+                lat = (info.get("buffer_latency_ms") or 0) / 1000 + (
+                    args.compute_s if info.get("buffer_latency_ms") else 0
+                )
                 turns = ref_turns(ref)
                 roster = sorted({k for *_, k in ref})
                 gap = (args.gap_start, args.gap_start + 55.0) if cfg.get("gap") else None
                 for seed in range(args.seeds):
                     rng = np.random.default_rng(seed)
-                    anchors = make_anchors(turns, cfg["density"], rng, poll, gap=gap,
-                                           wrong_rate=cfg.get("wrong_rate", 0.0), roster=roster)
-                    r = simulate(ref, probs, anchors, lat, gap)
+                    anchors = make_anchors(
+                        turns,
+                        cfg["density"],
+                        rng,
+                        poll,
+                        gap=gap,
+                        wrong_rate=cfg.get("wrong_rate", 0.0),
+                        roster=roster,
+                    )
+                    r = simulate(ref, probs, anchors, lat, gap, tuned=args.tuned)
                     for k in ("correct", "speaker_n", "wrong", "no_cluster", "anchors"):
                         agg[k].append(r[k])
                     agg["named_frac"].append(r["named_speakers"] / r["speakers"])
@@ -222,8 +305,15 @@ def main():
             res["ttfn_median_s"] = float(np.median(ttfns)) if ttfns else None
             res["ttfn_p90_s"] = float(np.percentile(ttfns, 90)) if ttfns else None
             out[system][sc] = res
-            print(f"{system:28s} {sc:11s} " + " ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in res.items()))
-    (ROOT / "out" / f"anchor_sim.{args.variant}.json").write_text(json.dumps(out, indent=1))
+            print(
+                f"{system:28s} {sc:11s} "
+                + " ".join(
+                    f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in res.items()
+                )
+            )
+    (
+        ROOT / "out" / f"anchor_sim.{args.variant}{'.tuned' if args.tuned else ''}{args.tag}.json"
+    ).write_text(json.dumps(out, indent=1))
 
 
 if __name__ == "__main__":

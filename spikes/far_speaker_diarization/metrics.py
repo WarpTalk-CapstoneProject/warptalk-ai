@@ -1,4 +1,5 @@
 """DER (pyannote.metrics) and cluster-stability metrics for every system in out/."""
+
 from __future__ import annotations
 
 import argparse
@@ -35,12 +36,15 @@ def ref_frames(segs, n: int) -> tuple[np.ndarray, list[str]]:
     names = sorted({k for _, _, k in segs})
     m = np.zeros((n, len(names)), dtype=bool)
     for s, e, k in segs:
-        m[int(round(s / FRAME)): int(round(e / FRAME)), names.index(k)] = True
+        m[int(round(s / FRAME)) : int(round(e / FRAME)), names.index(k)] = True
     return m, names
 
 
 def ref_turns(segs, merge_gap: float = 0.5, min_dur: float = 0.0):
-    """Same-speaker segments separated by < merge_gap become one turn (what a Meet caption block covers)."""
+    """Same-speaker segments separated by < merge_gap become one turn.
+
+    One turn ~= what a Meet caption block covers.
+    """
     by = defaultdict(list)
     for s, e, k in segs:
         by[k].append((s, e))
@@ -68,8 +72,9 @@ def dominant_cluster(probs: np.ndarray) -> np.ndarray:
 def stability(segs, probs: np.ndarray, min_turn: float = 1.0) -> dict:
     """How often a reference speaker's dominant cluster changes between consecutive turns.
 
-    flips: count of turn-to-turn changes of the dominant cluster (turns >= min_turn s, single-speaker
-    frames only). primary_share: share of the speaker's speech time spent on their most common cluster.
+    flips: count of turn-to-turn changes of the dominant cluster (turns >= min_turn s,
+    single-speaker frames only). primary_share: share of the speaker's speech time spent on
+    their most common cluster.
     """
     n = probs.shape[0]
     rf, names = ref_frames(segs, n)
@@ -95,49 +100,85 @@ def stability(segs, probs: np.ndarray, min_turn: float = 1.0) -> dict:
         out_flips += flips
         out_turns += max(len(seq) - 1, 0)
         shares.append(share)
-    return {"flips": out_flips, "turn_transitions": out_turns,
-            "flip_rate": out_flips / out_turns if out_turns else 0.0,
-            "primary_share_mean": float(np.nanmean(shares)), "per_speaker": per_spk}
+    return {
+        "flips": out_flips,
+        "turn_transitions": out_turns,
+        "flip_rate": out_flips / out_turns if out_turns else 0.0,
+        "primary_share_mean": float(np.nanmean(shares)),
+        "per_speaker": per_spk,
+    }
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--systems", default="", help="comma list of out/<system>; default all")
     ap.add_argument("--variant", default="meet")
+    ap.add_argument("--uris", default="", help="only these clips (paired comparison)")
+    ap.add_argument(
+        "--crop", type=float, default=0, help="score only the first N seconds (paired comparison)"
+    )
+    ap.add_argument("--tag", default="", help="suffix for the output json")
     ap.add_argument("--collar", type=float, default=0.25)
     args = ap.parse_args()
-    systems = args.systems.split(",") if args.systems else sorted(p.name for p in (ROOT / "out").iterdir() if p.is_dir())
+    systems = (
+        args.systems.split(",")
+        if args.systems
+        else sorted(p.name for p in (ROOT / "out").iterdir() if p.is_dir())
+    )
     results = {}
     for system in systems:
         der = DiarizationErrorRate(collar=args.collar, skip_overlap=False)
         der0 = DiarizationErrorRate(collar=0.0, skip_overlap=False)
         rows, tim = [], []
+        scored = 0.0
         for npz in sorted((ROOT / "out" / system).glob(f"*.{args.variant}.npz")):
+            if args.uris and npz.name.split(".")[0] not in args.uris.split(","):
+                continue
             uri = npz.name.split(".")[0]
             info = json.loads(npz.with_suffix(".json").read_text())
-            end = info["audio_s"]  # streaming runs may be cropped; score the same span
-            ref = [(s, min(e, end), k) for s, e, k in read_rttm(ROOT / f"data/clips/{uri}.rttm") if s < end]
-            hyp = read_rttm(npz.with_suffix(".rttm"))
-            probs = np.load(npz)["probs"].astype(np.float32)
+            # streaming runs may be cropped; score the same span
+            end = min(info["audio_s"], args.crop or 1e9)
+            scored += end
+            ref = [
+                (s, min(e, end), k)
+                for s, e, k in read_rttm(ROOT / f"data/clips/{uri}.rttm")
+                if s < end
+            ]
+            hyp = [
+                (s, min(e, end), k) for s, e, k in read_rttm(npz.with_suffix(".rttm")) if s < end
+            ]
+            probs = np.load(npz)["probs"].astype(np.float32)[: int(round(end / FRAME))]
             r, h = to_annotation(ref, uri), to_annotation(hyp, uri)
             comp = der(r, h, detailed=True)
             der0(r, h)
             st = stability(ref, probs)
             tim.append(info)
-            rows.append({"uri": uri, "der": comp["diarization error rate"],
-                         "miss": comp["missed detection"] / comp["total"],
-                         "fa": comp["false alarm"] / comp["total"],
-                         "conf": comp["confusion"] / comp["total"],
-                         "n_ref": len({k for *_, k in ref}), "n_hyp": len({k for *_, k in hyp}),
-                         "flips": st["flips"], "transitions": st["turn_transitions"],
-                         "primary_share": st["primary_share_mean"], "rtf": info["rtf"]})
+            rows.append(
+                {
+                    "uri": uri,
+                    "der": comp["diarization error rate"],
+                    "miss": comp["missed detection"] / comp["total"],
+                    "fa": comp["false alarm"] / comp["total"],
+                    "conf": comp["confusion"] / comp["total"],
+                    "n_ref": len({k for *_, k in ref}),
+                    "n_hyp": len({k for *_, k in hyp}),
+                    "flips": st["flips"],
+                    "transitions": st["turn_transitions"],
+                    "primary_share": st["primary_share_mean"],
+                    "rtf": info["rtf"],
+                }
+            )
         if not rows:
             continue
         audio = sum(t["audio_s"] for t in tim)
         results[system] = {
-            "files": len(rows), "audio_min": audio / 60,
-            "DER_collar": abs(der), "DER_nocollar": abs(der0),
-            "flip_rate": sum(r["flips"] for r in rows) / max(1, sum(r["transitions"] for r in rows)),
+            "files": len(rows),
+            "audio_min": audio / 60,  # audio the system processed (basis of rtf)
+            "scored_min": scored / 60,  # audio the DER / stability numbers cover
+            "DER_collar": abs(der),
+            "DER_nocollar": abs(der0),
+            "flip_rate": sum(r["flips"] for r in rows)
+            / max(1, sum(r["transitions"] for r in rows)),
             "primary_share": float(np.mean([r["primary_share"] for r in rows])),
             "rtf": sum(t["wall_s"] for t in tim) / audio,
             "cpu_s_per_audio_s": sum(t["cpu_s_per_audio_s"] * t["audio_s"] for t in tim) / audio,
@@ -145,10 +186,20 @@ def main():
             "chunk_compute_ms_mean": float(np.mean([t["chunk_compute_ms_mean"] for t in tim])),
             "rows": rows,
         }
-        print(f"\n== {system} ({len(rows)} files, {audio/60:.1f} min)  DER(c={args.collar})={abs(der):.3f}  DER(c=0)={abs(der0):.3f}")
+        print(
+            f"\n== {system} ({len(rows)} files, {audio / 60:.1f} min)  "
+            f"DER(c={args.collar})={abs(der):.3f}  DER(c=0)={abs(der0):.3f}"
+        )
         for r in rows:
-            print("  " + "  ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in r.items()))
-    (ROOT / "out" / f"metrics.{args.variant}.json").write_text(json.dumps(results, indent=1))
+            print(
+                "  "
+                + "  ".join(
+                    f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in r.items()
+                )
+            )
+    (ROOT / "out" / f"metrics.{args.variant}{args.tag}.json").write_text(
+        json.dumps(results, indent=1)
+    )
 
 
 if __name__ == "__main__":

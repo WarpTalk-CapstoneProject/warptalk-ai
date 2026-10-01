@@ -1,8 +1,10 @@
 """Build the evaluation set from public data (no WarpTalk audio, no recording).
 
 Sources (Hugging Face, not gated):
-  diarizers-community/ami          ihm/test-00000-of-00003.parquet  -> AMI IHM-mix (sum of close-talk mics)
-  diarizers-community/voxconverse  data/test-00000-of-00011.parquet -> VoxConverse test (2-4 speaker files)
+  diarizers-community/ami          ihm/test-00000-of-00003.parquet
+      -> AMI IHM-mix (sum of close-talk mics)
+  diarizers-community/voxconverse  data/test-00000-of-00011.parquet
+      -> VoxConverse test (2-4 speaker files)
 
 AMI IHM-mix is the closest public analogue of a Meet loopback track: every participant has
 their own mic, and the far end hears the sum. Each clip is also passed through a real Opus
@@ -11,6 +13,7 @@ Chrome actually plays out of a Meet call ("meet" variant).
 
 Output: data/clips/<clip_id>.<variant>.wav (16 kHz mono) and data/clips/<clip_id>.rttm
 """
+
 from __future__ import annotations
 
 import argparse
@@ -29,10 +32,14 @@ CLIPS = DATA / "clips"
 SR = 16000
 
 SHARDS = {
-    "ami": ("ami_ihm_test0.parquet",
-            "https://huggingface.co/datasets/diarizers-community/ami/resolve/main/ihm/test-00000-of-00003.parquet"),
-    "vox": ("vox_test0.parquet",
-            "https://huggingface.co/datasets/diarizers-community/voxconverse/resolve/main/data/test-00000-of-00011.parquet"),
+    "ami": (
+        "ami_ihm_test0.parquet",
+        "https://huggingface.co/datasets/diarizers-community/ami/resolve/main/ihm/test-00000-of-00003.parquet",
+    ),
+    "vox": (
+        "vox_test0.parquet",
+        "https://huggingface.co/datasets/diarizers-community/voxconverse/resolve/main/data/test-00000-of-00011.parquet",
+    ),
 }
 
 
@@ -41,6 +48,7 @@ def ensure_shard(name: str) -> Path:
     p = DATA / fname
     if not p.exists():
         import urllib.request
+
         DATA.mkdir(parents=True, exist_ok=True)
         print(f"downloading {url}")
         urllib.request.urlretrieve(url, p)
@@ -52,6 +60,7 @@ def decode(audio_bytes: bytes) -> np.ndarray:
     x = x.mean(axis=1)
     if sr != SR:
         import librosa
+
         x = librosa.resample(x, orig_sr=sr, target_sr=SR)
     return x
 
@@ -63,7 +72,8 @@ def meetify(x: np.ndarray) -> np.ndarray:
     peak = float(np.max(np.abs(y)) or 1.0)
     y = 0.7 * y / peak
     buf = io.BytesIO()
-    # compression_level: 0 = highest quality, 1 = lowest; with libsndfile 1.2.2, 0.88 ~= 24-28 kbit/s for 16 kHz speech.
+    # compression_level: 0 = highest quality, 1 = lowest; with libsndfile 1.2.2, 0.88 gives
+    # ~28-37 kbit/s on these clips (Meet-like).
     sf.write(buf, y, SR, format="OGG", subtype="OPUS", compression_level=0.88)
     size = buf.tell()
     buf.seek(0)
@@ -89,9 +99,17 @@ def write_rttm(path: Path, uri: str, starts, ends, spks, max_s: float):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max-seconds", type=float, default=600.0, help="crop each recording to this length")
-    ap.add_argument("--ami-rows", default="0,1,2,4,5", help="row indices in the AMI IHM shard (one per meeting)")
-    ap.add_argument("--vox-rows", default="3,2,16,18", help="row indices in the VoxConverse shard (2-4 speakers)")
+    ap.add_argument(
+        "--max-seconds", type=float, default=600.0, help="crop each recording to this length"
+    )
+    ap.add_argument(
+        "--ami-rows", default="0,1,2,4,5", help="row indices in the AMI IHM shard (one per meeting)"
+    )
+    ap.add_argument(
+        "--vox-rows",
+        default="3,2,16,18",
+        help="row indices in the VoxConverse shard (2-4 speakers)",
+    )
     args = ap.parse_args()
     CLIPS.mkdir(parents=True, exist_ok=True)
     manifest = []
@@ -104,14 +122,26 @@ def main():
             x = x[: int(args.max_seconds * SR)]
             dur = len(x) / SR
             uri = f"{name}{r:02d}"
-            nseg = write_rttm(CLIPS / f"{uri}.rttm", uri, rec["timestamps_start"], rec["timestamps_end"],
-                              rec["speakers"], dur)
+            nseg = write_rttm(
+                CLIPS / f"{uri}.rttm",
+                uri,
+                rec["timestamps_start"],
+                rec["timestamps_end"],
+                rec["speakers"],
+                dur,
+            )
             sf.write(CLIPS / f"{uri}.clean.wav", x, SR)
             y, kbps = meetify(x)
             sf.write(CLIPS / f"{uri}.meet.wav", y, SR)
             spk = sorted({k for s, k in zip(rec["timestamps_start"], rec["speakers"]) if s < dur})
-            item = {"uri": uri, "source": rec["audio"].get("path"), "duration": round(dur, 1),
-                    "num_speakers": len(spk), "segments": nseg, "opus_kbps": round(kbps, 1)}
+            item = {
+                "uri": uri,
+                "source": rec["audio"].get("path"),
+                "duration": round(dur, 1),
+                "num_speakers": len(spk),
+                "segments": nseg,
+                "opus_kbps": round(kbps, 1),
+            }
             print(item)
             manifest.append(item)
     (CLIPS / "manifest.json").write_text(json.dumps(manifest, indent=1))
