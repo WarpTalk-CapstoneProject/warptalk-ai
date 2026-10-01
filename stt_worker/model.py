@@ -49,6 +49,9 @@ SESSION_IDLE_TIMEOUT_S = 300.0
 
 # Guard against OpenAI never sending a completed/error event for a commit.
 TRANSCRIBE_EVENT_TIMEOUT_S = 15.0
+# Items whose deltas arrived on a speaker's socket before (or without) their commit — see
+# _transcribe_via_session. Only the last few can still be committed; older ones were cleared.
+_MAX_PENDING_ITEMS = 8
 
 # Every `filtered_*` line in this module logs at INFO, not DEBUG, and that is deliberate.
 #
@@ -1836,9 +1839,32 @@ class OpenAISTT:
         await conn.input_audio_buffer.commit()
         session["last_used"] = time.monotonic()
 
+        # DELTAS BELONG TO AN ITEM, AND NOT EVERY ITEM ON THIS SOCKET IS THIS COMMIT'S.
+        #
+        # gpt-live-transcribe transcribes audio AS IT IS APPENDED, so the connection carries
+        # deltas for audio this call never committed: a streamed turn that was abandoned and
+        # cleared after the model had already spoken its first words, or the opening of the
+        # speaker's next turn. Every event says which item it is about. This loop used to
+        # ignore that and add every delta to one buffer, so words from one turn were published
+        # as the start of another ("Ai Vậy mình cắt…", "…the onboarding flow Two more はい…"),
+        # the variety guard then discarded whole sentences as repetitions, and the completed
+        # transcript no longer started with what had been flushed — `stt_delta_final_mismatch`,
+        # whose answer is to drop the rest of the turn. Measured in tools/meeting_sim: within
+        # one item the deltas always add up to the completed transcript; mixed across items
+        # they did not, and that is where the lost sentences came from.
+        #
+        # So deltas are kept per item until `input_audio_buffer.committed` names the item this
+        # commit created, and only that item's text is ever flushed or compared. Deltas for any
+        # other item stay on the session for the call that commits it. An event with no item id
+        # (an older SDK, the tests' scripted events) is taken as this commit's, which is
+        # exactly what the loop did before.
+        pending_items: dict[str, str] = session.setdefault("item_deltas", {})
+
         async def _collect() -> tuple[str, float]:
             buffer = ""
             flushed = ""
+            # The item this commit created. None until `input_audio_buffer.committed` says.
+            mine: str | None = None
             # gpt-realtime-whisper occasionally gets stuck on trailing silence/noise and
             # emits the same short sentence over and over in the delta stream instead of
             # ever reaching "completed" — with no per-chunk confidence signal to catch
@@ -1847,34 +1873,60 @@ class OpenAISTT:
             # Cut the turn short once the same sentence repeats 3x in a row.
             last_sentence: str | None = None
             repeat_count = 0
+
+            async def take_delta(delta: str) -> None:
+                nonlocal buffer, flushed, last_sentence, repeat_count
+                if on_sentence is None:
+                    return
+                buffer += delta
+                if not buffer:
+                    return
+                ends_clean = buffer[-1] in ".!?"
+                sentences = split_into_sentences(buffer)
+                flush_count = len(sentences) if ends_clean else len(sentences) - 1
+                if flush_count > 0:
+                    for sentence in sentences[:flush_count]:
+                        normalized = sentence.strip().casefold()
+                        if normalized and normalized == last_sentence:
+                            repeat_count += 1
+                        else:
+                            repeat_count = 0
+                        last_sentence = normalized
+                        if repeat_count >= 2:
+                            logger.warning("stt_repetition_loop_detected", sentence=sentence[:60])
+                            raise RuntimeError("stt_repetition_loop_detected")
+                        await on_sentence(sentence)
+                        flushed += sentence + " "
+                    buffer = "" if ends_clean else sentences[-1]
+
             async for event in conn:
                 etype = getattr(event, "type", "")
+                item_id = getattr(event, "item_id", None)
+                item_id = item_id if isinstance(item_id, str) and item_id else None
+                if etype == "input_audio_buffer.committed":
+                    if mine is None and item_id is not None:
+                        mine = item_id
+                        # What the model already said about this audio while it was being
+                        # streamed in — the reason flash mode is fast — is this commit's text.
+                        early = pending_items.pop(mine, "")
+                        if early:
+                            await take_delta(early)
+                    continue
                 if etype == "conversation.item.input_audio_transcription.delta":
-                    if on_sentence is None:
+                    delta = getattr(event, "delta", "") or ""
+                    if item_id is not None and item_id != mine:
+                        pending_items[item_id] = pending_items.get(item_id, "") + delta
+                        while len(pending_items) > _MAX_PENDING_ITEMS:
+                            pending_items.pop(next(iter(pending_items)))
                         continue
-                    buffer += getattr(event, "delta", "") or ""
-                    if not buffer:
-                        continue
-                    ends_clean = buffer[-1] in ".!?"
-                    sentences = split_into_sentences(buffer)
-                    flush_count = len(sentences) if ends_clean else len(sentences) - 1
-                    if flush_count > 0:
-                        for sentence in sentences[:flush_count]:
-                            normalized = sentence.strip().casefold()
-                            if normalized and normalized == last_sentence:
-                                repeat_count += 1
-                            else:
-                                repeat_count = 0
-                            last_sentence = normalized
-                            if repeat_count >= 2:
-                                logger.warning(
-                                    "stt_repetition_loop_detected", sentence=sentence[:60]
-                                )
-                                raise RuntimeError("stt_repetition_loop_detected")
-                            await on_sentence(sentence)
-                            flushed += sentence + " "
-                        buffer = "" if ends_clean else sentences[-1]
+                    await take_delta(delta)
                 elif etype == "conversation.item.input_audio_transcription.completed":
+                    if item_id is not None and item_id != mine:
+                        # Another item finishing. The server confirms a commit before it
+                        # transcribes it, so a completion that arrives ahead of this commit's
+                        # `committed` — or for any other item — is not this call's to report.
+                        pending_items.pop(item_id, None)
+                        continue
                     final_text = (getattr(event, "transcript", "") or "").strip()
                     token_logprobs = [
                         float(value)
