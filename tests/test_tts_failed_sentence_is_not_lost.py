@@ -184,8 +184,7 @@ async def test_a_half_spoken_sentence_is_not_retried_from_its_first_word(
         worker_settings,
         tts_settings=_settings(prosody_continuity=True, stream_to_livekit=True),
     )
-    worker._turns = {}
-    worker._turn_connections = {}
+    worker._contexts = {}
     publisher = _FakePublisher()
     publisher.retire_voice_variants = MagicMock()  # type: ignore[attr-defined]
     worker.livekit_publisher = publisher  # type: ignore[assignment]
