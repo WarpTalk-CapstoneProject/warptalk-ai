@@ -137,6 +137,9 @@ class ChatTool:
     #: False keeps a built-in out of the manifest: internal plumbing a user never asks for (the
     #: meeting-chat -> widget handoff). It is still given to the model wherever offered_on allows.
     listed: bool = True
+    #: The plugin a dynamic MCP tool belongs to, from the backend's tool list. None for the
+    #: worker's own tools; it is how the tool-call log tells a plugin call from a built-in one.
+    plugin_key: str | None = None
 
     def to_openai_schema(self) -> dict[str, Any]:
         """Tool declaration in the shape /v1/responses expects.
