@@ -19,7 +19,8 @@ SHAPE (contract v1, key `assistant:tools:manifest`, a JSON string under a plain 
     audience each definition declares beside its schema. Plugin (MCP) tools are not included; the
     backend already knows those. Platform-scope tools (platform_tools.PLATFORM_TOOLS) are not
     included either: they are offered only on a platform-admin conversation, never to WarpBot in
-    a workspace.
+    a workspace. A built-in marked `listed=False` (continue_in_widget, the meeting-chat handoff)
+    is internal plumbing rather than something a user asks for, and is left out too.
 
 LIFETIME
     Written on startup, then every REFRESH_INTERVAL_SECONDS with a TTL_SECONDS expiry. If the
@@ -112,7 +113,7 @@ def build_manifest(
         "generatedAt": moment.isoformat().replace("+00:00", "Z"),
         "workerVersion": worker_version(),
         "webSearch": {"available": web_search_available(settings)},
-        "tools": [_tool_entry(tool) for tool in tools],
+        "tools": [_tool_entry(tool) for tool in tools if tool.listed],
     }
 
 

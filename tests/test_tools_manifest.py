@@ -54,7 +54,16 @@ def _settings(
 def test_manifest_covers_every_registered_tool() -> None:
     manifest = build_manifest(_settings())
 
-    assert [tool["name"] for tool in manifest["tools"]] == [tool.name for tool in TOOLS]
+    assert [tool["name"] for tool in manifest["tools"]] == [
+        tool.name for tool in TOOLS if tool.listed
+    ]
+
+
+def test_unlisted_tools_are_left_out() -> None:
+    names = {tool["name"] for tool in build_manifest(_settings())["tools"]}
+
+    assert "continue_in_widget" not in names
+    assert [tool.name for tool in TOOLS if not tool.listed] == ["continue_in_widget"]
 
 
 def test_every_tool_declares_valid_metadata() -> None:
@@ -158,7 +167,7 @@ async def test_publish_writes_json_with_ttl() -> None:
     key, value, ttl = redis.set_with_ttl.await_args.args
     assert key == MANIFEST_KEY == "assistant:tools:manifest"
     assert ttl == TTL_SECONDS == 1800
-    assert len(json.loads(value)["tools"]) == len(TOOLS)
+    assert len(json.loads(value)["tools"]) == len([tool for tool in TOOLS if tool.listed])
 
 
 async def test_redis_failure_is_swallowed_and_logged() -> None:

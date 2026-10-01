@@ -134,6 +134,9 @@ class ChatTool:
     category: str | None = None
     effect: str | None = None
     audience: str | None = None
+    #: False keeps a built-in out of the manifest: internal plumbing a user never asks for (the
+    #: meeting-chat -> widget handoff). It is still given to the model wherever offered_on allows.
+    listed: bool = True
 
     def to_openai_schema(self) -> dict[str, Any]:
         """Tool declaration in the shape /v1/responses expects.
@@ -3185,6 +3188,7 @@ TOOLS: list[ChatTool] = [
         category="conversation",
         effect="read",
         audience="member",
+        listed=False,
     ),
 ]
 
