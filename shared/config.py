@@ -667,6 +667,12 @@ class TTSSettings(BaseSettings):
     # so it should; TTS_STREAM_TO_LIVEKIT=false is here so that being wrong costs an env var
     # and a restart rather than a release.
     stream_to_livekit: bool = True
+    # Generate a speaker's next sentence while the previous one is still PLAYING, instead of
+    # after it (LiveKitTTSPublisher.stream_ahead). Playout order per track is unchanged; what goes
+    # is the per-sentence Cartesia time-to-first-audio that every queued sentence used to pay
+    # after the one before it had ended. Off until verified in a live meeting:
+    # TTS_PREFETCH_WHILE_PLAYING=true. Needs stream_to_livekit and prosody_continuity.
+    prefetch_while_playing: bool = False
     voice_clone_max_upgrades: int = 1
     # How much better a later clip must score before it is worth replacing a working clone. Small
     # gains are noise in the estimator, and re-cloning for them would change the voice people are
