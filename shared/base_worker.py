@@ -16,7 +16,7 @@ import signal
 import socket
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +29,7 @@ from shared.integration_status import (
     IntegrationReport,
     publish_integration_status,
 )
+from shared.lang import is_same_language
 from shared.logger import get_logger
 from shared.platform_settings import PlatformSettings, reader_for
 from shared.provider_calls import bind_provider_calls
@@ -587,6 +588,41 @@ class BaseWorker(ABC):
             return str(voice_id), score
         return None, None
 
+    def is_text_only_dub(self, room_id: str, speaker_user_id: str, target_lang: str) -> bool:
+        """Whether a dub of this speaker into `target_lang` would be played into nothing.
+
+        TEXT-ONLY GOOGLE MEET BRIDGE (PO 2026-10-01)
+            A bridge participant in text-only mode sits in the Meet call with their REAL mic and
+            speakers. Their dub into the far side's language exists only to be played into Meet
+            through a virtual cable, and there is no cable — Meet already hears their own voice.
+            The backend marks exactly those routes (speaker -> far-side stand-in) `TextOnly`.
+
+        PER ROUTE, AND ONLY WHEN EVERY ROUTE AGREES
+            tts_worker renders one track per (speaker, target language) and every listener in
+            that language shares it. So the dub is skipped only when ALL of this speaker's routes
+            into this language are text-only: another WarpTalk participant who listens in the far
+            side's language still needs the track. The room-level TEXT_ONLY_MODE status is not
+            used for this — it would also silence the inbound side and every other speaker.
+
+        Fails open (False -> synthesize) on an unknown room, a speaker with no route into this
+        language, or a backend that does not send the field yet: a wrong False costs credits, a
+        wrong True silences someone whose cable is there.
+        """
+        matching = [
+            route
+            for route in self._room_routes.get(room_id, [])
+            if str(route.get("SourceUserId") or "").lower() == speaker_user_id.lower()
+            and is_same_language(str(route.get("TargetLanguage") or ""), target_lang)
+        ]
+        return bool(matching) and all(route.get("TextOnly") is True for route in matching)
+
+    async def text_only_dub_for(self, room_id: str, speaker_user_id: str, target_lang: str) -> bool:
+        """`is_text_only_dub`, recovering the route snapshot first when this worker has never been
+        told about the room (it restarted mid-meeting; pub/sub has no replay)."""
+        if room_id not in self._room_routes:
+            await self._load_route_snapshot(room_id)
+        return self.is_text_only_dub(room_id, speaker_user_id, target_lang)
+
     async def voice_clone_consent_state(
         self, room_id: str, speaker_user_id: str
     ) -> tuple[bool, str]:
@@ -889,8 +925,12 @@ class BaseWorker(ABC):
             min_idle_ms=self._reclaim_min_idle_ms(),
         )
         for message_id, data in messages:
+            if self._is_in_flight(message_id):
+                # Still being handled by this process — only queued long enough to look idle.
+                # Running it again would run it twice; acking it would ack unfinished work.
+                continue
             try:
-                await self._process_and_log_errors(message_id, data)
+                await self._process_reclaimed(message_id, data)
             except Exception:
                 attempts = await self.redis.pending_delivery_count(
                     self.input_stream,
@@ -898,44 +938,15 @@ class BaseWorker(ABC):
                     message_id,
                 )
                 if attempts >= self.max_delivery_attempts:
-                    original_payload = {
-                        (
-                            key.decode("utf-8", errors="replace")
-                            if isinstance(key, bytes)
-                            else str(key)
-                        ): (
-                            value.decode("utf-8", errors="replace")
-                            if isinstance(value, bytes)
-                            else str(value)
-                        )
-                        for key, value in data.items()
-                    }
-                    await self.redis.publish(
-                        f"{self.input_stream}:dead-letter",
-                        {
-                            "original_message_id": message_id.decode(
-                                "utf-8",
-                                errors="replace",
-                            ),
-                            "consumer_group": self.consumer_group,
-                            "worker": self.worker_name,
-                            "delivery_attempts": attempts,
-                            "failed_at_unix_ms": int(time.time() * 1000),
-                            "payload": json.dumps(original_payload),
-                        },
+                    await self._dead_letter(
+                        message_id, data, attempts=attempts, reason="delivery_attempts_exhausted"
                     )
                     await self.redis.redis.xack(
                         self.input_stream,
                         self.consumer_group,
                         message_id,
                     )
-                    await self._record_outcome("dead_letter")
-                    self.logger.error(
-                        "message_dead_lettered",
-                        message_id=message_id,
-                        stream=self.input_stream,
-                        attempts=attempts,
-                    )
+                    continue
                 # Under the limit, keep it pending. XAUTOCLAIM resets idle time,
                 # preventing a hot loop while scheduling another bounded retry.
                 continue
@@ -948,6 +959,71 @@ class BaseWorker(ABC):
         # live one first, or it still holds them and is (correctly) skipped.
         if self._housekeeping_due(self.input_stream, self.consumer_group):
             await self._prune_idle_consumers(self.input_stream, self.consumer_group)
+
+    async def _dead_letter(
+        self,
+        message_id: bytes,
+        data: Mapping[Any, Any],
+        *,
+        attempts: int,
+        reason: str,
+        details: Mapping[str, str] | None = None,
+    ) -> None:
+        """Park a message on `<input_stream>:dead-letter`, with why. Does NOT acknowledge it.
+
+        The one writer of the dead-letter convention, so every parked entry carries the same
+        fields: the original id and payload (replayable as-is), who parked it, how many attempts
+        it had, and — new with the TTS retry policy — a `reason`, because "it failed five times"
+        and "the vendor refused it on the first try" are different things to do something about.
+
+        Acknowledging stays with the caller: the reclaim path acks the parked entry itself, while
+        a worker that dead-letters ONE PART of a message from inside `process()` (a voice variant
+        Cartesia refused) lets the message's normal completion ack it.
+        """
+        original_payload = {
+            (key.decode("utf-8", errors="replace") if isinstance(key, bytes) else str(key)): (
+                value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+            )
+            for key, value in data.items()
+        }
+        entry: dict[str, Any] = {
+            "original_message_id": message_id.decode("utf-8", errors="replace"),
+            "consumer_group": self.consumer_group,
+            "worker": self.worker_name,
+            "delivery_attempts": attempts,
+            "reason": reason,
+            "failed_at_unix_ms": int(time.time() * 1000),
+            "payload": json.dumps(original_payload),
+        }
+        if details:
+            entry.update(details)
+        await self.redis.publish(f"{self.input_stream}:dead-letter", entry)
+        await self._record_outcome("dead_letter")
+        self.logger.error(
+            "message_dead_lettered",
+            message_id=message_id,
+            stream=self.input_stream,
+            attempts=attempts,
+            reason=reason,
+        )
+
+    def _is_in_flight(self, message_id: bytes) -> bool:
+        """Whether this process has already dispatched `message_id` and not yet finished it.
+
+        Always False for the default one-at-a-time loop, which never reclaims while anything is
+        running. A worker that keeps reading while earlier messages run (TTSWorker) overrides it:
+        a message queued behind a long-running one for its key sits in the pending list looking
+        exactly like an abandoned one, and XAUTOCLAIM cannot tell the difference.
+        """
+        return False
+
+    async def _process_reclaimed(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        """Run one reclaimed message. Raise to leave it pending (and count toward dead-letter).
+
+        A hook so a worker whose normal path wraps processing — TTSWorker's per-key ordering
+        lock — can put a reclaimed message through the same wrapper instead of around it.
+        """
+        await self._process_and_log_errors(message_id, data)
 
     def note_attempt_outcome(self, outcome: str) -> None:
         """Mark the message being processed as failed even though `process()` will return.

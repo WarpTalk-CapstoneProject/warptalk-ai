@@ -15,10 +15,13 @@ lightweight Redis-stream consumers with no need for a separate container.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import time
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -68,10 +71,16 @@ from ai_assistant_worker.mcp_tools import split_mcp_tool_arguments as _split_mcp
 from ai_assistant_worker.mcp_tools import (
     with_mcp_confirmation_parameter as _with_mcp_confirmation_parameter,
 )
+from ai_assistant_worker.meet_rooms import file_meet_rooms
 from ai_assistant_worker.meeting_links import (
+    CalendarEvent,
     MeetingLink,
+    bridged_meet_code_from_tool_result,
+    calendar_event_from_tool_result,
     ensure_meeting_links,
+    meet_code_from_url,
     meeting_link_from_tool_result,
+    merge_calendar_events,
     strip_meeting_markers,
 )
 from ai_assistant_worker.platform_tools import (
@@ -79,11 +88,13 @@ from ai_assistant_worker.platform_tools import (
     PLATFORM_TOOLS_BY_NAME,
     build_platform_system_prompt,
 )
+from ai_assistant_worker.tool_call_log import function_call_entry, web_search_entry
 from ai_assistant_worker.tool_targets import (
     describe_tool_target,
     describe_web_search_target,
     split_reasoning_summary,
 )
+from ai_assistant_worker.tools_manifest import run_manifest_publisher
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
 from shared.integration_status import OPENAI, IntegrationReport, credential_report
@@ -565,6 +576,8 @@ class ChatAssistantWorker(BaseWorker):
         # every path behind them is gated by the platform admin policy server-side.
         self._billing_client: httpx.AsyncClient | None = None
         self._auth_client: httpx.AsyncClient | None = None
+        # Publishes the built-in tool manifest for AssistantService (tools_manifest.py).
+        self._manifest_task: asyncio.Task[None] | None = None
 
     async def load_model(self) -> None:
         api_key = resolve_openai_api_key(self.chat_settings.api_key)
@@ -601,6 +614,11 @@ class ChatAssistantWorker(BaseWorker):
             timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
         )
         self.logger.info("chat_assistant_ready", model=self.chat_settings.model)
+        # Redis is connected before load_model runs (BaseWorker.start), so the first write lands
+        # at startup. The loop never raises on a failed write; see tools_manifest.
+        self._manifest_task = asyncio.create_task(
+            run_manifest_publisher(self.redis, self.chat_settings, self.logger)
+        )
 
     def integration_reports(self) -> dict[str, IntegrationReport]:
         return {
@@ -611,6 +629,11 @@ class ChatAssistantWorker(BaseWorker):
         }
 
     async def _cleanup(self) -> None:
+        if self._manifest_task is not None:
+            self._manifest_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._manifest_task
+            self._manifest_task = None
         for client in (
             self._workspace_client,
             self._assistant_client,
@@ -863,6 +886,12 @@ class ChatAssistantWorker(BaseWorker):
         # Meetings a tool created this turn. Their links are appended to the answer if the model
         # left them out - see meeting_links.
         created_meetings: list[MeetingLink] = []
+        # GMCAL1001: Calendar events chained onto a Meet this turn (folded onto its card), the Meet
+        # codes create_meeting already bridged (no second room), and the zone each Meet's time was
+        # given in (a bare date-time from the model is local, not UTC).
+        calendar_events: list[CalendarEvent] = []
+        bridged_meet_codes: set[str] = set()
+        meet_time_zones: dict[str, str] = {}
         final_text = ""
 
         for _ in range(self.chat_settings.max_tool_iterations):
@@ -872,6 +901,9 @@ class ChatAssistantWorker(BaseWorker):
             # Per ITERATION, not per turn: a second round of searching is a second target, and
             # carrying the first one over would label the new step with the old query.
             web_search_detail = ""
+            # When each hosted search item was first seen, for its log entry's startedAt. The
+            # search runs server-side, so this is the only moment the worker can put on it.
+            web_search_seen_at: dict[str, datetime] = {}
             # The reasoning summary the model is currently writing. Accumulated across deltas
             # and published whole, because half a sentence appearing and then being completed
             # under the reader is worse than the sentence arriving a moment later.
@@ -954,6 +986,9 @@ class ChatAssistantWorker(BaseWorker):
                 elif etype in ("response.output_item.added", "response.output_item.done"):
                     item = getattr(event, "item", None)
                     if getattr(item, "type", "") == "web_search_call":
+                        item_id = str(getattr(item, "id", "") or "")
+                        if item_id:
+                            web_search_seen_at.setdefault(item_id, datetime.now(UTC))
                         found = describe_web_search_target(getattr(item, "action", None))
                         if found:
                             web_search_detail = found
@@ -981,6 +1016,19 @@ class ChatAssistantWorker(BaseWorker):
 
             if buffer:
                 await self._publish_result(request, type_="chunk", content=buffer)
+
+            # One entry per hosted search, with no query text. Logged from the completed output
+            # rather than the lifecycle events, so a search is counted once however many events
+            # it streamed.
+            for item in output_items:
+                if getattr(item, "type", "") == "web_search_call":
+                    item_id = str(getattr(item, "id", "") or "")
+                    tool_call_log.append(
+                        web_search_entry(
+                            item,
+                            started_at=web_search_seen_at.get(item_id) or datetime.now(UTC),
+                        )
+                    )
 
             function_calls = [
                 item for item in output_items if getattr(item, "type", "") == "function_call"
@@ -1017,17 +1065,23 @@ class ChatAssistantWorker(BaseWorker):
                 )
 
                 tool = tool_lookup.get(tool_name)
+                started_at = datetime.now(UTC)
+                started_clock = time.perf_counter()
+                error_code: str | None = None
                 if tool is None:
                     result_json = json.dumps({"error": f"Unknown tool '{tool_name}'."})
                     status = "failed"
+                    error_code = "unknown_tool"
                 else:
                     try:
                         result_json = await tool.handler(tool_context, arguments)
                         status = "completed"
-                    except Exception:
+                    except Exception as exc:
                         self.logger.exception("tool_execution_failed", tool=tool_name)
                         result_json = json.dumps({"error": "The tool failed to execute."})
                         status = "failed"
+                        error_code = type(exc).__name__
+                duration_seconds = time.perf_counter() - started_clock
 
                 await self._publish_result(
                     request,
@@ -1050,6 +1104,20 @@ class ChatAssistantWorker(BaseWorker):
                     created = meeting_link_from_tool_result(result_json)
                     if created is not None:
                         created_meetings.append(created)
+                    calendar_event = calendar_event_from_tool_result(result_json)
+                    if calendar_event is not None:
+                        calendar_events.append(calendar_event)
+                    bridged = bridged_meet_code_from_tool_result(result_json)
+                    if bridged:
+                        bridged_meet_codes.add(bridged)
+                    meet_code: str | None = None
+                    if created is not None and created.kind == "google_meet":
+                        meet_code = created.code or meet_code_from_url(created.url)
+                    elif calendar_event is not None:
+                        meet_code = calendar_event.meet_code
+                    time_zone = (arguments or {}).get("timeZone")
+                    if meet_code and isinstance(time_zone, str) and time_zone.strip():
+                        meet_time_zones.setdefault(meet_code.lower(), time_zone.strip())
 
                 if tool_name == "ask_user" and status == "completed":
                     await self._publish_result(
@@ -1096,13 +1164,19 @@ class ChatAssistantWorker(BaseWorker):
                         "output": result_json,
                     }
                 )
+                plugin_key = tool.plugin_key if tool is not None else None
                 tool_call_log.append(
-                    {
-                        "tool": tool_name,
-                        "arguments": raw_arguments,
-                        "result": result_json,
-                        "status": status,
-                    }
+                    function_call_entry(
+                        tool=tool_name,
+                        arguments=raw_arguments,
+                        result=result_json,
+                        status=status,
+                        source="plugin" if plugin_key else "builtin",
+                        plugin_key=plugin_key,
+                        started_at=started_at,
+                        duration_seconds=duration_seconds,
+                        error_code=error_code,
+                    )
                 )
         else:
             # Hit max_tool_iterations while the model still wanted another tool.
@@ -1111,6 +1185,20 @@ class ChatAssistantWorker(BaseWorker):
                 or "I wasn't able to finish looking that up — please try rephrasing your question."
             )
 
+        # One card per meeting: a Calendar event made for a Meet this turn lands on that Meet's
+        # card rather than beside it.
+        created_meetings = merge_calendar_events(created_meetings, calendar_events)
+        # Every Meet WarpBot created goes on WarpTalk's own calendar as an EXTERNAL_BRIDGE room,
+        # filed here rather than left to the model. Never raises - see meet_rooms.
+        try:
+            await file_meet_rooms(
+                tool_context,
+                created_meetings,
+                already_bridged=bridged_meet_codes,
+                time_zones=meet_time_zones,
+            )
+        except Exception:
+            self.logger.exception("meet_room_filing_failed")
         return ensure_meeting_links(final_text, created_meetings), tool_call_log
 
     async def _load_dynamic_mcp_tools(
@@ -1186,6 +1274,7 @@ class ChatAssistantWorker(BaseWorker):
                         policy=policy,
                     ),
                     handler=self._build_mcp_tool_handler(plugin_key, name, request, label),
+                    plugin_key=plugin_key,
                 )
             )
 

@@ -100,12 +100,46 @@ class ToolContext:
     page_entity_id: str | None = None
 
 
+#: Allowed values for a built-in tool's manifest metadata (see tools_manifest.py). The category ids
+#: are the ones the web's /{slug}/tools page groups by (warpbot-tools-catalog.ts), plus "other" as
+#: the contract's catch-all.
+TOOL_CATEGORIES = (
+    "meetings",
+    "knowledge",
+    "documents",
+    "glossary",
+    "translation",
+    "workspace",
+    "conversation",
+    "platform",
+    "other",
+)
+#: "write" means the tool changes data (creates, saves or shares something).
+TOOL_EFFECTS = ("read", "write")
+#: "member": everyone. "host": listed for everyone, but only a meeting's host can complete it.
+#: "platform_staff": answers only for a WarpTalk platform administrator.
+TOOL_AUDIENCES = ("member", "host", "platform_staff")
+
+
 @dataclass
 class ChatTool:
     name: str
     description: str
     parameters: dict[str, Any]
     handler: Callable[[ToolContext, dict[str, Any]], Awaitable[str]]
+    #: Manifest metadata, published to Redis so the backend can list WarpBot's tools. Declared on
+    #: every built-in in TOOLS, next to its schema, so the two cannot drift; a test fails if one is
+    #: missing. Optional only because plugin (MCP) and platform tools reuse this class and are not
+    #: in the manifest.
+    category: str | None = None
+    effect: str | None = None
+    audience: str | None = None
+    #: False keeps a built-in out of the manifest: internal plumbing a user never asks for (the
+    #: meeting-chat -> widget handoff). It is still given to the model wherever offered_on allows.
+    listed: bool = True
+    #: The plugin a dynamic MCP tool belongs to, from the backend's tool list. None for the
+    #: worker's own tools; it is how the tool-call log tells a plugin call from a built-in one.
+    plugin_key: str | None = None
 
     def to_openai_schema(self) -> dict[str, Any]:
         """Tool declaration in the shape /v1/responses expects.
@@ -2483,6 +2517,9 @@ TOOLS: list[ChatTool] = [
             "required": ["questions"],
         },
         handler=_ask_user,
+        category="conversation",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="create_meeting",
@@ -2595,14 +2632,15 @@ TOOLS: list[ChatTool] = [
                     "enum": list(EXTERNAL_PROVIDER_CHOICES),
                     "description": (
                         "NONE for an ordinary WarpTalk meeting - which is nearly always the "
-                        "answer. GOOGLE_MEET only when a Google Meet link was just created "
-                        "by a plugin tool and this room should bridge to it."
+                        "answer. GOOGLE_MEET only to bridge an existing Google Meet link the "
+                        "user gave you. Never for a Google Meet you just created with the "
+                        "plugin tool - WarpBot already puts that one on the WarpTalk calendar."
                     ),
                 },
                 "external_meeting_url": {
                     "type": "string",
                     "description": (
-                        "Exact Google Meet URL returned by the plugin tool. Must start with "
+                        "Exact Google Meet URL, as the user or a tool gave it. Must start with "
                         "https://meet.google.com/ - never compose or guess one."
                     ),
                 },
@@ -2618,6 +2656,9 @@ TOOLS: list[ChatTool] = [
             "required": ["title", "translation_room_type", "source_language", "target_languages"],
         },
         handler=_create_meeting,
+        category="meetings",
+        effect="write",
+        audience="member",
     ),
     ChatTool(
         name="create_action_item",
@@ -2672,6 +2713,9 @@ TOOLS: list[ChatTool] = [
             "required": ["task", "owner"],
         },
         handler=_create_action_item,
+        category="meetings",
+        effect="write",
+        audience="member",
     ),
     ChatTool(
         name="create_glossary",
@@ -2711,6 +2755,9 @@ TOOLS: list[ChatTool] = [
             "required": ["name", "source_language", "target_language"],
         },
         handler=_create_glossary,
+        category="glossary",
+        effect="write",
+        audience="member",
     ),
     ChatTool(
         name="add_glossary_term",
@@ -2742,6 +2789,9 @@ TOOLS: list[ChatTool] = [
             "required": ["source_term", "target_term"],
         },
         handler=_add_glossary_term,
+        category="glossary",
+        effect="write",
+        audience="member",
     ),
     ChatTool(
         name="share_meeting_minutes",
@@ -2765,6 +2815,9 @@ TOOLS: list[ChatTool] = [
             "required": ["email"],
         },
         handler=_share_meeting_minutes,
+        category="meetings",
+        effect="write",
+        audience="host",
     ),
     ChatTool(
         name="search_workspace_members",
@@ -2787,6 +2840,9 @@ TOOLS: list[ChatTool] = [
             "required": [],
         },
         handler=_search_workspace_members,
+        category="workspace",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="search_terminology",
@@ -2804,6 +2860,9 @@ TOOLS: list[ChatTool] = [
             "required": ["query"],
         },
         handler=_search_terminology,
+        category="glossary",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="list_recent_meetings",
@@ -2823,6 +2882,9 @@ TOOLS: list[ChatTool] = [
             "required": [],
         },
         handler=_list_recent_meetings,
+        category="meetings",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="translate_text",
@@ -2842,6 +2904,9 @@ TOOLS: list[ChatTool] = [
             "required": ["text", "target_language"],
         },
         handler=_translate_text,
+        category="translation",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="search_facts",
@@ -2872,6 +2937,9 @@ TOOLS: list[ChatTool] = [
             "required": [],
         },
         handler=_search_facts,
+        category="knowledge",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="semantic_search",
@@ -2890,6 +2958,9 @@ TOOLS: list[ChatTool] = [
             "required": ["query"],
         },
         handler=_semantic_search,
+        category="knowledge",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="get_meeting_summary",
@@ -2910,6 +2981,9 @@ TOOLS: list[ChatTool] = [
             "required": ["meeting_id"],
         },
         handler=_get_meeting_summary,
+        category="meetings",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="get_room_detail",
@@ -2931,6 +3005,9 @@ TOOLS: list[ChatTool] = [
             "required": ["room_id"],
         },
         handler=_get_room_detail,
+        category="meetings",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="get_transcript",
@@ -2979,6 +3056,9 @@ TOOLS: list[ChatTool] = [
             "required": ["meeting_id"],
         },
         handler=_get_transcript,
+        category="meetings",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="search_documents",
@@ -3009,6 +3089,9 @@ TOOLS: list[ChatTool] = [
             "required": [],
         },
         handler=_search_documents,
+        category="documents",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="get_document",
@@ -3029,6 +3112,9 @@ TOOLS: list[ChatTool] = [
             "required": ["document_id"],
         },
         handler=_get_document,
+        category="documents",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="get_platform_analytics",
@@ -3077,6 +3163,9 @@ TOOLS: list[ChatTool] = [
             "required": ["reports"],
         },
         handler=_get_platform_analytics,
+        category="platform",
+        effect="read",
+        audience="platform_staff",
     ),
     ChatTool(
         name=CONTINUE_IN_WIDGET_TOOL,
@@ -3100,6 +3189,10 @@ TOOLS: list[ChatTool] = [
             "required": [],
         },
         handler=_continue_in_widget,
+        category="conversation",
+        effect="read",
+        audience="member",
+        listed=False,
     ),
 ]
 

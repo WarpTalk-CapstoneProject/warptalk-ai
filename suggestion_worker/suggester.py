@@ -348,6 +348,7 @@ class OpenAISuggester:
         temperature: float,
         max_suggestion_chars: int,
         request_timeout_seconds: float,
+        reasoning_effort: str | None = None,
     ) -> None:
         self.api_key = api_key
         self.decide_model = decide_model
@@ -357,21 +358,29 @@ class OpenAISuggester:
         self.temperature = temperature
         self.max_suggestion_chars = max_suggestion_chars
         self.request_timeout_seconds = request_timeout_seconds
+        self.reasoning_effort = reasoning_effort
         self._client: AsyncOpenAI | None = None
 
     async def load(self) -> None:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required for the suggestion worker")
 
+        # max_retries=0: the SDK default of 2 re-sends a timed-out request twice, so one
+        # slow hint held this consumer for ~27s, three 8s attempts plus backoff. Prod logged
+        # three such failures 27s apart on 1 Oct 2026. The SDK also retries 429, which the
+        # repo's retry policy forbids. A hint that missed its moment is not worth a second
+        # attempt — the same "fail fast and stay quiet" reasoning as the timeout itself.
         self._client = AsyncOpenAI(
             api_key=self.api_key,
             timeout=self.request_timeout_seconds,
             http_client=observed_openai_http_client("suggestion"),
+            max_retries=0,
         )
         logger.info(
             "suggester_client_initialized",
             decide_model=self.decide_model,
             generate_model=self.generate_model,
+            reasoning_effort=self.reasoning_effort,
         )
 
     async def decide(
@@ -390,6 +399,7 @@ class OpenAISuggester:
                     self.decide_model,
                     self.decide_max_tokens,
                     self.temperature,
+                    reasoning_effort=self.reasoning_effort,
                 ),
                 response_format={"type": "json_object"},
             )
@@ -446,6 +456,7 @@ class OpenAISuggester:
                     self.generate_model,
                     self.generate_max_tokens,
                     self.temperature,
+                    reasoning_effort=self.reasoning_effort,
                 ),
                 response_format={"type": "json_object"},
             )

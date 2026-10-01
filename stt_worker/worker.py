@@ -18,8 +18,10 @@ from typing import Any
 
 from shared.base_worker import TERMINAL_ROOM_STATUSES, BaseWorker
 from shared.config import STTSettings, resolve_openai_api_key
+from shared.control_markers import is_external_bridge_speaker
 from shared.disfluency import detect_question, prepass
 from shared.disfluency.normalize import resolve_language
+from shared.far_speaker import CaptionHintTracker, FarSpeakerTracker, SegmentWindow
 from shared.integration_status import OPENAI, IntegrationReport, credential_report
 from shared.prosody import (
     SpeakerBaseline,
@@ -38,6 +40,14 @@ from shared.schemas import (
     STTResultMessage,
 )
 from shared.text_utils import split_into_sentences
+from stt_worker.far_side_dedupe import (
+    DedupeConfig,
+    LeakConfig,
+    NamedSegmentRef,
+    audio_start_epoch_ms,
+    find_far_side_duplicate,
+    find_far_side_leak,
+)
 from stt_worker.model import OpenAISTT, _normalize_language, _normalize_overheard_text
 
 
@@ -95,6 +105,14 @@ _DUB_ECHO_SCAN_COUNT = 48
 # seconds — a 2s-stale read can never miss the line it needs, and chunks arrive about once a
 # second per speaker, so this turns a per-chunk stream read into one every couple of seconds.
 _DUB_ECHO_CACHE_TTL_S = 2.0
+
+# FAR-SIDE DEDUPE (stt_worker/far_side_dedupe.py). stt:results entries to look back through for
+# recent lines. Bridge stand-in chunks pay this read (forward dedupe); named chunks pay it only
+# when STT_FAR_SIDE_LEAK_DEDUPE_ENABLED is on (reverse/leak dedupe).
+_FAR_SIDE_SCAN_COUNT = 64
+# Short, unlike the dub-echo cache: the named copy of a sentence and its Meet echo are published
+# within about a second of each other, and a 2s-stale read would miss exactly that line.
+_FAR_SIDE_CACHE_TTL_S = 0.5
 
 _RECENT_CONTEXT_SEGMENTS = 4
 _MAX_STT_PROMPT_CHARS = 600
@@ -636,6 +654,10 @@ class STTWorker(BaseWorker):
         self._room_languages.pop(room_id, None)
         getattr(self, "_room_noise_reduction", {}).pop(room_id, None)
         getattr(self, "_dub_echo_cache", {}).pop(room_id, None)
+        getattr(self, "_far_side_ref_cache", {}).pop(room_id, None)
+        tracker = getattr(self, "_far_speaker_tracker_impl", None)
+        if tracker is not None and hasattr(tracker, "forget"):
+            tracker.forget(room_id)
         # Same reasoning as the four above: one entry per (meeting, speaker) whose turn was
         # open when the room ended, held forever otherwise.
         for noise_key in [
@@ -842,6 +864,17 @@ class STTWorker(BaseWorker):
         keywords = await self._get_stt_keywords(chunk.meeting_id)
         noise_reduction = await self._get_noise_reduction(chunk.meeting_id, chunk.speaker_id)
         recent_dub_texts = await self._get_recent_dub_texts(chunk.meeting_id)
+        # BRIDGE STAND-IN: where this chunk sits on the epoch clock caption hints use. The
+        # far-side reference lines are read per segment AFTER recognition (_review_far_side /
+        # _is_far_side_leak), not here: the other copy of a sentence is racing through a
+        # different STT session, and the later the read, the more likely it has landed.
+        bridge_chunk = is_external_bridge_speaker(chunk.speaker_id)
+        leak_review = not bridge_chunk and self.stt_settings.far_side_leak_dedupe_enabled
+        # A streamed turn's chunk can carry no PCM of its own; its speech_ms still says how
+        # long the speaker talked.
+        chunk_epoch_start_ms = chunk.timestamp_ms - (
+            _chunk_audio_duration_ms(chunk) or max(0, chunk.speech_ms)
+        )
 
         # Measured CONCURRENTLY with recognition, not before it. Transcription is a
         # network round trip of hundreds of milliseconds; the measurement is single-digit
@@ -948,6 +981,15 @@ class STTWorker(BaseWorker):
                     timestamp_ms=chunk.timestamp_ms,
                     prosody=None,
                 )
+                if bridge_chunk:
+                    reviewed = await self._review_far_side(
+                        result, chunk, chunk_epoch_start_ms, chunk_offset_ms
+                    )
+                    if reviewed is None:
+                        return
+                    result = reviewed
+                elif leak_review and await self._is_far_side_leak(result):
+                    return
                 result = await self._publish_stt_result(result, message_id)
                 self.logger.info(
                     "stt_early_sentence",
@@ -1095,6 +1137,7 @@ class STTWorker(BaseWorker):
             chunk_index=chunk.chunk_index,
         )
 
+        published_segments = 0
         for segment in segments:
             if segment.confidence >= _CONTEXT_MIN_CONFIDENCE:
                 self._remember_transcript(chunk.meeting_id, segment.text)
@@ -1126,7 +1169,18 @@ class STTWorker(BaseWorker):
                 prosody=prosody,
             )
 
+            if bridge_chunk:
+                reviewed = await self._review_far_side(
+                    result, chunk, chunk_epoch_start_ms, chunk_offset_ms
+                )
+                if reviewed is None:
+                    continue
+                result = reviewed
+            elif leak_review and await self._is_far_side_leak(result):
+                continue
+
             result = await self._publish_stt_result(result, message_id)
+            published_segments += 1
 
             self.logger.info(
                 "segment_transcribed",
@@ -1149,7 +1203,9 @@ class STTWorker(BaseWorker):
                 inference_ms=inference_ms,
             )
 
-        if not segments and chunk.is_final_chunk:
+        # On PUBLISHED segments, not recognised ones: a final chunk whose every line was a
+        # far-side duplicate (stand-in) or a far-side leak (named) still has to close its turn.
+        if not published_segments and chunk.is_final_chunk:
             result = STTResultMessage(
                 segment_id=_build_segment_id(
                     chunk.meeting_id,
@@ -1654,6 +1710,249 @@ class STTWorker(BaseWorker):
 
         cache[meeting_id] = (texts, now)
         return texts
+
+    def _far_side_dedupe_config(self) -> DedupeConfig:
+        s = self.stt_settings
+        return DedupeConfig(
+            window_ms=s.far_side_dedupe_window_ms,
+            min_ratio=s.far_side_dedupe_min_ratio,
+            min_chars=s.far_side_dedupe_min_chars,
+            same_language=s.far_side_dedupe_same_language,
+            min_lag_ms=s.far_side_dedupe_min_lag_ms,
+            max_lag_ms=s.far_side_dedupe_max_lag_ms,
+        )
+
+    def _far_side_leak_config(self) -> LeakConfig:
+        s = self.stt_settings
+        return LeakConfig(
+            min_ratio=s.far_side_leak_min_ratio,
+            min_chars=s.far_side_leak_min_chars,
+            same_language=s.far_side_dedupe_same_language,
+            max_named_delay_ms=s.far_side_leak_max_named_delay_ms,
+        )
+
+    async def _get_named_speaker_refs(self, meeting_id: str) -> list[NamedSegmentRef]:
+        """Recent lines NAMED speakers in this room published, for the forward dedupe."""
+        if not self.stt_settings.far_side_dedupe_enabled:
+            return []
+        return (await self._get_far_side_refs(meeting_id))[0]
+
+    async def _get_stand_in_refs(self, meeting_id: str) -> list[NamedSegmentRef]:
+        """Recent lines the bridge STAND-IN published, for the reverse (leak) dedupe.
+
+        Empty in every room without a bridge - which is what limits the leak check to bridge
+        rooms: no stand-in line, nothing for a named line to be a leaked copy of.
+        """
+        if not self.stt_settings.far_side_leak_dedupe_enabled:
+            return []
+        return (await self._get_far_side_refs(meeting_id))[1]
+
+    async def _get_far_side_refs(
+        self, meeting_id: str
+    ) -> tuple[list[NamedSegmentRef], list[NamedSegmentRef]]:
+        """(named lines, stand-in lines) recently published in this room. One read, cached.
+
+        Read from stt:results:{meeting} - every replica's output for the room, which an
+        in-memory list on this replica would not be. Fails open to ([], []) like the dub-echo
+        read. Each ref carries its AUDIO start (anchor_ms + start_ms), which is what the
+        direction rule decides on; None when the line stated no usable origin.
+        """
+        cache: (
+            dict[str, tuple[tuple[list[NamedSegmentRef], list[NamedSegmentRef]], float]] | None
+        ) = getattr(self, "_far_side_ref_cache", None)
+        if cache is None:
+            cache = {}
+            self._far_side_ref_cache = cache
+        now = time.monotonic()
+        cached = cache.get(meeting_id)
+        if cached is not None and now - cached[1] < _FAR_SIDE_CACHE_TTL_S:
+            return cached[0]
+
+        named: list[NamedSegmentRef] = []
+        standin: list[NamedSegmentRef] = []
+        # Twice the match window: the timestamp prefilter compares in both directions.
+        horizon_ms = 2 * self.stt_settings.far_side_dedupe_window_ms
+        try:
+            entries = (
+                await self.redis.redis.xrevrange(
+                    f"stt:results:{meeting_id}", count=_FAR_SIDE_SCAN_COUNT
+                )
+                or []
+            )
+            now_ms = int(time.time() * 1000)
+            for _entry_id, fields in entries:
+                if not fields:
+                    continue
+                data = {
+                    (key.decode() if isinstance(key, bytes) else key): (
+                        value.decode() if isinstance(value, bytes) else value
+                    )
+                    for key, value in fields.items()
+                }
+                try:
+                    ts = int(data.get("timestamp_ms", "0"))
+                except ValueError:
+                    continue
+                if now_ms - ts > horizon_ms:
+                    break
+                speaker = data.get("speaker_id", "")
+                if not speaker:
+                    continue
+                text = _normalize_overheard_text(data.get("text", ""))
+                if not text:
+                    continue
+                try:
+                    audio_start = audio_start_epoch_ms(
+                        int(data.get("anchor_ms") or 0), int(data.get("start_ms") or 0)
+                    )
+                except ValueError:
+                    audio_start = None
+                ref = NamedSegmentRef(
+                    speaker_id=speaker,
+                    text=text,
+                    language=data.get("language", ""),
+                    timestamp_ms=ts,
+                    audio_start_ms=audio_start,
+                )
+                (standin if is_external_bridge_speaker(speaker) else named).append(ref)
+        except Exception:
+            self.logger.warning("far_side_ref_lookup_failed", meeting_id=meeting_id, exc_info=True)
+            named, standin = [], []
+        cache[meeting_id] = ((named, standin), now)
+        return named, standin
+
+    async def _is_far_side_leak(self, result: STTResultMessage) -> bool:
+        """A NAMED line that is Meet audio leaking into this person's mic (reverse dedupe).
+
+        Checked only against stand-in lines ALREADY published: a named line recognised before
+        the stand-in's copy lands is kept, because stt:results has no retraction message to take
+        it back later. Fails open: any error keeps the line.
+        """
+        try:
+            refs = await self._get_stand_in_refs(result.meeting_id)
+            if not refs:
+                return False
+            audio_start = audio_start_epoch_ms(result.anchor_ms, result.start_ms)
+            match = find_far_side_leak(
+                _normalize_overheard_text(result.text),
+                result.language,
+                result.timestamp_ms,
+                refs,
+                self._far_side_dedupe_config(),
+                self._far_side_leak_config(),
+                audio_start_ms=audio_start,
+            )
+        except Exception:
+            self.logger.warning(
+                "far_side_leak_check_failed", meeting_id=result.meeting_id, exc_info=True
+            )
+            return False
+        if match is None:
+            return False
+        self._far_side_leaks_dropped = getattr(self, "_far_side_leaks_dropped", 0) + 1
+        self.logger.info(
+            "filtered_far_side_leak",
+            meeting_id=result.meeting_id,
+            speaker_id=result.speaker_id,
+            leak_of_speaker_id=match.speaker_id,
+            text=result.text[:80],
+            language=result.language,
+            is_early=result.is_early,
+            # Stand-in audio start minus this line's: <= 0 means the stand-in had it first.
+            lag_ms=(match.audio_start_ms or 0) - (audio_start or 0),
+            dropped_total=self._far_side_leaks_dropped,
+        )
+        return True
+
+    def _far_speaker_tracker(self) -> FarSpeakerTracker | None:
+        """Who-on-the-far-side source. Caption hints today; WT-677 swaps in diarization."""
+        if not self.stt_settings.far_speaker_hints_enabled:
+            return None
+        tracker: FarSpeakerTracker | None = getattr(self, "_far_speaker_tracker_impl", None)
+        if tracker is None:
+            redis = self.redis.redis
+
+            async def read_hints(key: str, count: int) -> Any:
+                return await redis.xrevrange(key, count=count)
+
+            tracker = CaptionHintTracker(
+                read_hints,
+                lag_ms=self.stt_settings.far_speaker_hint_lag_ms,
+                max_gap_ms=self.stt_settings.far_speaker_hint_max_gap_ms,
+            )
+            self._far_speaker_tracker_impl = tracker
+        return tracker
+
+    async def _review_far_side(
+        self,
+        result: STTResultMessage,
+        chunk: AudioChunkMessage,
+        chunk_epoch_start_ms: int,
+        chunk_offset_ms: int,
+    ) -> STTResultMessage | None:
+        """A bridge stand-in line: None when it echoes a named speaker, else labelled.
+
+        Dropped only when its audio started `min_lag_ms`..`max_lag_ms` AFTER the matching named
+        line's - the Meet round trip. Stand-in first or simultaneous is the leak case, where the
+        stand-in is the true copy and is kept; unknown timing keeps it too.
+        """
+        refs = await self._get_named_speaker_refs(result.meeting_id)
+        audio_start = audio_start_epoch_ms(result.anchor_ms, result.start_ms)
+        if refs:
+            match = find_far_side_duplicate(
+                _normalize_overheard_text(result.text),
+                result.language,
+                result.timestamp_ms,
+                refs,
+                self._far_side_dedupe_config(),
+                audio_start_ms=audio_start,
+            )
+            if match is not None:
+                self._far_side_duplicates_dropped = (
+                    getattr(self, "_far_side_duplicates_dropped", 0) + 1
+                )
+                self.logger.info(
+                    "filtered_far_side_duplicate",
+                    meeting_id=result.meeting_id,
+                    speaker_id=result.speaker_id,
+                    duplicate_of_speaker_id=match.speaker_id,
+                    text=result.text[:80],
+                    language=result.language,
+                    is_early=result.is_early,
+                    # Audio start of this stand-in line minus the named line's (both known).
+                    lag_ms=(audio_start or 0) - (match.audio_start_ms or 0),
+                    dropped_total=self._far_side_duplicates_dropped,
+                )
+                return None
+
+        tracker = self._far_speaker_tracker()
+        if tracker is None:
+            return result
+        chunk_end_ms = chunk.timestamp_ms
+        # The segment's own span inside the chunk when the model gave one; the whole chunk when
+        # it did not (early sentences carry start == end).
+        if result.end_ms > result.start_ms:
+            start = chunk_epoch_start_ms + max(0, result.start_ms - chunk_offset_ms)
+            end = chunk_epoch_start_ms + max(0, result.end_ms - chunk_offset_ms)
+            window = SegmentWindow(min(start, chunk_end_ms), min(end, chunk_end_ms))
+        else:
+            window = SegmentWindow(chunk_epoch_start_ms, chunk_end_ms)
+        try:
+            attribution = await tracker.attribute(result.meeting_id, window)
+        except Exception:
+            self.logger.warning(
+                "far_speaker_attribution_failed", meeting_id=result.meeting_id, exc_info=True
+            )
+            return result
+        if attribution is None:
+            return result
+        return result.model_copy(
+            update={
+                "far_speaker_name": attribution.name,
+                "far_speaker_source": attribution.source,
+                "far_speaker_confidence": attribution.confidence,
+            }
+        )
 
     async def _get_stt_keywords(self, meeting_id: str) -> list[str]:
         """Return structured glossary terms for the provider's keyword-bias field."""

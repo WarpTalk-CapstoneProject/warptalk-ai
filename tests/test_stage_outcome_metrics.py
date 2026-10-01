@@ -152,8 +152,11 @@ async def test_the_stt_and_tts_vendor_failure_paths_are_marked() -> None:
         'event_type="stt_unavailable"'
     )
     assert 'self.note_attempt_outcome("vendor_error")' in tts
+    # Marked where the sentence is given up on, ahead of the event that tells the room. Not at
+    # the per-attempt `cartesia_synthesis_failed` line any more: a sentence that failed once and
+    # was spoken on its retry is a message that worked.
     assert tts.index('self.note_attempt_outcome("vendor_error")') < tts.index(
-        '"cartesia_synthesis_failed"'
+        'event_type="tts_unavailable"'
     )
 
 

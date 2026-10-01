@@ -57,11 +57,23 @@ class AudioChunkMessage(BaseModel):
     #: and it is also what an older ingress keeps sending through a rolling deploy.
     turn_id: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    #: Bridge stand-in only: milliseconds of this chunk the ingress zeroed because they
+    #: overlapped (within the Meet path-delay window) with a WarpTalk participant's own mic —
+    #: their voice coming back through Meet. See livekit_ingress_worker/far_side_gate.py.
+    #: 0 (and absent on the wire) for every other chunk and for an older ingress.
+    suppressed_overlap_ms: int = 0
 
     model_config = {"arbitrary_types_allowed": True}
 
     def to_redis(self) -> dict[str, str]:
         """Serialize to Redis Stream fields (all str values)."""
+        payload = self._base_redis_fields()
+        # Omitted when 0 so every non-bridge chunk is byte-for-byte what it was before.
+        if self.suppressed_overlap_ms > 0:
+            payload["suppressed_overlap_ms"] = str(self.suppressed_overlap_ms)
+        return payload
+
+    def _base_redis_fields(self) -> dict[str, str]:
         return {
             "meeting_id": self.meeting_id,
             "speaker_id": self.speaker_id,
@@ -102,6 +114,7 @@ class AudioChunkMessage(BaseModel):
             is_final_chunk=d.get("is_final_chunk") == "1",
             turn_id=d.get("turn_id", ""),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
+            suppressed_overlap_ms=int(d.get("suppressed_overlap_ms", "0") or "0"),
         )
 
 
@@ -321,6 +334,18 @@ class STTResultMessage(BaseModel):
     # shared.disfluency flags for `clean_text`: filler_only, fillers_removed, stutter_removed,
     # escalate. Empty when nothing was flagged.
     clean_flags: tuple[str, ...] = ()
+    # Bridge stand-in segments only: WHICH person on the far side of the call said this line,
+    # when something could tell (shared/far_speaker.py). The stand-in's speaker_id stays the
+    # stand-in GUID — these name a person inside it, they do not replace the seat.
+    #
+    # All three None (and absent on the wire) when there is no answer — every non-bridge segment,
+    # every bridge segment with no hint near it, every older producer. The persisting consumer
+    # stores them as far_speaker_key / far_speaker_source / far_speaker_confidence.
+    far_speaker_name: str | None = None
+    # "meet_caption" for phase-1 caption hints; a diarization tracker (WT-677) names its own.
+    far_speaker_source: str | None = None
+    # 0..1. 1.0 = every hint inside the segment named this person.
+    far_speaker_confidence: float | None = None
 
     @property
     def display_text(self) -> str:
@@ -356,6 +381,13 @@ class STTResultMessage(BaseModel):
             payload["clean_text"] = self.clean_text
         if self.clean_flags:
             payload["clean_flags"] = ",".join(self.clean_flags)
+        # Only with a name: a source or confidence without one is not an attribution.
+        if self.far_speaker_name:
+            payload["far_speaker_name"] = self.far_speaker_name
+            if self.far_speaker_source:
+                payload["far_speaker_source"] = self.far_speaker_source
+            if self.far_speaker_confidence is not None:
+                payload["far_speaker_confidence"] = str(self.far_speaker_confidence)
         return payload
 
     @classmethod
@@ -383,6 +415,9 @@ class STTResultMessage(BaseModel):
             # Absent on everything published before WT-716: no clean version was computed.
             clean_text=d.get("clean_text"),
             clean_flags=_split_flags(d.get("clean_flags")),
+            far_speaker_name=d.get("far_speaker_name") or None,
+            far_speaker_source=d.get("far_speaker_source") or None,
+            far_speaker_confidence=optional_confidence(d.get("far_speaker_confidence")),
         )
 
 

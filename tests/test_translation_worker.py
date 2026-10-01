@@ -701,6 +701,30 @@ class TestTranslationWorker:
         assert translated_stream_writes == []
         assert list(worker._recent_source_contexts.get("m1", ())) == []
 
+    async def test_a_line_of_unknown_confidence_becomes_context_for_the_next(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """Production STT returns no logprobs, so every line is STT_UNKNOWN_CONFIDENCE (-1.0).
+        The context floor read that as low and the rolling context stayed empty in every
+        production meeting. Unknown is admitted; a MEASURED low score still is not."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"en"}
+        mock_redis_client._redis.get.return_value = None
+        worker.translator.translate_with_valence = AsyncMock(return_value=("Translated.", None))
+
+        unknown = self._make_stt_msg(language="vi", text="Chúng ta bàn về ngân sách quý ba.")
+        unknown.confidence = -1.0
+        await worker.process(b"msg-unknown", unknown.to_redis())
+
+        measured_low = self._make_stt_msg(language="vi", text="Một câu nghe không rõ lắm.")
+        measured_low.segment_id = "seg-low"
+        measured_low.confidence = -0.9
+        await worker.process(b"msg-low", measured_low.to_redis())
+
+        assert list(worker._recent_source_contexts.get("m1", ())) == [
+            "Chúng ta bàn về ngân sách quý ba."
+        ]
+
     async def test_a_suppression_the_context_caused_is_overturned_and_delivered(
         self, mock_redis_client, worker_settings: WorkerSettings
     ) -> None:

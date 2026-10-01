@@ -329,6 +329,54 @@ class WorkerSettings(BaseSettings):
     near_field_gate_min_baseline_chunks: int = 2
     near_field_gate_baseline_ema_alpha: float = 0.3
 
+    # FAR-SIDE SAME-SOURCE GATE (ingress worker only, see livekit_ingress_worker/far_side_gate.py).
+    #
+    # In a Meet-bridged room a WarpTalk user who is ALSO in the Meet is heard twice: their own
+    # mic under their own identity, and again inside the stand-in's mixed Meet feed a few hundred
+    # ms later. The gate zeroes a stand-in frame (32ms, never a whole turn) only when its content
+    # is explained by a real participant's own track, delayed and gain/EQ-shaped; a Meet-side
+    # person talking over a WarpTalk user is kept, as a native room would keep them. Unsure ->
+    # keep. The STT text dedupe (STT_FAR_SIDE_DEDUPE_*) remains the second layer.
+    #
+    # OFF BY DEFAULT. Synthetic evaluation (scripts/far_side_gate_eval: TTS speech through a
+    # simulated Meet chain with real libopus at ~31kbps, 3 seeds) at these defaults: ~1% of a
+    # Meet-side speaker's overlapped speech time is wrongly zeroed (worst case ~4% when they are
+    # 12dB quieter than the duplicate), 0% when only the Meet side talks — but only ~20% of the
+    # duplicate's frames are removed (~4% during crosstalk), as scattered frames that may leave
+    # the duplicate's text harder for the text dedupe to match. The speech is synthetic and the
+    # Meet path simulated: turn on only after checking a real bridged Meet recording.
+    #
+    # Env: FAR_SIDE_GATE_<NAME> for every field below.
+    far_side_gate_enabled: bool = False
+    # Where to look for a participant's copy, relative to their own track (arrival clock).
+    # Meet's path is expected around 300-600ms+ but not measured across networks, so the range is
+    # wide and the lag is tracked, not assumed. A peak on the range's edge is ignored.
+    far_side_gate_lag_min_ms: int = 150
+    far_side_gate_lag_max_ms: int = 1200
+    # Feature history kept per track. Raised to lag_max + 1500 if set lower.
+    far_side_gate_history_ms: int = 4000
+    # Lag lock: the ~1s band-envelope correlation peak needed to (re)confirm a participant's lag,
+    # and how long a lock lives without re-confirmation (no lock -> nothing is zeroed).
+    far_side_gate_lock_min_corr: float = 0.5
+    far_side_gate_lock_hold_ms: int = 8000
+    # Per-hop duplicate test: the ~64ms spectro-temporal patch similarity required (0..1) ...
+    far_side_gate_frame_min_corr: float = 0.7
+    # ... and at most this share of the stand-in's power may sit more than residual_margin_db
+    # above what the reference predicts.
+    far_side_gate_residual_margin_db: float = 6.0
+    far_side_gate_residual_max_ratio: float = 0.15
+    # A reference hop counts as speech this many dB above that track's own noise floor.
+    far_side_gate_ref_active_db: float = 15.0
+    # Second voice: when 3 of the last 5 hops put >= second_voice_ratio of the stand-in's power
+    # more than second_voice_margin_db above the prediction, somebody else is talking and
+    # nothing is zeroed for second_voice_hold_ms. This hangover is the main crosstalk guard:
+    # shorter holds remove more of the duplicate and more of the Meet-side speaker (300ms with
+    # second_voice_ratio 0.3 / frame_min_corr 0.6: ~50% of the duplicate, ~12% of overlapped
+    # crosstalk in the same evaluation).
+    far_side_gate_second_voice_margin_db: float = 12.0
+    far_side_gate_second_voice_ratio: float = 0.15
+    far_side_gate_second_voice_hold_ms: int = 1500
+
     # Keep the speech forwarded to STT, so a meeting can be transcribed a second time after
     # it ends — see livekit_ingress_worker/audio_archive.py for why the existing recording
     # cannot serve that purpose. Off by default because it writes files and uploads them;
@@ -441,6 +489,53 @@ class STTSettings(BaseSettings):
     # on purpose — a different room means a different microphone, and a baseline built in one is
     # not a description of how they sound in the other.
     prosody_baseline_ttl_seconds: int = 21600  # 6h
+
+    # FAR-SIDE TEXT DEDUPE (stt_worker/far_side_dedupe.py). The second line of defence behind
+    # the ingress overlap gate: a bridge stand-in segment whose text matches a line a NAMED
+    # WarpTalk speaker in the same room just said is that speaker heard back through Meet, and
+    # is dropped. Env: STT_FAR_SIDE_DEDUPE_*.
+    far_side_dedupe_enabled: bool = True
+    # How far apart (by chunk timestamp) the two copies may be. Meet's path delay is sub-second;
+    # the slack is for the named speaker's chunk closing on a different pause than the stand-in's.
+    far_side_dedupe_window_ms: int = 15_000
+    # SequenceMatcher ratio at or above which two normalized lines are the same line.
+    far_side_dedupe_min_ratio: float = 0.8
+    # Shorter stand-in lines are never dropped — "ok", "yeah" are said by real far-side people.
+    far_side_dedupe_min_chars: int = 8
+    # Require the two segments' languages to agree when both are known.
+    far_side_dedupe_same_language: bool = True
+    # DIRECTION, by AUDIO start (anchor_ms + start_ms), never by publish order: the stand-in is
+    # dropped only when its audio starts this much LATER than the named line's. The floor
+    # matches FAR_SIDE_GATE_LAG_MIN_MS; a smaller lag (stand-in first or simultaneous) is the
+    # LEAK case below, where the stand-in is the true copy. Unknown timing on either side keeps
+    # both lines.
+    far_side_dedupe_min_lag_ms: int = 150
+    far_side_dedupe_max_lag_ms: int = 2_000
+
+    # FAR-SIDE LEAK DEDUPE (reverse). Host on laptop speakers: Meet audio played by Chrome leaks
+    # into the host's real mic (Electron's AEC has no cross-process reference), so the host's
+    # line repeats what the stand-in already carried first. With this on, a NAMED line whose
+    # audio starts between `far_side_dedupe_min_lag_ms` before and `far_side_leak_max_named_
+    # delay_ms` after an already-published stand-in line with the same text is dropped as the
+    # leak. Bridge rooms only (it needs a stand-in line to exist). Env: STT_FAR_SIDE_LEAK_*.
+    #
+    # OFF BY DEFAULT: audio start is chunk-granular (a sentence mid-chunk carries its chunk's
+    # start), so a forward echo whose two chunks were cut differently can land in the leak band
+    # and the WarpTalk user's line would be re-attributed to the stand-in. Turn on after
+    # measuring on real bridge sessions.
+    far_side_leak_dedupe_enabled: bool = False
+    # Stricter than the forward thresholds: what this drops is a WarpTalk user's line.
+    far_side_leak_min_ratio: float = 0.85
+    far_side_leak_min_chars: int = 12
+    far_side_leak_max_named_delay_ms: int = 1_000
+
+    # FAR-SPEAKER HINTS (shared/far_speaker.py): names read from Meet captions by the desktop,
+    # attached to stand-in segments as far_speaker_name/source/confidence. Env: STT_FAR_SPEAKER_*.
+    far_speaker_hints_enabled: bool = True
+    # How long after the words a caption is observed. Hints are shifted back by this much.
+    far_speaker_hint_lag_ms: int = 500
+    # A hint outside the segment window but within this gap still names it, at reduced confidence.
+    far_speaker_hint_max_gap_ms: int = 1500
 
 
 class TranslationSettings(BaseSettings):
@@ -621,7 +716,36 @@ class TTSSettings(BaseSettings):
     # speakers and target languages overruns the plan and every excess sentence fails outright.
     # Waiting for a slot costs a fraction of a sentence; a 429 costs the whole one. Keep this at
     # the plan's limit divided by the number of TTS replicas (tts-worker is a singleton).
+    #
+    # A slot covers GENERATION, not playout: it is taken before Cartesia is asked and given back
+    # when the sentence's audio has arrived (flush_done, or the one-shot response) — see
+    # tts_worker.synthesizer.GenerationLease. It used to be held until the streamed sentence had
+    # finished PLAYING, which made a third speaker wait out somebody else's dub. What Cartesia
+    # counts is requests generating; an open-but-idle prosody context between two sentences of a
+    # turn was never inside the slot either, and that design has been running since #189.
     cartesia_max_concurrency: int = 2
+
+    # What happens to a sentence Cartesia failed. It used to be logged and acknowledged — the
+    # sentence was gone, silently, with no retry and no record anywhere to replay it from.
+    #
+    # Retried ONLY for failures that are about the moment, not the request: a dropped
+    # connection, a 5xx, a timeout. Never a 4xx — 402 (out of credits), 401/403 (key) and 429
+    # (concurrency) answer the same way the next time, and retrying them only multiplies the load
+    # the vendor is already refusing (see the 429 logout storm). Those go straight to
+    # `translate:results:dead-letter` with the reason, as does a sentence whose retries ran out.
+    #
+    # ONE retry by default, because the Cartesia SDK (max_retries=2) has already retried a 5xx,
+    # 408, 409 or timeout on the one-shot HTTP call before it surfaces here. What it cannot retry
+    # is a stream that broke after it started, and a prosody-context failure followed by a failed
+    # fallback — those are what this catches.
+    #
+    # The retry runs inside the sentence's per-key lock, so nothing newer from the same speaker
+    # and language can play in between: a retried line is late, never out of order. That is also
+    # why the window exists — every second spent retrying holds that speaker's next line back —
+    # and why a failure that already took longer than the window is not retried at all.
+    synthesis_max_retries: int = 1
+    synthesis_retry_backoff_seconds: float = 0.5
+    synthesis_retry_window_seconds: float = 10.0
 
     # Delete in-meeting clones from the Cartesia account once nothing can reach them.
     #
@@ -757,6 +881,16 @@ class SuggestionSettings(BaseSettings):
     decide_max_tokens: int = 64  # a {should_suggest, category, confidence, reason} object
     generate_max_tokens: int = 200
     temperature: float = 0.2
+    # Reasoning effort for either stage when it runs on a gpt-5 model (ignored otherwise).
+    # Production generates on gpt-5.6-luna, whose token cap is shared between hidden
+    # reasoning and the visible answer. At its default effort a ~5.5k-token prompt spent
+    # 35-85 reasoning tokens per call in a probe (1 Oct 2026), so some draws exhaust the
+    # 200-token cap and OpenAI answers 400 "max_tokens or model output limit was reached"
+    # with nothing to show: 2 of 15 generate calls in prod that morning, with 3 more lost to
+    # the 8s timeout. "none" spent 0 reasoning tokens and answered in ~1.6s instead of
+    # 2-4s. The judgement this hint needs was already made by the decide stage.
+    # Supported values are per model: luna rejects "minimal".
+    reasoning_effort: str | None = "none"
     # A hung request would stall this consumer's whole loop, and a suggestion that arrives
     # after the conversation has moved on is worse than none — fail fast and stay quiet.
     request_timeout_seconds: float = 8.0

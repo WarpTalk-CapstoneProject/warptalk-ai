@@ -157,6 +157,35 @@ def test_confirmation_question_offers_always_allow_with_the_token_and_the_flag()
     assert "alwaysAllow: true" in always["value"]
 
 
+def test_confirmation_question_leaves_out_always_allow_when_the_workspace_asks_every_time() -> None:
+    question_payload = build_mcp_confirmation_questions(
+        {"message": "Confirm first.", "confirmationToken": "token-1", "alwaysAllowOffered": False},
+        tool_name="linear_save_issue",
+    )
+
+    options = question_payload["permission"]["options"]
+    assert [option["label"] for option in options] == [
+        "Yes",
+        "No, and tell WarpBot what to do differently",
+    ]
+    assert all("alwaysAllow: true" not in option["value"] for option in options)
+
+
+def test_a_workspace_tool_block_points_at_the_owner_not_at_reconnecting() -> None:
+    payload = normalize_mcp_tool_payload(
+        {
+            "isSuccess": False,
+            "errorCode": "workspace_tool_blocked",
+            "message": "Search is blocked for WarpBot in this workspace.",
+        }
+    )
+
+    action = payload["userAction"]
+    assert action["type"] == "workspace_tool_blocked"
+    assert "Owner" in action["message"]
+    assert "reconnect" in action["message"].lower()
+
+
 def test_policy_decides_whether_a_tool_asks_and_effect_is_the_fallback() -> None:
     parameters = {"type": "object", "properties": {}}
 
