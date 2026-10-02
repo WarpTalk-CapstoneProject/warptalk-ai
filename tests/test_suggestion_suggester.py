@@ -623,3 +623,14 @@ class TestReaderLanguages:
 
         assert budget(completions.requests[0]) == 200
         assert budget(completions.requests[1]) == 600
+
+
+def test_a_reader_copy_translates_the_quote_too() -> None:
+    """A hint for an English reader quoted the Vietnamese line verbatim, in the middle of an
+    English sentence — the one part of the card that reader could not read (prod, 2 Oct)."""
+    from suggestion_worker.suggester import _translations_rule
+
+    rule = _translations_rule(["en"])
+
+    assert "INCLUDING anything quoted from the transcript" in rule
+    assert "keep the quoted words" not in rule
