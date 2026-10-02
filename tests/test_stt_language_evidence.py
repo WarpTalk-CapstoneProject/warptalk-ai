@@ -14,6 +14,7 @@ from stt_worker.model import (
     OpenAISTT,
     TranscribedSegment,
     _detect_unambiguous_language,
+    _release_verdict,
 )
 
 
@@ -145,3 +146,131 @@ class TestOverrideRelease:
         model._language_evidence = {}
         model._language_override = {}
         assert model._apply_language_override(("m", "s"), "en") == "en"
+
+
+class TestSpeakingTheDeclarationReleasesTheOverride:
+    """Production meeting 01a0fbe6 (2 Oct 2026).
+
+    Tú declared en, said two short Vietnamese lines, and the override en -> vi was learned at
+    16:18:19 — correctly. Tú then spoke English for the rest of the meeting, and every sentence
+    was stored as vi, so the vi listener got no translation of any of it. The only exit was to
+    re-declare, which nothing on screen told anyone to do. These are the lines Tú actually said.
+    """
+
+    KEY = ("01a0fbe6", "019f0d00-0de0-7000-9000-000000000001")
+
+    def _model(self) -> OpenAISTT:
+        model = OpenAISTT.__new__(OpenAISTT)
+        model._language_evidence = {}
+        model._release_evidence = {}
+        model._language_override = {self.KEY: ("vi", "en")}
+        return model
+
+    def _hear(self, model: OpenAISTT, *texts: str) -> list[TranscribedSegment]:
+        # Under the vi pin, Latin text with no evidence comes back labelled vi — that is the bug.
+        segments = [_segment(text, "vi") for text in texts]
+        pinned = model._apply_language_override(self.KEY, "en")
+        model._learn_language_evidence(self.KEY, pinned, segments)
+        return segments
+
+    def test_two_english_sentences_take_the_microphone_back(self):
+        model = self._model()
+        segments = self._hear(model, "Good morning.", "AI is great.", "I use it for reports.")
+
+        assert self.KEY not in model._language_override
+        assert model._apply_language_override(self.KEY, "en") == "en"
+        # This chunk's own lines ship under the language they proved, not the one they disproved.
+        assert [s.language for s in segments] == ["en", "en", "en"]
+
+    def test_the_evidence_may_span_chunks(self):
+        model = self._model()
+        self._hear(model, "I use it for reports.")
+        assert self.KEY in model._language_override
+
+        self._hear(model, "AI can be wrong.")
+        assert self.KEY not in model._language_override
+
+    def test_one_sentence_is_not_enough(self):
+        model = self._model()
+        segments = self._hear(model, "I use it for reports.")
+
+        assert model._language_override[self.KEY] == ("vi", "en")
+        assert segments[0].language == "vi"
+
+    def test_vietnamese_in_between_resets_the_count(self):
+        model = self._model()
+        self._hear(model, "I use it for reports.", "Rồi, bắt đầu đi.", "AI can be wrong.")
+
+        assert model._language_override[self.KEY] == ("vi", "en")
+
+    def test_short_acknowledgements_prove_nothing(self):
+        model = self._model()
+        self._hear(model, "Yeah.", "OK, hey", "So", "It is", "We must")
+
+        assert model._language_override[self.KEY] == ("vi", "en")
+
+    def test_a_short_line_does_not_break_a_run_either(self):
+        model = self._model()
+        self._hear(model, "I use it for reports.", "Yeah.", "AI can be wrong.")
+
+        assert self.KEY not in model._language_override
+
+    def test_vietnamese_without_its_unique_letters_is_still_not_english(self):
+        # "Tôi là Nam" carries none of the Vietnamese-unique class — that class is narrow on
+        # purpose — but it is not ASCII, and that is what keeps it from counting as English.
+        model = self._model()
+        self._hear(model, "Tôi là Nam", "Em là ai vậy", "Cho nên là")
+
+        assert model._language_override[self.KEY] == ("vi", "en")
+
+    def test_a_hallucinated_third_language_is_neutral(self):
+        model = self._model()
+        self._hear(model, "I use it for reports.", "嗯", "AI can be wrong.")
+
+        assert self.KEY not in model._language_override
+
+    def test_a_vietnamese_speaker_keeps_their_override(self):
+        model = self._model()
+        self._hear(
+            model,
+            "Hôm nay chúng ta sẽ bàn về AI.",
+            "Mọi người đã trải nghiệm AI như thế nào rồi?",
+        )
+
+        assert model._language_override[self.KEY] == ("vi", "en")
+
+    def test_released_speaker_can_earn_the_override_again(self):
+        model = self._model()
+        self._hear(model, "AI is great.", "I use it for reports.")
+        assert self.KEY not in model._language_override
+
+        model._learn_language_evidence(
+            self.KEY, "en", [_segment("Chào anh", "vi"), _segment("Đổi tên đi", "vi")]
+        )
+        assert model._language_override[self.KEY] == ("vi", "en")
+
+    def test_redeclaring_clears_half_collected_release_evidence(self):
+        model = self._model()
+        self._hear(model, "I use it for reports.")
+        model._apply_language_override(self.KEY, "ja")
+
+        assert self.KEY not in model._release_evidence
+
+
+class TestReleaseVerdict:
+    def test_script_evidence_for_the_declaration_supports_release(self):
+        # declared ja, re-pinned to vi, now audibly Japanese again.
+        assert _release_verdict("今日はいい天気です", "vi", "ja") is True
+
+    def test_proof_of_the_learned_language_opposes_release(self):
+        assert _release_verdict("Đổi tên đi", "vi", "en") is False
+
+    def test_ascii_latin_cannot_speak_for_a_non_latin_declaration(self):
+        assert _release_verdict("I use it for reports.", "vi", "ja") is None
+
+    def test_ascii_latin_cannot_speak_for_a_vietnamese_declaration(self):
+        # Declared vi, re-pinned to ja: plain Latin text does not prove Vietnamese.
+        assert _release_verdict("I use it for reports.", "ja", "vi") is None
+
+    def test_a_regional_declaration_is_compared_on_its_base(self):
+        assert _release_verdict("I use it for reports.", "vi", "en-US") is True

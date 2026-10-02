@@ -453,6 +453,44 @@ def _guess_language_from_text(text: str, allowed: set[str] | None = None) -> str
 # patience is another chunk decoded with the wrong language.
 _LANGUAGE_OVERRIDE_SEGMENTS = 2
 
+# The shortest plain-ASCII sentence that counts as evidence AGAINST a learned override. Shorter
+# lines — "OK", "Yeah.", "So" — are said in every language of this product and prove nothing.
+_RELEASE_MIN_WORDS = 3
+_WORD_RE = re.compile(r"[^\W\d_]+")
+
+
+def _release_verdict(text: str, learned: str, declaration: str) -> bool | None:
+    """Does this line show the speaker is back on their DECLARED language?
+
+    True supports releasing the override, False shows they are still speaking the learned
+    language, None proves nothing either way.
+
+    Unambiguous evidence decides first, in both directions. Otherwise only one shape of
+    Latin text counts: a sentence of `_RELEASE_MIN_WORDS` or more whose letters are all ASCII,
+    for a Latin-script declaration other than Vietnamese. ASCII, not "no Vietnamese-unique
+    character", because that class is deliberately narrow: "Tôi là Nam" carries none of it and
+    is still Vietnamese, but it is not ASCII. An English sentence is.
+    """
+    proven = _detect_unambiguous_language(text)
+    learned_base = base_language(learned)
+    declared_base = base_language(declaration)
+    if proven is not None:
+        if proven == learned_base:
+            return False
+        if proven == declared_base:
+            return True
+        # A third language — "嗯" from a cough — says nothing about this override.
+        return None
+
+    if declared_base == "vi" or declared_base in _LANGUAGE_SCRIPTS:
+        return None
+    if not all(ch.isascii() for ch in text if ch.isalpha()):
+        return None
+    if len(_WORD_RE.findall(text)) < _RELEASE_MIN_WORDS:
+        return None
+    return True
+
+
 _MIN_SPEECH_SECONDS_FOR_LONG_TEXT = 0.5
 _MAX_CHARS_FOR_SHORT_AUDIO = 20
 
@@ -1292,6 +1330,9 @@ class OpenAISTT:
         # because the override only holds while that declaration stands — a fresh pick in the
         # meeting bar releases it (see transcribe).
         self._language_override: dict[tuple[str, str], tuple[str, str | None]] = {}
+        # Consecutive lines showing a speaker is back on their declared language while an
+        # override pins them elsewhere — see _learn_release_evidence.
+        self._release_evidence: dict[tuple[str, str], int] = {}
         self._warm_sessions: deque[dict[str, Any]] = deque()
         # How many warm sockets to keep ready. Set by warm_up() and used by
         # _schedule_warm_refill to replace every socket a speaker claims.
@@ -1774,6 +1815,9 @@ class OpenAISTT:
             evidence = getattr(self, "_language_evidence", None)
             if evidence is not None:
                 evidence.pop(key, None)
+            release_evidence = getattr(self, "_release_evidence", None)
+            if release_evidence is not None:
+                release_evidence.pop(key, None)
             logger.info(
                 "stt_language_override_released",
                 meeting_id=key[0],
@@ -1826,6 +1870,9 @@ class OpenAISTT:
             self._language_override = {}
 
         if key in self._language_override:
+            # `declared` here is what transcribe() pinned the session to, which with an override
+            # in place is the LEARNED language — the original declaration lives in the entry.
+            self._learn_release_evidence(key, segments)
             return
 
         for segment in segments:
@@ -1853,6 +1900,70 @@ class OpenAISTT:
                     after_segments=count,
                 )
                 return
+
+    def _learn_release_evidence(
+        self,
+        key: tuple[str, str],
+        segments: list[TranscribedSegment],
+    ) -> None:
+        """Let speech in the declared language take the microphone back from an override.
+
+        The override used to have exactly one exit: declaring a different language. Speaking
+        the declared one was not an exit, because the learning loop returned early while an
+        override existed, and English carries none of the evidence that loop looks for.
+
+        Production meeting 01a0fbe6 (2 Oct). A speaker declared en said two short Vietnamese
+        lines; the override (en -> vi) was learned at 16:18:19, correctly. They then spoke
+        English for the rest of the meeting — "Good morning.", "AI is great.", "I use it for
+        reports." — and every sentence was stored as vi. The vi listener received NONE of it:
+        source vi, target vi, dropped as same-language. Nobody re-declared, because nothing on
+        screen said the microphone had been re-pinned.
+
+        Symmetric with learning: _LANGUAGE_OVERRIDE_SEGMENTS consecutive supporting lines, any
+        line proving the learned language resets the count, and neutral lines ("Yeah.", a
+        stray "嗯") neither count nor reset. On release, this chunk's own lines are relabelled
+        — the ones that proved the point would otherwise ship under the language they just
+        disproved. Lines already published from earlier chunks are not.
+        """
+        entry = self._language_override.get(key)
+        if not entry:
+            return
+        learned, declaration = entry
+        if not declaration:
+            return
+
+        if getattr(self, "_release_evidence", None) is None:
+            self._release_evidence = {}
+
+        for segment in segments:
+            verdict = _release_verdict(segment.text, learned, declaration)
+            if verdict is None:
+                continue
+            if verdict is False:
+                self._release_evidence.pop(key, None)
+                continue
+
+            count = self._release_evidence.get(key, 0) + 1
+            self._release_evidence[key] = count
+            if count < _LANGUAGE_OVERRIDE_SEGMENTS:
+                continue
+
+            self._language_override.pop(key, None)
+            self._release_evidence.pop(key, None)
+            for line in segments:
+                if _detect_unambiguous_language(line.text) in (None, base_language(declaration)):
+                    line.language = declaration
+            logger.warning(
+                "stt_language_override_released",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                was_speaking=learned,
+                old_declaration=declaration,
+                new_declaration=declaration,
+                reason="speech_matches_declaration",
+                after_segments=count,
+            )
+            return
 
     async def _transcribe_via_session(
         self,
