@@ -27,6 +27,7 @@ from livekit_ingress_worker.far_side_gate import (
     zero_frames,
 )
 from livekit_ingress_worker.near_field_gate import NearFieldGate
+from livekit_ingress_worker.speech_level_floor import SpeechLevelFloor
 from shared.base_worker import BaseWorker
 from shared.control_markers import is_external_bridge_speaker
 from shared.integration_status import LIVEKIT, IntegrationReport, livekit_report
@@ -1634,6 +1635,10 @@ class LiveKitIngressWorker(BaseWorker):
         # feed carries clean digital audio, not a far-field voice bleeding into a mic.
         bridge_speaker = is_external_bridge_speaker(speaker_id)
         near_field_gate = None if bridge_speaker else NearFieldGate(self.settings)
+        # One energy floor per track, for the same reason: its baseline is this speaker's own
+        # history (speech_level_floor.py). Kept for the bridge stand-in too — it only ever LOWERS
+        # the absolute floor, so it cannot silence a quiet far-side voice the way a raised bar can.
+        energy_floor = SpeechLevelFloor.from_settings(self.settings, _ENERGY_FLOOR_RMS)
         if bridge_speaker:
             self.logger.info(
                 "near_field_gate_disabled_for_bridge",
@@ -1861,6 +1866,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 turn_id=turn_id,
                                 speech_samples=speech_samples,
                                 suppressed_overlap_ms=_frames_to_ms(suppressed_frames),
+                                energy_floor=energy_floor,
                             )
                             suppressed_frames = 0
                             chunk_index += 1
@@ -1940,6 +1946,7 @@ class LiveKitIngressWorker(BaseWorker):
                                         turn_id=turn_id,
                                         speech_samples=speech_samples,
                                         suppressed_overlap_ms=_frames_to_ms(suppressed_frames),
+                                        energy_floor=energy_floor,
                                     )
                                     chunk_index += 1
                                 else:
@@ -2008,6 +2015,7 @@ class LiveKitIngressWorker(BaseWorker):
                     near_field_gate=near_field_gate,
                     speech_samples=speech_samples,
                     suppressed_overlap_ms=_frames_to_ms(suppressed_frames),
+                    energy_floor=energy_floor,
                 )
             # The gate's reference for this speaker is deliberately NOT forgotten here: a
             # republished track replaces this reader while the new one is already feeding it,
@@ -2213,6 +2221,7 @@ class LiveKitIngressWorker(BaseWorker):
         turn_id: str = "",
         speech_samples: int | None = None,
         suppressed_overlap_ms: int = 0,
+        energy_floor: SpeechLevelFloor | None = None,
     ) -> None:
         # Transcription is NOT translation, and this gate used to conflate them.
         #
@@ -2259,23 +2268,57 @@ class LiveKitIngressWorker(BaseWorker):
         # segment carries STT_UNKNOWN_CONFIDENCE and `min_avg_logprob` — and every per-language
         # floor beneath it — is skipped by construction. This gate and the language/script
         # evidence are what actually stand between marginal audio and a fluent invented caption.
+        #
+        # PER SPEAKER, AND NEVER SILENT. The floor is lowered — never raised — for a speaker whose
+        # own voice has proven quiet (speech_level_floor.py: a 0.027-RMS speaker lost 14.5 s of
+        # real sentences per meeting to it), and what it still drops is logged at INFO with the
+        # speech it carried. It used to log at DEBUG, which production does not emit.
         total_samples = len(pcm)
-        floor = _ENERGY_FLOOR_RMS
-        if speech_samples is not None and 0 < speech_samples < total_samples:
-            floor *= float(np.sqrt(speech_samples / total_samples))
-        if raw_rms < floor:
-            self.logger.debug(
-                "skipped_low_energy_chunk",
-                chunk_index=chunk_index,
-                raw_rms=round(float(raw_rms), 6),
-                floor=round(float(floor), 6),
-                speech_share=(
-                    round(speech_samples / total_samples, 3)
-                    if speech_samples is not None and total_samples
-                    else None
-                ),
+        speech_share = (
+            speech_samples / total_samples
+            if speech_samples is not None and 0 < speech_samples < total_samples
+            else None
+        )
+        # No track floor means no history, so no baseline either: the absolute floor alone,
+        # exactly as before.
+        floor_gate = (
+            energy_floor if energy_floor is not None else SpeechLevelFloor(_ENERGY_FLOOR_RMS)
+        )
+        verdict = floor_gate.judge(float(raw_rms), speech_share)
+        if not verdict.accept or verdict.relative:
+            speech_ms = (
+                (speech_samples if speech_samples is not None else total_samples)
+                * 1000
+                // sample_rate
             )
-            return
+            fields: dict[str, Any] = {
+                "room": room_name,
+                "speaker_id": speaker_id,
+                "chunk_index": chunk_index,
+                "speech_ms": speech_ms,
+                "duration_ms": duration_ms,
+                "raw_rms": round(float(raw_rms), 6),
+                "speech_rms": round(verdict.speech_rms, 6),
+                "absolute_floor": verdict.absolute_floor,
+                "baseline_speech_rms": (
+                    round(verdict.baseline, 6) if verdict.baseline is not None else None
+                ),
+                "relative_floor": (
+                    round(verdict.relative_floor, 6) if verdict.relative_floor is not None else None
+                ),
+            }
+            if not verdict.accept:
+                floor_gate.note_dropped(speech_ms)
+                self.logger.info(
+                    "ingress_low_energy_dropped",
+                    **fields,
+                    # Running totals for this track: a microphone the floor is failing reads as a
+                    # climbing count here rather than as captions that never appear.
+                    dropped_chunks=floor_gate.dropped_chunks,
+                    dropped_speech_ms=floor_gate.dropped_speech_ms,
+                )
+                return
+            self.logger.info("ingress_low_energy_admitted", **fields, rule="speaker_relative")
 
         # Near-field gate: reject a chunk that's much quieter than this track's own
         # established near-field peak — a far-away/muffled voice, not the primary
