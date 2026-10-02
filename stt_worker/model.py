@@ -25,7 +25,7 @@ from openai import AsyncOpenAI
 from shared.config import STTSettings
 from shared.lang import base_language
 from shared.logger import get_logger
-from shared.openai_options import realtime_session_expired
+from shared.openai_options import REALTIME_SESSION_MAX_AGE_S, realtime_session_expired
 from shared.provider_calls import observed_openai_http_client
 from shared.schemas import STT_UNKNOWN_CONFIDENCE
 from shared.text_utils import split_into_sentences
@@ -46,6 +46,11 @@ REALTIME_SAMPLE_RATE = 24000
 # that haven't been used in a while rather than leaking connections for the process
 # lifetime.
 SESSION_IDLE_TIMEOUT_S = 300.0
+# WT-923. A warm socket is retired and replaced at this age, BEFORE the cap above makes a claim
+# discard it. Checked every WARM_POOL_MAINTENANCE_INTERVAL_S, so the pool never holds a socket
+# older than the sum of the two — 46 minutes, safely under REALTIME_SESSION_MAX_AGE_S.
+WARM_SOCKET_ROTATE_AGE_S = REALTIME_SESSION_MAX_AGE_S - 5 * 60.0
+WARM_POOL_MAINTENANCE_INTERVAL_S = 60.0
 
 # Guard against OpenAI never sending a completed/error event for a commit.
 TRANSCRIBE_EVENT_TIMEOUT_S = 15.0
@@ -1360,6 +1365,40 @@ class OpenAISTT:
             else:
                 warm_sessions.append(result)
         logger.info("stt_realtime_pool_warmed", connections=len(warm_sessions))
+
+    async def rotate_warm_pool(self, now: float | None = None) -> int:
+        """Retire warm sockets nearing the age cap and top the pool back up. WT-923.
+
+        The claim-time age check stops a dead socket from failing a sentence, but it does so by
+        throwing the socket away and paying the ~1–2s handshake inline. The pool is opened all at
+        once, so all of it ages out together: after any quiet 50 minutes the next speaker found
+        nothing but expired sockets, and their first sentence paid the handshake anyway. Rotating
+        ahead of the cap, off the request path, means a claim always finds a live one.
+
+        Also retries a refill that stopped on a provider error — otherwise only the next claim
+        would, and that claim is a person waiting.
+        """
+        warm_sessions = getattr(self, "_warm_sessions", None)
+        retired: list[dict[str, Any]] = []
+        if warm_sessions:
+            now = time.monotonic() if now is None else now
+            keep: list[dict[str, Any]] = []
+            for candidate in warm_sessions:
+                opened_at = candidate.get("opened_at")
+                if opened_at is None or now - opened_at >= WARM_SOCKET_ROTATE_AGE_S:
+                    retired.append(candidate)
+                else:
+                    keep.append(candidate)
+            # No await between reading and rewriting the deque, so a concurrent claim cannot
+            # interleave and take a socket that is being retired.
+            warm_sessions.clear()
+            warm_sessions.extend(keep)
+        for candidate in retired:
+            asyncio.create_task(self._close_session(candidate))
+        if retired:
+            logger.info("stt_warm_sockets_rotated", retired=len(retired))
+        self._schedule_warm_refill()
+        return len(retired)
 
     def _schedule_warm_refill(self) -> None:
         """Top the warm pool back up, off the caller's critical path.
