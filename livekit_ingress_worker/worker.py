@@ -431,6 +431,13 @@ class LiveKitIngressWorker(BaseWorker):
         # rather than being refused as a duplicate of it.
         self.audio_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self.audio_task_tracks: dict[tuple[str, str], str] = {}
+        # The Track OBJECT each reader is bound to, beside its sid — because the sid alone cannot
+        # tell a live subscription from a dead one. When the LiveKit connection resumes, the SDK
+        # re-subscribes every track: same sid, new FFI handle, and the reader still bound to the
+        # old handle receives nothing ever again while looking perfectly alive. Production room
+        # 01a0fbe6 (2026-10-02): two of three speakers went unheard from the 16:27:41 resume to
+        # the end of the meeting, because the sid matched and the "duplicate" was refused.
+        self._audio_task_track_objects: dict[tuple[str, str], rtc.Track] = {}
         # WT-529: in-flight speaker-name writes, held so the event loop cannot collect a task
         # nobody awaits. Discarded on completion — see _remember_speaker_name.
         self._speaker_name_tasks: set[asyncio.Task[None]] = set()
@@ -963,23 +970,37 @@ class LiveKitIngressWorker(BaseWorker):
 
         if existing is not None and not existing.done():
             if self.audio_task_tracks.get(key) == track.sid:
-                # Same microphone, already being read. Nothing to do.
-                return False
-            # A new sid for a speaker who already has a live reader means they republished:
-            # the old track is stale and its reader must go, or both will publish the same
-            # speech under two chunk counters.
-            self.logger.info(
-                "replacing_stale_audio_reader",
-                room=room_name,
-                speaker_id=speaker_id,
-                previous_track=self.audio_task_tracks.get(key),
-                new_track=track.sid,
-            )
+                if self._audio_task_track_objects.get(key) is track:
+                    # Same subscription, already being read. Nothing to do.
+                    return False
+                # Same sid, different Track object: LiveKit re-subscribed this microphone (a
+                # connection resume does it to every track) and the reader is bound to the
+                # handle that subscription replaced. That reader is not "already reading"; it
+                # will never receive another frame. Warning, because a resume is the event
+                # that silently deafened a meeting before this branch existed.
+                self.logger.warning(
+                    "replacing_resubscribed_audio_reader",
+                    room=room_name,
+                    speaker_id=speaker_id,
+                    track=track.sid,
+                )
+            else:
+                # A new sid for a speaker who already has a live reader means they republished:
+                # the old track is stale and its reader must go, or both will publish the same
+                # speech under two chunk counters.
+                self.logger.info(
+                    "replacing_stale_audio_reader",
+                    room=room_name,
+                    speaker_id=speaker_id,
+                    previous_track=self.audio_task_tracks.get(key),
+                    new_track=track.sid,
+                )
             existing.cancel()
 
         task = asyncio.create_task(self.process_audio_track(room_name, speaker_id, track))
         self.audio_tasks[key] = task
         self.audio_task_tracks[key] = track.sid
+        self._audio_task_track_objects[key] = track
         task.add_done_callback(lambda finished: self._forget_audio_task(key, finished))
         return True
 
@@ -989,6 +1010,28 @@ class LiveKitIngressWorker(BaseWorker):
         if self.audio_tasks.get(key) is task:
             del self.audio_tasks[key]
             self.audio_task_tracks.pop(key, None)
+            self._audio_task_track_objects.pop(key, None)
+
+    def _is_resubscription_of_live_reader(
+        self, room_name: str, speaker_id: str, track_sid: str
+    ) -> bool:
+        """Whether this muted-looking track is one we are reading RIGHT NOW, by sid.
+
+        WT-542 refuses to read a muted publication, and it learns about a mute from exactly one
+        place: the `track_muted` event, whose handler cancels the reader. So a reader that is
+        still live means no mute ever arrived for that microphone. If the same sid then turns
+        up flagged muted, the flag was not delivered as an event — it rode in on a
+        re-subscription, and the last thing LiveKit actually TOLD us was "unmuted".
+
+        That is the 01a0fbe6 resume: every track came back `muted`, the owners' microphones
+        were on, and no `track_unmuted` followed for two of them. Believing the flag left them
+        unheard for the rest of the meeting; trusting the last event instead costs, at worst,
+        reading a microphone that was genuinely muted during the outage — which delivers
+        silence, and silence is refused twice before STT (VAD, then the WT-422 energy floor).
+        """
+        key = (room_name, speaker_id)
+        task = self.audio_tasks.get(key)
+        return task is not None and not task.done() and self.audio_task_tracks.get(key) == track_sid
 
     def _cancel_audio_task(self, room_name: str, speaker_id: str) -> bool:
         """Stop reading one speaker, leaving the rest of the room untouched.
@@ -1006,6 +1049,7 @@ class LiveKitIngressWorker(BaseWorker):
         # who unmutes in that window would get no reader at all.
         self.audio_tasks.pop(key, None)
         self.audio_task_tracks.pop(key, None)
+        self._audio_task_track_objects.pop(key, None)
         return True
 
     def _start_pending_audio_tasks(self, room_name: str, room: rtc.Room) -> int:
@@ -1021,7 +1065,14 @@ class LiveKitIngressWorker(BaseWorker):
                 # WT-542. Without this the reaper sweep undoes the mute: it re-attaches any
                 # track with no live reader, which after on_track_muted is precisely the
                 # muted one, and the hallucinations resume one sweep later.
-                if pub.muted:
+                #
+                # Except a muted flag on a microphone we are still reading: no mute event ever
+                # stopped that reader, so the flag came with a re-subscription and the reader
+                # is bound to the handle it replaced. See _is_resubscription_of_live_reader;
+                # this is the backstop for when the subscribe event did not get there first.
+                if pub.muted and not self._is_resubscription_of_live_reader(
+                    room_name, participant.identity, track.sid
+                ):
                     continue
                 # WT-631. The sweep re-attaches anything without a live reader, so leaving the
                 # source check out here would quietly undo the one on_track_subscribed makes,
@@ -1047,6 +1098,7 @@ class LiveKitIngressWorker(BaseWorker):
             task.cancel()
             self.audio_tasks.pop(key, None)
             self.audio_task_tracks.pop(key, None)
+            self._audio_task_track_objects.pop(key, None)
 
     async def _finish_archive(self, room_id: str) -> None:
         """Seal one meeting's audio tracks, put them somewhere durable, free the disk.
@@ -1461,14 +1513,26 @@ class LiveKitIngressWorker(BaseWorker):
                 participant.identity
             ):
                 if publication.muted:
-                    # WT-542. Somebody who joined muted is not speaking, and reading them
-                    # anyway is what put words in their mouth — see on_track_muted.
-                    self.logger.info(
-                        "audio_track_subscribed_muted",
+                    if not self._is_resubscription_of_live_reader(
+                        room_name, participant.identity, track.sid
+                    ):
+                        # WT-542. Somebody who joined muted is not speaking, and reading them
+                        # anyway is what put words in their mouth — see on_track_muted.
+                        self.logger.info(
+                            "audio_track_subscribed_muted",
+                            participant=participant.identity,
+                            track=track.sid,
+                        )
+                        return
+                    # A microphone we are reading, re-subscribed with a muted flag that no
+                    # track_muted event ever delivered — a connection resume. Fall through and
+                    # move the reader onto the new handle; see _is_resubscription_of_live_reader.
+                    self.logger.warning(
+                        "audio_track_resubscribed_muted_while_reading",
+                        room=room_name,
                         participant=participant.identity,
                         track=track.sid,
                     )
-                    return
                 if not _carries_speech(publication):
                     # WT-631. A screen share's audio, a shared tab — audio the participant is
                     # PLAYING, not speech they are producing. Read as speech it is transcribed,
