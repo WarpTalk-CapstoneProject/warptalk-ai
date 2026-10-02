@@ -1001,6 +1001,14 @@ class STTWorker(BaseWorker):
 
     async def _process_chunk(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         chunk = AudioChunkMessage.from_redis(data)
+        # What billing charges this chunk by, named on every segment it produces — early or
+        # completed — so the chunk is paid for once whichever arrives first. See
+        # STTResultMessage.chunk_id. The duration is the same PCM arithmetic the model uses for
+        # the completed segment's `end` (_pcm16_duration_seconds).
+        chunk_id = message_id.decode("utf-8", errors="replace")
+        chunk_duration_ms = (
+            int((len(chunk.audio_data) // 2) * 1000 / chunk.sample_rate) if chunk.sample_rate else 0
+        )
 
         if not await self._room_state_allows_stt(chunk.meeting_id):
             self.logger.info(
@@ -1161,6 +1169,8 @@ class STTWorker(BaseWorker):
                     # start_ms == end_ms sends billing_worker down its zero-duration fallback,
                     # which prices a fifteen-second turn as four one-second ones.
                     is_early=True,
+                    chunk_id=chunk_id,
+                    chunk_duration_ms=chunk_duration_ms,
                     timestamp_ms=chunk.timestamp_ms,
                     prosody=None,
                 )
@@ -1347,6 +1357,8 @@ class STTWorker(BaseWorker):
                 anchor_ms=anchor_ms,
                 chunk_index=chunk.chunk_index,
                 is_final_chunk=chunk.is_final_chunk,
+                chunk_id=chunk_id,
+                chunk_duration_ms=chunk_duration_ms,
                 timestamp_ms=chunk.timestamp_ms,
                 # Every segment recognised in this chunk shares the chunk's delivery. The
                 # measurement's granularity is the audio, and splitting it per segment would

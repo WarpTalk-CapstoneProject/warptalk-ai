@@ -318,6 +318,20 @@ class STTResultMessage(BaseModel):
     #
     # Consumers that render or translate should IGNORE this flag; only money cares.
     is_early: bool = False
+    # THE AUDIO CHUNK THIS SEGMENT CAME OUT OF, AND HOW LONG IT IS — what billing charges by.
+    #
+    # The invariant on `is_early` above assumed every chunk has a completed segment to pay for it.
+    # In flash mode it often does not: when every sentence went out early, the completed event
+    # carries an empty remainder, `_filter_segments` drops it, and the chunk had nothing billable
+    # at all. On prod, 2 Oct, that was 136 of 664 translated chunks over three days — about a
+    # fifth of all translated speech, translated and dubbed for free.
+    #
+    # So the chunk is named on every segment it produced, early or completed, with its PCM
+    # duration (the same number the completed segment's `end` has always been), and billing
+    # charges the CHUNK once, on whichever of its segments arrives first. "" / 0 is what an
+    # older producer sends, and billing then falls back to the old per-segment rule.
+    chunk_id: str = ""
+    chunk_duration_ms: int = 0
     # How the speaker sounded saying this, measured from the audio chunk this segment came out
     # of — the only point in the pipeline where the audio still exists. None when nothing could
     # be measured; see ProsodyEnvelope.
@@ -371,6 +385,11 @@ class STTResultMessage(BaseModel):
             "is_early": "1" if self.is_early else "0",
             "timestamp_ms": str(self.timestamp_ms),
         }
+        # Omitted when unknown, so an older producer's message is unchanged on the wire.
+        if self.chunk_id:
+            payload["chunk_id"] = self.chunk_id
+        if self.chunk_duration_ms > 0:
+            payload["chunk_duration_ms"] = str(self.chunk_duration_ms)
         # Omitted rather than sent as a neutral placeholder — "not measured" and "measured as
         # ordinary" are different instructions to the synthesizer.
         if self.prosody is not None:
@@ -410,6 +429,8 @@ class STTResultMessage(BaseModel):
             # Absent on anything published before this field existed, which reads as False —
             # the safe direction, since a pre-existing message was a completed segment.
             is_early=d.get("is_early") == "1",
+            chunk_id=d.get("chunk_id", ""),
+            chunk_duration_ms=int(d.get("chunk_duration_ms") or "0"),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
             prosody=ProsodyEnvelope.from_wire(d.get("prosody")),
             # Absent on everything published before WT-716: no clean version was computed.
@@ -546,6 +567,10 @@ class TranslationResultMessage(BaseModel):
     # already carries that chunk's whole duration, so charging both bills the same audio
     # twice. See STTResultMessage.is_early for the full invariant.
     is_early: bool = False
+    # Carried unchanged from the STT segment — the audio chunk billing charges once. See
+    # STTResultMessage.chunk_id.
+    chunk_id: str = ""
+    chunk_duration_ms: int = 0
     # Carried unchanged from the STT segment this was translated from. The translation worker
     # measures nothing — it is the courier. Every sentence split out of one STT segment inherits
     # the same envelope, because the measurement's granularity is the audio chunk, not the
@@ -606,6 +631,10 @@ class TranslationResultMessage(BaseModel):
             "source_segment_id": self.source_segment_id,
             "chunk_index": str(self.chunk_index),
         }
+        if self.chunk_id:
+            payload["chunk_id"] = self.chunk_id
+        if self.chunk_duration_ms > 0:
+            payload["chunk_duration_ms"] = str(self.chunk_duration_ms)
         # Redis stream fields are strings, so "unknown" cannot be encoded as a value — omit the
         # field entirely. Consumers treat an absent field as NULL (WT-277); writing "None" or a
         # placeholder number here is exactly the failure this ticket removed.
@@ -654,6 +683,8 @@ class TranslationResultMessage(BaseModel):
             translator_model=d.get("translator_model", ""),
             source_segment_id=d.get("source_segment_id", ""),
             chunk_index=int(d.get("chunk_index", "0")),
+            chunk_id=d.get("chunk_id", ""),
+            chunk_duration_ms=int(d.get("chunk_duration_ms") or "0"),
             prosody=ProsodyEnvelope.from_wire(d.get("prosody")),
             # Absent means "not measured", which is a different fact from zero — a producer
             # that did no translation work reports nothing rather than claiming it was instant.

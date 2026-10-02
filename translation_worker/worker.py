@@ -623,6 +623,8 @@ class TranslationWorker(BaseWorker):
                         # Courier, not judge — billing_worker is what reads this. See
                         # STTResultMessage.is_early.
                         is_early=stt_result.is_early,
+                        chunk_id=stt_result.chunk_id,
+                        chunk_duration_ms=stt_result.chunk_duration_ms,
                         prosody=stt_result.prosody,
                     )
                     await self._publish_once(stt_result.meeting_id, result)
@@ -951,6 +953,8 @@ class TranslationWorker(BaseWorker):
                 # Courier, not judge — billing_worker is what reads this. See
                 # STTResultMessage.is_early.
                 is_early=stt_result.is_early,
+                chunk_id=stt_result.chunk_id,
+                chunk_duration_ms=stt_result.chunk_duration_ms,
                 # Delivery is carried, not derived: how the speaker sounded is settled upstream
                 # at the audio, and translating the words does not change it. VALENCE is the one
                 # part that cannot come from the audio — anger and delight look alike on pitch
@@ -987,6 +991,8 @@ class TranslationWorker(BaseWorker):
                 # Flash mode: an early sentence is spoken but never billed. When a dub goes
                 # missing this says which half of the pipeline it belonged to.
                 is_early=stt_result.is_early,
+                chunk_id=stt_result.chunk_id,
+                chunk_duration_ms=stt_result.chunk_duration_ms,
                 speculative_hit=speculative_hit if idx == 0 else False,
                 stage_latency_ms=sentence_latency_ms,
                 pipeline_latency_ms=max(0, int(time.time() * 1000) - stt_result.timestamp_ms),
