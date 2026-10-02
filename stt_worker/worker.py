@@ -48,7 +48,12 @@ from stt_worker.far_side_dedupe import (
     find_far_side_duplicate,
     find_far_side_leak,
 )
-from stt_worker.model import OpenAISTT, _normalize_language, _normalize_overheard_text
+from stt_worker.model import (
+    WARM_POOL_MAINTENANCE_INTERVAL_S,
+    OpenAISTT,
+    _normalize_language,
+    _normalize_overheard_text,
+)
 
 
 def _decode_field(data: Mapping[Any, Any], key: str) -> str:
@@ -173,6 +178,14 @@ def _chunk_audio_duration_ms(chunk: AudioChunkMessage) -> int:
 # `stt:chunk:published:{audio:chunks entry id}` — see STTWorker._chunk_already_published. As
 # long as a chunk can still be redelivered: five deliveries, each after the reclaim threshold,
 # and a consumer-group replay of the retained stream.
+# What prepares a speaker's Realtime socket ahead of their first sentence.
+#
+# WT-923: track_published alone fired at the first microphone, and a person who joins muted
+# unmutes in order to speak — so the "prewarm" ran at the same moment as the first sentence and
+# saved nothing. participant_joined fires when they connect. track_published stays: it re-pins
+# the session once the gateway has written the speaker's language, which a join usually beats.
+_PREWARM_EVENT_TYPES = ("meeting.track_published", "meeting.participant_joined")
+
 _CHUNK_PUBLISHED_KEY_PREFIX = "stt:chunk:published:"
 _CHUNK_PUBLISHED_TTL_SECONDS = 2 * 60 * 60
 
@@ -257,6 +270,7 @@ class STTWorker(BaseWorker):
         self._clean_error_logged_at = 0.0
         self._clean_errors_suppressed = 0
         self._prewarm_listener_task: asyncio.Task[None] | None = None
+        self._warm_pool_task: asyncio.Task[None] | None = None
 
     def integration_reports(self) -> dict[str, IntegrationReport]:
         s = self.stt_settings
@@ -275,6 +289,7 @@ class STTWorker(BaseWorker):
         await self.model.load()
         await self.model.warm_up(pool_size=self.stt_settings.realtime_pool_size)
         self._prewarm_listener_task = asyncio.create_task(self._listen_for_track_prewarm())
+        self._warm_pool_task = asyncio.create_task(self._maintain_warm_pool())
         # Started unconditionally, and that is the point of flash mode being per ROOM.
         #
         # It used to be gated on `settings.stt_streaming_enabled`, which made the deployment
@@ -609,7 +624,7 @@ class STTWorker(BaseWorker):
         while not self._shutdown_event.is_set():
             pubsub = self.redis.redis.pubsub()
             try:
-                await pubsub.subscribe("meeting.track_published")
+                await pubsub.subscribe(*_PREWARM_EVENT_TYPES)
                 while not self._shutdown_event.is_set():
                     message = await pubsub.get_message(
                         ignore_subscribe_messages=True,
@@ -638,13 +653,25 @@ class STTWorker(BaseWorker):
                 except Exception:
                     self.logger.warning("stt_prewarm_listener_close_failed")
 
+    async def _maintain_warm_pool(self) -> None:
+        """Keep the Realtime warm pool young, so a claim never meets an aged-out socket."""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(WARM_POOL_MAINTENANCE_INTERVAL_S)
+                await self._require_model().rotate_warm_pool()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The cost of a missed rotation is one cold handshake, never a stopped loop.
+                self.logger.exception("stt_warm_pool_maintenance_failed")
+
     async def _prewarm_from_track_event(self, serialized_event: bytes | str) -> None:
         try:
             envelope = json.loads(serialized_event)
         except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
             return
         if (
-            envelope.get("event_type") != "meeting.track_published"
+            envelope.get("event_type") not in _PREWARM_EVENT_TYPES
             or envelope.get("schema_version") != 1
             or envelope.get("producer") != "meeting-service"
         ):
@@ -824,8 +851,10 @@ class STTWorker(BaseWorker):
             baselines.pop(key, None)
 
     async def _cleanup(self) -> None:
-        task = getattr(self, "_prewarm_listener_task", None)
-        if task is not None:
+        for name in ("_prewarm_listener_task", "_warm_pool_task"):
+            task = getattr(self, name, None)
+            if task is None:
+                continue
             task.cancel()
             try:
                 await task

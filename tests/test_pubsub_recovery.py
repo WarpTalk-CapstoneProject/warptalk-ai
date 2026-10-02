@@ -43,6 +43,9 @@ async def test_livekit_ingress_resubscribes_after_transient_redis_failure() -> N
     await asyncio.wait_for(worker._consume_loop(), timeout=3)
 
     assert worker.redis.redis.pubsub.call_count == 2
-    recovered_pubsub.subscribe.assert_awaited_once_with("meeting.track_published")
+    # WT-923: a person joining summons the bot too, so the recovered listener must hear both.
+    recovered_pubsub.subscribe.assert_awaited_once_with(
+        "meeting.track_published", "meeting.participant_joined"
+    )
     failed_pubsub.close.assert_awaited_once()
     recovered_pubsub.close.assert_awaited_once()

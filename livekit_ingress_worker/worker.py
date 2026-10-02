@@ -277,6 +277,22 @@ def _is_rate_limited_error(error: BaseException) -> bool:
     return "429" in text or "too many requests" in text or "rate limit" in text
 
 
+_TRACK_PUBLISHED_CHANNEL = "meeting.track_published"
+
+# WT-923 — what summons the bot BEFORE anybody has a microphone.
+#
+# track_published alone summoned it at the first microphone. A person who joins muted publishes
+# nothing until they unmute, and they unmute to speak — so the bot started its webhook → token →
+# WebRTC dial at the very moment the first sentence began, and that sentence was gone before the
+# bot was subscribed. The host saw an empty transcript for the opening of every such meeting.
+#
+# participant_joined arrives when the person connects, seconds or minutes before they speak. The
+# bot joins then; the later unmute is just a subscription on a connection it already holds.
+# track_published is still subscribed and still connects — it covers a lost pub/sub message and
+# rooms where the join event raced a restart.
+_PARTICIPANT_JOINED_CHANNEL = "meeting.participant_joined"
+
+
 def _parse_track_published_event(
     envelope: dict[str, Any],
 ) -> tuple[str, str | None, str] | None:
@@ -302,6 +318,28 @@ def _parse_track_published_event(
     if not isinstance(track_id, str) or not track_id:
         return None
     return room_name, participant_identity, track_id
+
+
+def _parse_participant_joined_event(envelope: dict[str, Any]) -> tuple[str, str] | None:
+    """Validate and extract the versioned meeting.participant_joined contract (WT-923)."""
+    if (
+        envelope.get("event_type") != _PARTICIPANT_JOINED_CHANNEL
+        or envelope.get("schema_version") != 1
+        or envelope.get("producer") != "meeting-service"
+    ):
+        return None
+
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    room_name = payload.get("room_name")
+    participant_identity = payload.get("participant_identity")
+    if not isinstance(room_name, str) or not room_name:
+        return None
+    if not isinstance(participant_identity, str) or not participant_identity:
+        return None
+    return room_name, participant_identity
 
 
 # WT-B/flash mode — the per-room switch for streaming audio during speech.
@@ -576,12 +614,15 @@ class LiveKitIngressWorker(BaseWorker):
         # meeting already in progress, has already been published and will not repeat.
         await self._rediscover_active_rooms()
 
-        self.logger.info("Starting Redis Pub/Sub listener for meeting.track_published")
+        self.logger.info(
+            "Starting Redis Pub/Sub listener",
+            channels=[_TRACK_PUBLISHED_CHANNEL, _PARTICIPANT_JOINED_CHANNEL],
+        )
 
         while not self._shutdown_event.is_set():
             pubsub = self.redis.redis.pubsub()
             try:
-                await pubsub.subscribe("meeting.track_published")
+                await pubsub.subscribe(_TRACK_PUBLISHED_CHANNEL, _PARTICIPANT_JOINED_CHANNEL)
                 self.logger.info("track_published_listener_started")
                 while not self._shutdown_event.is_set():
                     # get_message timeout prevents blocking indefinitely
@@ -591,10 +632,15 @@ class LiveKitIngressWorker(BaseWorker):
                     )
                     if message:
                         payload = json.loads(message["data"])
+                        handler = (
+                            self.handle_participant_joined
+                            if self._as_text(message.get("channel")) == _PARTICIPANT_JOINED_CHANNEL
+                            else self.handle_track_published
+                        )
                         # asyncio keeps only a weak reference to a running task, so a
                         # bare create_task() can be collected mid-await and take its
                         # exception with it. Hold it until it finishes.
-                        task = asyncio.create_task(self.handle_track_published(payload))
+                        task = asyncio.create_task(handler(payload))
                         self._event_tasks.add(task)
                         task.add_done_callback(self._event_tasks.discard)
             except asyncio.CancelledError:
@@ -628,16 +674,45 @@ class LiveKitIngressWorker(BaseWorker):
             participant=participant_identity,
             track=track_id,
         )
+        await self._ensure_room_connected(room_name, "track_published", track=track_id)
 
+    async def handle_participant_joined(self, payload: dict[str, Any]) -> None:
+        """WT-923: be in the room before the person who just joined says anything."""
+        parsed = _parse_participant_joined_event(payload)
+        if parsed is None:
+            self.logger.warning("invalid_participant_joined_event")
+            return
+        room_name, participant_identity = parsed
+        # The backend already drops these; checked again because our own join must never be
+        # what keeps our own bot in a room.
+        if _is_ai_bot_identity(participant_identity):
+            return
+        self._ensure_idle_sweeper()
+        await self._hydrate_room_status(room_name)
+
+        self.logger.info(
+            "received_participant_joined",
+            room=room_name,
+            participant=participant_identity,
+        )
+        await self._ensure_room_connected(
+            room_name, "participant_joined", participant=participant_identity
+        )
+
+    async def _ensure_room_connected(self, room_name: str, trigger: str, **context: Any) -> None:
+        """Connect this replica's bot to the room unless it is already there or owned elsewhere.
+
+        `trigger` prefixes the log events, so track_published keeps the names it always had.
+        """
         async with self._room_lock(room_name):
             # S1: fan-out means the other replica is running this exact handler for this
             # exact room right now. Exactly one of us may hold "AIBot_{room_name}".
             if not await self._claim_room_ownership(room_name):
                 self._deferred_rooms.add(room_name)
                 self.logger.info(
-                    "track_published_room_owned_by_other_replica",
+                    f"{trigger}_room_owned_by_other_replica",
                     room=room_name,
-                    track=track_id,
+                    **context,
                 )
                 return
 
@@ -649,10 +724,10 @@ class LiveKitIngressWorker(BaseWorker):
                 # the room down to pick up one new track is what caused the 429 storm.
                 started = self._start_pending_audio_tasks(room_name, room)
                 self.logger.info(
-                    "track_published_reusing_connection",
+                    f"{trigger}_reusing_connection",
                     room=room_name,
-                    track=track_id,
                     audio_tasks_started=started,
+                    **context,
                     connected_rooms=len(self.rooms),
                 )
                 return
