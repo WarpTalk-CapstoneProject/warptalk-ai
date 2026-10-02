@@ -339,6 +339,17 @@ class WorkerSettings(BaseSettings):
     near_field_gate_min_baseline_chunks: int = 2
     near_field_gate_baseline_ema_alpha: float = 0.3
 
+    # Speaker-relative energy floor (ingress worker only, see
+    # livekit_ingress_worker/speech_level_floor.py). Lowers — never raises — the absolute 0.02
+    # floor for a speaker whose own voice has proven quiet: a chunk under it is still accepted at
+    # >= this fraction of the median speech level of the track's last
+    # `ingress_energy_baseline_window` chunks that cleared the absolute floor, once there are
+    # `ingress_energy_baseline_min_chunks` of them. 0.4 is 8 dB under the speaker's own level;
+    # measured, dropped real speech sat at 0.56-0.77 of it and noise at <= 0.23. 0 disables.
+    ingress_energy_relative_ratio: float = 0.4
+    ingress_energy_baseline_min_chunks: int = 3
+    ingress_energy_baseline_window: int = 8
+
     # FAR-SIDE SAME-SOURCE GATE (ingress worker only, see livekit_ingress_worker/far_side_gate.py).
     #
     # In a Meet-bridged room a WarpTalk user who is ALSO in the Meet is heard twice: their own
