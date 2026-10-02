@@ -38,6 +38,7 @@ class FakeRedis:
         self.counters: dict[str, int] = {}
         self.published: list[tuple[str, dict[str, str]]] = []
         self.policy = policy
+        self.hashes: dict[str, dict[bytes, bytes]] = {}
 
     async def get(self, key: str) -> str | None:
         if key.endswith(":ai_policy") and key not in self.values:
@@ -45,6 +46,9 @@ class FakeRedis:
                 return None
             return json.dumps({"allow_external_llm": self.policy})
         return self.values.get(key)
+
+    async def hgetall(self, key: str) -> dict[bytes, bytes]:
+        return self.hashes.get(key, {})
 
     async def set_if_absent(self, key: str, value: str, ttl_seconds: int) -> bool:
         if key in self.values:
@@ -73,6 +77,7 @@ class RecordingSuggester:
         self.suggestion = suggestion
         self.decide_calls: list[tuple[list[TranscriptTurn], TranscriptTurn]] = []
         self.generate_calls: int = 0
+        self.reader_languages: list[Sequence[str]] = []
         self.loaded: bool = False
 
     async def load(self) -> None:
@@ -92,8 +97,10 @@ class RecordingSuggester:
         segment: TranscriptTurn,
         decision: SuggestionDecision,
         context_snapshot: str = "",
+        reader_languages: Sequence[str] = (),
     ) -> GeneratedSuggestion | None:
         self.generate_calls += 1
+        self.reader_languages.append(reader_languages)
         return self.suggestion
 
 
@@ -637,3 +644,64 @@ def test_a_vietnamese_document_name_is_not_escaped_into_ascii() -> None:
     from suggestion_worker.worker import _sources_json
 
     assert "Kế hoạch" in _sources_json(("Kế hoạch 2026.docx",))
+
+
+class TestReaderLanguages:
+    """WT-922 — a viewer listening in English must not be handed a Vietnamese hint."""
+
+    @staticmethod
+    def _room_languages(redis: FakeRedis, **by_user: str) -> None:
+        redis.hashes["translationRoom:room-1:languages"] = {
+            user.encode(): language.encode() for user, language in by_user.items()
+        }
+
+    @pytest.mark.asyncio
+    async def test_asks_for_every_listen_language_except_the_speakers(self) -> None:
+        worker, redis, suggester = build_worker(suggester=approving_suggester())
+        # speaker-1 speaks "vi". "klingon" is not a language anybody can be given.
+        self._room_languages(redis, alice="en-US", bob="ja", carol="vi", dave="en", eve="klingon")
+
+        await worker.process(b"1-0", stt_message())
+
+        assert suggester.reader_languages == [["en", "ja"]]
+
+    @pytest.mark.asyncio
+    async def test_publishes_one_copy_per_reader_language(self) -> None:
+        recorder = approving_suggester()
+        recorder.suggestion = GeneratedSuggestion(
+            content="Chưa có ai nhận phần tích hợp.",
+            detail="Thiếu owner.",
+            category="action",
+            token_count=110,
+            translations={"en": ("Nobody owns the integration yet.", "No owner named.")},
+        )
+        worker, redis, _ = build_worker(suggester=recorder)
+        self._room_languages(redis, alice="en")
+
+        await worker.process(b"1-0", stt_message())
+
+        room_stream = [
+            p for stream, p in redis.published if stream == "ai_assistant:results:room-1"
+        ]
+        assert [(p["language"], p["content"]) for p in room_stream] == [
+            ("vi", "Chưa có ai nhận phần tích hợp."),
+            ("en", "Nobody owns the integration yet."),
+        ]
+        english = room_stream[1]
+        assert english["segment_id"] == "segment-1", "the copy anchors to the same line"
+        assert english["detail"] == "No owner named."
+        assert english["token_count"] == "0", "the tokens are counted once, on the original"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_language_read_still_publishes_the_hint(self) -> None:
+        worker, redis, suggester = build_worker(suggester=approving_suggester())
+
+        async def broken(key: str) -> dict[bytes, bytes]:
+            raise ConnectionError("redis down")
+
+        redis.hgetall = broken  # type: ignore[method-assign]
+
+        await worker.process(b"1-0", stt_message())
+
+        assert suggester.reader_languages == [[]]
+        assert len(redis.published) == 2
