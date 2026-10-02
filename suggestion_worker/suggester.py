@@ -260,8 +260,11 @@ def _translations_rule(reader_languages: Sequence[str]) -> str:
 Some participants read this meeting in other languages. Also return `translations`: an object \
 keyed by each of these language codes — {wanted} — whose value is \
 {{"content": string, "detail": string}}, the same hint and detail written naturally in that \
-language. Same meaning, same limits; keep the quoted words, names, terms and figures exactly as \
-they were spoken. When `content` is empty, return `translations` as {{}}."""
+language. Same meaning, same limits. Every word of it is in that language, INCLUDING anything \
+quoted from the transcript: a reader who does not know the speaker's language cannot read a \
+quote left in it, so render the quote in the reader's language. Only proper names, product and \
+technical terms, and figures stay exactly as they were spoken. When `content` is empty, \
+return `translations` as {{}}."""
 
 
 def _generate_system_prompt(
