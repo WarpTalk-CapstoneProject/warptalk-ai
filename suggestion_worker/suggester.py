@@ -16,11 +16,12 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from openai import AsyncOpenAI
 
+from shared.languages import language_name
 from shared.logger import get_logger
 from shared.openai_options import completion_options
 from shared.provider_calls import observed_openai_http_client
@@ -75,6 +76,9 @@ class GeneratedSuggestion:
     #: Documents from the meeting's own snapshot that this hint drew on. Only ever names the
     #: snapshot actually contained — see _known_documents.
     sources: tuple[str, ...] = ()
+    #: WT-922. The same hint for each reader whose listen language differs from the speaker's:
+    #: {language code: (content, detail)}. Only codes the worker asked for are kept.
+    translations: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 class Suggester(Protocol):
@@ -95,6 +99,7 @@ class Suggester(Protocol):
         segment: TranscriptTurn,
         decision: SuggestionDecision,
         context_snapshot: str = "",
+        reader_languages: Sequence[str] = (),
     ) -> GeneratedSuggestion | None: ...
 
 
@@ -117,6 +122,7 @@ class NullSuggester:
         segment: TranscriptTurn,
         decision: SuggestionDecision,
         context_snapshot: str = "",
+        reader_languages: Sequence[str] = (),
     ) -> GeneratedSuggestion | None:
         return None
 
@@ -237,13 +243,37 @@ _CATEGORY_CONTRACTS = {
 }
 
 
-def _generate_system_prompt(max_chars: int, category: str) -> str:
+def _translations_rule(reader_languages: Sequence[str]) -> str:
+    """WT-922: the extra output that puts the hint in front of each reader in their language.
+
+    Suggestions are fanned out to the whole room, and the client shows each viewer the copy in
+    the language they listen in (translationRoom-store.addSuggestion). The worker used to write
+    only the speaker's language, so a viewer listening in English to a Vietnamese speaker read
+    a Vietnamese hint beside an English transcript. Asked for in the SAME call rather than a
+    second one: a hint already arrives seconds after the line it is about.
+    """
+    if not reader_languages:
+        return ""
+    wanted = ", ".join(f'"{code}" ({language_name(code)})' for code in reader_languages)
+    return f"""
+
+Some participants read this meeting in other languages. Also return `translations`: an object \
+keyed by each of these language codes — {wanted} — whose value is \
+{{"content": string, "detail": string}}, the same hint and detail written naturally in that \
+language. Same meaning, same limits; keep the quoted words, names, terms and figures exactly as \
+they were spoken. When `content` is empty, return `translations` as {{}}."""
+
+
+def _generate_system_prompt(
+    max_chars: int, category: str, reader_languages: Sequence[str] = ()
+) -> str:
     """Built per call rather than str.format()-ed from a constant: the template embeds a
     literal JSON schema, and format() would read those braces as placeholders.
 
     Takes the category so the contract for THIS hint is in the system prompt rather than
     mentioned in passing in the user turn — see _CATEGORY_CONTRACTS.
     """
+    extra_field = ', "translations": object' if reader_languages else ""
     contract = _CATEGORY_CONTRACTS.get(
         category,
         "State the hint directly and make it specific enough to act on.",
@@ -276,7 +306,7 @@ never explained the term. That is the situation `term` exists for.
 {_UNTRUSTED_INPUT_RULE}
 
 Respond ONLY with a JSON object of exactly this shape:
-{{"content": string, "detail": string, "source": string}}
+{{"content": string, "detail": string, "source": string{extra_field}}}
 content is the badge text and must be at most {max_chars} characters — the one sentence that \
 satisfies the contract above. detail is what the reader sees when they expand the badge: one \
 or two sentences carrying the evidence for `content` — the surrounding quote, the earlier \
@@ -288,7 +318,7 @@ appears in its `--- Document: ... ---` header, when the hint came out of a docum
 "general knowledge" when it rests on what is publicly known about a named thing rather than on \
 anything in this meeting. Use "" when it came from the transcript, which is the normal case. A \
 document name that is not one of the headers you were given is discarded, so inventing one only \
-loses you the credit."""
+loses you the credit.{_translations_rule(reader_languages)}"""
 
 
 #: How MeetingStartedEventConsumer labels each document inside the snapshot blob. The names in
@@ -309,6 +339,25 @@ def _known_documents(context_snapshot: str) -> dict[str, str]:
         that blob is a name that exists; anything else is dropped in silence.
     """
     return {name.casefold(): name for name in _DOCUMENT_HEADER.findall(context_snapshot or "")}
+
+
+def _parse_translations(raw: Any, reader_languages: Sequence[str]) -> dict[str, tuple[str, str]]:
+    """Only the languages that were asked for, and only entries with content.
+
+    A missing or malformed entry costs that reader the translation — they still get the
+    speaker's-language copy — never the hint itself.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    translations: dict[str, tuple[str, str]] = {}
+    for code in reader_languages:
+        entry = raw.get(code)
+        if not isinstance(entry, dict):
+            continue
+        content = str(entry.get("content", "")).strip()
+        if content:
+            translations[code] = (content, str(entry.get("detail", "")).strip())
+    return translations
 
 
 def _render_transcript(window: Sequence[TranscriptTurn], segment: TranscriptTurn) -> str:
@@ -432,8 +481,11 @@ class OpenAISuggester:
         segment: TranscriptTurn,
         decision: SuggestionDecision,
         context_snapshot: str = "",
+        reader_languages: Sequence[str] = (),
     ) -> GeneratedSuggestion | None:
-        system_content = _generate_system_prompt(self.max_suggestion_chars, decision.category)
+        system_content = _generate_system_prompt(
+            self.max_suggestion_chars, decision.category, reader_languages
+        )
         user_content = (
             f"Hint type: {decision.category}\n"
             f"Why it was flagged: {decision.reason}\n"
@@ -454,7 +506,10 @@ class OpenAISuggester:
                 ],
                 **completion_options(
                     self.generate_model,
-                    self.generate_max_tokens,
+                    # WT-922: every reader language is another copy of content + detail in the
+                    # same JSON. At the flat 200-token budget two of them truncated the object,
+                    # json.loads failed, and the hint was lost for EVERY reader, not just them.
+                    self.generate_max_tokens * (1 + len(reader_languages)),
                     self.temperature,
                     reasoning_effort=self.reasoning_effort,
                 ),
@@ -487,6 +542,7 @@ class OpenAISuggester:
             category=decision.category,
             token_count=_total_tokens(completion),
             sources=sources,
+            translations=_parse_translations(parsed.get("translations"), reader_languages),
         )
 
     def _require_client(self) -> AsyncOpenAI:
