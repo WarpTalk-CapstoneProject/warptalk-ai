@@ -133,7 +133,7 @@ async def test_one_failing_half_of_overview_does_not_erase_the_other() -> None:
 
 
 async def test_revenue_keeps_one_figure_per_currency() -> None:
-    """plans.currency defaults to VND and USD plans exist. Summing them invents a rate."""
+    """plans.currency defaults to USD and VND plans still exist. Summing them invents a rate."""
     ctx = _ctx(
         billing=_client(
             {
