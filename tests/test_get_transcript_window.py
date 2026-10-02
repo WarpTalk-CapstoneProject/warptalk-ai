@@ -89,7 +89,9 @@ class FakeTranscriptService:
 
 def _ctx(service: FakeTranscriptService, registry: SourceRegistry | None = None) -> ToolContext:
     room_client = AsyncMock()
-    room_client.get.return_value = _response(200, {"id": MEETING_ID, "title": "Client call"})
+    room_client.get.return_value = _response(
+        200, {"id": MEETING_ID, "workspaceId": "ws-1", "title": "Client call"}
+    )
     transcript_client = AsyncMock()
     transcript_client.get.side_effect = service.get
     return ToolContext(

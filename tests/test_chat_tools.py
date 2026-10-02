@@ -227,12 +227,26 @@ class TestGetMeetingSummaryAuthorization:
 
     @staticmethod
     def _ctx(room_response: MagicMock, *, bearer: str = "Bearer test-token") -> ToolContext:
+        # WT-929: the summary itself is read through TranslationRoomService as the caller. The
+        # Redis hash is still stubbed so every refusal below can assert it is NEVER consulted.
         redis = MagicMock()
         redis.hgetall = AsyncMock(
             return_value={b"content": b"CONFIDENTIAL SUMMARY", b"action_items": b"[]"}
         )
         room_client = AsyncMock()
-        room_client.get.return_value = room_response
+
+        async def _get(url: str, **_kwargs):
+            if url.endswith("/summary/renderings"):
+                return _response(
+                    200, [{"templateKey": "general", "language": "", "isCanonical": True}]
+                )
+            if url.endswith("/summary"):
+                return _response(200, {"status": "ready", "content": "CONFIDENTIAL SUMMARY"})
+            if url.endswith("/participants"):
+                return _response(403, {})
+            return room_response
+
+        room_client.get.side_effect = _get
         return ToolContext(
             workspace_id="ws-1",
             user_id="user-1",
@@ -244,6 +258,14 @@ class TestGetMeetingSummaryAuthorization:
             model="gpt-4.1",
             redis=redis,
         )
+
+    @staticmethod
+    def _summary_reads(ctx: ToolContext) -> list[str]:
+        return [
+            call.args[0]
+            for call in ctx.translation_room_client.get.await_args_list
+            if "/room-artifacts/" in call.args[0]
+        ]
 
     async def test_another_workspaces_summary_is_refused(self) -> None:
         """THE BUG. The room exists and the token is valid — it is simply not ours.
@@ -259,24 +281,31 @@ class TestGetMeetingSummaryAuthorization:
         )
 
         assert result == {"error": "No meeting found with that id."}
+        assert self._summary_reads(ctx) == []
         ctx.redis.hgetall.assert_not_awaited()
 
     async def test_own_workspaces_summary_is_returned(self) -> None:
-        ctx = self._ctx(_response(200, {"id": self.OWN_MEETING, "workspaceId": "ws-1"}))
+        ctx = self._ctx(
+            _response(200, {"id": self.OWN_MEETING, "workspaceId": "ws-1", "status": "ENDED"})
+        )
 
         result = json.loads(await _get_meeting_summary(ctx, {"meeting_id": self.OWN_MEETING}))
 
         assert result["summary"] == "CONFIDENTIAL SUMMARY"
-        ctx.redis.hgetall.assert_awaited_once_with(f"meeting:{self.OWN_MEETING}:summary")
+        # Through the service that owns the access rule — never out of Redis (WT-929).
+        assert len(self._summary_reads(ctx)) == 2
+        ctx.redis.hgetall.assert_not_awaited()
 
     async def test_the_callers_own_token_is_what_is_presented(self) -> None:
         """Not an internal/service bypass — the check must be the caller's own identity."""
-        ctx = self._ctx(_response(200, {"id": self.OWN_MEETING, "workspaceId": "ws-1"}))
+        ctx = self._ctx(
+            _response(200, {"id": self.OWN_MEETING, "workspaceId": "ws-1", "status": "ENDED"})
+        )
 
         await _get_meeting_summary(ctx, {"meeting_id": self.OWN_MEETING})
 
-        _args, kwargs = ctx.translation_room_client.get.call_args
-        assert kwargs["headers"] == {"Authorization": "Bearer test-token"}
+        for call in ctx.translation_room_client.get.await_args_list:
+            assert call.kwargs["headers"] == {"Authorization": "Bearer test-token"}
 
     async def test_rejected_token_is_refused(self) -> None:
         """This worker verifies no signature and no expiry of its own — a 401 from the
