@@ -352,7 +352,7 @@ def test_an_unusable_custom_range_is_refused_not_guessed() -> None:
 
 async def test_revenue_this_month_vs_last_asks_for_the_previous_month_comparison() -> None:
     recorder = _Recorder()
-    metrics = {"metrics": [{"id": "revenue", "value": 10, "previous": 8, "unit": "vnd"}]}
+    metrics = {"metrics": [{"id": "revenue", "value": 10, "previous": 8, "unit": "money"}]}
     ctx = _ctx(recorder, billing={"/api/v1/admin/billing/insights": _json(metrics)})
 
     payload = json.loads(
@@ -373,6 +373,9 @@ async def test_revenue_this_month_vs_last_asks_for_the_previous_month_comparison
     assert params["tz"] == "Asia/Ho_Chi_Minh"
     assert payload["billing"]["metrics"][0]["previous"] == 8
     assert payload["admin_link"].endswith("compare=previousMonth")
+    # USD is the accounting currency; the model is told so rather than left to guess.
+    assert payload["money_currency"] == "USD"
+    assert payload["billing"]["metrics"][0]["currency"] == "USD"
 
 
 # ── the scope boundary in the agent loop ──────────────────────────────────────────────────────
