@@ -236,6 +236,11 @@ _MENTION_TOOL_HINTS = {
 # Minutes (biên bản) have no read tool: the only minutes endpoint this package calls is the
 # share grant. The closest existing read is the summary plus the room detail, and the model is
 # told so rather than left to present a summary as the signed minutes.
+#
+# WT-929: standing in for the minutes with the summary is only honest for somebody who may read
+# the minutes. A DRAFT is readable by the host alone (signing is the publish act), so before the
+# model is pointed at the summary the worker asks the minutes endpoint AS THE CALLER — see
+# _unreadable_minutes_mentions — and a refused mention is rendered as a refusal instead.
 _ARTIFACT_MENTION_READS = {
     "summary": (
         "meeting summary",
@@ -286,19 +291,74 @@ def _normalize_mention(mention: dict[str, Any]) -> tuple[str, str, str] | None:
     return entity_type, entity_id, str(label)
 
 
-def _format_mentions(mentions_json: str) -> str | None:
+def _parse_mentions(mentions_json: str) -> list[Any]:
+    if not mentions_json:
+        return []
+    try:
+        mentions = json.loads(mentions_json)
+    except json.JSONDecodeError:
+        return []
+    return mentions if isinstance(mentions, list) else []
+
+
+async def _unreadable_minutes_mentions(
+    mentions_json: str,
+    client: httpx.AsyncClient | None,
+    bearer_token: str,
+) -> frozenset[str]:
+    """The meeting ids whose @minutes mention this caller may NOT have answered. WT-929.
+
+    WHY THE WORKER ASKS, RATHER THAN A TOOL
+        There is no minutes read tool; the mention is served by the summary. So the minutes'
+        own gate — MeetingMinutesService.GetCurrentAsync: room read, and a DRAFT only for the
+        host, the designated secretary and a workspace Owner/Admin — is never reached by any
+        tool call, and a participant who @mentioned an unsigned draft was answered from the
+        content it was drawn from. `GET /rooms/{id}/minutes` with the caller's own token is
+        that gate, asked verbatim.
+
+    FAILS CLOSED: anything but a 200 — a refusal, no minutes at all, an unreachable service, no
+    client, no token, an id that is not a UUID — puts the id in the refused set.
+    """
+    refused: set[str] = set()
+    for mention in _parse_mentions(mentions_json):
+        if not isinstance(mention, dict):
+            continue
+        normalized = _normalize_mention(mention)
+        if normalized is None or normalized[0] != "minutes":
+            continue
+        meeting_id = normalized[1]
+        if meeting_id in refused:
+            continue
+        readable = False
+        try:
+            # The id is interpolated into a path, so it must be an id and nothing else.
+            uuid.UUID(meeting_id)
+            if client is not None and bearer_token:
+                response = await client.get(
+                    f"/api/v1/rooms/{meeting_id}/minutes",
+                    headers={"Authorization": bearer_token},
+                )
+                readable = response.status_code == 200
+        except Exception:
+            readable = False
+        if not readable:
+            refused.add(meeting_id)
+    return frozenset(refused)
+
+
+def _format_mentions(
+    mentions_json: str, refused_minutes: frozenset[str] = frozenset()
+) -> str | None:
     """Render the frontend's explicit @mention list into a system message. Unlike ambient
     page context, a mention is the user's own deliberate act of attaching a specific entity
     to this message — treat it as the primary subject, not just background. Malformed or
     empty payloads are silently ignored.
+
+    `refused_minutes` are the meeting ids _unreadable_minutes_mentions refused: their @minutes
+    line tells the model to decline instead of pointing it at the summary.
     """
-    if not mentions_json:
-        return None
-    try:
-        mentions = json.loads(mentions_json)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(mentions, list) or not mentions:
+    mentions = _parse_mentions(mentions_json)
+    if not mentions:
         return None
 
     lines: list[str] = []
@@ -318,6 +378,15 @@ def _format_mentions(mentions_json: str) -> str | None:
             lines.append(
                 f'- plugin "{label}" (id={entity_id}) — the user explicitly selected this '
                 "plugin for this request; prefer its tools over any other way of answering."
+            )
+            continue
+        if entity_type == "minutes" and entity_id in refused_minutes:
+            lines.append(
+                f'- meeting minutes of "{label}" (meeting id={entity_id}) — the user does NOT '
+                "have access to these minutes: they are either an unsigned draft only the host "
+                "can read, or not available to this user at all. Tell them so, suggest asking "
+                "the meeting's host, and do NOT answer about these minutes from the meeting's "
+                "summary, transcript or any other source."
             )
             continue
         artifact_read = _ARTIFACT_MENTION_READS.get(entity_type)
@@ -815,7 +884,16 @@ class ChatAssistantWorker(BaseWorker):
         page_context_message = _format_page_context(request.page_context_json)
         if page_context_message:
             instructions_parts.append(page_context_message)
-        mentions_message = _format_mentions(request.mentions_json)
+        mentions_message = _format_mentions(
+            request.mentions_json,
+            await _unreadable_minutes_mentions(
+                request.mentions_json,
+                # getattr: a context without the client refuses every @minutes mention rather
+                # than failing the turn.
+                getattr(tool_context, "translation_room_client", None),
+                request.bearer_token,
+            ),
+        )
         if mentions_message:
             instructions_parts.append(mentions_message)
         instructions_parts.append(citation_instruction())

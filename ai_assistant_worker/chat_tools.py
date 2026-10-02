@@ -857,8 +857,64 @@ class MeetingAccess:
     room: dict[str, Any]
 
 
-async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> MeetingAccess:
+#: Room statuses after which a meeting's record (summary, minutes) exists. Mirrors
+#: TranslationRoomConstants.TerminalStatuses in TranslationRoomService.
+TERMINAL_ROOM_STATUSES = frozenset({"ENDED", "CANCELLED", "EXPIRED"})
+
+
+async def _caller_took_part_in(ctx: ToolContext, meeting_id: str, room: dict[str, Any]) -> bool:
+    """Whether this caller is the room's host or on its roster. WT-929.
+
+    WHY THIS EXISTS
+        A bridge room ignores workspace for membership: every user sitting in the same Google
+        Meet joins ONE WarpTalk room, whichever workspace each of them works in. For those
+        people the room's workspace is somebody else's, and a bare workspace comparison would
+        refuse a participant the transcript of the meeting they are sitting in. So taking part
+        in the room is admitted regardless of workspace — and nothing weaker is: a standing
+        invitation, or being Owner/Admin of the OTHER workspace, both pass the room read and
+        neither counts here.
+
+    Asked of the service with the caller's own token, never derived from the room payload
+    alone, and FAILS CLOSED: any answer other than a roster naming this user is a "no".
+    """
+    user_id = (ctx.user_id or "").strip().lower()
+    if not user_id:
+        return False
+
+    for key in ("effectiveHostId", "hostId"):
+        if str(room.get(key) or "").strip().lower() == user_id:
+            return True
+
+    try:
+        response = await ctx.translation_room_client.get(
+            f"/api/v1/translation-rooms/{meeting_id}/participants",
+            headers=_auth_headers(ctx),
+        )
+        if response.status_code != 200:
+            return False
+        roster = response.json()
+    except Exception:
+        logger.warning("meeting_roster_lookup_failed", meeting_id=meeting_id)
+        return False
+
+    if not isinstance(roster, list):
+        return False
+    return any(
+        isinstance(row, dict) and str(row.get("userId") or "").strip().lower() == user_id
+        for row in roster
+    )
+
+
+async def _authorize_meeting_access(
+    ctx: ToolContext, meeting_id: str, *, subject: str = "meeting summary"
+) -> MeetingAccess:
     """A `denial` of None if this caller may read this meeting's derived data, else the error.
+
+    WT-929: the ONE gate for every tool that takes a model-supplied meeting id —
+    get_meeting_summary, get_room_detail and get_transcript. The last two used to forward the
+    token and compare nothing, so a meeting of another workspace the caller happened to have a
+    relation to (an email invitation, Owner/Admin over there) was readable from this
+    workspace's chat. `subject` only words the "try again" error.
 
     S2. `meeting_id` is a MODEL-SUPPLIED tool argument — the assistant will pass whatever id
     appears in the conversation, including one a user simply typed. Tools that answer out of
@@ -873,14 +929,15 @@ async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> Meetin
       is presently valid: this worker performs no signature verification and no expiry check
       of its own, so an unauthenticated (or expired) request must be refused by the .NET
       service, not by us.
-    - The room's workspace must be the workspace this chat turn is scoped to.
-      GET /api/v1/translation-rooms/{id} is [Authorize] but performs no workspace or
-      participant check of its own, so a 200 alone only proves the room EXISTS — any
-      authenticated user in any workspace gets one. Without the workspace comparison this
-      gate would still hand a user another workspace's meeting summary, which is the bug.
+    - The room's workspace must be the workspace this chat turn is scoped to — unless the
+      caller took part in the room (see _caller_took_part_in: bridge rooms span workspaces).
+      GET /api/v1/translation-rooms/{id} answers 200 for the host, a participant, an invitee
+      and an Owner/Admin of the ROOM's workspace, so a 200 alone says nothing about the
+      workspace this turn is scoped to. Without the comparison this gate would still hand a
+      user another workspace's meeting, which is the bug.
     """
     not_found = json.dumps({"error": "No meeting found with that id."})
-    unavailable = json.dumps({"error": "Could not look up the meeting summary right now."})
+    unavailable = json.dumps({"error": f"Could not look up the {subject} right now."})
 
     try:
         uuid.UUID(meeting_id)
@@ -935,7 +992,18 @@ async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> Meetin
     room_workspace_id = str(room.get("workspaceId") or "")
 
     # Fail closed: a room whose workspace we cannot read is a room we cannot clear.
-    if not room_workspace_id or room_workspace_id.lower() != (ctx.workspace_id or "").lower():
+    same_workspace = bool(room_workspace_id) and (
+        room_workspace_id.lower() == (ctx.workspace_id or "").lower()
+    )
+    # The bridge exemption needs a workspace-scoped turn AND a room that names its workspace: it
+    # widens "which workspace", never "is there one".
+    took_part = (
+        not same_workspace
+        and bool(room_workspace_id)
+        and bool(ctx.workspace_id)
+        and await _caller_took_part_in(ctx, meeting_id, cast(dict[str, Any], room))
+    )
+    if not same_workspace and not took_part:
         logger.warning(
             "meeting_summary_denied_cross_workspace",
             meeting_id=meeting_id,
@@ -957,50 +1025,152 @@ async def _get_meeting_summary(ctx: ToolContext, arguments: dict[str, Any]) -> s
     if access.denial is not None:
         return access.denial
 
-    try:
-        summary_hash = await ctx.redis.hgetall(f"meeting:{meeting_id}:summary")
-        if not summary_hash:
-            return json.dumps(
-                {
-                    "summary": None,
-                    "note": (
-                        "No summary has been generated for this meeting yet. Meeting summaries "
-                        "are only produced automatically as a meeting's transcript pipeline "
-                        "completes — there is currently no on-demand trigger."
-                    ),
-                }
-            )
-
-        decoded = {
-            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
-            for k, v in summary_hash.items()
+    no_summary = json.dumps(
+        {
+            "summary": None,
+            "note": (
+                "No summary has been generated for this meeting yet. Meeting summaries "
+                "are only produced automatically as a meeting's transcript pipeline "
+                "completes — there is currently no on-demand trigger."
+            ),
         }
-        # WT-647. The same summary reaches the model through two doors — this tool, and
-        # semantic_search over the chunks the summary was indexed into. Only the second one used
-        # to carry a marker, so whether the answer came out cited depended on which door the
-        # model happened to walk through, and the reader could not see which that was. One
-        # meeting is one source however it is reached; both doors issue the same kind now.
-        #
-        # The id is the room's own, not the model-supplied argument, so that a citation raised
-        # here and one raised by get_room_detail for the same meeting are the SAME source rather
-        # than two chips differing only in how somebody typed a UUID.
-        return json.dumps(
-            _with_marker(
-                {
-                    "summary": decoded.get("content"),
-                    "action_items": decoded.get("action_items"),
-                },
-                _cite(
-                    ctx,
-                    "meeting",
-                    access.room.get("title"),
-                    str(access.room.get("id") or meeting_id),
-                ),
-            )
-        )
+    )
+    unavailable = json.dumps({"error": "Could not look up the meeting summary right now."})
+
+    # A meeting still running has no published summary, and the artifact endpoints below would
+    # answer that as a refusal. Said plainly instead.
+    if str(access.room.get("status") or "").strip().upper() not in TERMINAL_ROOM_STATUSES:
+        return no_summary
+
+    try:
+        published = await _read_published_summary(ctx, meeting_id)
     except Exception:
         logger.exception("get_meeting_summary_error")
-        return json.dumps({"error": "Could not look up the meeting summary right now."})
+        return unavailable
+
+    if published.outcome == "denied":
+        logger.warning("meeting_summary_denied_by_artifact_access", meeting_id=meeting_id)
+        return json.dumps(
+            {
+                "error": (
+                    "This meeting's summary has not been shared with you. Only the host can "
+                    "read it until they share the meeting's record with its participants."
+                )
+            }
+        )
+    if published.outcome == "absent":
+        return no_summary
+    if published.outcome != "ready":
+        return unavailable
+
+    # WT-647. The same summary reaches the model through two doors — this tool, and
+    # semantic_search over the chunks the summary was indexed into. One meeting is one source
+    # however it is reached; both doors issue the same kind.
+    #
+    # The id is the room's own, not the model-supplied argument, so that a citation raised
+    # here and one raised by get_room_detail for the same meeting are the SAME source rather
+    # than two chips differing only in how somebody typed a UUID.
+    return json.dumps(
+        _with_marker(
+            {
+                "summary": published.content,
+                "templateKey": published.template_key,
+                "language": published.language or None,
+            },
+            _cite(
+                ctx,
+                "meeting",
+                access.room.get("title"),
+                str(access.room.get("id") or meeting_id),
+            ),
+        )
+    )
+
+
+@dataclass(frozen=True)
+class _PublishedSummary:
+    #: "ready" (content is set), "absent" (no summary exists), "denied" (ArtifactAccess said
+    #: no) or "unavailable" (anything this could not read — fails closed).
+    outcome: str
+    content: Any = None
+    template_key: str | None = None
+    language: str | None = None
+
+
+async def _read_published_summary(ctx: ToolContext, meeting_id: str) -> _PublishedSummary:
+    """The meeting's published summary, read through TranslationRoomService AS THE CALLER.
+
+    WT-929 — WHY NOT REDIS
+        This tool used to answer out of `meeting:{id}:summary`. Redis has no notion of who is
+        asking, so the only checks were the ones the gate above re-creates: room read and
+        workspace. The product's rule for a summary is stricter — ArtifactAccessHelper: the
+        host always, a participant or invitee only once the host has shared the record — and
+        a participant of a HOST_ONLY room, or a workspace Owner/Admin who hosts nothing, read
+        through WarpBot what the web refuses them. Re-implementing that rule here would be a
+        second copy of an authorization decision; asking the endpoint the web asks is not.
+        (The Redis copy is also the first draft: a host's rewrite never reached it.)
+
+    TWO READS, AND WHY
+        `/summary` is a GET that QUEUES a model call when asked for a (shape, language) pair
+        nobody has rendered yet. A tool must never cause that, so the renderings list is read
+        first to learn which pair the host published, and exactly that pair is asked for —
+        which the service answers from the stored artifact. Both reads sit behind the same
+        ArtifactAccess gate.
+    """
+    base = f"/api/v1/room-artifacts/rooms/{meeting_id}/summary"
+
+    listing = await ctx.translation_room_client.get(
+        f"{base}/renderings", headers=_auth_headers(ctx)
+    )
+    if listing.status_code in (401, 403):
+        return _PublishedSummary("denied")
+    if listing.status_code == 404:
+        return _PublishedSummary("absent")
+    if listing.status_code != 200:
+        logger.warning("meeting_summary_renderings_failed", status=listing.status_code)
+        return _PublishedSummary("unavailable")
+
+    renderings = listing.json()
+    canonical = next(
+        (
+            row
+            for row in (renderings if isinstance(renderings, list) else [])
+            if isinstance(row, dict) and row.get("isCanonical")
+        ),
+        None,
+    )
+    if canonical is None:
+        return _PublishedSummary("absent")
+
+    template_key = str(canonical.get("templateKey") or "general")
+    language = str(canonical.get("language") or "")
+    params: dict[str, Any] = {"template": template_key}
+    if language:
+        params["language"] = language
+
+    response = await ctx.translation_room_client.get(
+        base, params=params, headers=_auth_headers(ctx)
+    )
+    if response.status_code in (401, 403):
+        return _PublishedSummary("denied")
+    if response.status_code != 200:
+        # 202 lands here on purpose: the host rewrote the summary between the two reads and
+        # this pair is now being generated. "Try again" is the honest answer.
+        logger.warning("meeting_summary_read_failed", status=response.status_code)
+        return _PublishedSummary("unavailable")
+
+    body = response.json()
+    if not isinstance(body, dict) or body.get("status") != "ready":
+        return _PublishedSummary("unavailable")
+
+    raw = body.get("content")
+    if not isinstance(raw, str) or not raw.strip():
+        return _PublishedSummary("absent")
+    try:
+        content: Any = json.loads(raw)
+    except ValueError:
+        content = raw
+    return _PublishedSummary("ready", content, template_key, language)
 
 
 async def _get_room_detail(ctx: ToolContext, arguments: dict[str, Any]) -> str:
@@ -1010,18 +1180,15 @@ async def _get_room_detail(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             {"error": "A room_id is required — call list_recent_meetings first to find one."}
         )
 
-    try:
-        response = await ctx.translation_room_client.get(
-            f"/api/v1/translation-rooms/{room_id}",
-            headers=_auth_headers(ctx),
-        )
-        if response.status_code == 404:
-            return json.dumps({"error": "No room found with that id."})
-        if response.status_code != 200:
-            logger.warning("get_room_detail_failed", status=response.status_code)
-            return json.dumps({"error": "Could not look up that room right now."})
+    # WT-929: through the same gate as the summary. This used to GET the room and return it,
+    # so the only check was the service's own room read — which a caller scoped to ANOTHER
+    # workspace passes for any room they hold an invitation to or administer over there.
+    access = await _authorize_meeting_access(ctx, room_id, subject="room")
+    if access.denial is not None:
+        return access.denial
 
-        room = response.json()
+    try:
+        room = access.room
         # WT-647, DELIBERATE: this one cites, and list_recent_meetings does not.
         #
         # The line is between a tool that ANSWERS ABOUT ONE NAMED MEETING and one that offers
@@ -1054,45 +1221,6 @@ async def _get_room_detail(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     except Exception:
         logger.exception("get_room_detail_error")
         return json.dumps({"error": "Could not look up that room right now."})
-
-
-async def _meeting_title(ctx: ToolContext, meeting_id: str) -> str | None:
-    """What to call this meeting on a chip, or None when it cannot be named.
-
-    WHY A TRANSCRIPT HAS TO ASK SOMEBODY ELSE WHAT IT IS CALLED
-        TranscriptDto carries ids, a status, languages and counts, and no title — the name a
-        reader would recognise ("Sprint review") lives on the translation room. So a transcript
-        either asks the room what it is called or says nothing, and saying nothing is the worse
-        of the two: a meeting-kind chip has no destination in the client, so its title is the
-        entire chip, and a row of chips all reading "Transcript" names no source at all.
-
-    WHY FAILING HERE IS NOT AN ERROR
-        None means no marker, which means an uncited answer — precisely the state the tool was
-        already in before this ticket. The transcript itself is unaffected; losing the transcript
-        because its footnote could not be labelled would be trading the answer for the citation.
-
-    WHY THIS IS NOT AN AUTHORIZATION CHECK, AND MUST NOT BE READ AS ONE
-        It declines to NAME; it never declines to READ. What decides whether this caller may see
-        the transcript is /api/v1/transcripts/..., answering the caller's own bearer token, the
-        same way every other HTTP-backed tool in this module inherits its authorization. Note the
-        asymmetry with get_meeting_summary, which answers out of Redis and therefore has to run
-        the S2 gate itself: this tool does not have that gate, and this function is not one.
-    """
-    try:
-        response = await ctx.translation_room_client.get(
-            f"/api/v1/translation-rooms/{meeting_id}",
-            headers=_auth_headers(ctx),
-        )
-        if response.status_code != 200:
-            return None
-        room = response.json()
-    except Exception:
-        logger.warning("meeting_title_lookup_failed", meeting_id=meeting_id)
-        return None
-
-    if not isinstance(room, dict):
-        return None
-    return str(room.get("title") or "").strip() or None
 
 
 class _SegmentReadError(Exception):
@@ -1246,6 +1374,14 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
         return json.dumps({"error": parsed})
     from_beginning, before = parsed
 
+    # WT-929. TranscriptService decides WHO may read (host, a participant, and once the meeting
+    # has ended only while the record is shared — TranscriptReadAccess); it has no idea which
+    # workspace this chat turn belongs to. This gate adds that, with the bridge exemption: a
+    # participant of the room reads its transcript whatever workspace the room lives in.
+    access = await _authorize_meeting_access(ctx, meeting_id, subject="transcript")
+    if access.denial is not None:
+        return access.denial
+
     try:
         transcript_response = await ctx.transcript_client.get(
             f"/api/v1/transcripts/by-room/{meeting_id}",
@@ -1294,11 +1430,10 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
         # on an id to come out as one chip; this kind is registered by exactly one tool, so the
         # only way to split it would be two get_transcript calls for the same meeting typed two
         # different ways — and the price of that is a duplicate chip, not a wrong one.
-        marker = (
-            _cite(ctx, "transcript", await _meeting_title(ctx, meeting_id), meeting_id)
-            if ordered
-            else None
-        )
+        #
+        # The title comes from the room the gate already read — no second request for it.
+        title = str(access.room.get("title") or "").strip() or None
+        marker = _cite(ctx, "transcript", title, meeting_id) if ordered else None
         result: dict[str, Any] = {
             "transcriptId": transcript_id,
             "status": transcript.get("status"),
