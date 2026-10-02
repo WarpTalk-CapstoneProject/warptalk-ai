@@ -375,6 +375,40 @@ def _detect_script_language(text: str) -> str | None:
     return None
 
 
+_HAN_RUN_RE = re.compile(r"[一-鿿]+")
+
+
+def _without_undeclared_han(
+    text: str,
+    room_languages: set[str],
+    speaker_language: str | None,
+) -> str:
+    """The text with its Han characters removed, when Han can only mean Chinese here.
+
+    WT-928, production room 01a0fb2e (2 Oct): a vi/en/ja meeting showed Chinese in its
+    transcript — 嗯, 可能, 都, and "嗯 Chào mừng mọi người đến với" from a Vietnamese speaker.
+    The script allow-list cannot catch it: Japanese is written in Han too, so a room that
+    declared ja permits Han, and _detect_script_language then labels any Han-without-kana
+    text `zh`. Two such lines in a row re-pinned the speaker to Chinese for the rest of the
+    meeting.
+
+    Han with no kana is Chinese, or a Japanese speaker writing only kanji. So when the room
+    did NOT declare Chinese, it is kept only for a speaker whose own language is written in
+    Han (ja, ko); for anyone else it is a hallucinated filler, and it is cut out of the line.
+    What is left is what they actually said. An empty result means the whole line was the
+    hallucination.
+
+    Kana anywhere in the line settles it as Japanese, and the line is left alone.
+    """
+    if not _HAN_RE.search(text) or _KANA_RE.search(text):
+        return text
+    if "zh" in {base_language(language) for language in room_languages}:
+        return text
+    if "han" in _LANGUAGE_SCRIPTS.get(base_language(speaker_language or ""), frozenset()):
+        return text
+    return " ".join(_HAN_RUN_RE.sub(" ", text).split())
+
+
 def _detect_unambiguous_language(text: str) -> str | None:
     """The language the TEXT proves, or None when the text proves nothing.
 
@@ -947,6 +981,10 @@ def _filter_segments(
     # allow-list is not evidence that the room is all-Latin.
     languages_declared = bool(allowed_languages)
     allowed = {_normalize_language(lang) for lang in (allowed_languages or ())}
+    # The room's own set, before the speaker's language is added to it below. WT-928: with a
+    # learned override in place `lang_code` is the LEARNED language, so `allowed` alone cannot
+    # say whether the room ever declared it.
+    room_languages = set(allowed) if languages_declared else set()
     if not allowed:
         allowed = set(_DEFAULT_ALLOWED_LANGUAGES)
     # The speaker's OWN declared language is always allowed. STT is pinned to it on the
@@ -1034,6 +1072,20 @@ def _filter_segments(
                 )
                 continue
 
+        # WT-928. Han the room cannot be speaking is cut out — see _without_undeclared_han.
+        if room_languages:
+            kept = _without_undeclared_han(text, room_languages, lang_code)
+            if kept != text:
+                logger.info(
+                    "filtered_undeclared_han",
+                    text=text[:80],
+                    kept=kept[:80],
+                    declared=sorted(room_languages),
+                )
+                if not kept:
+                    continue
+                text = kept
+
         # Realtime completed events expose token logprobs when explicitly requested in
         # the session include list. transcribe() averages those into avg_logprob;
         # STT_UNKNOWN_CONFIDENCE (-1.0) remains the compatibility fallback for an older
@@ -1104,11 +1156,19 @@ def _filter_segments(
         # for a vi/en room the first term was ALWAYS None and the declaration always won.
         # _detect_unambiguous_language adds the Vietnamese-unique evidence that was previously
         # locked inside the no-declaration fallback path.
-        seg_lang = (
-            _detect_unambiguous_language(text)
-            or lang_code
-            or _guess_language_from_text(text, allowed)
-        )
+        evidence = _detect_unambiguous_language(text)
+        # WT-928: evidence for a language the room never declared is not a label this room can
+        # carry. What survives the script check above in such a case is kanji-only Japanese
+        # (Han is Japanese's script too), which _detect_script_language calls `zh`; the speaker's
+        # own language is the right label for it. Without this, two such lines in a row taught
+        # _learn_language_evidence to re-pin the speaker to Chinese for the rest of the meeting.
+        if (
+            evidence
+            and room_languages
+            and base_language(evidence) not in {base_language(lang) for lang in room_languages}
+        ):
+            evidence = None
+        seg_lang = evidence or lang_code or _guess_language_from_text(text, allowed)
         # Before the contradiction log below, deliberately: an echoed dub is exactly a segment
         # whose language contradicts the declaration, and letting it write that log line is the
         # confusion this guard exists to remove.
