@@ -32,6 +32,7 @@ from shared import isochrony
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
 from shared.control_markers import EXTERNAL_BRIDGE_SPEAKER_ID, is_external_bridge_speaker
+from shared.far_speaker import CaptionHintTracker, SegmentWindow
 from shared.integration_status import (
     CARTESIA,
     LIVEKIT,
@@ -48,8 +49,9 @@ from shared.platform_settings import (
 from shared.prosody import SPEED_MAX, Arousal, Delivery, Valence, to_generation_config
 from shared.provider_calls import classify_exception, record_provider_call
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
-from tts_worker import prosody_context
+from tts_worker import far_speaker_clone, prosody_context
 from tts_worker.clone_sample_quality import MAX_SAMPLE_SCORE, assess_clone_sample
+from tts_worker.far_speaker_clone import FarCloneState, FarKey
 from tts_worker.livekit_publisher import (
     AUDIO_SOURCE_QUEUE_MS,
     FRAME_MS,
@@ -343,6 +345,26 @@ def _settle_live_clone(
         clone_refused.add(key)
 
 
+def _settle_far_clone(
+    task: asyncio.Task[Any], *, key: FarKey, in_flight: set[FarKey], refused: set[FarKey]
+) -> None:
+    """A far-speaker clone call has ended: let that name be captured again, or never (WT-933).
+
+    The far path has no upgrade and so no score to walk back, which is all of what
+    _settle_live_clone does beyond this. A refusal no later clip can change stops the capture for
+    that name; anything else (a clip the vendor could not use, consent withdrawn mid-call, an
+    outage) simply lets the next clip try.
+    """
+    in_flight.discard(key)
+    if task.cancelled() or task.exception() is not None:
+        return
+    if task.result() in _PERMANENT_CLONE_REFUSALS:
+        refused.add(key)
+
+
+# What `_clone_and_cache` answers when the person withdrew while Cartesia was still cloning them.
+_FAR_CLONE_CONSENT_WITHDRAWN = "CONSENT_WITHDRAWN"
+
 # WT-B — a clone that outlives the meeting it was made in.
 #
 # WHY THE HAND-OFF EXISTS AT ALL
@@ -535,6 +557,16 @@ class _OpenContext:
             self.idle_timer = None
 
 
+def _decode_hash(raw: Mapping[Any, Any] | None) -> dict[str, str]:
+    """A Redis hash as the client returns it (bytes or str, either side) -> str to str."""
+    return {
+        (k.decode() if isinstance(k, bytes) else str(k)): (
+            v.decode() if isinstance(v, bytes) else str(v)
+        )
+        for k, v in (raw or {}).items()
+    }
+
+
 def _decode_field(data: Mapping[Any, Any], key: str) -> str:
     raw = data.get(key)
     if raw is None:
@@ -694,6 +726,8 @@ class TTSWorker(BaseWorker):
         asyncio.create_task(self._consume_upload_clone_requests())
         asyncio.create_task(self._consume_preview_requests())
         asyncio.create_task(self._consume_voice_delete_requests())
+        if self.tts_settings.far_speaker_clone_enabled:
+            asyncio.create_task(self._watch_far_clone_consents())
         if self.tts_settings.orphan_voice_sweep_enabled:
             asyncio.create_task(self._sweep_orphan_voices())
         if self.tts_settings.voice_catalog_warm_enabled:
@@ -1012,6 +1046,11 @@ class TTSWorker(BaseWorker):
         contexts = self._open_contexts()
         for context_key, context in [(k, c) for k, c in contexts.items() if k[0] == room_id]:
             self._retire_context(context_key, context, abandon=True)
+        # WT-933: buffered Meet-side audio, held chunks and streaks of a room that has ended.
+        # Only touched when it exists, so a worker with the flag off never creates the state.
+        far_state: FarCloneState | None = getattr(self, "_far_clone_state_impl", None)
+        if far_state is not None:
+            far_state.forget_room(room_id)
 
     # ------------------------------------------------------------------
     # Cartesia contexts: open only while a sentence needs one
@@ -1564,6 +1603,10 @@ class TTSWorker(BaseWorker):
             translation.target_lang,
             far_speaker_name=translation.far_speaker_name,
             far_speaker_confidence=translation.far_speaker_confidence,
+            far_segment_id=translation.segment_id,
+            far_duration_ms=far_speaker_clone.sentence_duration_ms(
+                translation.start_ms, translation.end_ms, translation.chunk_duration_ms
+            ),
         )
         # Before synthesizing: a listener is still subscribed to any variant track this speaker
         # no longer gets, and hears nothing on it. See LiveKitTTSPublisher.retire_voice_variants.
@@ -1622,6 +1665,8 @@ class TTSWorker(BaseWorker):
         target_lang: str,
         far_speaker_name: str | None = None,
         far_speaker_confidence: float | None = None,
+        far_segment_id: str = "",
+        far_duration_ms: int = 0,
     ) -> list[tuple[str, str, str]]:
         """Every distinct (voice_id, voice_type, voice_key) this (speaker, target_lang)
         must be rendered into.
@@ -1654,6 +1699,14 @@ class TTSWorker(BaseWorker):
             the stand-in's own LiveKit identity — no new variant, no new track. A listener's
             explicit pick below is untouched, and still collapses the whole far side into the
             voice they picked.
+
+        ... AND ONE OF THEM MAY HAVE CONSENTED TO THEIR OWN VOICE (WT-933)
+            Behind TTS_FAR_SPEAKER_CLONE_ENABLED, the same default entry carries that person's
+            CLONE (voice_type "cloned") when _far_speaker_clone_voice says every condition holds,
+            and the WT-932 stock voice otherwise. `far_segment_id` / `far_duration_ms` exist only
+            for that decision. Still one default variant on the stand-in's identity, and a
+            listener's explicit pick is still rendered beside it: the stand-in seat itself has
+            no voice of its own, so the rule below about a speaker's own clone does not apply.
 
             It did not work that way. `_get_explicit_voice_choices` was applied to every
             speaker unconditionally, and the client accepts ONLY the preference track once
@@ -1690,7 +1743,25 @@ class TTSWorker(BaseWorker):
                 if meeting_id
                 else None
             )
-            if far_key:
+            # Asked before the stock voice and for every stand-in sentence, not only the ones
+            # that end up cloned: it is also what counts the streak. None with the flag off.
+            far_clone_voice_id = (
+                await self._far_speaker_clone_voice(
+                    meeting_id,
+                    speaker_id,
+                    target_lang,
+                    far_speaker_name,
+                    far_speaker_confidence,
+                    far_segment_id,
+                    far_duration_ms,
+                )
+                if self.tts_settings.far_speaker_clone_enabled and meeting_id
+                else None
+            )
+            default_voice_type = "cloned" if far_clone_voice_id else "default"
+            if far_clone_voice_id:
+                default_voice_id = far_clone_voice_id
+            elif far_key:
                 default_voice_id = await self._far_speaker_voice_id(
                     target_lang, meeting_id, speaker_id, far_key
                 )
@@ -1698,7 +1769,6 @@ class TTSWorker(BaseWorker):
                 default_voice_id = await self._hashed_default_voice_id(
                     target_lang, speaker_id, meeting_id
                 )
-            default_voice_type = "default"
 
         variants: list[tuple[str, str, str]] = [(default_voice_id, default_voice_type, "")]
 
@@ -2843,6 +2913,22 @@ class TTSWorker(BaseWorker):
                         chunk = AudioChunkMessage.from_redis(data)
                         key = (chunk.meeting_id, chunk.speaker_id)
 
+                        # WT-933, flag off by default. The bridge stand-in is several people on
+                        # one feed, so its audio never enters the per-speaker buffers below: it
+                        # is set aside, attributed to a caption name once the hints for it can
+                        # have arrived, and buffered per NAME only if that person consented.
+                        # Setting it aside is a deque append; nobody else's chunk waits on it.
+                        #
+                        # With the flag off the stand-in falls through to the consent gate
+                        # exactly as it always has (and is refused there: the seat has no
+                        # route that opts it in).
+                        if (
+                            self.tts_settings.far_speaker_clone_enabled
+                            and is_external_bridge_speaker(chunk.speaker_id)
+                        ):
+                            self._hold_far_chunk(chunk)
+                            continue
+
                         # Consent gate: never buffer/clone a speaker's voice (biometric
                         # data) unless they have at least one current outgoing route with
                         # VoiceCloneEnabled = true. See base_worker.is_voice_clone_consented.
@@ -3190,6 +3276,437 @@ class TTSWorker(BaseWorker):
                 self.logger.exception("audio_consumer_error")
                 await asyncio.sleep(2)
 
+    # ------------------------------------------------------------------
+    # WT-933 — a consenting Meet-side person's own voice (flag off by default)
+    # ------------------------------------------------------------------
+    #
+    # Read tts_worker/far_speaker_clone.py first. Three paths meet here:
+    #
+    #   CAPTURE   _hold_far_chunk -> _drain_far_chunks -> _capture_far_chunk -> _clone_and_cache
+    #   USE       _resolve_voice_variants -> _far_speaker_clone_voice
+    #   WITHDRAW  any of the above, or _watch_far_clone_consents -> _withdraw_far_clone
+    #
+    # A name never appears below. It is hashed into the consent field as it is read and only
+    # the hash travels; logs carry `far_speaker_hash`, the field's first 12 hex characters.
+
+    def _far_clone_state(self) -> FarCloneState:
+        # getattr, like every other per-room cache here: the tests build workers with __new__.
+        state: FarCloneState | None = getattr(self, "_far_clone_state_impl", None)
+        if state is None:
+            state = FarCloneState()
+            self._far_clone_state_impl = state
+        return state
+
+    def _far_clone_tracker(self) -> CaptionHintTracker:
+        """The same caption-hint attribution stt_worker labels the transcript with.
+
+        Two differences from the STT tracker, both in the direction of refusing more:
+
+        * `max_gap_ms=0`. The nearest-hint path can answer at most 0.5 and capture needs 1.0,
+          so a hint that only lands NEAR a chunk is not looked for at all.
+        * a deeper scan. A chunk is attributed a couple of seconds after it was spoken, and a
+          scan too shallow to reach back to its beginning would see only the hints for its end:
+          a hand-over inside the chunk would then read as one unanimous speaker.
+        """
+        state = self._far_clone_state()
+        if state.tracker is None:
+            redis = self.redis.redis
+
+            async def read_hints(key: str, count: int) -> Any:
+                return await redis.xrevrange(key, count=count)
+
+            state.tracker = CaptionHintTracker(
+                read_hints,
+                lag_ms=self.tts_settings.far_speaker_clone_hint_lag_ms,
+                max_gap_ms=0,
+                scan_count=256,
+            )
+        return state.tracker
+
+    def _hold_far_chunk(self, chunk: AudioChunkMessage) -> None:
+        """Set a stand-in chunk aside until the caption hints for it can have been written.
+
+        WHY IT WAITS
+            The desktop reads a caption after the words were spoken, so the hints for a chunk
+            are still arriving when the chunk does. Attributed on arrival, the end of every
+            chunk would have no hint yet and a change of speaker there would go unseen.
+
+        WHY NOBODY ELSE WAITS
+            Nothing here awaits. The chunk goes on a bounded queue and one background task
+            (_drain_far_chunks) takes them off when they are due; the capture loop is already
+            on the next speaker's chunk.
+
+        The wait is counted from the chunk's own timestamp, so a chunk that already sat in the
+        stream for a while is not held for its full length again, and is capped at the setting
+        so a clock that disagrees with the ingress cannot park audio here.
+        """
+        state = self._far_clone_state()
+        state.watched.add(chunk.meeting_id)
+        # Decided before holding, so a short chunk's audio is never kept even for two seconds.
+        if far_speaker_clone.chunk_speech_ms(chunk) < far_speaker_clone.CLONE_MIN_SPEECH_MS:
+            return
+        wait_s = max(0, self.tts_settings.far_speaker_clone_hint_wait_ms) / 1000
+        age_s = max(0.0, time.time() - chunk.timestamp_ms / 1000)
+        state.hold(chunk, time.monotonic() + max(0.0, wait_s - age_s))
+        if state.drainer is None or state.drainer.done():
+            state.drainer = asyncio.create_task(self._drain_far_chunks())
+
+    async def _drain_far_chunks(self) -> None:
+        """Attribute held stand-in chunks as they come due. Ends when none are left."""
+        state = self._far_clone_state()
+        while state.pending:
+            wait_s = state.pending[0].due - time.monotonic()
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+                continue
+            held = state.pending.popleft()
+            try:
+                await self._capture_far_chunk(held.chunk)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The chunk is simply not used. One bad chunk must not end the drain and leave
+                # the rest of the queue holding audio with nothing to release it.
+                self.logger.exception(
+                    "far_speaker_clone_chunk_error", meeting_id=held.chunk.meeting_id
+                )
+
+    async def _capture_far_chunk(self, chunk: AudioChunkMessage) -> None:
+        """One stand-in chunk: whose is it, did they consent, and is there a clone to make.
+
+        THE AUDIO IS DROPPED UNLESS EVERY ANSWER IS YES
+            Not attributed, attributed below certainty, a name with no consent field, consent
+            that could not be read: the chunk is not appended to anything and is gone when this
+            returns. Only audio that passed all of it reaches a buffer, and the buffer is the
+            consenting person's own, keyed by their consent field.
+
+        ONE CLONE PER NAME PER MEETING
+            The native path may replace a clone with a better clip. This one does not: every
+            extra sample is another stretch of a mixed feed taken on the strength of captions,
+            and a clone that passed the quality gate once is good enough to keep.
+        """
+        state = self._far_clone_state()
+        meeting_id = chunk.meeting_id
+        end_ms = chunk.timestamp_ms
+        window = SegmentWindow(end_ms - far_speaker_clone.chunk_pcm_ms(chunk), end_ms)
+        attribution = await self._far_clone_tracker().attribute(meeting_id, window)
+        if attribution is None or attribution.confidence < far_speaker_clone.CLONE_MIN_CONFIDENCE:
+            return
+        field = far_speaker_clone.consent_field(attribution.name)
+        if field is None:
+            return
+        key: FarKey = (meeting_id, field)
+
+        consent = await self._far_clone_consent(meeting_id, field)
+        if consent is not True:
+            state.drop_buffer(key)
+            if consent is False:
+                # Present a moment ago, or never: either way nothing of theirs may remain.
+                await self._withdraw_far_clone(meeting_id, field)
+            return
+
+        # The platform kill switch narrows this exactly as it narrows a native speaker's clone.
+        if not await self._voice_clone_allowed(meeting_id):
+            state.drop_buffer(key)
+            return
+        if key in state.refused or key in state.in_flight:
+            state.drop_buffer(key)
+            return
+        if await self._far_clone_voice_id(meeting_id, field):
+            state.drop_buffer(key)
+            return
+
+        state.buffers.setdefault(key, bytearray()).extend(chunk.audio_data)
+        duration_s = len(chunk.audio_data) / 2 / max(chunk.sample_rate, 1)
+        state.buffer_seconds[key] = state.buffer_seconds.get(key, 0.0) + duration_s
+        state.buffer_lang[key] = chunk.language
+        if state.buffer_seconds[key] < await self._clone_min_seconds():
+            return
+
+        # From here on it is the native path's own gate, in the native path's own order: not
+        # under a guess about the language, and not from a clip that is not worth referring to.
+        clone_lang = _resolve_clone_language(state.buffer_lang.get(key, ""))
+        if clone_lang is None:
+            self._trim_clone_buffer(key, state.buffers, state.buffer_seconds, chunk.sample_rate)
+            return
+        assessment = assess_clone_sample(bytes(state.buffers[key]), chunk.sample_rate)
+        if not assessment.accepted:
+            self.logger.info(
+                "far_speaker_clone_sample_rejected",
+                meeting_id=meeting_id,
+                far_speaker_hash=far_speaker_clone.far_hash(field),
+                reason=assessment.reason,
+                active_speech_ratio=round(assessment.active_speech_ratio, 3),
+            )
+            self._trim_clone_buffer(key, state.buffers, state.buffer_seconds, chunk.sample_rate)
+            return
+
+        audio_snapshot = bytes(state.buffers[key])
+        state.drop_buffer(key)
+        state.in_flight.add(key)
+        self.logger.info(
+            "far_speaker_clone_sample_accepted",
+            meeting_id=meeting_id,
+            far_speaker_hash=far_speaker_clone.far_hash(field),
+            seconds=round(len(audio_snapshot) / 2 / max(chunk.sample_rate, 1), 1),
+            score=round(assessment.score, 3),
+        )
+        clone_task = asyncio.create_task(
+            self._clone_and_cache(
+                meeting_id,
+                chunk.speaker_id,
+                audio_snapshot,
+                clone_lang,
+                chunk.sample_rate,
+                assessment.score,
+                far_field=field,
+            )
+        )
+        clone_task.add_done_callback(
+            functools.partial(
+                _settle_far_clone, key=key, in_flight=state.in_flight, refused=state.refused
+            )
+        )
+
+    async def _far_clone_consent(self, meeting_id: str, field: str) -> bool | None:
+        """Is this person's consent field present right now? None when it could not be read.
+
+        Asked every time and never cached: the contract is "present right now", and a cached
+        yes is a withdrawal that has not taken effect.
+
+        THREE ANSWERS, BECAUSE TWO WOULD BE WRONG IN ONE DIRECTION OR THE OTHER
+            An unreadable hash must stop the clone being captured or spoken, like a no. It must
+            NOT delete the voice model, unlike a no: a Redis blip is not a person withdrawing,
+            and a deletion cannot be taken back.
+        """
+        try:
+            value = await self.redis.hget(far_speaker_clone.consents_key(meeting_id), field)
+        except Exception:
+            self.logger.warning(
+                "far_speaker_clone_consent_unreadable", meeting_id=meeting_id, exc_info=True
+            )
+            return None
+        return value is not None
+
+    async def _far_clone_voice_id(self, meeting_id: str, field: str) -> str | None:
+        cached = await self.redis.hget(far_speaker_clone.clones_key(meeting_id), field)
+        if not cached:
+            return None
+        return cached.decode() if isinstance(cached, bytes) else cached
+
+    async def _cache_far_clone(
+        self, meeting_id: str, field: str, voice_id: str, language: str, score: float | None
+    ) -> str:
+        """Record a just-made clone of a Meet-side person. The far half of _clone_and_cache.
+
+        WHAT IS DIFFERENT FROM A NATIVE SPEAKER'S CLONE, AND WHY
+
+        Where it is stored. Under the person's consent field in a hash of its own, never at
+        `voice:{meeting}:{stand-in}`: that key is "the speaker's voice", and the speaker here is
+        a seat several people share.
+
+        Consent is asked AGAIN. The clone call takes seconds and the person may have withdrawn
+        during them. A voice that arrives after its consent left is deleted here and never
+        becomes reachable.
+
+        No carry-over. _offer_carry_over renames a clone so the orphan sweep leaves it alone and
+        hands it to AuthService as a user's profile. This person is not a WarpTalk user, and
+        their consent is to this meeting. The voice keeps its `speaker-` name, so whatever
+        happens to this process the sweep still collects it.
+
+        No `voice_clone_ready` event and no clone-state: both address the person at a WarpTalk
+        microphone by speaker id, and this speaker id is the stand-in.
+        """
+        if await self._far_clone_consent(meeting_id, field) is not True:
+            await self._request_voice_delete(voice_id, "far_speaker_consent_withdrawn")
+            self.logger.info(
+                "far_speaker_clone_discarded",
+                meeting_id=meeting_id,
+                far_speaker_hash=far_speaker_clone.far_hash(field),
+                voice_id=voice_id,
+            )
+            return _FAR_CLONE_CONSENT_WITHDRAWN
+        cache_key = far_speaker_clone.clones_key(meeting_id)
+        await self.redis.hset(cache_key, field, voice_id)
+        # hset has no TTL of its own. The same lifetime a native clone's key has, which is the
+        # bound the orphan sweep's minimum age is derived from.
+        await self.redis.expire(cache_key, self.tts_settings.voice_clone_key_ttl_seconds)
+        self._far_clone_state().watched.add(meeting_id)
+        self.logger.info(
+            "far_speaker_voice_cloned",
+            meeting_id=meeting_id,
+            far_speaker_hash=far_speaker_clone.far_hash(field),
+            voice_id=voice_id,
+            language=base_language(language),
+            score=None if score is None else round(score, 3),
+        )
+        return ""
+
+    async def _far_speaker_clone_voice(
+        self,
+        meeting_id: str,
+        speaker_id: str,
+        target_lang: str,
+        far_speaker_name: str | None,
+        far_speaker_confidence: float | None,
+        segment_id: str,
+        duration_ms: int,
+    ) -> str | None:
+        """The clone to speak this stand-in sentence in, or None for the WT-932 stock voice.
+
+        Every condition of the contract, and the caller has already checked the flag:
+
+            the sentence is the stand-in's and names someone
+            its confidence is 1.0 and it is at least 1.5 s long        (it "qualifies")
+            it is at least the 3rd qualifying sentence in a row for that name
+            the platform has not switched cloning off
+            that person has a clone
+            their consent field is present right now
+
+        WHY THREE IN A ROW
+            A wrong name with a stock voice is one person's words in a stranger's voice. A wrong
+            name with a CLONE is one person's words in another real person's own voice, which a
+            listener hears as that person saying them. So a single certain sentence is not
+            enough: the attribution has to have held.
+
+        The streak is counted on every named stand-in sentence, cloned or not, so that it is
+        already there when the clone arrives. Every failure answers None: the stock voice is
+        always available and a dub must never wait on, or fail for, this.
+        """
+        if not is_external_bridge_speaker(speaker_id):
+            return None
+        state = self._far_clone_state()
+        state.watched.add(meeting_id)
+        field = far_speaker_clone.consent_field(far_speaker_name)
+        if field is None:
+            return None
+        streak = state.note_sentence(
+            meeting_id,
+            field,
+            target_lang,
+            segment_id,
+            far_speaker_clone.sentence_qualifies(far_speaker_confidence, duration_ms),
+        )
+        if streak < far_speaker_clone.CLONE_MIN_STREAK:
+            return None
+        try:
+            if not await self._voice_clone_allowed(meeting_id):
+                return None
+            voice_id = await self._far_clone_voice_id(meeting_id, field)
+            if not voice_id:
+                return None
+            consent = await self._far_clone_consent(meeting_id, field)
+            if consent is False:
+                await self._withdraw_far_clone(meeting_id, field)
+            return voice_id if consent is True else None
+        except Exception:
+            self.logger.warning(
+                "far_speaker_clone_unavailable",
+                meeting_id=meeting_id,
+                far_speaker_hash=far_speaker_clone.far_hash(field),
+                exc_info=True,
+            )
+            return None
+
+    async def _withdraw_far_clone(self, meeting_id: str, field: str) -> None:
+        """This person's consent field is gone: forget their audio and destroy their voice.
+
+        The pointer is removed FIRST, so the very next sentence cannot find the voice, and the
+        HDEL's own answer decides who asks for the deletion: three paths can notice a withdrawal
+        in the same second, and only the one whose HDEL removed the field goes on.
+
+        The voice model is then deleted through `voice:delete_requests`, the path withdrawn
+        consent already takes for a native speaker (_consume_voice_delete_requests). A stream
+        rather than a direct call so that a deletion this process dies in the middle of is
+        redelivered rather than lost.
+        """
+        self._far_clone_state().drop_buffer((meeting_id, field))
+        voice_id = await self._far_clone_voice_id(meeting_id, field)
+        if not voice_id:
+            return
+        removed = await self.redis.redis.hdel(far_speaker_clone.clones_key(meeting_id), field)
+        if not removed:
+            return
+        await self._request_voice_delete(voice_id, "far_speaker_consent_withdrawn")
+        self.logger.info(
+            "far_speaker_clone_withdrawn",
+            meeting_id=meeting_id,
+            far_speaker_hash=far_speaker_clone.far_hash(field),
+            voice_id=voice_id,
+        )
+
+    async def _request_voice_delete(self, voice_id: str, reason: str) -> None:
+        """Ask for a voice model to be destroyed, on the stream _handle_voice_delete_request reads.
+
+        Never raises. If the request cannot even be written the voice is still named `speaker-`,
+        so the orphan sweep deletes it; that is late, and it is said loudly for that reason.
+        """
+        try:
+            await self.redis.publish(_VOICE_DELETE_STREAM, {"voice_id": voice_id, "reason": reason})
+        except Exception:
+            self.logger.error(
+                "voice_delete_request_not_published",
+                voice_id=voice_id,
+                reason=reason,
+                exc_info=True,
+            )
+
+    async def _reconcile_far_clones(self, meeting_id: str) -> None:
+        """Compare what this room holds of Meet-side people with who still consents.
+
+        Withdrawal is an HDEL on the backend's side and nothing announces it, so it has to be
+        looked for. The capture and the dub both look, but only when that person speaks; this
+        is for the person who withdraws and then stays silent, whose voice model would otherwise
+        sit in the account until the orphan sweep.
+
+        A hash that cannot be read changes nothing (see _far_clone_consent). A hash that reads
+        as EMPTY is everybody withdrawn, which is what an expired or deleted hash means in the
+        contract.
+        """
+        state = self._far_clone_state()
+        buffered = [key for key in state.buffers if key[0] == meeting_id]
+        try:
+            clones = _decode_hash(
+                await self.redis.hgetall(far_speaker_clone.clones_key(meeting_id))
+            )
+            if not clones and not buffered:
+                return
+            consents = _decode_hash(
+                await self.redis.hgetall(far_speaker_clone.consents_key(meeting_id))
+            )
+        except Exception:
+            self.logger.warning(
+                "far_speaker_clone_consent_unreadable", meeting_id=meeting_id, exc_info=True
+            )
+            return
+        for key in buffered:
+            if key[1] not in consents:
+                state.drop_buffer(key)
+        for field in clones:
+            if field not in consents:
+                await self._withdraw_far_clone(meeting_id, field)
+
+    async def _watch_far_clone_consents(self) -> None:
+        """Run _reconcile_far_clones for every room a stand-in has been seen in. Flag on only.
+
+        The rooms are remembered in memory, so a restart forgets them until the far side says
+        something again. A room that stays silent after a restart keeps its clones until the
+        orphan sweep, which is the same backstop every in-meeting clone has.
+        """
+        interval = max(1.0, self.tts_settings.far_speaker_clone_consent_poll_seconds)
+        while not self._shutdown_event.is_set():
+            for meeting_id in list(self._far_clone_state().watched):
+                try:
+                    await self._reconcile_far_clones(meeting_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.logger.exception("far_speaker_clone_reconcile_failed")
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)
+            except TimeoutError:
+                pass
+
     async def _note_clone_state(
         self,
         key: tuple[str, str],
@@ -3295,8 +3812,14 @@ class TTSWorker(BaseWorker):
         language: str = "en",
         sample_rate: int = 16000,
         score: float | None = None,
+        *,
+        far_field: str | None = None,
     ) -> str:
         """Clone voice via Cartesia and cache voice_id in Redis.
+
+        `far_field` (WT-933) is set only for a Meet-side person's clone: `speaker_id` is then the
+        stand-in seat and the voice is recorded under that person's consent field instead of at
+        the speaker's own key. See _cache_far_clone for everything that differs.
 
         Returns "" once the voice is cached, else the `_clone_failure` code for why it is not.
         The capture loop reads it (see _settle_live_clone): until WT-874 it assumed every clone it
@@ -3336,6 +3859,8 @@ class TTSWorker(BaseWorker):
                 label,
                 language,
             )
+            if far_field is not None:
+                return await self._cache_far_clone(meeting_id, far_field, voice_id, language, score)
             cache_key = f"voice:{meeting_id}:{speaker_id}"
             await self.redis.hset(cache_key, "voice_id", voice_id)
             cached = True
@@ -3369,6 +3894,10 @@ class TTSWorker(BaseWorker):
                 speaker_id=speaker_id,
                 error=str(e),
             )
+            if far_field is not None:
+                # No clone-state for the stand-in seat: that stream drives the progress bar of
+                # the person at a WarpTalk microphone, and nobody is sitting at this one.
+                return _clone_failure(e)[0]
             # The last silent exit on this path, and the one that hid the bug above for the whole
             # life of the feature. Every OTHER branch in _consume_audio_for_cloning publishes its
             # reason (WT-420), so the clone-state stream showed `capturing` → `cloning` → nothing,
