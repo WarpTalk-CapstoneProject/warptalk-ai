@@ -22,7 +22,18 @@ from shared.config import STTSettings, resolve_openai_api_key
 from shared.control_markers import is_external_bridge_room, is_external_bridge_speaker
 from shared.disfluency import detect_question, prepass
 from shared.disfluency.normalize import resolve_language
-from shared.far_speaker import CaptionHintTracker, FarSpeakerTracker, SegmentWindow
+from shared.far_speaker import (
+    CaptionHintTracker,
+    FarSpeakerAttribution,
+    FarSpeakerTracker,
+    SegmentWindow,
+)
+from shared.far_speaker_late import (
+    FAR_SPEAKER_LATE_STREAM,
+    LateFarSpeakerName,
+    LateFarSpeakerNamer,
+    needs_late_attribution,
+)
 from shared.integration_status import OPENAI, IntegrationReport, credential_report
 from shared.prosody import (
     SpeakerBaseline,
@@ -256,6 +267,26 @@ def _build_segment_id(
     source_id = source_message_id.decode("utf-8", errors="replace")
     material = f"warptalk:stt:{meeting_id}:{speaker_id}:{source_id}:{start_ms}:{end_ms}:{text}"
     return str(uuid.uuid5(uuid.NAMESPACE_URL, material))
+
+
+def _far_speaker_window(
+    result: STTResultMessage,
+    chunk: AudioChunkMessage,
+    chunk_epoch_start_ms: int,
+    chunk_offset_ms: int,
+) -> SegmentWindow:
+    """A stand-in line's span in unix-epoch ms, the clock caption hints are stamped in.
+
+    The segment's own span inside the chunk when the model gave one; the whole chunk when it did
+    not (early sentences carry start == end). One function so the attribution at publish time and
+    the late re-attribution (shared/far_speaker_late.py) ask about exactly the same window.
+    """
+    chunk_end_ms = chunk.timestamp_ms
+    if result.end_ms > result.start_ms:
+        start = chunk_epoch_start_ms + max(0, result.start_ms - chunk_offset_ms)
+        end = chunk_epoch_start_ms + max(0, result.end_ms - chunk_offset_ms)
+        return SegmentWindow(min(start, chunk_end_ms), min(end, chunk_end_ms))
+    return SegmentWindow(chunk_epoch_start_ms, chunk_end_ms)
 
 
 class STTWorker(BaseWorker):
@@ -933,6 +964,10 @@ class STTWorker(BaseWorker):
         tracker = getattr(self, "_far_speaker_tracker_impl", None)
         if tracker is not None and hasattr(tracker, "forget"):
             tracker.forget(room_id)
+        # A line still waiting for its late far-side name belongs to a meeting that is over.
+        namer: LateFarSpeakerNamer | None = getattr(self, "_late_far_speaker_namer_impl", None)
+        if namer is not None:
+            namer.cancel_meeting(room_id)
         # Same reasoning as the four above: one entry per (meeting, speaker) whose turn was
         # open when the room ended, held forever otherwise.
         for noise_key in [
@@ -953,6 +988,9 @@ class STTWorker(BaseWorker):
             baselines.pop(key, None)
 
     async def _cleanup(self) -> None:
+        namer: LateFarSpeakerNamer | None = getattr(self, "_late_far_speaker_namer_impl", None)
+        if namer is not None:
+            namer.cancel_all()
         for name in ("_prewarm_listener_task", "_warm_pool_task"):
             task = getattr(self, name, None)
             if task is None:
@@ -1288,6 +1326,10 @@ class STTWorker(BaseWorker):
                 elif leak_review and await self._is_far_side_leak(result):
                     return
                 result = await self._publish_stt_result(result, message_id)
+                if bridge_chunk:
+                    self._schedule_late_far_speaker(
+                        result, chunk, chunk_epoch_start_ms, chunk_offset_ms
+                    )
                 self.logger.info(
                     "stt_early_sentence",
                     meeting_id=chunk.meeting_id,
@@ -1485,6 +1527,10 @@ class STTWorker(BaseWorker):
 
             result = await self._publish_stt_result(result, message_id)
             published_segments += 1
+            if bridge_chunk:
+                self._schedule_late_far_speaker(
+                    result, chunk, chunk_epoch_start_ms, chunk_offset_ms
+                )
 
             self.logger.info(
                 "segment_transcribed",
@@ -2232,15 +2278,7 @@ class STTWorker(BaseWorker):
         tracker = self._far_speaker_tracker()
         if tracker is None:
             return result
-        chunk_end_ms = chunk.timestamp_ms
-        # The segment's own span inside the chunk when the model gave one; the whole chunk when
-        # it did not (early sentences carry start == end).
-        if result.end_ms > result.start_ms:
-            start = chunk_epoch_start_ms + max(0, result.start_ms - chunk_offset_ms)
-            end = chunk_epoch_start_ms + max(0, result.end_ms - chunk_offset_ms)
-            window = SegmentWindow(min(start, chunk_end_ms), min(end, chunk_end_ms))
-        else:
-            window = SegmentWindow(chunk_epoch_start_ms, chunk_end_ms)
+        window = _far_speaker_window(result, chunk, chunk_epoch_start_ms, chunk_offset_ms)
         try:
             attribution = await tracker.attribute(result.meeting_id, window)
         except Exception:
@@ -2279,6 +2317,68 @@ class STTWorker(BaseWorker):
                 "far_speaker_confidence": attribution.confidence,
             }
         )
+
+    def _late_far_speaker_namer(self) -> LateFarSpeakerNamer | None:
+        """The late-name scheduler (shared/far_speaker_late.py), or None when it is off."""
+        tracker = self._far_speaker_tracker()
+        if tracker is None:
+            return None
+        namer: LateFarSpeakerNamer | None = getattr(self, "_late_far_speaker_namer_impl", None)
+        if namer is None:
+
+            async def publish_late(message: LateFarSpeakerName) -> None:
+                # Its own stream, never stt:results - see shared/far_speaker_late.py.
+                await self.publish(FAR_SPEAKER_LATE_STREAM, message.meeting_id, message.to_redis())
+
+            namer = LateFarSpeakerNamer(
+                tracker,
+                publish_late,
+                self.logger,
+                min_confidence=self.stt_settings.far_speaker_name_min_confidence,
+                delays_ms=self.stt_settings.far_speaker_late_delays_ms,
+                max_pending=self.stt_settings.far_speaker_late_max_pending,
+            )
+            self._late_far_speaker_namer_impl = namer
+        return namer if namer.enabled else None
+
+    def _schedule_late_far_speaker(
+        self,
+        result: STTResultMessage,
+        chunk: AudioChunkMessage,
+        chunk_epoch_start_ms: int,
+        chunk_offset_ms: int,
+    ) -> None:
+        """A stand-in line that just went out unnamed: ask again once its speaker's hints land.
+
+        THE HAND-OVER LINE (PO 2026-10-03). When the far side changes speaker, the new speaker's
+        first line is finalized before their captions reach the desktop, so it is published with
+        the fallback label. Called AFTER the publish and never awaits anything: the line, its
+        translation and its dub are not delayed. A line that went out with a name the gateway
+        shows is never scheduled - a late answer may turn the fallback into a name, never one
+        name into another. Best effort: nothing here may break the transcription path.
+        """
+        try:
+            shown: FarSpeakerAttribution | None = None
+            if result.far_speaker_name and result.far_speaker_confidence is not None:
+                shown = FarSpeakerAttribution(
+                    name=result.far_speaker_name,
+                    source=result.far_speaker_source or "",
+                    confidence=result.far_speaker_confidence,
+                )
+            namer = self._late_far_speaker_namer()
+            if namer is None or not needs_late_attribution(
+                shown, self.stt_settings.far_speaker_name_min_confidence
+            ):
+                return
+            namer.schedule(
+                result.meeting_id,
+                result.segment_id,
+                _far_speaker_window(result, chunk, chunk_epoch_start_ms, chunk_offset_ms),
+            )
+        except Exception:
+            self.logger.warning(
+                "far_speaker_late_schedule_failed", meeting_id=result.meeting_id, exc_info=True
+            )
 
     async def _get_stt_keywords(self, meeting_id: str) -> list[str]:
         """Return structured glossary terms for the provider's keyword-bias field."""
