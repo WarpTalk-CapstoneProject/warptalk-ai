@@ -2613,7 +2613,9 @@ TOOLS: list[ChatTool] = [
             "meetings rules.) The questions appear as a card the user picks from; their answer "
             "arrives "
             "as a normal message on your next turn. Ask everything you need in ONE call: three "
-            "questions in one card is a form, three cards in a row is an interrogation."
+            "questions in one card is a form, three cards in a row is an interrogation. Write "
+            "every question, header and option in the language you are replying in (see the "
+            "Language rule) - not in the language of the meeting text you are asking about."
         ),
         parameters={
             "type": "object",
