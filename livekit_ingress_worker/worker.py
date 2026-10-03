@@ -215,6 +215,20 @@ _SUBSCRIPTION_GRACE_S = 2.0
 # sentence somebody says is usually within ten seconds of joining.
 _SUBSCRIPTION_REPAIR_DELAYS_S = (1.0, 3.0, 6.0, 10.0)
 
+# THE INGRESS OOM, prod 3 Oct 2026. Every reader that stopped — a mute, a republished track that
+# replaced it, a cancel — left its rtc.AudioStream open: nothing called aclose(), so the native
+# side kept delivering 48 kHz frames into the stream's queue, which is UNBOUNDED by default, and
+# nobody was reading it any more. Memory climbed 300-500 MiB per meeting and never came back
+# (Prometheus: 446 -> 858 MiB across one meeting, flat for an hour after), until the pod hit its
+# 1536Mi limit and was OOMKilled at 09:31:32 UTC in the middle of a bridge meeting — after eight
+# minutes in which it published nothing at all.
+#
+# Two guards. Every stream is closed when its reader ends (_close_audio_stream). And the queue
+# is bounded, so even a reader that falls behind costs at most this much audio, dropped oldest
+# first, instead of the process: 3000 frames of 10 ms is 30 s.
+_AUDIO_STREAM_CAPACITY_FRAMES = 3000
+_AUDIO_STREAM_CLOSE_TIMEOUT_S = 5.0
+
 # Room lifecycle states that mean "this meeting is happening right now", used by
 # _rediscover_active_rooms to decide which snapshots are worth reclaiming after a restart.
 #
@@ -1795,7 +1809,7 @@ class LiveKitIngressWorker(BaseWorker):
 
     async def process_audio_track(self, room_name: str, speaker_id: str, track: rtc.Track) -> None:
         """Stream audio from LiveKit, gate with VAD, publish only speech chunks."""
-        audio_stream = rtc.AudioStream(track)
+        audio_stream = rtc.AudioStream(track, capacity=_AUDIO_STREAM_CAPACITY_FRAMES)
         sample_rate = self.SAMPLE_RATE
         # Distinguishes a reader somebody stopped from one that stopped itself — see the finally
         # block. Without it both ended on the same INFO line and WT-404 was invisible.
@@ -2244,6 +2258,9 @@ class LiveKitIngressWorker(BaseWorker):
         except Exception:
             self.logger.exception("process_audio_track_error", track_sid=track.sid)
         finally:
+            # FIRST, and off this task: see _AUDIO_STREAM_CAPACITY_FRAMES. Scheduled rather than
+            # awaited so a cancelled reader is not held open by its own teardown.
+            self._schedule_audio_stream_close(audio_stream, track.sid)
             # Publish any remaining speech buffer. Gated on the speech in it, for the same reason
             # the end-of-utterance path is: the track can end on a hangover tail, and buffer
             # length would count that padding as somebody having spoken.
@@ -2283,6 +2300,26 @@ class LiveKitIngressWorker(BaseWorker):
                     detail="the reader stopped without being cancelled; "
                     "the idle sweep re-attaches if the track is still published",
                 )
+
+    def _schedule_audio_stream_close(self, audio_stream: Any, track_sid: str) -> None:
+        task = asyncio.create_task(self._close_audio_stream(audio_stream, track_sid))
+        tasks: set[asyncio.Task[Any]] | None = getattr(self, "_event_tasks", None)
+        if tasks is not None:
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+    async def _close_audio_stream(self, audio_stream: Any, track_sid: str) -> None:
+        """Release the native stream and its frame queue. Bounded: aclose waits for the stream's
+        own task to see end-of-stream, and a stream that never says so must not leak a waiter."""
+        try:
+            await asyncio.wait_for(audio_stream.aclose(), timeout=_AUDIO_STREAM_CLOSE_TIMEOUT_S)
+        except TimeoutError:
+            run_task = getattr(audio_stream, "_task", None)
+            if isinstance(run_task, asyncio.Task):
+                run_task.cancel()
+            self.logger.warning("audio_stream_close_timed_out", track_sid=track_sid)
+        except Exception:
+            self.logger.debug("audio_stream_close_failed", track_sid=track_sid, exc_info=True)
 
     def _far_side_overlap_gate(self) -> FarSideOverlapGate | None:
         """The per-process same-source gate, or None when FAR_SIDE_GATE_ENABLED is off.
