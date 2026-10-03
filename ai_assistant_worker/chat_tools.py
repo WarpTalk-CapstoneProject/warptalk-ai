@@ -1347,6 +1347,19 @@ def _transcript_window_arguments(
         before = int(raw_before)
     except (TypeError, ValueError):
         return "before_sequence must be a positive integer."
+    # 0 AND 1 MEAN "NOT GIVEN" (prod, 3 Oct 2026, room 01a1016c).
+    #
+    # The model fills every property it is offered, optional or not, so a
+    # plain "what was said?" arrived as before_sequence=0. That was refused as not positive, the
+    # model "corrected" it to 1, and 1 means "the segments before the first one" — always none.
+    # Every in-meeting question about the transcript came back `segments: []` beside
+    # `totalSegments: 40`, and WarpBot told the room the transcript was not ready.
+    #
+    # Neither value is ever a real page: nothing precedes segment 1, and a page that starts at
+    # 1 reports omittedEarlier=false, so no hint ever asks for before_sequence=1. Both therefore
+    # fall through to `range`, which is what the caller meant.
+    if before in (0, 1):
+        return raw_range == "beginning", None
     if before < 1:
         return "before_sequence must be a positive integer."
     # An explicit position outranks `range`: it already says which part of the meeting.
@@ -3182,9 +3195,9 @@ TOOLS: list[ChatTool] = [
                     "type": "integer",
                     "description": (
                         "Page backwards: return the segments immediately before this sequence "
-                        "number (those with a smaller one), ending right before it. A positive "
-                        "integer — pass the returnedFrom of the previous call to read the part "
-                        "before it."
+                        "number (those with a smaller one), ending right before it. Only set it "
+                        "to the returnedFrom of a previous call whose omittedEarlier was true; "
+                        "otherwise omit it (0 is treated as omitted) and use range."
                     ),
                 },
             },
