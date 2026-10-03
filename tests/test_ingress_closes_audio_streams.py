@@ -128,3 +128,53 @@ async def test_a_close_that_never_returns_does_not_leak_a_waiter(
     assert run_task.cancelled()
     warned = [c.args[0] for c in worker.logger.warning.call_args_list]
     assert "audio_stream_close_timed_out" in warned
+
+
+@pytest.mark.asyncio
+async def test_livekit_resamples_natively_to_what_the_pipeline_uses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """48 kHz frames crossed into Python 3x larger than needed and back out through a second
+    FFI resample call, per frame per speaker. LiveKit is asked for 16 kHz mono instead."""
+    factory = MagicMock(return_value=_Stream(ends=True))
+    monkeypatch.setattr(rtc, "AudioStream", factory)
+    worker = _worker()
+
+    await worker.process_audio_track(ROOM, SPEAKER, _track())
+    await _drain(worker)
+
+    kwargs = factory.call_args.kwargs
+    assert kwargs["sample_rate"] == LiveKitIngressWorker.SAMPLE_RATE
+    assert kwargs["num_channels"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_frame_already_at_16k_mono_skips_the_python_resampler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = rtc.AudioFrame(
+        data=b"\x00\x00" * 160, sample_rate=16000, num_channels=1, samples_per_channel=160
+    )
+
+    class _OneFrame(_Stream):
+        def __init__(self) -> None:
+            super().__init__(ends=True)
+            self.sent = False
+
+        async def __anext__(self) -> object:
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            event = MagicMock()
+            event.frame = frame
+            return event
+
+    monkeypatch.setattr(rtc, "AudioStream", MagicMock(return_value=_OneFrame()))
+    resampler = MagicMock()
+    monkeypatch.setattr(rtc, "AudioResampler", resampler)
+    worker = _worker()
+
+    await worker.process_audio_track(ROOM, SPEAKER, _track())
+    await _drain(worker)
+
+    resampler.assert_not_called()

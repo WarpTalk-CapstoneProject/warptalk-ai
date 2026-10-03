@@ -1809,8 +1809,18 @@ class LiveKitIngressWorker(BaseWorker):
 
     async def process_audio_track(self, room_name: str, speaker_id: str, track: rtc.Track) -> None:
         """Stream audio from LiveKit, gate with VAD, publish only speech chunks."""
-        audio_stream = rtc.AudioStream(track, capacity=_AUDIO_STREAM_CAPACITY_FRAMES)
         sample_rate = self.SAMPLE_RATE
+        # Resampled and downmixed by LiveKit's native side, not here. Asked for at the 48 kHz the
+        # track carries, every 10 ms frame crossed into Python three times larger than the VAD and
+        # STT ever use, and then crossed back out again through a second FFI call to
+        # rtc.AudioResampler — per frame, per speaker, for the whole meeting. The resampler below
+        # stays as a fallback for a stream that does not honour the request.
+        audio_stream = rtc.AudioStream(
+            track,
+            capacity=_AUDIO_STREAM_CAPACITY_FRAMES,
+            sample_rate=sample_rate,
+            num_channels=1,
+        )
         # Distinguishes a reader somebody stopped from one that stopped itself — see the finally
         # block. Without it both ended on the same INFO line and WT-404 was invisible.
         cancelled = False
@@ -1992,14 +2002,17 @@ class LiveKitIngressWorker(BaseWorker):
                     )
                     first_frame_logged = True
 
-                if resampler is None:
-                    resampler = rtc.AudioResampler(
-                        input_rate=frame.sample_rate,
-                        output_rate=sample_rate,
-                        num_channels=frame.num_channels,
-                    )
-
-                resampled_frames = resampler.push(frame)
+                if frame.sample_rate == sample_rate and frame.num_channels == 1:
+                    # The ordinary case now: LiveKit already delivered 16 kHz mono.
+                    resampled_frames = [frame]
+                else:
+                    if resampler is None:
+                        resampler = rtc.AudioResampler(
+                            input_rate=frame.sample_rate,
+                            output_rate=sample_rate,
+                            num_channels=frame.num_channels,
+                        )
+                    resampled_frames = resampler.push(frame)
 
                 for r_frame in resampled_frames:
                     data = bytes(r_frame.data)
