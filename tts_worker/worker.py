@@ -20,6 +20,7 @@ import functools
 import hashlib
 import json
 import time
+import unicodedata
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -30,6 +31,7 @@ from typing import Any, cast
 from shared import isochrony
 from shared.base_worker import BaseWorker
 from shared.config import TTSSettings
+from shared.control_markers import EXTERNAL_BRIDGE_SPEAKER_ID, is_external_bridge_speaker
 from shared.integration_status import (
     CARTESIA,
     LIVEKIT,
@@ -115,6 +117,51 @@ _PREVIEW_RESULT_PREFIX = "voice:preview:"
 # deleted takes its preview with it at the next expiry. A day keeps repeat plays free without
 # holding audio for a voice nobody has touched in a week.
 _PREVIEW_RESULT_TTL_SECONDS = 24 * 60 * 60
+
+# WT-932 — one stock voice per person on the Meet side of a bridge room.
+#
+# Everyone in the Meet call is published under ONE stand-in speaker_id, so the hashed default
+# voice gave the whole far side a single voice. The caption name translation_worker now forwards
+# (TranslationResultMessage.far_speaker_name) is the only thing that can tell two of them apart,
+# and it is a guess: STT matched caption hints to the segment's audio window.
+#
+# Only a certain guess is acted on. 1.0 means every caption hint inside the segment named this
+# person; anything lower is a hand-over between speakers or the nearest-hint path (capped at 0.5).
+# Acting on those would be worse than doing nothing: a wrong name puts one person's words in
+# ANOTHER person's voice, which a listener reads as that other person saying them, whereas the
+# shared stand-in voice is merely uninformative. Below this the segment keeps today's voice.
+FAR_SPEAKER_VOICE_MIN_CONFIDENCE = 1.0
+# field = short hash of the far-speaker key, value = the catalog voice it was given. Keyed by
+# meeting AND language because catalogs are per language. See _far_speaker_voice_id.
+_FAR_SPEAKER_VOICES_PREFIX = "tts:far_speaker_voices:"
+# hset has no TTL of its own. Refreshed whenever a new name is given a voice, so it outlives any
+# meeting that is still meeting new people and is gone a day after the last one.
+_FAR_SPEAKER_VOICES_TTL_SECONDS = 24 * 60 * 60
+
+
+def far_speaker_voice_key(
+    speaker_id: str, far_speaker_name: str | None, far_speaker_confidence: float | None
+) -> str | None:
+    """The per-person key a bridge stand-in segment's stock voice is chosen for, or None.
+
+    None is "today's voice", and it is the answer for everything except a stand-in segment whose
+    caption name is certain: a native speaker (the gate is the stand-in id — stray far_speaker
+    fields on anyone else are ignored), a segment nobody named, and a name below
+    FAR_SPEAKER_VOICE_MIN_CONFIDENCE.
+
+    The name is folded (NFKC, casefold, whitespace collapsed) so "Trần  An" and "trần an" are one
+    person with one voice. The key starts with the stand-in id so it can never equal a real
+    participant's id in the persona hash.
+    """
+    if not is_external_bridge_speaker(speaker_id):
+        return None
+    if far_speaker_confidence is None or far_speaker_confidence < FAR_SPEAKER_VOICE_MIN_CONFIDENCE:
+        return None
+    name = " ".join(unicodedata.normalize("NFKC", far_speaker_name or "").casefold().split())
+    if not name:
+        return None
+    return f"{EXTERNAL_BRIDGE_SPEAKER_ID}:{name}"
+
 
 # What the preview says, per language.
 #
@@ -1512,7 +1559,11 @@ class TTSWorker(BaseWorker):
             return
 
         variants = await self._resolve_voice_variants(
-            translation.meeting_id, translation.speaker_id, translation.target_lang
+            translation.meeting_id,
+            translation.speaker_id,
+            translation.target_lang,
+            far_speaker_name=translation.far_speaker_name,
+            far_speaker_confidence=translation.far_speaker_confidence,
         )
         # Before synthesizing: a listener is still subscribed to any variant track this speaker
         # no longer gets, and hears nothing on it. See LiveKitTTSPublisher.retire_voice_variants.
@@ -1565,7 +1616,12 @@ class TTSWorker(BaseWorker):
             )
 
     async def _resolve_voice_variants(
-        self, meeting_id: str, speaker_id: str, target_lang: str
+        self,
+        meeting_id: str,
+        speaker_id: str,
+        target_lang: str,
+        far_speaker_name: str | None = None,
+        far_speaker_confidence: float | None = None,
     ) -> list[tuple[str, str, str]]:
         """Every distinct (voice_id, voice_type, voice_key) this (speaker, target_lang)
         must be rendered into.
@@ -1590,6 +1646,14 @@ class TTSWorker(BaseWorker):
             not overrule it. What the listener chooses is which language they hear — and
             the same voice is rendered once per distinct target language, so A speaking
             Vietnamese with a cloned voice is heard by B in English IN A'S VOICE.
+
+        THE BRIDGE STAND-IN IS SEVERAL PEOPLE (WT-932)
+            `far_speaker_name` / `far_speaker_confidence` only ever change WHICH catalogue voice
+            the "default" entry carries, and only for the stand-in seat with a certain name (see
+            far_speaker_voice_key). The entry is still the one default variant, voice_key "", on
+            the stand-in's own LiveKit identity — no new variant, no new track. A listener's
+            explicit pick below is untouched, and still collapses the whole far side into the
+            voice they picked.
 
             It did not work that way. `_get_explicit_voice_choices` was applied to every
             speaker unconditionally, and the client accepts ONLY the preference track once
@@ -1620,9 +1684,20 @@ class TTSWorker(BaseWorker):
         elif cloned_voice_id:
             default_voice_id, default_voice_type = cloned_voice_id, "cloned"
         else:
-            default_voice_id = await self._hashed_default_voice_id(
-                target_lang, speaker_id, meeting_id
+            # Only reached with no profile and no clone, so those two are untouched by this.
+            far_key = (
+                far_speaker_voice_key(speaker_id, far_speaker_name, far_speaker_confidence)
+                if meeting_id
+                else None
             )
+            if far_key:
+                default_voice_id = await self._far_speaker_voice_id(
+                    target_lang, meeting_id, speaker_id, far_key
+                )
+            else:
+                default_voice_id = await self._hashed_default_voice_id(
+                    target_lang, speaker_id, meeting_id
+                )
             default_voice_type = "default"
 
         variants: list[tuple[str, str, str]] = [(default_voice_id, default_voice_type, "")]
@@ -1857,6 +1932,121 @@ class TTSWorker(BaseWorker):
         roster = await self._room_speaker_ids(meeting_id) if meeting_id else set()
         roster.add(speaker_id)
         return str(self._assign_voice(catalog, sorted(roster), speaker_id)["id"])
+
+    async def _far_speaker_voice_id(
+        self, language: str, meeting_id: str, speaker_id: str, far_key: str
+    ) -> str:
+        """The stock voice ONE person on the Meet side of a bridge room is dubbed in (WT-932).
+
+        `far_key` comes from far_speaker_voice_key; `speaker_id` is the stand-in seat.
+
+        WHY THE KEY IS NOT SIMPLY ADDED TO THE ROSTER
+            _assign_voice walks the sorted roster and lets each id claim in turn, so a new id
+            shifts whoever sorts after it and wanted the same voice. A far-speaker key starts
+            with the stand-in GUID — all zeros — and therefore sorts ahead of nearly every real
+            participant: the first caption name would be free to take a voice somebody in the
+            room has been heard in since the meeting started. Names appear mid-meeting by
+            nature, so that reshuffle would be the normal case, not the rare one _assign_voice
+            accepts for a join.
+
+        WHAT IT DOES INSTEAD: FIRST CLAIM, REMEMBERED
+            The roster is resolved exactly as it is today, without the key in it. The key then
+            claims — with the same _claim_voice preference walk — the first voice that is not
+            held by anyone on the roster (the plain stand-in included, so a named person does not
+            sound like "somebody on the far side"), by another caption name, or by a listener's
+            explicit pick. The answer is written to a per-(meeting, language) Redis hash and read
+            back for every later sentence. So:
+
+            * nobody already in the room changes voice, because nothing about their resolution
+              changed;
+            * the same name keeps the same voice for the meeting even when the roster changes
+              under it, on every replica — which a stateless rule could not promise;
+            * two names differ whenever the catalogue has a voice left. When it has none they
+              share, deterministically, as speakers already do.
+
+            A participant who joins later can still land on a voice a caption name already
+            holds: they resolve statelessly and do not look here. That is the same trade
+            _assign_voice makes for joins, and it never moves anyone already speaking.
+
+            Not atomic across replicas: two workers meeting the same NEW name at the same
+            instant compute the same answer from the same state, and two different new names in
+            one instant could pick one voice. One audio feed says one thing at a time, so that
+            needs two people to be named for the first time within a round trip of each other.
+
+        Any failure to read the hash is answered with today's stand-in voice rather than a guess:
+        an unremembered choice could differ on the next sentence, and one shared voice is the
+        behaviour this feature started from.
+        """
+        catalog = await self._get_voice_catalog(language)
+        if not catalog:
+            return CartesiaSynthesizer._default_voice_id(language)
+
+        hash_key = f"{_FAR_SPEAKER_VOICES_PREFIX}{meeting_id}:{language}"
+        # A short hash, never the name: this is a person's display name from someone else's
+        # call, and neither Redis keys nor logs are a place for it.
+        field = hashlib.sha256(far_key.encode()).hexdigest()[:12]
+        try:
+            raw = await self.redis.hgetall(hash_key)
+        except Exception:
+            self.logger.warning(
+                "far_speaker_voices_unavailable",
+                meeting_id=meeting_id,
+                lang=language,
+                exc_info=True,
+            )
+            return await self._hashed_default_voice_id(language, speaker_id, meeting_id)
+        remembered = {
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+            for k, v in (raw or {}).items()
+        }
+
+        # Still in the catalogue: a refresh can drop a voice, and a remembered id Cartesia no
+        # longer serves would fail every sentence this person says. Then they claim again.
+        existing = remembered.get(field)
+        if existing and any(str(voice["id"]) == existing for voice in catalog):
+            return existing
+
+        ordered_catalog = sorted(catalog, key=lambda voice: str(voice["id"]))
+        roster = await self._room_speaker_ids(meeting_id)
+        roster.add(speaker_id)
+        # The same walk _assign_voice does, kept whole: every voice the room resolves to today.
+        taken: set[str] = set()
+        for uid in sorted(roster):
+            taken.add(str(self._claim_voice(ordered_catalog, uid, taken)["id"]))
+        taken.update(voice for name, voice in remembered.items() if name != field)
+        # A listener's pick is rendered as its own variant unless the default already carries
+        # that voice. Keeping names off picked voices keeps that variant's track from being
+        # retired and reopened as the far side changes speaker.
+        try:
+            taken.update(await self._get_explicit_voice_choices(meeting_id, language))
+        except Exception:
+            self.logger.warning(
+                "voice_preferences_unavailable",
+                meeting_id=meeting_id,
+                lang=language,
+                exc_info=True,
+            )
+
+        voice_id = str(self._claim_voice(ordered_catalog, far_key, taken)["id"])
+        try:
+            await self.redis.hset(hash_key, field, voice_id)
+            await self.redis.expire(hash_key, _FAR_SPEAKER_VOICES_TTL_SECONDS)
+        except Exception:
+            self.logger.warning(
+                "far_speaker_voice_not_remembered",
+                meeting_id=meeting_id,
+                lang=language,
+                exc_info=True,
+            )
+        # Once per (meeting, name, language): every later sentence returns from the hash above.
+        self.logger.info(
+            "far_speaker_voice_assigned",
+            meeting_id=meeting_id,
+            lang=language,
+            voice_id=voice_id,
+            far_speaker_hash=field,
+        )
+        return voice_id
 
     async def _get_explicit_voice_choices(self, meeting_id: str, target_lang: str) -> set[str]:
         """Distinct voice_ids explicitly chosen (via TranslationRoomHub.
