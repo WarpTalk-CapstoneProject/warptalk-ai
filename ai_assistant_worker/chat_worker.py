@@ -56,6 +56,9 @@ from ai_assistant_worker.mcp_tools import (
 from ai_assistant_worker.mcp_tools import (
     build_mcp_plugin_connection_action as _build_mcp_plugin_connection_action,
 )
+from ai_assistant_worker.mcp_tools import (
+    drop_blank_optional_arguments as _drop_blank_optional_arguments,
+)
 from ai_assistant_worker.mcp_tools import normalize_mcp_tool_payload as _normalize_mcp_tool_payload
 from ai_assistant_worker.mcp_tools import (
     parse_disabled_plugin_keys as _parse_disabled_plugin_keys,
@@ -1379,7 +1382,13 @@ class ChatAssistantWorker(BaseWorker):
                         effect=effect,
                         policy=policy,
                     ),
-                    handler=self._build_mcp_tool_handler(plugin_key, name, request, label),
+                    handler=self._build_mcp_tool_handler(
+                        plugin_key,
+                        name,
+                        request,
+                        label,
+                        parameters=cast(dict[str, Any], parameters),
+                    ),
                     plugin_key=plugin_key,
                 )
             )
@@ -1392,6 +1401,7 @@ class ChatAssistantWorker(BaseWorker):
         tool_name: str,
         request: ChatRequestMessage,
         tool_label: str | None = None,
+        parameters: dict[str, Any] | None = None,
     ) -> Callable[[ToolContext, dict[str, Any]], Awaitable[str]]:
         async def handler(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             assistant_client = ctx.assistant_client
@@ -1400,6 +1410,9 @@ class ChatAssistantWorker(BaseWorker):
 
             always_allow = _read_mcp_always_allow(arguments)
             tool_arguments, confirmation_token = _split_mcp_tool_arguments(arguments)
+            # Before the confirmation token is checked server-side too: the confirm call re-sends
+            # the model's arguments and both are filtered the same way, so their hashes agree.
+            tool_arguments = _drop_blank_optional_arguments(tool_arguments, parameters)
             response = await assistant_client.post(
                 "/api/v1/assistant/mcp/tools/execute",
                 json={

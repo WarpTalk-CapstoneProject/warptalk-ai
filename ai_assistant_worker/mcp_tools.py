@@ -72,6 +72,37 @@ def split_mcp_tool_arguments(arguments: dict[str, Any]) -> tuple[dict[str, Any],
     return clean_arguments, None
 
 
+def drop_blank_optional_arguments(
+    arguments: dict[str, Any], parameters: dict[str, Any] | None
+) -> dict[str, Any]:
+    """The arguments without optional strings the model filled with nothing.
+
+    The model fills every property it is offered (it does not omit optional ones), so a plain
+    "list my Linear issues" arrives as ``team: ""``, ``cursor: ""``, ``customView: " "``. Most
+    servers shrug at ``""``; some refuse it, and where the schema forbids ``""`` (Linear's
+    ``customView`` has ``minLength: 1``) the model reaches for ``" "``, then "all", then "x". Prod,
+    2 and 3 Oct 2026: 12 of 20 Linear calls failed with ``tool_error`` this way, each answer
+    arriving only after several rounds.
+
+    Only a top-level property the schema does NOT list as required, whose value is a string that
+    is empty or whitespace, is dropped. A required one is kept for the server to judge, and so is
+    every non-string: ``0`` and ``false`` are real values as often as they are filler.
+    """
+    if not arguments:
+        return arguments
+    required_raw = (parameters or {}).get("required")
+    required = (
+        {name for name in required_raw if isinstance(name, str)}
+        if isinstance(required_raw, list)
+        else set()
+    )
+    return {
+        name: value
+        for name, value in arguments.items()
+        if name in required or not (isinstance(value, str) and not value.strip())
+    }
+
+
 def read_mcp_always_allow(arguments: dict[str, Any]) -> bool:
     """WT-687: the user chose Always allow on the card. Only a real ``true`` counts."""
     return arguments.get("alwaysAllow") is True
