@@ -22,7 +22,7 @@ import json
 import time
 import unicodedata
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -481,8 +481,13 @@ def _clone_language(hint: str) -> str:
 _UNRESOLVED_LANGUAGES = {"", "auto", "unknown", "und"}
 
 #: How often dub tracks are checked against the room's current languages — see
-#: TTSWorker._reconcile_dub_targets. Two HGETALLs per room with a live dub track, per pass.
+#: TTSWorker._reconcile_dub_targets. Two HGETALLs per GOOGLE MEET BRIDGE room with a live dub
+#: track, per pass; native meeting rooms are never reconciled.
 _DUB_TARGET_RECONCILE_S = 3.0
+#: How long a room found NOT to be a bridge room (no stand-in seat in speak_languages yet) is
+#: trusted before one HGET re-checks it — the stand-in may join after the first dub track. A
+#: positive answer is kept for the room's lifetime.
+_BRIDGE_ROOM_RECHECK_S = 30.0
 #: A sentence already in flight when the speaker re-picked may still publish on the old track a
 #: moment after the change was seen; that is not translation still feeding it.
 _DUB_TARGET_CHANGE_GRACE_S = 5.0
@@ -1044,8 +1049,48 @@ class TTSWorker(BaseWorker):
                 # A missed pass costs what this exists to remove, at most one idle timeout.
                 self.logger.exception("dub_target_reconcile_failed")
 
+    async def _is_bridge_room(self, meeting_id: str, speaker_ids: Iterable[str]) -> bool:
+        """Whether this meeting is a Google Meet EXTERNAL_BRIDGE room, cached per room.
+
+        Free when this process already dubs the stand-in (a speaker id is the stand-in's);
+        otherwise one HGET of the stand-in's field in `speak_languages` — only an
+        EXTERNAL_BRIDGE room seats it (shared.control_markers.is_external_bridge_room). A
+        positive is kept until _cleanup_room; a negative is re-checked after
+        _BRIDGE_ROOM_RECHECK_S, so a room whose stand-in joins late is picked up. An
+        unreadable answer counts as "not bridge" for this pass and is not cached.
+        """
+        cache: dict[str, float | None] | None = getattr(self, "_dub_bridge_rooms", None)
+        if cache is None:
+            cache = {}
+            self._dub_bridge_rooms = cache
+        if meeting_id in cache:
+            checked_at = cache[meeting_id]
+            if checked_at is None:
+                return True
+            if time.monotonic() - checked_at < _BRIDGE_ROOM_RECHECK_S:
+                return False
+        if any(is_external_bridge_speaker(speaker_id) for speaker_id in speaker_ids):
+            cache[meeting_id] = None
+            return True
+        try:
+            seat = await self.redis.hget(
+                f"translationRoom:{meeting_id}:speak_languages", EXTERNAL_BRIDGE_SPEAKER_ID
+            )
+        except Exception:
+            self.logger.warning("dub_bridge_room_unreadable", meeting_id=meeting_id, exc_info=True)
+            return False
+        if seat is not None:
+            cache[meeting_id] = None
+            return True
+        cache[meeting_id] = time.monotonic()
+        return False
+
     async def _reconcile_dub_targets(self) -> int:
         """Retire dub tracks whose (speaker, target language) stopped being a target.
+
+        GOOGLE MEET BRIDGE ROOMS ONLY (_is_bridge_room). A native meeting room is skipped before
+        any of the reads below and keeps the previous behaviour: its tracks leave on the idle
+        sweep and nothing else.
 
         A MID-MEETING LANGUAGE CHANGE REACHES THIS WORKER ONLY AS THE ABSENCE OF MESSAGES
             Translation fans out per utterance from the room's hashes (translation_worker
@@ -1098,6 +1143,8 @@ class TTSWorker(BaseWorker):
         now = time.monotonic()
         retired = 0
         for meeting_id, speakers in by_room.items():
+            if not await self._is_bridge_room(meeting_id, speakers):
+                continue
             try:
                 listen = _decode_hash(
                     await self.redis.hgetall(f"translationRoom:{meeting_id}:languages")
@@ -1151,6 +1198,7 @@ class TTSWorker(BaseWorker):
         stale_keys = [key for key in self._key_locks if key[0] == room_id]
         for key in stale_keys:
             self._key_locks.pop(key, None)
+        getattr(self, "_dub_bridge_rooms", {}).pop(room_id, None)
         # Same lifetime as the locks. A room that ends and is somehow seen again must not judge
         # its first sentence as late against a timeline from the previous meeting.
         #

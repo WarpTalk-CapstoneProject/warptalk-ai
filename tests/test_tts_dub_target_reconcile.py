@@ -5,6 +5,10 @@ reach tts_worker only as messages that stop arriving. The track used to stay for
 timeout, and while it is in the room the web client mutes the speaker's microphone for that
 language's listeners — the bridge host who switched to the Meet side's language went silent there
 for over a minute.
+
+Google Meet BRIDGE rooms only: a native meeting room is never reconciled (its tracks still leave
+only on the idle sweep, as before), and costs at most one HGET per _BRIDGE_ROOM_RECHECK_S to find
+out it is not a bridge room.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock
 
+import tts_worker.worker as tts_worker_module
 from tts_worker.livekit_publisher import LiveKitTTSPublisher
 from tts_worker.worker import TTSWorker
 
@@ -31,11 +36,23 @@ def _publisher_with(bots: dict[tuple[str, str, str, str], float]) -> LiveKitTTSP
     return publisher
 
 
-def _worker(publisher: LiveKitTTSPublisher, listen: dict, speak: dict) -> TTSWorker:
+def _worker(
+    publisher: LiveKitTTSPublisher, listen: dict, speak: dict, *, bridge: bool = True
+) -> TTSWorker:
+    """`bridge=True` seeds room "m" as an already-detected bridge room, so the reconcile tests
+    below do not each have to seat the stand-in; detection itself is tested separately."""
     worker = TTSWorker.__new__(TTSWorker)
     worker.livekit_publisher = publisher
     worker.logger = MagicMock()
     worker.redis = MagicMock()
+    if bridge:
+        worker._dub_bridge_rooms = {"m": None}
+
+    async def hget(key: str, field: str):
+        assert key.endswith(":speak_languages"), key
+        return speak.get(field)
+
+    worker.redis.hget = AsyncMock(side_effect=hget)
 
     async def hgetall(key: str) -> dict:
         if key.endswith(":speak_languages"):
@@ -164,3 +181,65 @@ class TestReconcileDubTargets:
         worker = TTSWorker.__new__(TTSWorker)
         worker.livekit_publisher = None
         assert await worker._reconcile_dub_targets() == 0
+
+
+class TestBridgeRoomsOnly:
+    """The user's rule: reconciliation exists for Google Meet bridge rooms. A native meeting
+    room behaves exactly as before — no retirement, no listen/speak hash reads."""
+
+    async def test_native_room_is_never_reconciled(self) -> None:
+        # Would retire (nobody listens in ja) in a bridge room.
+        publisher = _publisher_with({("m", "host", "ja", ""): time.monotonic()})
+        speak = {"host": "vi", "guest": "en"}
+        worker = _worker(publisher, listen={"host": "vi", "guest": "en"}, speak=speak, bridge=False)
+        assert await worker._reconcile_dub_targets() == 0
+        speak["host"] = "ja"
+        assert await worker._reconcile_dub_targets() == 0
+        assert ("m", "host", "ja", "") in publisher._bots
+        worker.redis.hgetall.assert_not_awaited()
+        # One HGET to learn it is not a bridge room, then cached.
+        assert worker.redis.hget.await_count == 1
+
+    async def test_native_room_is_rechecked_so_a_late_stand_in_is_picked_up(
+        self, monkeypatch
+    ) -> None:
+        clock = [1000.0]
+        monkeypatch.setattr(tts_worker_module.time, "monotonic", lambda: clock[0])
+        publisher = _publisher_with({("m", "host", "ja", ""): clock[0]})
+        speak = {"host": "vi"}
+        listen = {"host": "vi", STANDIN: "en"}
+        worker = _worker(publisher, listen=listen, speak=speak, bridge=False)
+        assert await worker._reconcile_dub_targets() == 0
+        speak[STANDIN] = "en"  # the stand-in joins
+        clock[0] += 1
+        assert await worker._reconcile_dub_targets() == 0  # negative still trusted
+        clock[0] += tts_worker_module._BRIDGE_ROOM_RECHECK_S
+        assert await worker._reconcile_dub_targets() == 1
+        assert worker._dub_bridge_rooms["m"] is None  # positive kept for the room's lifetime
+
+    async def test_stand_in_seat_in_speak_languages_makes_it_a_bridge_room(self) -> None:
+        publisher = _publisher_with({("m", "host", "ja", ""): time.monotonic()})
+        worker = _worker(
+            publisher,
+            listen={"host": "vi", STANDIN: "en"},
+            speak={"host": "vi", STANDIN: "en"},
+            bridge=False,
+        )
+        assert await worker._reconcile_dub_targets() == 1
+
+    async def test_dubbing_the_stand_in_detects_a_bridge_room_without_a_read(self) -> None:
+        publisher = _publisher_with({("m", STANDIN, "ja", ""): time.monotonic()})
+        worker = _worker(publisher, listen={"host": "vi"}, speak={"host": "vi"}, bridge=False)
+        assert await worker._reconcile_dub_targets() == 1
+        worker.redis.hget.assert_not_awaited()
+
+    async def test_room_cleanup_forgets_the_answer(self) -> None:
+        worker = TTSWorker.__new__(TTSWorker)
+        worker._key_locks = {}
+        worker._dub_bridge_rooms = {"m": None, "other": None}
+        worker._room_routes = {}
+        worker._translation_active = {}
+        worker._route_states = {}
+        worker._paused_rooms = set()
+        worker._cleanup_room("m")
+        assert worker._dub_bridge_rooms == {"other": None}

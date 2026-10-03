@@ -1501,10 +1501,39 @@ class TestSTTWorker:
         await worker.process(b"msg-1", chunk.to_redis())
 
         assert worker.model.transcribe.await_args.kwargs["prompt"] is None
+        # A native room: the model keeps the old declaration handling.
+        assert worker.model.transcribe.await_args.kwargs["bridge_room"] is False
         # BaseWorker.publish() calls xadd twice: room stream + global stream
         mock_redis_client._redis.xadd.assert_called()
         streams_published = [str(c.args[0]) for c in mock_redis_client._redis.xadd.call_args_list]
         assert any("stt:results" in s for s in streams_published)
+
+    async def test_a_stand_in_chunk_marks_the_room_bridge_for_the_model(
+        self,
+        mock_redis_client,
+        worker_settings: WorkerSettings,
+        sample_audio_bytes: bytes,
+    ) -> None:
+        worker = STTWorker.__new__(STTWorker)
+        worker.settings = worker_settings
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker.stt_settings = STTSettings()
+        worker._paused_rooms = set()
+        worker._stt_prompts = {}
+        worker._room_languages = {}
+        worker.model = MagicMock()
+        worker.model.transcribe = AsyncMock(return_value=[])
+        chunk = AudioChunkMessage(
+            meeting_id="meeting-1",
+            speaker_id="00000000-0000-0000-0000-00000000b21d",
+            chunk_index=0,
+            audio_data=sample_audio_bytes,
+            language="en",
+        )
+        await worker.process(b"msg-1", chunk.to_redis())
+        assert worker.model.transcribe.await_args.kwargs["bridge_room"] is True
+        assert worker._is_bridge_room("meeting-1")
 
     async def test_process_publishes_early_sentences_without_claiming_confidence(
         self,
@@ -1898,6 +1927,7 @@ class TestSTTWorker:
         worker.redis = mock_redis_client
         worker.logger = MagicMock()
         worker._room_languages = {}
+        worker._bridge_rooms = {"m1"}
         mock_redis_client._redis.get.return_value = None
         mock_redis_client._redis.hgetall.return_value = {b"host": b"vi", b"standin": b"en"}
         assert await worker._get_room_languages("m1", "en") == {"vi", "en"}
@@ -1914,6 +1944,7 @@ class TestSTTWorker:
         worker.redis = mock_redis_client
         worker.logger = MagicMock()
         worker._room_languages = {}
+        worker._bridge_rooms = {"m1"}
         mock_redis_client._redis.get.return_value = None
         mock_redis_client._redis.hgetall.return_value = {b"a": b"vi", b"b": b"en"}
         await worker._get_room_languages("m1", "vi")
@@ -1930,6 +1961,7 @@ class TestSTTWorker:
         worker.redis = mock_redis_client
         worker.logger = MagicMock()
         worker._room_languages = {}
+        worker._bridge_rooms = {"m1"}
         mock_redis_client._redis.get.return_value = None
         mock_redis_client._redis.hgetall.return_value = {b"a": b"vi"}
         assert await worker._get_room_languages("m1", "ja") == {"vi", "ja"}
@@ -1943,6 +1975,7 @@ class TestSTTWorker:
         worker.redis = mock_redis_client
         worker.logger = MagicMock()
         worker._room_languages = {}
+        worker._bridge_rooms = {"m1"}
         mock_redis_client._redis.get.return_value = json.dumps(
             {"room_languages": ["vi", "en", "AUTO"]}
         ).encode()
@@ -1961,6 +1994,7 @@ class TestSTTWorker:
         worker.redis = mock_redis_client
         worker.logger = MagicMock()
         worker._room_languages = {"m1": ({"vi", "en"}, time.monotonic()), "m2": ({"ja"}, 0.0)}
+        worker._bridge_rooms = {"m1", "m2"}
         worker._room_routes = {}
         worker._translation_active = {}
         worker._route_states = {}
@@ -1991,6 +2025,7 @@ class TestSTTWorker:
         worker.redis = mock_redis_client
         worker.logger = MagicMock()
         worker._room_languages = {}
+        worker._bridge_rooms = {"m1"}
         mock_redis_client._redis.get.return_value = None
         mock_redis_client._redis.hgetall.return_value = {}
         assert await worker._get_room_languages("m1", "ja") == set()
@@ -2004,15 +2039,115 @@ class TestSTTWorker:
         worker.redis = mock_redis_client
         worker.logger = MagicMock()
         worker._room_languages = {}
+        worker._bridge_rooms = {"m1"}
         mock_redis_client._redis.get.return_value = None
         mock_redis_client._redis.hgetall.return_value = {b"a": b"vi", b"b": b"en"}
         clock = [1000.0]
         monkeypatch.setattr(stt_worker_module.time, "monotonic", lambda: clock[0])
         await worker._get_room_languages("m1", "vi")
         mock_redis_client._redis.hgetall.return_value = {b"a": b"vi", b"b": b"ja"}
-        clock[0] += stt_worker_module._ROOM_LANGUAGES_TTL_S + 0.1
+        clock[0] += stt_worker_module._BRIDGE_ROOM_LANGUAGES_TTL_S + 0.1
         assert await worker._get_room_languages("m1", "vi") == {"vi", "ja"}
-        assert stt_worker_module._ROOM_LANGUAGES_TTL_S <= 5.0
+        assert stt_worker_module._BRIDGE_ROOM_LANGUAGES_TTL_S <= 5.0
+
+    # --- Native meeting rooms keep the previous behaviour; bridge detection ---------------
+
+    async def test_native_room_keeps_the_15s_ttl_and_never_refetches_for_a_new_pick(
+        self, mock_redis_client, monkeypatch
+    ) -> None:
+        import stt_worker.worker as stt_worker_module
+
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {}
+        worker._bridge_rooms = set()
+        mock_redis_client._redis.get.return_value = None
+        mock_redis_client._redis.hgetall.return_value = {b"a": b"vi", b"b": b"en"}
+        clock = [1000.0]
+        monkeypatch.setattr(stt_worker_module.time, "monotonic", lambda: clock[0])
+        first = await worker._get_room_languages("m1", "vi")
+        assert first == {"vi", "en"}
+
+        mock_redis_client._redis.hgetall.return_value = {b"a": b"vi", b"b": b"fr"}
+        clock[0] += 10.0  # past the bridge TTL, inside the native one
+        # Not in the set, and still no refetch and no merge: exactly the old cache.
+        assert await worker._get_room_languages("m1", "fr") is first
+        assert first == {"vi", "en"}
+        assert mock_redis_client._redis.hgetall.await_count == 1
+
+        clock[0] += 5.1  # past 15s
+        assert await worker._get_room_languages("m1", "ja") == {"vi", "fr"}
+        assert mock_redis_client._redis.hgetall.await_count == 2
+        assert stt_worker_module._ROOM_LANGUAGES_TTL_S == 15.0
+        assert worker._bridge_rooms == set()
+
+    async def test_native_room_keeps_the_old_entry_parsing(self, mock_redis_client) -> None:
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {}
+        mock_redis_client._redis.get.return_value = json.dumps(
+            {"room_languages": ["vi", "AUTO"]}
+        ).encode()
+        mock_redis_client._redis.hgetall.return_value = {b"a": b"vi", b"b": b"auto"}
+        # The old normalise-then-compare let "auto" through as "au"; native rooms are unchanged.
+        assert await worker._get_room_languages("m1", "auto") == {"vi", "au"}
+
+    async def test_native_room_keeps_its_cache_on_audio_routes_updated(
+        self, mock_redis_client
+    ) -> None:
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {"m1": ({"vi", "en"}, time.monotonic())}
+        worker._bridge_rooms = set()
+        worker._room_routes = {}
+        worker._translation_active = {}
+        worker._route_states = {}
+        worker._paused_rooms = set()
+        await worker._handle_route_update_message(
+            {
+                "type": "pmessage",
+                "channel": b"translationRoom:m1:events",
+                "data": json.dumps({"type": "AUDIO_ROUTES_UPDATED", "data": {"routes": []}}),
+            }
+        )
+        assert "m1" in worker._room_languages
+
+    async def test_the_stand_in_seat_is_detected_on_refresh_not_latched_negative(
+        self, mock_redis_client, monkeypatch
+    ) -> None:
+        import stt_worker.worker as stt_worker_module
+
+        worker = STTWorker.__new__(STTWorker)
+        worker.redis = mock_redis_client
+        worker.logger = MagicMock()
+        worker._room_languages = {}
+        mock_redis_client._redis.get.return_value = None
+        mock_redis_client._redis.hgetall.return_value = {b"host": b"vi"}
+        clock = [1000.0]
+        monkeypatch.setattr(stt_worker_module.time, "monotonic", lambda: clock[0])
+        await worker._get_room_languages("m1", "vi")
+        assert not worker._is_bridge_room("m1")
+
+        # The stand-in joins; the next (native-TTL) refresh sees its seat.
+        mock_redis_client._redis.hgetall.return_value = {
+            b"host": b"vi",
+            b"00000000-0000-0000-0000-00000000b21d": b"en",
+        }
+        clock[0] += stt_worker_module._ROOM_LANGUAGES_TTL_S + 0.1
+        assert await worker._get_room_languages("m1", "vi") == {"vi", "en"}
+        assert worker._is_bridge_room("m1")
+
+        # From here bridge rules: a pick the cache lacks refetches at once.
+        mock_redis_client._redis.hgetall.return_value = {
+            b"host": b"vi",
+            b"00000000-0000-0000-0000-00000000b21d": b"fr",
+        }
+        clock[0] += 1.0
+        assert await worker._get_room_languages("m1", "fr") == {"vi", "fr"}
+        assert mock_redis_client._redis.hgetall.await_count == 3
 
 
 def _pcm_tone(hz: float, seconds: float = 1.0, amplitude: float = 0.4) -> bytes:

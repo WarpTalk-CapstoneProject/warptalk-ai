@@ -19,7 +19,7 @@ from typing import Any
 
 from shared.base_worker import TERMINAL_ROOM_STATUSES, BaseWorker
 from shared.config import STTSettings, resolve_openai_api_key
-from shared.control_markers import is_external_bridge_speaker
+from shared.control_markers import is_external_bridge_room, is_external_bridge_speaker
 from shared.disfluency import detect_question, prepass
 from shared.disfluency.normalize import resolve_language
 from shared.far_speaker import CaptionHintTracker, FarSpeakerTracker, SegmentWindow
@@ -82,14 +82,18 @@ def _extract_speaker_key(
 
 
 # The room language set is derived from participants' declared speak-languages, which
-# change as people join/leave AND as they re-pick mid-meeting (TranslationRoomHub
-# SetSpeakLanguage / SetExternalMeetingLanguage write the same hash). Cache it briefly rather
-# than per room-lifetime (unlike the prompt) so a change is picked up within a few seconds.
-# 5s, not the 15s it was: in a bridge room this set is the candidate list the text language-ID
-# labels Latin-script lines from, and a list missing the language somebody just switched to
-# labels their sentences as one of the old languages — evidence _learn_language_evidence then
-# re-pins them with. The speaker's OWN new pick does not wait even 5s (see _get_room_languages).
-_ROOM_LANGUAGES_TTL_S = 5.0
+# change as people join/leave. Cache it briefly rather than per room-lifetime (unlike the
+# prompt) so a newly joined speaker's language is picked up within a few seconds.
+# This is the NATIVE meeting-room TTL and is unchanged.
+_ROOM_LANGUAGES_TTL_S = 15.0
+# GOOGLE MEET BRIDGE ROOMS ONLY (see STTWorker._is_bridge_room): the set also changes when
+# somebody re-picks mid-meeting (TranslationRoomHub SetSpeakLanguage /
+# SetExternalMeetingLanguage write the same hash). There this set is the candidate list the text
+# language-ID labels Latin-script lines from, and a list missing the language somebody just
+# switched to labels their sentences as one of the old languages — evidence
+# _learn_language_evidence then re-pins them with. So bridge rooms refresh every 5s, and the
+# speaker's OWN new pick does not wait even that (see _get_room_languages).
+_BRIDGE_ROOM_LANGUAGES_TTL_S = 5.0
 
 # Denoising modes the provider accepts. An unrecognised string fails the WHOLE session update,
 # taking the language hint and the keywords down with it — _degrade_session_config exists because
@@ -198,6 +202,8 @@ def _room_language_code(value: str | None) -> str:
     stand-in's speak language when the far side speaks several languages (WT-909) — and it put
     a non-language into the room set, the session's language list and the text language-ID's
     candidates.
+
+    Used for Google Meet bridge rooms only; native rooms keep the old parsing unchanged.
     """
     stripped = (value or "").strip()
     if not stripped or stripped.lower() == "auto":
@@ -286,6 +292,9 @@ class STTWorker(BaseWorker):
         # meeting_id -> (set of declared language codes, monotonic timestamp fetched).
         # Refreshed every _ROOM_LANGUAGES_TTL_S so late joiners' languages are picked up.
         self._room_languages: dict[str, tuple[set[str], float]] = {}
+        # Meetings known to be Google Meet EXTERNAL_BRIDGE rooms — see _is_bridge_room. Only
+        # positives are remembered; a room not (yet) in here is re-checked on every refresh.
+        self._bridge_rooms: set[str] = set()
         # (meeting_id, speaker_id) -> lock serializing THAT speaker's own chunks — see
         # _consume_loop for why.
         self._speaker_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -760,6 +769,8 @@ class STTWorker(BaseWorker):
                 meeting_id=meeting_id,
                 speaker_id=speaker_id,
             )
+        if is_external_bridge_speaker(speaker_id):
+            self._mark_bridge_room(meeting_id)
         allowed_languages = await self._get_room_languages(
             meeting_id, _language_hint_for_stt(declared_language) if declared_language else None
         )
@@ -863,7 +874,8 @@ class STTWorker(BaseWorker):
         await self._run_in_speaker_order(message_id, data)
 
     async def _handle_route_update_message(self, message: dict[str, Any]) -> None:
-        """Base handling, then drop this room's cached language set on AUDIO_ROUTES_UPDATED.
+        """Base handling, then — in a Google Meet bridge room only — drop this room's cached
+        language set on AUDIO_ROUTES_UPDATED. Native rooms keep their cache for the TTL, as before.
 
         A participant_language_changed (SetSpeakLanguage / SetListenLanguage /
         SetExternalMeetingLanguage) makes translation-room rebuild the mesh, rewrite
@@ -876,8 +888,28 @@ class STTWorker(BaseWorker):
         """
         await super()._handle_route_update_message(message)
         room_id = _route_update_room_id(message)
-        if room_id:
+        if room_id and self._is_bridge_room(room_id):
             self._room_languages.pop(room_id, None)
+
+    def _is_bridge_room(self, meeting_id: str) -> bool:
+        """Whether this meeting is a Google Meet EXTERNAL_BRIDGE room. No Redis read.
+
+        Positives are learned for free: from `speak_languages` field names on every refresh in
+        _get_room_languages (the hash it reads anyway — shared.control_markers
+        .is_external_bridge_room), and from a chunk / prewarm by the stand-in itself. A positive
+        is kept for the room's lifetime (cleared in _cleanup_room); a negative is never stored,
+        so a room whose stand-in joins late becomes a bridge room on the next refresh.
+        """
+        return meeting_id in getattr(self, "_bridge_rooms", ())
+
+    def _mark_bridge_room(self, meeting_id: str) -> None:
+        bridge_rooms: set[str] | None = getattr(self, "_bridge_rooms", None)
+        if bridge_rooms is None:
+            bridge_rooms = set()
+            self._bridge_rooms = bridge_rooms
+        if meeting_id not in bridge_rooms:
+            bridge_rooms.add(meeting_id)
+            self.logger.info("stt_bridge_room_detected", meeting_id=meeting_id)
 
     def _cleanup_room(self, room_id: str) -> None:
         super()._cleanup_room(room_id)
@@ -890,6 +922,7 @@ class STTWorker(BaseWorker):
         getattr(self, "_last_final_turn", {}).pop(room_id, None)
         getattr(self, "_recent_transcripts", {}).pop(room_id, None)
         self._room_languages.pop(room_id, None)
+        getattr(self, "_bridge_rooms", set()).discard(room_id)
         getattr(self, "_room_noise_reduction", {}).pop(room_id, None)
         getattr(self, "_dub_echo_cache", {}).pop(room_id, None)
         getattr(self, "_far_side_ref_cache", {}).pop(room_id, None)
@@ -1116,6 +1149,8 @@ class STTWorker(BaseWorker):
         # _cached_transcript_anchor.
         anchor_ms = self._cached_transcript_anchor(chunk.meeting_id)
         language_hint = _language_hint_for_stt(chunk.language)
+        if is_external_bridge_speaker(chunk.speaker_id):
+            self._mark_bridge_room(chunk.meeting_id)
         allowed_languages = await self._get_room_languages(chunk.meeting_id, language_hint)
         keywords = await self._get_stt_keywords(chunk.meeting_id)
         noise_reduction = await self._get_noise_reduction(chunk.meeting_id, chunk.speaker_id)
@@ -1309,6 +1344,9 @@ class STTWorker(BaseWorker):
                 chunk_offset_ms=chunk_offset_ms,
                 meeting_id=chunk.meeting_id,
                 speaker_id=chunk.speaker_id,
+                # Google Meet bridge rooms only: a changed declaration also wipes half-counted
+                # language evidence (OpenAISTT._note_declaration). Native rooms: unchanged.
+                bridge_room=self._is_bridge_room(chunk.meeting_id),
                 # Never send title/description/instruction prose to STT. A production
                 # failure transcribed and translated that prose verbatim. Keywords retain
                 # vocabulary bias without giving the model a sentence it can recite.
@@ -2309,14 +2347,22 @@ class STTWorker(BaseWorker):
     async def _get_room_languages(self, meeting_id: str, declared: str | None = None) -> set[str]:
         """Every language this meeting may contain.
 
-        `declared` is the language THIS chunk's speaker declared (AudioChunkMessage.language,
-        which livekit_ingress_worker reads fresh from `speak_languages` per utterance). A
-        declaration the cached set does not contain is a pick made since the cache was filled —
-        a mid-meeting SetSpeakLanguage / SetExternalMeetingLanguage — so the cache is refetched
-        at once instead of serving the old set for the rest of the TTL. It is also unioned into
-        a non-empty result: the ingress read it from the very hash this set is built from, so
-        it IS one of the room's languages even if this read raced the write. An empty set stays
-        empty ("nothing declared" has its own handling in _filter_segments).
+        NATIVE MEETING ROOMS: exactly the previous behaviour — cached for _ROOM_LANGUAGES_TTL_S
+        (15s), `declared` ignored, the old entry parsing.
+
+        GOOGLE MEET BRIDGE ROOMS (_is_bridge_room; detected from the very `speak_languages`
+        read below, so the detection costs no extra round trip):
+            `declared` is the language THIS chunk's speaker declared (AudioChunkMessage.language,
+            which livekit_ingress_worker reads fresh from `speak_languages` per utterance). A
+            declaration the cached set does not contain is a pick made since the cache was
+            filled — a mid-meeting SetSpeakLanguage / SetExternalMeetingLanguage — so the cache
+            is refetched at once instead of serving the old set for the rest of the (5s,
+            _BRIDGE_ROOM_LANGUAGES_TTL_S) TTL. It is also unioned into a non-empty result: the
+            ingress read it from the very hash this set is built from, so it IS one of the
+            room's languages even if this read raced the write. An empty set stays empty
+            ("nothing declared" has its own handling in _filter_segments). "auto" entries are
+            skipped (_room_language_code), and AUDIO_ROUTES_UPDATED drops the cache
+            (_handle_route_update_message).
 
         TWO SOURCES, AND THE SECOND ONE IS THE ANSWER TO A REAL BUG
             `speak_languages` is what the people currently in the room are SPEAKING —
@@ -2339,32 +2385,49 @@ class STTWorker(BaseWorker):
         Empty set ⇒ nothing declared yet, and _filter_segments then filters nothing rather
         than filtering on an assumption.
         """
-        declared_code = _room_language_code(declared)
         now = time.monotonic()
         cached = self._room_languages.get(meeting_id)
-        if (
-            cached is not None
-            and now - cached[1] < _ROOM_LANGUAGES_TTL_S
-            and (not declared_code or declared_code in cached[0])
-        ):
-            return set(cached[0])
+        bridge = self._is_bridge_room(meeting_id)
+        declared_code = _room_language_code(declared) if bridge else ""
+        if bridge:
+            if (
+                cached is not None
+                and now - cached[1] < _BRIDGE_ROOM_LANGUAGES_TTL_S
+                and (not declared_code or declared_code in cached[0])
+            ):
+                return set(cached[0])
+        elif cached is not None and now - cached[1] < _ROOM_LANGUAGES_TTL_S:
+            return cached[0]
 
         langs: set[str] = set()
 
         raw = await self.redis.hgetall(f"translationRoom:{meeting_id}:speak_languages")
+        if not bridge and is_external_bridge_room(raw or {}):
+            # The stand-in has joined: from this refresh on, bridge rules apply.
+            self._mark_bridge_room(meeting_id)
+            bridge = True
+            declared_code = _room_language_code(declared)
         for value in (raw or {}).values():
-            code = _room_language_code(value.decode() if isinstance(value, bytes) else value)
-            if code:
+            if bridge:
+                code = _room_language_code(value.decode() if isinstance(value, bytes) else value)
+                if code:
+                    langs.add(code)
+                continue
+            code = value.decode() if isinstance(value, bytes) else value
+            code = _normalize_language(code.strip()) if code else ""
+            if code and code != "auto":
                 langs.add(code)
 
-        langs |= await self._get_configured_room_languages(meeting_id)
-        if langs and declared_code:
+        langs |= await self._get_configured_room_languages(meeting_id, bridge=bridge)
+        if bridge and langs and declared_code:
             langs.add(declared_code)
 
         self._room_languages[meeting_id] = (langs, now)
-        return set(langs)
+        return set(langs) if bridge else langs
 
-    async def _get_configured_room_languages(self, meeting_id: str) -> set[str]:
+    async def _get_configured_room_languages(
+        self, meeting_id: str, *, bridge: bool = False
+    ) -> set[str]:
         """The room's own language configuration, from the audio_routes payload.
 
         Same key `_room_state_allows_stt` already reads, so this adds no round trip
@@ -2372,6 +2435,9 @@ class STTWorker(BaseWorker):
         older-format payload (one published before `room_languages` existed) yields an
         empty set and the speak-languages half stands alone, which is exactly the previous
         behaviour.
+
+        `bridge` (Google Meet bridge rooms) skips "auto" before normalising
+        (_room_language_code); native rooms keep the old parsing.
         """
         try:
             raw = await self.redis.get(f"translationRoom:{meeting_id}:audio_routes")
@@ -2383,7 +2449,12 @@ class STTWorker(BaseWorker):
             for value in configured:
                 if not isinstance(value, str):
                     continue
-                code = _room_language_code(value)
+                if bridge:
+                    code = _room_language_code(value)
+                else:
+                    code = _normalize_language(value.strip())
+                    if code == "auto":
+                        code = ""
                 if code:
                     langs.add(code)
             return langs
