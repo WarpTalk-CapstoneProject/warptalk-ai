@@ -91,6 +91,34 @@ _RENEWED_SOCKET_GRACE_S = TRANSCRIBE_EVENT_TIMEOUT_S + 5.0
 # Items whose deltas arrived on a speaker's socket before (or without) their commit — see
 # _transcribe_via_session. Only the last few can still be committed; older ones were cleared.
 _MAX_PENDING_ITEMS = 8
+# Live text (the words of an utterance that is still being spoken) is published at most this
+# often per item. Deltas arrive roughly per word; a caption redrawn faster than this is flicker,
+# and every publish is a Redis message and a SignalR frame per listener.
+_LIVE_TEXT_MIN_INTERVAL_S = 0.15
+
+
+class _PumpClosed:
+    """Queued when a session's socket stops yielding events: the connection closed."""
+
+
+_PUMP_CLOSED = _PumpClosed()
+
+
+@dataclass(frozen=True)
+class _PumpFailed:
+    """Queued when reading a session's socket raised; `_collect` re-raises it unchanged."""
+
+    exc: BaseException
+
+
+def _log_live_text_failure(task: asyncio.Task[None]) -> None:
+    """A live caption that failed to publish is not worth more than a log line."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("stt_live_text_publish_failed", error=str(exc))
+
 
 # Every `filtered_*` line in this module logs at INFO, not DEBUG, and that is deliberate.
 #
@@ -1451,6 +1479,11 @@ class OpenAISTT:
         self.text_language_id_enabled = text_language_id_enabled
         self.text_language_id_min_confidence = text_language_id_min_confidence
         self._client: AsyncOpenAI | None = None
+        # Called with (key, item_id, text, language) while a speaker is still talking — the
+        # live caption. Set by the worker; None publishes nothing. See _pump_session_events.
+        self.on_live_text: (
+            Callable[[tuple[str, str], str, str, str | None], Awaitable[None]] | None
+        ) = None
         # (meeting_id, speaker_id) -> {"manager": ..., "conn": ..., "last_used": float}
         self._sessions: dict[tuple[str, str], dict[str, Any]] = {}
         # WHAT THIS SPEAKER IS ACTUALLY SPEAKING, when it contradicts what they declared.
@@ -1718,7 +1751,13 @@ class OpenAISTT:
 
         self._session_epoch = getattr(self, "_session_epoch", 0) + 1
         renewed = {
-            **{k: v for k, v in old.items() if k not in ("item_deltas",)},
+            **{
+                k: v
+                for k, v in old.items()
+                # The reader, its queue and its live text belong to the OLD socket.
+                if k
+                not in ("item_deltas", "event_queue", "event_pump", "live_items", "closed_items")
+            },
             "manager": manager,
             "conn": conn,
             "epoch": self._session_epoch,
@@ -2468,6 +2507,10 @@ class OpenAISTT:
                     await conn.input_audio_buffer.append(audio=base64.b64encode(frame).decode())
 
             await conn.input_audio_buffer.commit()
+            # Every item spoken into this buffer so far is this commit's: its words now go out as
+            # segments, so live text for it stops here.
+            closed: set[str] = session.setdefault("closed_items", set())
+            closed.update(session.get("live_items", {}).keys())
             session["last_used"] = time.monotonic()
             # The commit took the buffer. Frames of the speaker's next turn may land on it again
             # before this call returns, and they set it back.
@@ -2535,13 +2578,20 @@ class OpenAISTT:
                             flushed += sentence + " "
                         buffer = "" if ends_clean else sentences[-1]
 
-                async for event in conn:
+                events = self._session_event_queue(key, session)
+                while True:
+                    event = await events.get()
+                    if event is _PUMP_CLOSED:
+                        break
+                    if isinstance(event, _PumpFailed):
+                        raise event.exc
                     etype = getattr(event, "type", "")
                     item_id = getattr(event, "item_id", None)
                     item_id = item_id if isinstance(item_id, str) and item_id else None
                     if etype == "input_audio_buffer.committed":
                         if mine is None and item_id is not None:
                             mine = item_id
+                            session.setdefault("closed_items", set()).add(item_id)
                             # What the model already said about this audio while it was being
                             # streamed in — the reason flash mode is fast — is this commit's text.
                             early = pending_items.pop(mine, "")
@@ -2961,6 +3011,98 @@ class OpenAISTT:
         )
         return session
 
+    def _session_event_queue(
+        self, key: tuple[str, str], session: dict[str, Any]
+    ) -> asyncio.Queue[Any]:
+        """The queue this session's events arrive on, starting its reader if none is running.
+
+        ONE READER PER SOCKET. gpt-live-transcribe transcribes audio as it is appended, so in flash
+        mode the model is already producing words while the speaker talks. Nothing read them: the
+        socket was only iterated inside `_collect`, after the commit, so every word spoken waited
+        out the speaker's whole turn plus the silence hangover before anybody saw it. A reader that
+        runs for the socket's whole life can show those words as they come (the live caption) and
+        still hand `_collect` exactly the events it used to read, in order, through this queue.
+        """
+        queue = session.get("event_queue")
+        pump = session.get("event_pump")
+        if queue is not None and pump is not None and not pump.done():
+            return cast("asyncio.Queue[Any]", queue)
+        if queue is None or pump is not None:
+            # A reader that already finished left its end-of-stream marker in the old queue;
+            # a reader started over must not inherit it.
+            queue = asyncio.Queue()
+            session["event_queue"] = queue
+        session["event_pump"] = asyncio.create_task(self._pump_session_events(key, session, queue))
+        return cast("asyncio.Queue[Any]", queue)
+
+    async def _pump_session_events(
+        self, key: tuple[str, str], session: dict[str, Any], queue: asyncio.Queue[Any]
+    ) -> None:
+        live: dict[str, str] = session.setdefault("live_items", {})
+        last_sent: dict[str, float] = {}
+        try:
+            async for event in session["conn"]:
+                if (
+                    getattr(event, "type", "")
+                    == "conversation.item.input_audio_transcription.delta"
+                ):
+                    item_id = getattr(event, "item_id", None)
+                    if isinstance(item_id, str) and item_id:
+                        self._note_live_delta(
+                            key,
+                            session,
+                            item_id,
+                            getattr(event, "delta", "") or "",
+                            live,
+                            last_sent,
+                        )
+                await queue.put(event)
+        except Exception as exc:  # noqa: BLE001 - handed to `_collect`, which decides what it means
+            await queue.put(_PumpFailed(exc))
+            return
+        await queue.put(_PUMP_CLOSED)
+
+    def _note_live_delta(
+        self,
+        key: tuple[str, str],
+        session: dict[str, Any],
+        item_id: str,
+        delta: str,
+        live: dict[str, str],
+        last_sent: dict[str, float],
+    ) -> None:
+        """Accumulate one word of a turn still being spoken, and publish it when it is worth it.
+
+        Only items that have NOT been committed: once the turn is committed its words go out as
+        real segments (early sentences, then the completion), and live text for it as well would
+        show the same words twice. Live text is never billed, translated or stored — it is a
+        preview the final segment replaces.
+        """
+        live[item_id] = live.get(item_id, "") + delta
+        while len(live) > _MAX_PENDING_ITEMS:
+            live.pop(next(iter(live)))
+        hook = getattr(self, "on_live_text", None)
+        if hook is None or item_id in session.get("closed_items", ()):
+            return
+        text = " ".join(live[item_id].split())
+        if not text:
+            return
+        now = time.monotonic()
+        ends_sentence = text[-1] in ".!?…。？！"
+        if not ends_sentence and now - last_sent.get(item_id, 0.0) < _LIVE_TEXT_MIN_INTERVAL_S:
+            return
+        # The same writing-system rule the final segment is held to: a delta in a script nobody
+        # in the room speaks is the hallucination class that got early partials switched off once
+        # (Han inside a Vietnamese sentence). Skipped, not cut — the next clean delta replaces it.
+        allowed = _allowed_scripts(
+            {session.get("language") or ""} | set(session.get("allowed_languages") or ())
+        )
+        if _scripts_in(text) - allowed:
+            return
+        last_sent[item_id] = now
+        task = asyncio.create_task(hook(key, item_id, text, session.get("language")))
+        task.add_done_callback(_log_live_text_failure)
+
     async def append_streamed_audio(
         self,
         key: tuple[str, str],
@@ -2992,6 +3134,8 @@ class OpenAISTT:
             await session["conn"].input_audio_buffer.append(
                 audio=base64.b64encode(pcm_24k).decode()
             )
+            # Read while the speaker talks, so their words can be shown as they come.
+            self._session_event_queue(key, session)
         except Exception:
             # A frame that does not land is not an error anybody needs to act on: the closed
             # utterance still carries the whole turn. Debug, because this fires per 96ms window.

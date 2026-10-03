@@ -356,6 +356,31 @@ class STTWorker(BaseWorker):
         self._prewarm_listener_task: asyncio.Task[None] | None = None
         self._warm_pool_task: asyncio.Task[None] | None = None
 
+    async def _publish_live_text(
+        self, key: tuple[str, str], item_id: str, text: str, language: str | None
+    ) -> None:
+        """The words of an utterance still being spoken, for the live caption.
+
+        Pub/Sub, not the stt:results stream, on purpose: live text is a preview that the final
+        segment replaces. It must never be stored, billed, translated or replayed to a client that
+        joins later, and a stream entry would be all four. The gateway relays it to the room as
+        TranscriptInterimReceived; a listener who misses one simply sees the next.
+        """
+        meeting_id, speaker_id = key
+        await self.redis.redis.publish(
+            "stt:interim",
+            json.dumps(
+                {
+                    "meeting_id": meeting_id,
+                    "speaker_id": speaker_id,
+                    "item_id": item_id,
+                    "text": text,
+                    "language": language or "",
+                },
+                ensure_ascii=False,
+            ),
+        )
+
     def integration_reports(self) -> dict[str, IntegrationReport]:
         s = self.stt_settings
         return {
@@ -373,6 +398,7 @@ class STTWorker(BaseWorker):
             text_language_id_min_confidence=self.stt_settings.text_language_id_min_confidence,
         )
         await self.model.load()
+        self.model.on_live_text = self._publish_live_text
         await self.model.warm_up(pool_size=self.stt_settings.realtime_pool_size)
         self._prewarm_listener_task = asyncio.create_task(self._listen_for_track_prewarm())
         self._warm_pool_task = asyncio.create_task(self._maintain_warm_pool())
