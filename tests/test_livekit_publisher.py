@@ -299,3 +299,55 @@ class TestLiveKitTTSPublisher:
         )
 
         assert max_in_flight == 2
+
+
+class TestStreamJoinsBeforeTheFirstChunk:
+    """3 Oct 2026: a cold key paid Cartesia's first byte and THEN the LiveKit join, in series."""
+
+    async def test_join_starts_when_the_stream_opens_not_at_the_first_chunk(
+        self, mock_livekit_sdk
+    ) -> None:
+        publisher = LiveKitTTSPublisher(_settings())
+        async with publisher.stream("room-1", "s1", "vi", 16000):
+            await asyncio.sleep(0)  # let the join task run, with no audio fed at all
+            mock_livekit_sdk["room"].connect.assert_awaited_once()
+
+    async def test_one_join_per_sentence_when_audio_follows(self, mock_livekit_sdk) -> None:
+        publisher = LiveKitTTSPublisher(_settings())
+        async with publisher.stream("room-1", "s1", "vi", 16000) as track:
+            await track.feed(b"\x00\x01" * 320 * 10)
+
+        assert mock_livekit_sdk["room"].connect.await_count == 1
+        assert mock_livekit_sdk["source"].capture_frame.await_count > 0
+        assert track.spoken_bytes > 0
+
+    async def test_close_waits_for_a_join_still_in_flight(self, mock_livekit_sdk) -> None:
+        # Released mid-join, the key's lock would let publish_pcm's fallback start a second bot
+        # with the same identity.
+        gate = asyncio.Event()
+
+        async def slow_connect(*_args) -> None:
+            await gate.wait()
+
+        mock_livekit_sdk["room"].connect = AsyncMock(side_effect=slow_connect)
+        publisher = LiveKitTTSPublisher(_settings())
+
+        async def sentence_without_audio() -> None:
+            async with publisher.stream("room-1", "s1", "vi", 16000):
+                pass
+
+        closing = asyncio.create_task(sentence_without_audio())
+        await asyncio.sleep(0.05)
+        assert not closing.done()
+        gate.set()
+        await asyncio.wait_for(closing, timeout=2)
+
+        await publisher.publish_pcm("room-1", "s1", "vi", b"\x00\x01" * 320, sample_rate=16000)
+        assert mock_livekit_sdk["room"].connect.await_count == 1
+
+    async def test_a_failed_join_breaks_only_this_sentence(self, mock_livekit_sdk) -> None:
+        mock_livekit_sdk["room"].connect = AsyncMock(side_effect=ConnectionError("down"))
+        publisher = LiveKitTTSPublisher(_settings())
+        async with publisher.stream("room-1", "s1", "vi", 16000) as track:
+            await track.feed(b"\x00\x01" * 320 * 10)
+        assert track.spoken_bytes == 0

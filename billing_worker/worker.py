@@ -78,7 +78,7 @@ from typing import Any
 from billing_worker.db import BillingRepository, SettlementOutcome
 from shared.config import BillingSettings, RedisSettings, WorkerSettings
 from shared.control_markers import is_system_speaker
-from shared.health_probe import heartbeat_key
+from shared.health_probe import heartbeat_key, touch_heartbeat_file
 from shared.logger import get_logger
 from shared.redis_client import BILLING_UNBILLED_KEY, BILLING_UNBILLED_REASONS, RedisStreamClient
 from shared.schemas import (
@@ -426,6 +426,7 @@ class BillingSettlementWorker:
             ),
             self.heartbeat_ttl_seconds,
         )
+        touch_heartbeat_file("billing")
 
     async def _heartbeat_loop(self) -> None:
         while not self._shutdown_event.is_set():
