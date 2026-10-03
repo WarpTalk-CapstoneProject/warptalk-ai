@@ -9,6 +9,7 @@ Pipeline:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -2161,7 +2162,8 @@ class STTWorker(BaseWorker):
             meeting_id=result.meeting_id,
             segment_id=result.segment_id,
             is_early=result.is_early,
-            far_speaker_name=attribution.name,
+            # A Meet participant is not a user and agreed to nothing: log a hash, not the name.
+            far_speaker_name_hash=hashlib.sha256(attribution.name.encode()).hexdigest()[:12],
             far_speaker_confidence=attribution.confidence,
             window_start_ms=window.start_ms,
             window_end_ms=window.end_ms,

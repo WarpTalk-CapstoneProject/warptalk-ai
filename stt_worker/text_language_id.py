@@ -32,6 +32,7 @@ FAIL-OPEN
 from __future__ import annotations
 
 import re
+import threading
 from functools import lru_cache
 from typing import Any
 
@@ -92,17 +93,53 @@ def _detector(codes: frozenset[str]) -> tuple[Any, dict[Any, str]] | None:
     return LanguageDetectorBuilder.from_languages(*languages).build(), languages
 
 
+_built: set[frozenset[str]] = set()
+_building: set[frozenset[str]] = set()
+_build_lock = threading.Lock()
+
+
+def _build_off_thread(codes: frozenset[str]) -> None:
+    try:
+        _detector(codes)
+    finally:
+        with _build_lock:
+            _building.discard(codes)
+            _built.add(codes)
+
+
+def _detector_if_ready(codes: frozenset[str]) -> tuple[Any, dict[Any, str]] | None:
+    """The detector for `codes` if it is already built; otherwise start building it and say None.
+
+    Building a detector for a new language set loads n-gram models (0.15-0.5 s). The STT label
+    path runs on the event loop, so the first lines of a room with a new set keep their declared
+    label while a thread loads the models, instead of stalling every meeting on the worker.
+    """
+    with _build_lock:
+        if codes in _built:
+            ready = True
+        else:
+            ready = False
+            if codes not in _building:
+                _building.add(codes)
+                threading.Thread(
+                    target=_build_off_thread, args=(codes,), name="text-lid-load", daemon=True
+                ).start()
+    return _detector(codes) if ready else None
+
+
 def identify_room_language(
     text: str,
     candidates: set[str] | frozenset[str],
     *,
     min_confidence: float = MIN_CONFIDENCE,
+    build_inline: bool = True,
 ) -> str | None:
     """The candidate language `text` is written in, or None when it cannot be told confidently.
 
     `candidates` must already be the room's LATIN-SCRIPT languages; fewer than two of them, a
     line shorter than MIN_LETTERS / MIN_WORDS, or a best score under `min_confidence` answer
-    None. Pure apart from the cached detector.
+    None. Pure apart from the cached detector. With `build_inline=False` (the event-loop caller)
+    a language set whose detector is not loaded yet answers None and loads in the background.
     """
     codes = frozenset(base_language(code) for code in candidates if code)
     codes = frozenset(code for code in codes if code and code not in {"auto", "unknown", "und"})
@@ -111,7 +148,12 @@ def identify_room_language(
     if _letters(text) < MIN_LETTERS or word_count(text) < MIN_WORDS:
         return None
 
-    built = _detector(codes)
+    if build_inline:
+        built = _detector(codes)
+        with _build_lock:
+            _built.add(codes)
+    else:
+        built = _detector_if_ready(codes)
     if built is None:
         return None
     detector, languages = built

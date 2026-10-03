@@ -1196,7 +1196,10 @@ def _filter_segments(
                 if base_language(language) not in _LANGUAGE_SCRIPTS
             }
             identified = identify_room_language(
-                text, latin_room_languages, min_confidence=text_language_id_min_confidence
+                text,
+                latin_room_languages,
+                min_confidence=text_language_id_min_confidence,
+                build_inline=False,
             )
         seg_lang = evidence or identified or lang_code or _guess_language_from_text(text, allowed)
         language_source = (

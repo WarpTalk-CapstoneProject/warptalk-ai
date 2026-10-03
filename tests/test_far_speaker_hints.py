@@ -312,3 +312,13 @@ class TestWorkerAttachesHints:
         await worker.process(b"msg-1", chunk.to_redis())
         [result] = worker.published  # type: ignore[attr-defined]
         assert result.far_speaker_name is None
+
+
+def test_b3_sole_name_near_the_edge_of_max_gap_stays_below_the_live_threshold() -> None:
+    # Review on #242: the same name on both sides of the window but only near the edge of max_gap
+    # (a hint seen late, or an interjection Meet folded into another speaker's caption) must not
+    # reach the gateway's 0.6.
+    hints = [_h("Lan", W.start_ms - 1_400), _h("Lan", W.end_ms + 1_300)]
+    got = attribute_far_speaker(W, hints, lag_ms=0, max_gap_ms=1_500)
+    assert got is not None and got.name == "Lan"
+    assert got.confidence < 0.6

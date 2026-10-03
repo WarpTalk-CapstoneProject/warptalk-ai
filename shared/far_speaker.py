@@ -53,8 +53,11 @@ _NEAREST_HINT_MAX_CONFIDENCE = 0.5
 #: gateway needs, and the line said "Google Meet participants" although only one person was
 #: talking. Requiring a hint AFTER the window keeps the hand-over case out: when Lan stops and Minh
 #: starts, Minh's first line has only Lan's hints BEFORE it until Minh's own arrive, and that
-#: stays a low-confidence guess.
-_SOLE_NEAR_HINT_MIN_CONFIDENCE = 0.6
+#: stays a low-confidence guess. The band decays with the gap and crosses the 0.6 display
+#: threshold at ~60% of max_gap: a name only that close clears the gateway, so a hint seen late
+#: (caption lag varies 0.5-1.5 s against a fixed 1 s shift) or a short interjection Meet folded
+#: into another speaker's caption is less likely to put the wrong name on screen.
+_SOLE_NEAR_HINT_MIN_CONFIDENCE = 0.45
 _SOLE_NEAR_HINT_MAX_CONFIDENCE = 0.85
 
 
