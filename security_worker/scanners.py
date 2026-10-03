@@ -62,7 +62,7 @@ MIN_SPLIT_CHARS = 1000
 JSON_ENVELOPE_TOKENS = 512
 
 
-class ScanReplyTruncated(ValueError):
+class ScanReplyTruncatedError(ValueError):
     """The model ran out of output room before finishing this chunk's masked copy."""
 
 
@@ -239,7 +239,7 @@ class OpenAISecurityScanner:
             return await self._scan_chunk(
                 text_to_analyze, pii_enabled, dlp_enabled, keywords_blacklist
             )
-        except ScanReplyTruncated:
+        except ScanReplyTruncatedError:
             if len(text_to_analyze) <= MIN_SPLIT_CHARS:
                 raise
             halves = split_for_analysis(text_to_analyze, len(text_to_analyze) // 2 + 1)
@@ -346,7 +346,7 @@ class OpenAISecurityScanner:
         # API key and at Qdrant. `finish_reason` is the API telling us plainly that it ran out of
         # room, and it costs nothing to look.
         if choice.finish_reason == "length":
-            raise ScanReplyTruncated(
+            raise ScanReplyTruncatedError(
                 "OpenAI reply was truncated by the output token limit "
                 f"({len(text_to_analyze)} chars analysed). The scan returns the masked text in "
                 "full, so the output budget must exceed the input; raise SECURITY_MAX_TOKENS or "

@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from security_worker.scanners import MIN_SPLIT_CHARS, OpenAISecurityScanner, ScanReplyTruncated
+from security_worker.scanners import MIN_SPLIT_CHARS, OpenAISecurityScanner, ScanReplyTruncatedError
 
 
 def _scanner(max_chars_per_reply: int) -> tuple[OpenAISecurityScanner, list[int]]:
@@ -77,7 +77,7 @@ async def test_a_chunk_cut_off_is_split_and_the_document_still_scans() -> None:
 async def test_below_the_floor_a_cut_reply_is_still_an_error() -> None:
     scanner, _ = _scanner(max_chars_per_reply=10)
 
-    with pytest.raises(ScanReplyTruncated):
+    with pytest.raises(ScanReplyTruncatedError):
         await scanner.scan_and_mask(
             _doc(MIN_SPLIT_CHARS * 3), pii_enabled=True, dlp_enabled=False, keywords_blacklist=[]
         )
