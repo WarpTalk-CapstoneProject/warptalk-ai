@@ -494,6 +494,15 @@ class STTSettings(BaseSettings):
     # retention stops improving. ViMedCSS (Vietnamese-English code-switching, 34.6h),
     # CanVEC and the relevant FLEURS split are suitable sources.
     min_avg_logprob_by_language: dict[str, float] = {}
+    # TEXT LANGUAGE-ID (stt_worker/text_language_id.py). The Realtime model returns no language,
+    # so between two Latin-script room languages (vi/en) a line used to carry the speaker's
+    # DECLARED language unless it held a Vietnamese-unique letter — "Anh làm gì?" from a host
+    # declared en was English, "Morning is great." from a Meet side declared vi was Vietnamese
+    # (bridge room 01a10069). With this on, such a line is identified among the ROOM's own
+    # Latin-script languages only, and relabelled only above a confidence floor and a minimum
+    # length. Env: STT_TEXT_LANGUAGE_ID_ENABLED (the kill switch).
+    text_language_id_enabled: bool = True
+    text_language_id_min_confidence: float = 0.9
     # Warm WebSockets are claimed by the first active speakers so their first utterance
     # does not pay the ~1–2s Realtime connection handshake.
     realtime_pool_size: int = 4

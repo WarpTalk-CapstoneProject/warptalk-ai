@@ -29,6 +29,7 @@ from shared.openai_options import REALTIME_SESSION_MAX_AGE_S, realtime_session_e
 from shared.provider_calls import observed_openai_http_client
 from shared.schemas import STT_UNKNOWN_CONFIDENCE
 from shared.text_utils import split_into_sentences
+from stt_worker.text_language_id import MIN_WORDS_TO_LEARN, identify_room_language, word_count
 
 logger = get_logger(__name__)
 
@@ -228,6 +229,10 @@ class TranscribedSegment:
     confidence: float
     start_ms: int
     end_ms: int
+    #: Where `language` came from: "evidence" (script / Vietnamese-unique letters), "text_id"
+    #: (stt_worker/text_language_id among the room's languages), "declared" (the speaker's pinned
+    #: language) or "guess". `_learn_language_evidence` only learns from the first two.
+    language_source: str = "declared"
 
 
 # OpenAI full-language-name → ISO 639-1 code (returned when language=None)
@@ -967,6 +972,9 @@ def _filter_segments(
     min_avg_logprob: float = -0.7,
     min_avg_logprob_by_language: dict[str, float] | None = None,
     recent_dub_texts: Sequence[str] | None = None,
+    #: Floor for the room-restricted text language-ID (stt_worker/text_language_id); None turns
+    #: it off. Production passes STTSettings.text_language_id_min_confidence.
+    text_language_id_min_confidence: float | None = None,
 ) -> list[TranscribedSegment]:
     language_known = detected_language != "unknown"
     lang_code = _normalize_language(detected_language) if language_known else None
@@ -1168,7 +1176,38 @@ def _filter_segments(
             and base_language(evidence) not in {base_language(lang) for lang in room_languages}
         ):
             evidence = None
-        seg_lang = evidence or lang_code or _guess_language_from_text(text, allowed)
+        # Bridge room 01a10069: between two Latin-script room languages the text itself proves
+        # nothing to the rules above ("Anh làm gì?" has only à/ì, "Morning is great." is ASCII),
+        # so the declaration won and a vi host read as English, an English Meet side as
+        # Vietnamese. Ask a language identifier — restricted to the ROOM's Latin-script
+        # languages, above a confidence floor — before falling back to the declaration. Never
+        # when the room declared nothing (no candidates to restrict to) or the line carries a
+        # non-Latin script (that is the script rules' call).
+        identified: str | None = None
+        if (
+            evidence is None
+            and text_language_id_min_confidence is not None
+            and room_languages
+            and not _scripts_in(text)
+        ):
+            latin_room_languages = {
+                language
+                for language in room_languages
+                if base_language(language) not in _LANGUAGE_SCRIPTS
+            }
+            identified = identify_room_language(
+                text, latin_room_languages, min_confidence=text_language_id_min_confidence
+            )
+        seg_lang = evidence or identified or lang_code or _guess_language_from_text(text, allowed)
+        language_source = (
+            "evidence"
+            if evidence
+            else "text_id"
+            if identified
+            else "declared"
+            if lang_code
+            else "guess"
+        )
         # Before the contradiction log below, deliberately: an echoed dub is exactly a segment
         # whose language contradicts the declaration, and letting it write that log line is the
         # confusion this guard exists to remove.
@@ -1342,6 +1381,7 @@ def _filter_segments(
                 confidence=round(avg_logprob, 4),
                 start_ms=chunk_offset_ms + int(seg.get("start", 0.0) * 1000),
                 end_ms=chunk_offset_ms + int(seg.get("end", 0.0) * 1000),
+                language_source=language_source,
             )
         )
 
@@ -1364,12 +1404,16 @@ class OpenAISTT:
         noise_reduction: str = _DEFAULTS.noise_reduction,
         min_avg_logprob: float = _DEFAULTS.min_avg_logprob,
         min_avg_logprob_by_language: dict[str, float] | None = None,
+        text_language_id_enabled: bool = _DEFAULTS.text_language_id_enabled,
+        text_language_id_min_confidence: float = _DEFAULTS.text_language_id_min_confidence,
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.noise_reduction = noise_reduction
         self.min_avg_logprob = min_avg_logprob
         self.min_avg_logprob_by_language = dict(min_avg_logprob_by_language or {})
+        self.text_language_id_enabled = text_language_id_enabled
+        self.text_language_id_min_confidence = text_language_id_min_confidence
         self._client: AsyncOpenAI | None = None
         # (meeting_id, speaker_id) -> {"manager": ..., "conn": ..., "last_used": float}
         self._sessions: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1407,6 +1451,14 @@ class OpenAISTT:
             api_key=self.api_key, http_client=observed_openai_http_client("stt")
         )
         logger.info("openai_stt_ready", model=self.model)
+        if self._text_language_id_floor() is not None:
+            # The language-ID loads its n-gram models on first use (~0.25 s, ~90 MB for vi+en).
+            # _filter_segments runs on the event loop, so pay that here, off the loop, rather than
+            # on the first line of the first meeting. Other room sets load lazily (cheaper: the
+            # per-language models are shared).
+            await asyncio.to_thread(
+                identify_room_language, "warm up the language models", {"vi", "en"}
+            )
 
     async def _open_warm_socket(self) -> dict[str, Any]:
         client = self._client
@@ -1682,6 +1734,7 @@ class OpenAISTT:
                 min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
                 min_avg_logprob_by_language=getattr(self, "min_avg_logprob_by_language", None),
                 recent_dub_texts=recent_dub_texts,
+                text_language_id_min_confidence=self._text_language_id_floor(),
             )
             for seg in segs:
                 await on_early_segment(seg)
@@ -1715,6 +1768,7 @@ class OpenAISTT:
                 min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
                 min_avg_logprob_by_language=getattr(self, "min_avg_logprob_by_language", None),
                 recent_dub_texts=recent_dub_texts,
+                text_language_id_min_confidence=self._text_language_id_floor(),
             )
             for seg in segs:
                 await on_speculative_segment(seg)
@@ -1822,12 +1876,27 @@ class OpenAISTT:
             # floor never applied to the completed path, the one place with real logprobs.
             min_avg_logprob_by_language=getattr(self, "min_avg_logprob_by_language", None),
             recent_dub_texts=recent_dub_texts,
+            text_language_id_min_confidence=self._text_language_id_floor(),
         )
         # Learned from the COMPLETED path only. Early and speculative segments are provisional
         # by construction, and re-pinning a session on a guess that a later completed event
         # withdraws would be worse than the mislabelling this exists to fix.
         self._learn_language_evidence((meeting_id, speaker_id), lang_arg, segments)
         return segments
+
+    def _text_language_id_floor(self) -> float | None:
+        """The text language-ID floor for _filter_segments, or None when it is switched off.
+
+        getattr, like the other per-instance settings here: tests build this class with
+        __new__ and never run __init__.
+        """
+        if not getattr(self, "text_language_id_enabled", _DEFAULTS.text_language_id_enabled):
+            return None
+        return float(
+            getattr(
+                self, "text_language_id_min_confidence", _DEFAULTS.text_language_id_min_confidence
+            )
+        )
 
     def _apply_language_override(
         self,
@@ -1908,10 +1977,12 @@ class OpenAISTT:
     ) -> None:
         """Let a speaker's actual speech correct the language they declared.
 
-        Only unambiguous evidence counts — a non-Latin writing system, or the Vietnamese-unique
-        character class — so ordinary Latin text never moves this. `_filter_segments` has
-        already resolved each segment's language through `_detect_unambiguous_language`, so a
-        label that differs from `declared` IS that evidence.
+        Only strong evidence counts — a non-Latin writing system, the Vietnamese-unique
+        character class, or a full sentence the room-restricted text language-ID placed above
+        its confidence floor (stt_worker/text_language_id; `language_source == "text_id"`).
+        `_filter_segments` has already resolved each segment's language from those, so a label
+        that differs from `declared` IS that evidence — and since the language-ID can answer
+        English, a speaker declared vi who speaks English is now re-pinned too.
 
         CONSECUTIVE, not cumulative. One contradicting segment in an otherwise consistent
         meeting is far more likely to be a stray mis-transcription than a person switching
@@ -1938,6 +2009,15 @@ class OpenAISTT:
         for segment in segments:
             if segment.language == declared:
                 self._language_evidence.pop(key, None)
+                continue
+            # A label from the room-restricted text language-ID (bridge room 01a10069) is how a
+            # speaker declared vi who is audibly speaking English is learned at all — ASCII is
+            # never "unambiguous evidence". It moves the pin only from a full sentence: a short
+            # line proves nothing either way, so it neither counts nor resets.
+            if (
+                segment.language_source == "text_id"
+                and word_count(segment.text) < MIN_WORDS_TO_LEARN
+            ):
                 continue
 
             previous_language, count = self._language_evidence.get(key, (segment.language, 0))
@@ -1997,6 +2077,18 @@ class OpenAISTT:
 
         for segment in segments:
             verdict = _release_verdict(segment.text, learned, declaration)
+            if (
+                verdict is None
+                and segment.language_source == "text_id"
+                and word_count(segment.text) >= MIN_WORDS_TO_LEARN
+            ):
+                # The text language-ID speaks in both directions too: a vi-declared speaker
+                # re-pinned to English takes the mic back with Vietnamese that carries no
+                # Vietnamese-unique letter ("Anh làm gì vậy?"), which _release_verdict cannot see.
+                if base_language(segment.language) == base_language(declaration):
+                    verdict = True
+                elif base_language(segment.language) == base_language(learned):
+                    verdict = False
             if verdict is None:
                 continue
             if verdict is False:
@@ -2011,6 +2103,10 @@ class OpenAISTT:
             self._language_override.pop(key, None)
             self._release_evidence.pop(key, None)
             for line in segments:
+                if line.language_source == "text_id" and base_language(
+                    line.language
+                ) != base_language(declaration):
+                    continue
                 if _detect_unambiguous_language(line.text) in (None, base_language(declaration)):
                     line.language = declaration
             logger.warning(
