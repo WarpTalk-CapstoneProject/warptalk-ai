@@ -120,6 +120,13 @@ def _apply_fade(pcm_s16le: bytes, sample_rate: int) -> bytes:
 # extra track for listeners who explicitly picked that voice via SetVoicePreference.
 _BotKey = tuple[str, str, str, str]
 
+#: The LiveKit participant attribute each dub bot carries saying WHOSE voice it speaks in:
+#: "cloned" (cloned from the speaker), "profile" (a voice the speaker picked), "default" (a
+#: stock catalogue voice assigned to them) or "preference" (a listener's pick). The meeting
+#: client plays a speaker's dub only when it is in the speaker's OWN voice — cloned or profile —
+#: and otherwise lets the listener hear the speaker as they actually sound.
+VOICE_KIND_ATTRIBUTE = "warptalk.voice"
+
 # How long close() may wait for queued audio to finish reaching the track before it gives up
 # and cancels the pump.
 #
@@ -394,6 +401,48 @@ class LiveKitTTSPublisher:
         # Started lazily by the first bot creation (see _ensure_reaper) rather than in
         # __init__, which runs outside any event loop.
         self._reaper: asyncio.Task[None] | None = None
+        # The voice kind each key was last told it speaks in (see VOICE_KIND_ATTRIBUTE). Kept
+        # apart from the bot so a bot created AFTER the kind was decided starts with it, and a
+        # bot that already exists is only re-announced when the kind actually changes.
+        self._voice_kinds: dict[_BotKey, str] = {}
+
+    async def set_voice_kind(
+        self,
+        meeting_id: str,
+        speaker_id: str,
+        target_lang: str,
+        voice_kind: str,
+        voice_key: str = "",
+    ) -> None:
+        """Record whose voice this key's track speaks in, and tell the room if it changed.
+
+        Called by the worker before each sentence, because the kind can change mid-meeting: a
+        speaker starts on the stock voice while their clone is captured, and moves to "cloned"
+        once it is ready (or back, if they withdraw consent). Never raises — an attribute that
+        failed to update must not cost the listener the sentence itself.
+        """
+        key: _BotKey = (meeting_id, speaker_id, target_lang, voice_key)
+        if self._voice_kinds.get(key) == voice_kind:
+            return
+        self._voice_kinds[key] = voice_kind
+        bot = self._bots.get(key)
+        if bot is not None:
+            await self._announce_voice_kind(bot["room"], voice_kind, key)
+
+    @staticmethod
+    async def _announce_voice_kind(room: Any, voice_kind: str, key: _BotKey) -> None:
+        try:
+            await room.local_participant.set_attributes({VOICE_KIND_ATTRIBUTE: voice_kind})
+        except Exception:
+            logger.warning(
+                "livekit_tts_voice_kind_failed",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                target_lang=key[2],
+                voice_key=key[3],
+                voice_kind=voice_kind,
+                exc_info=True,
+            )
 
     async def publish_pcm(
         self,
@@ -575,7 +624,11 @@ class LiveKitTTSPublisher:
             api.AccessToken(self.settings.api_key, self.settings.api_secret)
             .with_identity(identity)
             .with_name(f"AI Interpreter ({target_lang})")
-            .with_grants(api.VideoGrants(room_join=True, room=meeting_id))
+            .with_grants(
+                # can_update_own_metadata: without it LiveKit refuses set_attributes, and the
+                # client could never learn whose voice this bot speaks in.
+                api.VideoGrants(room_join=True, room=meeting_id, can_update_own_metadata=True)
+            )
             .to_jwt()
         )
 
@@ -593,6 +646,10 @@ class LiveKitTTSPublisher:
 
         bot = {"room": room, "source": source, "last_used": time.monotonic()}
         self._bots[key] = bot
+        # Before the first frame lands, so the client never has to guess a new bot's voice.
+        voice_kind = self._voice_kinds.get(key)
+        if voice_kind:
+            await self._announce_voice_kind(room, voice_kind, key)
         logger.info(
             "livekit_tts_bot_published",
             meeting_id=meeting_id,
@@ -650,6 +707,9 @@ class LiveKitTTSPublisher:
         reaper takes it the moment that sentence ends.
         """
         retired = 0
+        # Forgotten with the meeting: the next one decides each speaker's voice afresh.
+        for key in [k for k in self._voice_kinds if k[0] == meeting_id]:
+            del self._voice_kinds[key]
         for key in [k for k in self._bots if k[0] == meeting_id]:
             if self._is_publishing(key):
                 self._bots[key]["last_used"] = float("-inf")

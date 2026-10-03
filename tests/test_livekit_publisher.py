@@ -84,7 +84,10 @@ class TestLiveKitTTSPublisher:
             "ai-interpreter-ja-spk-42"
         )
         mock_livekit_sdk["api"].VideoGrants.assert_called_once_with(
-            room_join=True, room="019f6a39-a32c-7745-886e-1fe622c1f747"
+            room_join=True,
+            room="019f6a39-a32c-7745-886e-1fe622c1f747",
+            # Needed to set the warptalk.voice attribute (see VOICE_KIND_ATTRIBUTE).
+            can_update_own_metadata=True,
         )
 
     async def test_reuses_bot_across_calls_for_same_speaker_and_lang(

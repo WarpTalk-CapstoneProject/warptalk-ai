@@ -2423,6 +2423,28 @@ class TTSWorker(BaseWorker):
         # cached while the room was keeping up is not replayed at the wrong pace later.
         generation_config = self._with_catch_up(self._generation_config(translation), lag_ms)
 
+        # Says on the track whose voice this is, so the meeting client can play a speaker's dub
+        # only when it is in the speaker's own voice (see VOICE_KIND_ATTRIBUTE).
+        # Guarded here as well as inside the publisher: a label must never cost the sentence.
+        if self.livekit_publisher is not None:
+            try:
+                await self.livekit_publisher.set_voice_kind(
+                    translation.meeting_id,
+                    translation.speaker_id,
+                    translation.target_lang,
+                    voice_type,
+                    voice_key=voice_key,
+                )
+            except Exception:
+                self.logger.warning(
+                    "tts_voice_kind_not_announced",
+                    meeting_id=translation.meeting_id,
+                    speaker_id=translation.speaker_id,
+                    target_lang=translation.target_lang,
+                    voice_type=voice_type,
+                    exc_info=True,
+                )
+
         cache_key = self._cache_key(
             speaker_id=translation.speaker_id,
             target_lang=translation.target_lang,
