@@ -41,6 +41,7 @@ from shared.integration_status import (
     livekit_report,
 )
 from shared.lang import base_language, is_same_language
+from shared.languages import known_language_code
 from shared.platform_settings import (
     FLAG_VOICE_CLONE,
     VOICE_CLONE_MIN_SECONDS,
@@ -479,6 +480,13 @@ def _clone_language(hint: str) -> str:
 #: one (see the 2.6s hub window this repeatedly loses).
 _UNRESOLVED_LANGUAGES = {"", "auto", "unknown", "und"}
 
+#: How often dub tracks are checked against the room's current languages — see
+#: TTSWorker._reconcile_dub_targets. Two HGETALLs per room with a live dub track, per pass.
+_DUB_TARGET_RECONCILE_S = 3.0
+#: A sentence already in flight when the speaker re-picked may still publish on the old track a
+#: moment after the change was seen; that is not translation still feeding it.
+_DUB_TARGET_CHANGE_GRACE_S = 5.0
+
 
 def _resolve_clone_language(hint: str) -> str | None:
     """The language to clone in, or None when we do not yet know one.
@@ -726,6 +734,7 @@ class TTSWorker(BaseWorker):
         asyncio.create_task(self._consume_upload_clone_requests())
         asyncio.create_task(self._consume_preview_requests())
         asyncio.create_task(self._consume_voice_delete_requests())
+        asyncio.create_task(self._reconcile_dub_targets_loop())
         if self.tts_settings.far_speaker_clone_enabled:
             asyncio.create_task(self._watch_far_clone_consents())
         if self.tts_settings.orphan_voice_sweep_enabled:
@@ -1022,6 +1031,120 @@ class TTSWorker(BaseWorker):
         cartesia = getattr(self, "cartesia", None)
         if cartesia is not None:
             await cartesia.close()
+
+    async def _reconcile_dub_targets_loop(self) -> None:
+        """Run _reconcile_dub_targets every _DUB_TARGET_RECONCILE_S until shutdown."""
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(_DUB_TARGET_RECONCILE_S)
+            try:
+                await self._reconcile_dub_targets()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A missed pass costs what this exists to remove, at most one idle timeout.
+                self.logger.exception("dub_target_reconcile_failed")
+
+    async def _reconcile_dub_targets(self) -> int:
+        """Retire dub tracks whose (speaker, target language) stopped being a target.
+
+        A MID-MEETING LANGUAGE CHANGE REACHES THIS WORKER ONLY AS THE ABSENCE OF MESSAGES
+            Translation fans out per utterance from the room's hashes (translation_worker
+            _get_target_languages), so a change is followed on the next sentence: a NEW target
+            gets a bot on its first message. A target that DISAPPEARS just stops receiving
+            messages, and its bot used to sit in the room until the idle sweep — up to
+            SESSION_IDLE_TIMEOUT_S plus a reaper interval. While it is there the web client
+            mutes the speaker's microphone for that language's listeners. So the bridge host
+            who switches from vi to en, in a room whose Meet side listens in en, went silent on
+            the Meet side for over a minute: no dub (same language) and no microphone (a dub
+            track still existed).
+
+        THE CONTRACT (TranslationRoomHub, written by SetSpeakLanguage / SetListenLanguage /
+        SetExternalMeetingLanguage, keyed by participant identity — the stand-in's is
+        00000000-0000-0000-0000-00000000b21d):
+            translationRoom:{id}:languages        listen language per participant
+            translationRoom:{id}:speak_languages  speak language per participant ("auto" = unpinned)
+        Polled, because nothing on a channel this worker hears announces a language change.
+
+        TWO REASONS A TARGET STOPS BEING ONE
+            * nobody else listens in it any more — translation_worker's own rule, mirrored:
+              every distinct known listen language among the OTHER participants ("en" when there
+              are none). Translation cannot produce such a target whatever was said, so this is
+              exact.
+            * the speaker now SPEAKS it. Translation drops a target equal to each SEGMENT's
+              language, which is not always the declaration (a learned override, the text
+              language-ID), so the declaration alone cannot say a target is dead: a speaker
+              declared en who is audibly speaking vi still feeds the en track. It is therefore
+              only acted on after the speaker's declaration CHANGED to that language (seen by
+              this loop) and the track has not published since — a track translation still
+              feeds keeps its bot. The first observation of a speaker is not a change.
+
+        A room whose listen hash is empty or unreadable is left alone — there is nothing
+        trustworthy to compare against, and the idle sweep still applies.
+        """
+        publisher = getattr(self, "livekit_publisher", None)
+        if publisher is None:
+            return 0
+        declared_seen: dict[tuple[str, str], tuple[str, float | None]] | None = getattr(
+            self, "_dub_declared_speak", None
+        )
+        if declared_seen is None:
+            declared_seen = {}
+            self._dub_declared_speak = declared_seen
+        by_room: dict[str, dict[str, dict[str, float]]] = {}
+        for (meeting_id, speaker_id), langs in publisher.dub_targets().items():
+            by_room.setdefault(meeting_id, {})[speaker_id] = langs
+        for key in [key for key in declared_seen if key[0] not in by_room]:
+            declared_seen.pop(key, None)
+        now = time.monotonic()
+        retired = 0
+        for meeting_id, speakers in by_room.items():
+            try:
+                listen = _decode_hash(
+                    await self.redis.hgetall(f"translationRoom:{meeting_id}:languages")
+                )
+                speak = _decode_hash(
+                    await self.redis.hgetall(f"translationRoom:{meeting_id}:speak_languages")
+                )
+            except Exception:
+                self.logger.warning(
+                    "dub_target_languages_unreadable", meeting_id=meeting_id, exc_info=True
+                )
+                continue
+            if not listen:
+                continue
+            for speaker_id, langs in speakers.items():
+                wanted = {
+                    code
+                    for user_id, value in listen.items()
+                    if user_id != speaker_id and (code := known_language_code(value))
+                } or {"en"}
+                own = (speak.get(speaker_id) or "").strip().lower()
+                if own == "auto":
+                    own = ""
+                previous = declared_seen.get((meeting_id, speaker_id))
+                if previous is None:
+                    changed_at: float | None = None
+                elif previous[0] != own:
+                    changed_at = now
+                else:
+                    changed_at = previous[1]
+                declared_seen[(meeting_id, speaker_id)] = (own, changed_at)
+                for lang, last_used in langs.items():
+                    if not any(is_same_language(lang, target) for target in wanted):
+                        reason = "no_listener_in_target_language"
+                    elif (
+                        own
+                        and changed_at is not None
+                        and is_same_language(lang, own)
+                        and last_used <= changed_at + _DUB_TARGET_CHANGE_GRACE_S
+                    ):
+                        reason = "speaker_now_speaks_target_language"
+                    else:
+                        continue
+                    retired += publisher.retire_target_language(
+                        meeting_id, speaker_id, lang, reason
+                    )
+        return retired
 
     def _cleanup_room(self, room_id: str) -> None:
         super()._cleanup_room(room_id)
