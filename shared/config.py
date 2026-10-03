@@ -818,11 +818,18 @@ class TTSSettings(BaseSettings):
     # reach it by any path. This is that bound doubled, so the sweep is wrong only if the TTL
     # above changes without this changing with it.
     orphan_voice_min_age_seconds: int = 86400  # 24h
-    # WT-933. Clone the voice of a Meet-side person (bridge stand-in) who consented for
-    # themselves. OFF by default, and with it off nothing below is read and the worker behaves
-    # byte-for-byte as before. See tts_worker/far_speaker_clone.py. Env:
-    # TTS_FAR_SPEAKER_CLONE_ENABLED.
-    far_speaker_clone_enabled: bool = False
+    # WT-933. Clone the voice of a Meet-side person (bridge stand-in) whose consent is recorded
+    # for the room. See tts_worker/far_speaker_clone.py. Env: TTS_FAR_SPEAKER_CLONE_ENABLED.
+    #
+    # ON by default, and that is not what turns cloning on for anybody. The switch that matters
+    # is per room and per person: the consent hash the bridge popup's "Voice clone mode" writes
+    # when the host ticks someone who agreed. A room with no entry — every native meeting, and
+    # every bridge room whose host never opened that mode — clones nothing, because only the
+    # stand-in's audio is ever looked at and only a consented name's audio is ever kept.
+    #
+    # So this is the platform's kill switch, not the feature's on switch: set it to false and
+    # the worker behaves byte-for-byte as it did before WT-933, with nothing below read.
+    far_speaker_clone_enabled: bool = True
     # How long a stand-in chunk is held, counted from its own timestamp, before it is attributed
     # to a caption name. Caption hints trail the speech by roughly 0.3-1.2 s, so a chunk
     # attributed on arrival would be judged on hints that have not been written yet.

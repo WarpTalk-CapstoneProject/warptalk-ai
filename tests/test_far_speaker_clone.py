@@ -314,12 +314,15 @@ class TestTheContractVectors:
 
 
 class TestFlagOff:
-    def test_off_is_the_default(self) -> None:
-        assert TTSSettings().far_speaker_clone_enabled is False
-
-    def test_the_env_name_is_the_contracts(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("TTS_FAR_SPEAKER_CLONE_ENABLED", "true")
+    def test_on_is_the_default_because_consent_is_the_real_switch(self) -> None:
+        # The per-room consent hash decides who is cloned; this flag is only the kill switch.
         assert TTSSettings().far_speaker_clone_enabled is True
+
+    def test_the_env_name_is_the_contracts_and_turns_it_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TTS_FAR_SPEAKER_CLONE_ENABLED", "false")
+        assert TTSSettings().far_speaker_clone_enabled is False
 
     async def test_a_consented_clone_is_not_spoken(self) -> None:
         off = _worker(enabled=False)
