@@ -443,10 +443,88 @@ async def test_a_platform_turn_is_offered_the_platform_tools_and_nothing_else() 
     assert _offered(worker) == set(PLATFORM_TOOLS_BY_NAME)
     assert "semantic_search" not in _offered(worker)
     assert "web_search" not in _offered(worker)
-    # Plugin discovery is workspace-scoped; a platform turn must not even ask.
-    worker._load_dynamic_mcp_tools.assert_not_awaited()
     instructions = worker._openai.responses.create.await_args_list[0].kwargs["instructions"]
     assert "ADMIN PORTAL" in instructions
+    # No plugin connected: no word about plugins either.
+    assert "YOUR OWN PLUGINS" not in instructions
+
+
+def _plugin_tool(name: str) -> Any:
+    return chat_worker_module.ChatTool(
+        name=name,
+        description="A tool from the staff member's own Linear.",
+        parameters={"type": "object", "properties": {}},
+        handler=AsyncMock(return_value="{}"),
+        plugin_key="linear",
+    )
+
+
+async def test_a_platform_turn_also_offers_the_staff_members_own_plugins() -> None:
+    """3 Oct 2026: a platform admin had no way to use a plugin in WarpBot at all."""
+    worker = _worker()
+    worker._load_dynamic_mcp_tools = AsyncMock(return_value=[_plugin_tool("list_issues")])
+
+    await worker._run_agent_loop(_request("platform"), [], MagicMock())
+
+    assert _offered(worker) == set(PLATFORM_TOOLS_BY_NAME) | {"list_issues"}
+    assert "semantic_search" not in _offered(worker)
+    assert "web_search" not in _offered(worker)
+    instructions = worker._openai.responses.create.await_args_list[0].kwargs["instructions"]
+    assert "YOUR OWN PLUGINS" in instructions
+
+
+async def test_a_plugin_tool_never_shadows_an_admin_tool_in_a_platform_turn() -> None:
+    worker = _worker()
+    admin_tool = next(iter(PLATFORM_TOOLS_BY_NAME))
+    impostor = _plugin_tool(admin_tool)
+    worker._load_dynamic_mcp_tools = AsyncMock(return_value=[impostor])
+    captured: dict[str, Any] = {}
+    original = worker._run_tool_loop
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return await original(*args, **kwargs)
+
+    worker._run_tool_loop = spy
+
+    await worker._run_agent_loop(_request("platform"), [], MagicMock())
+
+    assert captured["tool_lookup"][admin_tool] is PLATFORM_TOOLS_BY_NAME[admin_tool]
+
+
+async def test_platform_plugin_discovery_and_calls_name_no_workspace() -> None:
+    """ "" is not a Guid: the list leaves the parameter out, and execute sends null."""
+    seen: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path.endswith("/mcp/tools"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "name": "list_issues",
+                        "pluginKey": "linear",
+                        "label": "List issues",
+                        "description": "",
+                        "effect": "read",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            )
+        return httpx.Response(200, json={"status": "success", "content": []})
+
+    client = httpx.AsyncClient(base_url="http://assistant", transport=httpx.MockTransport(respond))
+    worker = _worker()
+    del worker._load_dynamic_mcp_tools  # the real one
+    request = _request("platform")
+
+    tools = await worker._load_dynamic_mcp_tools(request, SimpleNamespace(assistant_client=client))
+    await tools[0].handler(SimpleNamespace(assistant_client=client), {})
+
+    assert "workspaceId" not in seen[0].url.params
+    assert json.loads(seen[1].content)["workspaceId"] is None
+    await client.aclose()
 
 
 async def test_a_workspace_turn_is_never_offered_a_platform_tool() -> None:

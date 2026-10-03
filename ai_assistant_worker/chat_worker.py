@@ -587,6 +587,15 @@ def _now_message(now: datetime | None = None) -> str:
     )
 
 
+_PLATFORM_PLUGIN_INSTRUCTION = (
+    "YOUR OWN PLUGINS: besides the admin tools you also have tools from plugins this staff member "
+    "connected to their own accounts (for example Linear or Notion). The read-only rule above is "
+    "about WarpTalk's platform data; these tools act on the staff member's own external accounts. "
+    "Use them when asked. A tool that changes something there shows the user a confirmation card "
+    "first - call it, and let the card ask, rather than refusing."
+)
+
+
 def _is_platform_turn(request: Any) -> bool:
     """Whether this turn belongs to a system admin's platform-scope conversation.
 
@@ -852,18 +861,30 @@ class ChatAssistantWorker(BaseWorker):
         # Responses carries the system prompt as `instructions` rather than as a leading
         # message, so the three system-role messages are joined into one.
         if _is_platform_turn(request):
+            # THE SCOPE BOUNDARY. A platform turn is offered the read-only admin tools, plus the
+            # plugins the staff member connected for their OWN account (3 Oct 2026) - nothing else:
+            # no workspace tool, no retrieval, no hosted web search. Which plugins is the
+            # backend's call: it offers them only to a caller holding warpbot.use, and returns an
+            # empty list to anyone else asking without a workspace.
+            platform_plugin_tools = await self._load_dynamic_mcp_tools(request, tool_context)
+            platform_parts = [build_platform_system_prompt(), _now_message()]
+            if platform_plugin_tools:
+                platform_parts.append(_PLATFORM_PLUGIN_INSTRUCTION)
+            platform_parts.append(citation_instruction())
             return await self._run_tool_loop(
                 request,
                 history,
                 tool_context,
-                instructions="\n\n".join(
-                    [build_platform_system_prompt(), _now_message(), citation_instruction()]
-                ),
-                # THE SCOPE BOUNDARY. A platform turn is offered the read-only admin tools and
-                # nothing else: no workspace tool, no retrieval, no plugin (MCP discovery is
-                # workspace-scoped and never called), no hosted web search.
-                tool_lookup=dict(PLATFORM_TOOLS_BY_NAME),
-                tool_schemas=[tool.to_openai_schema() for tool in PLATFORM_TOOLS],
+                instructions="\n\n".join(platform_parts),
+                # Admin tools last, so they win a name clash, as built-ins do in a workspace turn.
+                tool_lookup={
+                    **{tool.name: tool for tool in platform_plugin_tools},
+                    **PLATFORM_TOOLS_BY_NAME,
+                },
+                tool_schemas=[
+                    *(tool.to_openai_schema() for tool in PLATFORM_TOOLS),
+                    *(tool.to_openai_schema() for tool in platform_plugin_tools),
+                ],
             )
 
         template = resolve_template(
@@ -1319,9 +1340,13 @@ class ChatAssistantWorker(BaseWorker):
         if not isinstance(assistant_client, httpx.AsyncClient):
             return []
 
+        # A platform turn has no workspace. Sent as "", the backend's Guid? would not bind it, so
+        # the parameter is left out instead, which is what "no workspace" means there.
+        params: dict[str, Any] = {}
+        if request.workspace_id:
+            params["workspaceId"] = request.workspace_id
         # WT-687: plugins switched off for this conversation are left out by AssistantService, so
         # the model is never told they exist. Sent as a repeated query parameter.
-        params: dict[str, Any] = {"workspaceId": request.workspace_id}
         disabled_plugin_keys = _parse_disabled_plugin_keys(request.disabled_plugin_keys_json)
         if disabled_plugin_keys:
             params["excludePluginKeys"] = disabled_plugin_keys
@@ -1416,7 +1441,8 @@ class ChatAssistantWorker(BaseWorker):
             response = await assistant_client.post(
                 "/api/v1/assistant/mcp/tools/execute",
                 json={
-                    "workspaceId": request.workspace_id,
+                    # null, not "": System.Text.Json refuses "" for a Guid? and the call 400s.
+                    "workspaceId": request.workspace_id or None,
                     "pluginKey": plugin_key,
                     "toolName": tool_name,
                     "arguments": tool_arguments,
