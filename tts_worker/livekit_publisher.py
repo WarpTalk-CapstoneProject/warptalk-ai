@@ -132,6 +132,11 @@ _BotKey = tuple[str, str, str, str]
 _DRAIN_TIMEOUT_S = 30.0
 
 
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
 class TrackStream:
     """One sentence's audio, pushed onto the track while Cartesia is still generating it.
 
@@ -175,6 +180,8 @@ class TrackStream:
         self._spoken_bytes = 0
         self._broken = False
         self._first_audio_at: float | None = None
+        # The bot this sentence will speak through, joining while Cartesia generates — see start.
+        self._bot_task: asyncio.Task[dict[str, Any]] | None = None
 
     @property
     def spoken_bytes(self) -> int:
@@ -196,10 +203,46 @@ class TrackStream:
             self._queue.put_nowait(pcm_s16le)
 
     def start(self) -> None:
+        """Start the pump, and start joining the room NOW rather than at the first chunk.
+
+        The bot used to be created inside `_capture`, i.e. only once Cartesia's first chunk had
+        arrived, so a cold key paid Cartesia's time to first byte and then the whole LiveKit
+        handshake (room.connect + publish_track) one after the other. A key is cold for every
+        speaker who resumes after SESSION_IDLE_TIMEOUT_S of silence, and on prod 3 Oct 2026 that
+        handshake took 4.5-17.6s under CPU pressure, ahead of every such sentence. Started here,
+        it overlaps with the generation instead of following it; a warm key returns at once.
+        """
         if self._pump is None:
             self._pump = asyncio.create_task(self._pump_loop())
+        if self._bot_task is None:
+            self._bot_task = asyncio.create_task(
+                self._publisher._get_or_create_bot(*self._key, self._sample_rate)
+            )
+            # Consumed by _capture when audio arrives; a sentence that never produces any must
+            # not leave an unretrieved exception behind.
+            self._bot_task.add_done_callback(_consume_task_exception)
 
     async def close(self) -> None:
+        try:
+            await self._close_pump()
+        finally:
+            await self._settle_bot_task()
+
+    async def _settle_bot_task(self) -> None:
+        """Let a join still in flight finish while this key's lock is still held.
+
+        A sentence with no audio leaves this block with the join running. Released mid-join, the
+        lock would let publish_pcm's one-shot fallback for the same key reach _get_or_create_bot
+        concurrently and put a second bot with the same identity in the room. Bounded like the
+        drain, so a wedged handshake cannot stop this speaker's dub for the rest of the meeting.
+        """
+        task, self._bot_task = self._bot_task, None
+        if task is None or task.done():
+            return
+        with suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(task), timeout=_DRAIN_TIMEOUT_S)
+
+    async def _close_pump(self) -> None:
         if self._pump is None:
             return
         self._queue.put_nowait(None)
@@ -268,7 +311,13 @@ class TrackStream:
         remaining = pcm_s16le
         for attempt in range(2):
             try:
-                bot = await self._publisher._get_or_create_bot(*self._key, self._sample_rate)
+                # The first attempt takes the join start() began; a retry follows an eviction
+                # below and has to make a fresh bot.
+                prewarm, self._bot_task = self._bot_task, None
+                if attempt == 0 and prewarm is not None:
+                    bot = await prewarm
+                else:
+                    bot = await self._publisher._get_or_create_bot(*self._key, self._sample_rate)
             except Exception:
                 logger.exception(
                     "livekit_tts_bot_connect_error",

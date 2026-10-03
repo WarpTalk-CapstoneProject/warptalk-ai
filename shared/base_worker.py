@@ -23,7 +23,7 @@ from typing import Any
 from redis.asyncio.client import PubSub
 
 from shared.config import RedisSettings, WorkerSettings
-from shared.health_probe import heartbeat_key
+from shared.health_probe import heartbeat_key, touch_heartbeat_file
 from shared.integration_status import (
     REPORT_INTERVAL_SECONDS,
     IntegrationReport,
@@ -228,6 +228,7 @@ class BaseWorker(ABC):
             ),
             self.heartbeat_ttl_seconds,
         )
+        touch_heartbeat_file(self.worker_name)
         await self._report_integrations()
 
     # ------------------------------------------------------------------
