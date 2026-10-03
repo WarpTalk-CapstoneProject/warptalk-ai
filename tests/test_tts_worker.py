@@ -1002,3 +1002,41 @@ class TestTextOnlyBridgeIsNeverDubbedIntoMeet:
         await worker.process(b"msg-1", _make_msg(target_lang="vi").to_redis())
 
         worker.cartesia.synthesize.assert_not_called()
+
+    async def test_a_stale_text_only_route_in_memory_yields_to_the_snapshot(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        # The speaker switched text -> voice and this worker missed the AUDIO_ROUTES_UPDATED
+        # broadcast. The durable snapshot already says voice: the dub must be synthesized, or
+        # Meet hears the speaker's untranslated voice for the rest of the meeting.
+        worker = self._worker(
+            mock_redis_client, worker_settings, [_route("s1", STAND_IN, "vi", True)]
+        )
+        snapshot = json.dumps(
+            {"routes": [_route("s1", STAND_IN, "vi", False)], "room_status": "IN_PROGRESS"}
+        ).encode()
+        mock_redis_client._redis.get.side_effect = lambda key: (
+            snapshot if str(key).endswith(":audio_routes") else None
+        )
+
+        await worker.process(b"msg-1", _make_msg(target_lang="vi").to_redis())
+
+        worker.cartesia.synthesize.assert_called_once()
+        assert worker._room_routes["m1"][0]["TextOnly"] is False
+
+    async def test_a_snapshot_that_still_says_text_only_keeps_the_skip(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        worker = self._worker(
+            mock_redis_client, worker_settings, [_route("s1", STAND_IN, "vi", True)]
+        )
+        snapshot = json.dumps(
+            {"routes": [_route("s1", STAND_IN, "vi", True)], "room_status": "IN_PROGRESS"}
+        ).encode()
+        mock_redis_client._redis.get.side_effect = lambda key: (
+            snapshot if str(key).endswith(":audio_routes") else None
+        )
+
+        await worker.process(b"msg-1", _make_msg(target_lang="vi").to_redis())
+
+        worker.cartesia.synthesize.assert_not_called()

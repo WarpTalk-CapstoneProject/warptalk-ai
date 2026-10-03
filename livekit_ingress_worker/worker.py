@@ -28,7 +28,7 @@ from livekit_ingress_worker.far_side_gate import (
 )
 from livekit_ingress_worker.near_field_gate import NearFieldGate
 from livekit_ingress_worker.speech_level_floor import SpeechLevelFloor
-from shared.base_worker import BaseWorker
+from shared.base_worker import TERMINAL_ROOM_STATUSES, BaseWorker
 from shared.control_markers import is_external_bridge_speaker
 from shared.integration_status import LIVEKIT, IntegrationReport, livekit_report
 from shared.object_storage import ObjectStorage, ObjectStorageSettings
@@ -848,7 +848,30 @@ class LiveKitIngressWorker(BaseWorker):
             )
 
     async def _connect_room(self, room_name: str) -> None:
-        """Join this room's bot, honouring any backoff a previous failure imposed."""
+        """Join this room's bot, honouring any backoff a previous failure imposed.
+
+        A ROOM THAT WAS NOT JOINED IS PUT BACK IN THE QUEUE (2026-10-03, room 01a1010c)
+            Every caller reaches this having just WON the room's claim, and winning the claim
+            removes the room from `_deferred_rooms` (see _claim_room_ownership). So when this
+            returned without a connection — a backoff still running, or a dial that failed — the
+            room was in neither `self.rooms` nor `_deferred_rooms`, and nothing in this process
+            would ever try it again: the sweep only renews rooms it holds and only re-dials
+            rooms it has deferred. The lease, which nobody renewed, lapsed 45 seconds later,
+            and the other replica would take over only if it happened to have deferred the
+            room itself. Otherwise the meeting was recovered by nothing but the next
+            `meeting.track_published`, which in a room where everyone has already published
+            never comes.
+
+            That is exactly the moment a LiveKit hiccup produces: the connection drops, the
+            sweep requeues it, the very first re-dial fails or lands inside the backoff — and
+            the room stops being transcribed for good, for the host and the far side at once.
+
+            So both exits defer the room again, and the claim is KEPT rather than released: the
+            next sweep re-claims it from this replica (which renews the lease) and retries the
+            moment the backoff allows. Releasing it instead would hand a room that LiveKit is
+            rate-limiting straight to the other replica, whose own backoff knows nothing about
+            it — the WT-269 storm, one replica removed.
+        """
         now = asyncio.get_running_loop().time()
         not_before = self._connect_not_before.get(room_name, 0.0)
         if now < not_before:
@@ -858,6 +881,7 @@ class LiveKitIngressWorker(BaseWorker):
                 retry_in_s=round(not_before - now, 2),
                 consecutive_failures=self._connect_failures.get(room_name, 0),
             )
+            self._retry_connect_later(room_name)
             return
 
         await self._record_connect_attempt(room_name)
@@ -870,6 +894,29 @@ class LiveKitIngressWorker(BaseWorker):
             # sure something is actually watching it.
             self._room_last_occupied[room_name] = self._now()
             self._ensure_idle_sweeper()
+            return
+
+        self._retry_connect_later(room_name)
+
+    def _retry_connect_later(self, room_name: str) -> None:
+        """Keep a room this replica could not join in the sweep's re-dial queue. See _connect_room.
+
+        Not for a room the backend has already ended: the queue is left only by a claim or by
+        `_cleanup_room`, and a finished meeting that was not joined would otherwise be dialled
+        once per backoff for the life of the process.
+        """
+        if self._route_states.get(room_name) in TERMINAL_ROOM_STATUSES:
+            return
+        if room_name not in self._deferred_rooms:
+            self.logger.warning(
+                "livekit_room_connect_requeued",
+                room=room_name,
+                consecutive_failures=self._connect_failures.get(room_name, 0),
+            )
+        self._deferred_rooms.add(room_name)
+        # The sweep is what retries it, and it is started lazily. A process whose very first
+        # dial failed has never started one.
+        self._ensure_idle_sweeper()
 
     async def _record_connect_attempt(self, room_name: str) -> None:
         """Log every LiveKit dial, and shout when one room is dialling far too often.
@@ -1085,11 +1132,31 @@ class LiveKitIngressWorker(BaseWorker):
         return True
 
     def _start_pending_audio_tasks(self, room_name: str, room: rtc.Room) -> int:
-        """Attach to every already-published, UNMUTED human audio track we are not reading yet."""
+        """Attach to every already-published, UNMUTED human audio track we are not reading yet.
+
+        ONE MICROPHONE PER PERSON, CHOSEN ONCE PER SWEEP (2026-10-03, room 01a1010c)
+            Readers are keyed per (room, participant), so a participant with TWO live speech
+            publications cannot have both read — and this used to try. Each publication went to
+            `_start_audio_task` in turn, which replaces a reader on any other sid, so every sweep
+            cancelled the reader and started it again on the first, then on the second: two
+            restarts every fifteen seconds, each one throwing away the utterance in progress and
+            resetting the VAD, for as long as the second publication stayed.
+
+            That state is not exotic. A client whose full reconnect fails to remove its old
+            microphone ("failed to remove track") and then publishes a new one — which is
+            exactly what the web's mic re-publish does — leaves both on the server.
+
+            So the choice is made per participant: a reader already on one of their eligible
+            publications stays there (moved onto a fresh handle if the SDK re-subscribed it), and
+            only somebody with no reader on any of them is attached — to the last one listed.
+            The event handlers still follow the newest publish or unmute immediately; this sweep
+            no longer undoes them.
+        """
         started = 0
         for participant in room.remote_participants.values():
             if _is_ai_bot_identity(participant.identity):
                 continue
+            eligible: list[tuple[rtc.TrackPublication, rtc.Track]] = []
             for pub in participant.track_publications.values():
                 track = pub.track
                 if track is None or track.kind != rtc.TrackKind.KIND_AUDIO:
@@ -1111,15 +1178,31 @@ class LiveKitIngressWorker(BaseWorker):
                 # one sweep later — the same shape as the WT-542 mute bug directly above.
                 if not _carries_speech(pub):
                     continue
-                self._remember_speaker_name(room_name, participant)
-                if self._start_audio_task(room_name, participant.identity, track):
-                    self.logger.info(
-                        "subscribing_existing_audio_track",
-                        room=room_name,
-                        participant=participant.identity,
-                        track=track.sid,
-                    )
-                    started += 1
+                eligible.append((pub, track))
+            if not eligible:
+                continue
+
+            key = (room_name, participant.identity)
+            reader = self.audio_tasks.get(key)
+            reading_sid = (
+                self.audio_task_tracks.get(key)
+                if reader is not None and not reader.done()
+                else None
+            )
+            chosen = next(
+                (track for _pub, track in eligible if track.sid == reading_sid),
+                eligible[-1][1],
+            )
+            self._remember_speaker_name(room_name, participant)
+            if self._start_audio_task(room_name, participant.identity, chosen):
+                self.logger.info(
+                    "subscribing_existing_audio_track",
+                    room=room_name,
+                    participant=participant.identity,
+                    track=chosen.sid,
+                    speech_publications=len(eligible),
+                )
+                started += 1
         return started
 
     def _repair_missing_subscriptions(self, room_name: str, room: rtc.Room) -> int:
@@ -1697,6 +1780,22 @@ class LiveKitIngressWorker(BaseWorker):
             # MICROPHONE — a track that is still live and still unmuted.
             if not _carries_speech(publication):
                 return
+            # The same per-participant keying, one step further: the muted publication must be
+            # the one being READ. A participant can briefly hold two microphones — the old one a
+            # failed full reconnect could not remove, and the one the client re-published — and
+            # the old one being muted on its way out cancelled the reader on the new, live one.
+            # Nothing re-attached it until the next idle sweep, so up to fifteen seconds of the
+            # speaker were dropped at the very moment they had just come back.
+            reading = self.audio_task_tracks.get((room_name, participant.identity))
+            if reading is not None and reading != publication.sid:
+                self.logger.info(
+                    "audio_track_muted_not_being_read",
+                    room=room_name,
+                    participant=participant.identity,
+                    track=publication.sid,
+                    reading_track=reading,
+                )
+                return
             if self._cancel_audio_task(room_name, participant.identity):
                 self.logger.info(
                     "audio_reader_stopped_on_mute",
@@ -1740,6 +1839,39 @@ class LiveKitIngressWorker(BaseWorker):
             # The only signal that a rejoin is legitimately needed. Logged so a room that
             # keeps dropping is visible next to the connect attempts it causes.
             self.logger.warning("livekit_room_disconnected", room=room_name, reason=str(reason))
+
+        # THE BOT'S OWN RECONNECT WAS INVISIBLE (2026-10-03, room 01a1010c). A LiveKit hiccup
+        # that made the host's client do a full reconnect at 09:23:36 may well have taken this
+        # connection through one too, and nothing here said so: `isconnected()` reads True all
+        # the way through RECONNECTING, so neither the census nor the sweep could tell. Both
+        # edges are logged now, so "did the bot drop as well" is a grep, not a guess.
+        @room.on("reconnecting")
+        def on_reconnecting() -> None:
+            self.logger.warning("livekit_room_reconnecting", room=room_name)
+
+        @room.on("reconnected")
+        def on_reconnected() -> None:
+            # A reconnect re-subscribes every microphone on new handles. `track_subscribed`
+            # normally moves each reader across, but a reader the SDK did not re-announce sits on
+            # a dead handle until the 15s sweep finds it — so run the same post-join checks a
+            # publish gets (+1/3/6/10s), which re-attach and re-request within a second.
+            self.logger.warning("livekit_room_reconnected", room=room_name)
+            self._schedule_subscription_checks(room_name)
+
+        @room.on("participant_disconnected")
+        def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
+            # Logged, deliberately not acted on. A client's full reconnect is this followed by
+            # the same identity connecting again, and the order of the two is not guaranteed:
+            # cancelling the speaker's reader here could cancel the one already moved onto the
+            # new session's microphone. The old reader ends with its stream on its own.
+            if _is_ai_bot_identity(participant.identity):
+                return
+            self.logger.info(
+                "livekit_participant_disconnected",
+                room=room_name,
+                participant=participant.identity,
+                reading_track=self.audio_task_tracks.get((room_name, participant.identity)),
+            )
 
         try:
             await room.connect(self.settings.livekit.url, token)
