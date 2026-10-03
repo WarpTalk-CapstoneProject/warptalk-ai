@@ -720,6 +720,52 @@ class LiveKitTTSPublisher:
             )
         return [key[3] for key in stale]
 
+    def dub_targets(self) -> dict[tuple[str, str], dict[str, float]]:
+        """(meeting_id, speaker_id) -> {target language: monotonic time any of its bots (default
+        or voice variant) last published} for every bot this process holds."""
+        targets: dict[tuple[str, str], dict[str, float]] = {}
+        for (meeting_id, speaker_id, target_lang, _voice_key), bot in self._bots.items():
+            langs = targets.setdefault((meeting_id, speaker_id), {})
+            last_used = float(bot.get("last_used", 0.0))
+            langs[target_lang] = max(langs.get(target_lang, last_used), last_used)
+        return targets
+
+    def retire_target_language(
+        self, meeting_id: str, speaker_id: str, target_lang: str, reason: str
+    ) -> int:
+        """Disconnect EVERY bot (default track and voice variants) dubbing this speaker into
+        `target_lang`. Returns how many left.
+
+        For a target that stopped being one mid-meeting — the speaker switched to that very
+        language, or the last listener in it switched away. The track stayed for
+        SESSION_IDLE_TIMEOUT_S, and while it is in the room the web client counts the speaker
+        as dubbed into that language and MUTES their microphone for its listeners
+        (FilteredRoomAudio): a vi listener whose partner had just switched to vi heard nobody
+        for up to a minute and a quarter. Same rule as retire_voice_variants: a bot
+        mid-sentence is left for the reaper.
+        """
+        stale = [
+            key
+            for key in self._bots
+            if key[0] == meeting_id
+            and key[1] == speaker_id
+            and key[2] == target_lang
+            and not self._is_publishing(key)
+        ]
+        for key in stale:
+            bot = self._bots.pop(key)
+            self._locks.pop(key, None)
+            asyncio.create_task(self._close_bot(bot))
+            logger.info(
+                "livekit_tts_bot_retired",
+                meeting_id=meeting_id,
+                speaker_id=speaker_id,
+                target_lang=target_lang,
+                voice_key=key[3],
+                reason=reason,
+            )
+        return len(stale)
+
     def _is_publishing(self, key: _BotKey) -> bool:
         """Whether publish_pcm currently holds this key's lock.
 

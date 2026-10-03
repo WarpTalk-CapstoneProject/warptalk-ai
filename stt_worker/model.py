@@ -1473,6 +1473,12 @@ class OpenAISTT:
         # Consecutive lines showing a speaker is back on their declared language while an
         # override pins them elsewhere — see _learn_release_evidence.
         self._release_evidence: dict[tuple[str, str], int] = {}
+        # The declaration each speaker's previous chunk carried — see _note_declaration. Only
+        # kept for Google Meet bridge rooms (transcribe(bridge_room=True)). A change
+        # here is the only signal this process gets that the person re-picked their language
+        # mid-meeting (SetSpeakLanguage / SetExternalMeetingLanguage write the speak_languages
+        # hash, which livekit_ingress_worker reads per utterance into AudioChunkMessage.language).
+        self._declared_language: dict[tuple[str, str], str | None] = {}
         self._warm_sessions: deque[dict[str, Any]] = deque()
         # How many warm sockets to keep ready. Set by warm_up() and used by
         # _schedule_warm_refill to replace every socket a speaker claims.
@@ -1827,6 +1833,7 @@ class OpenAISTT:
         streamed_epoch: int | None = None,
         recent_dub_texts: Sequence[str] | None = None,
         speech_ms: int = 0,
+        bridge_room: bool = False,
     ) -> list[TranscribedSegment]:
         """Transcribe raw audio bytes via the OpenAI Realtime API.
 
@@ -1836,6 +1843,10 @@ class OpenAISTT:
             language: ISO 639-1 hint or None for auto-detect (fed to the session as
                 input_audio_transcription.language — see _get_or_create_session)
             chunk_offset_ms: Timestamp offset to add to segment times
+            bridge_room: the meeting is a Google Meet EXTERNAL_BRIDGE room (STTWorker
+                detects it from the stand-in seat in `speak_languages`). Only there does a
+                changed declaration also wipe half-counted evidence — see _note_declaration.
+                False keeps native rooms exactly on the previous behaviour.
             speech_ms: how much of `audio_bytes` VAD called speech, as published by the
                 ingress worker. 0 means it did not say. Feeds the "too much text for this
                 little audio" guard, which against the chunk's PADDED duration could never
@@ -1876,7 +1887,9 @@ class OpenAISTT:
         # getattr, not attribute access: instances built without __init__ are a supported
         # shape here — see the same guard on _warm_sessions — and this must not be the thing
         # that decides whether transcription runs at all.
-        lang_arg = self._apply_language_override((meeting_id, speaker_id), lang_arg)
+        lang_arg = self._apply_language_override(
+            (meeting_id, speaker_id), lang_arg, bridge_room=bridge_room
+        )
 
         detected_language = lang_arg or "unknown"
 
@@ -2131,6 +2144,8 @@ class OpenAISTT:
         self,
         key: tuple[str, str],
         declared: str | None,
+        *,
+        bridge_room: bool = False,
     ) -> str | None:
         """The language to pin this chunk's session to: the declaration, unless a learned
         override still corrects it.
@@ -2155,7 +2170,13 @@ class OpenAISTT:
         something NEW about themselves, and that statement gets the same initial trust a
         join-time declaration does. If they are still actually speaking something else, the
         evidence loop simply re-learns — two unambiguous segments, same as the first time.
+
+        `bridge_room` (Google Meet EXTERNAL_BRIDGE rooms only) additionally runs
+        _note_declaration, which also wipes evidence still COUNTING toward an override when the
+        declaration changes. Native rooms skip it and keep exactly the behaviour above.
         """
+        if bridge_room:
+            self._note_declaration(key, declared)
         overrides: dict[tuple[str, str], tuple[str, str | None]] | None = getattr(
             self, "_language_override", None
         )
@@ -2197,6 +2218,49 @@ class OpenAISTT:
             return learned
 
         return declared
+
+    def _note_declaration(self, key: tuple[str, str], declared: str | None) -> None:
+        """Forget everything learned against the previous declaration when it changes.
+
+        A NEW DECLARATION IS A FRESH START, NOT ONLY FOR THE OVERRIDE.
+
+        _apply_language_override already drops an override whose declaration no longer stands.
+        What it could not see is the evidence still COUNTING toward one: a speaker declared en
+        with one Vietnamese line on the counter who then picks ja keeps that (vi, 1), and their
+        next stray vi-looking line re-pins them to Vietnamese — learned against a declaration
+        they withdrew. The release counter has the same shape. Both are cleared here, so a
+        mid-meeting pick (bridge host via SetSpeakLanguage, the Meet side via
+        SetExternalMeetingLanguage) gets exactly the initial trust a join-time pick gets.
+
+        BRIDGE ROOMS ONLY. Called from _apply_language_override only when the worker says the
+        meeting is a Google Meet EXTERNAL_BRIDGE room; native meeting rooms keep the previous
+        behaviour (only a finished override is released on a new declaration).
+
+        The first chunk a speaker sends records their declaration and clears nothing: there is
+        no previous claim to withdraw.
+        """
+        declarations: dict[tuple[str, str], str | None] | None = getattr(
+            self, "_declared_language", None
+        )
+        if declarations is None:
+            declarations = {}
+            self._declared_language = declarations
+        seen = key in declarations
+        previous = declarations.get(key)
+        declarations[key] = declared
+        if not seen or previous == declared:
+            return
+        for name in ("_language_evidence", "_release_evidence"):
+            counters = getattr(self, name, None)
+            if counters is not None:
+                counters.pop(key, None)
+        logger.info(
+            "stt_declared_language_changed",
+            meeting_id=key[0],
+            speaker_id=key[1],
+            old_declaration=previous,
+            new_declaration=declared,
+        )
 
     def _learn_language_evidence(
         self,
