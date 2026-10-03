@@ -30,6 +30,7 @@ def _failing_worker(code: str) -> tuple[TTSWorker, list[bytes], list[str]]:
         _language: str = "en",
         _sample_rate: int = 16000,
         _score: float | None = None,
+        **_kwargs: Any,
     ) -> str:
         attempts.append(audio)
         return code

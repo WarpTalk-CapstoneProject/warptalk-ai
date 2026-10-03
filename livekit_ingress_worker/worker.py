@@ -201,6 +201,20 @@ _STORM_COUNTER_KEY_PREFIX = "livekit:ingress:connects:"
 # across the pipeline — and bounds the overshoot past the grace period to one tick.
 _IDLE_SWEEP_INTERVAL_S = 15.0
 
+# A microphone the bot can SEE but has never been handed. Production 3 Oct 2026, room 01a1009e:
+# the census counted three humans from 14:19:10, yet Ngọc Kỳ's microphone was subscribed at
+# 14:24:47 — six minutes of speech nobody heard — and Tuấn's 44 seconds after he joined. The
+# sweep could not help: `_start_pending_audio_tasks` only looks at publications that already
+# have a track, and nothing ever asked LiveKit to subscribe one that did not. Auto-subscribe is
+# a request the server is allowed to drop; nothing re-sends it.
+#
+# So the bot re-asks. Grace first, because an ordinary auto-subscribe takes a second or two and
+# re-requesting inside that window would only race it.
+_SUBSCRIPTION_GRACE_S = 2.0
+# Checked this long after every join and publish event, not merely on the 15s sweep: the first
+# sentence somebody says is usually within ten seconds of joining.
+_SUBSCRIPTION_REPAIR_DELAYS_S = (1.0, 3.0, 6.0, 10.0)
+
 # Room lifecycle states that mean "this meeting is happening right now", used by
 # _rediscover_active_rooms to decide which snapshots are worth reclaiming after a restart.
 #
@@ -476,6 +490,8 @@ class LiveKitIngressWorker(BaseWorker):
         self._room_last_occupied: dict[str, float] = {}
         self._idle_sweeper: asyncio.Task[None] | None = None
         self._idle_releases_total = 0
+        # (room, track sid) -> when that visible microphone was first seen without a track.
+        self._unsubscribed_since: dict[tuple[str, str], float] = {}
         # S1. Rooms another replica currently owns. We hold no connection for these, but we
         # remember them so the sweeper can retry the claim — otherwise a replica dying
         # mid-meeting would silently end audio ingestion for its rooms until the next
@@ -682,6 +698,7 @@ class LiveKitIngressWorker(BaseWorker):
             track=track_id,
         )
         await self._ensure_room_connected(room_name, "track_published", track=track_id)
+        self._schedule_subscription_checks(room_name)
 
     async def handle_participant_joined(self, payload: dict[str, Any]) -> None:
         """WT-923: be in the room before the person who just joined says anything."""
@@ -705,6 +722,7 @@ class LiveKitIngressWorker(BaseWorker):
         await self._ensure_room_connected(
             room_name, "participant_joined", participant=participant_identity
         )
+        self._schedule_subscription_checks(room_name)
 
     async def _ensure_room_connected(self, room_name: str, trigger: str, **context: Any) -> None:
         """Connect this replica's bot to the room unless it is already there or owned elsewhere.
@@ -1090,6 +1108,88 @@ class LiveKitIngressWorker(BaseWorker):
                     started += 1
         return started
 
+    def _repair_missing_subscriptions(self, room_name: str, room: rtc.Room) -> int:
+        """Re-request every visible human microphone that LiveKit never handed us.
+
+        Muted ones included: subscribing starts no reader (on_track_subscribed refuses a muted
+        track), it only means the reader can start the instant they unmute instead of after a
+        subscription nobody is going to re-send. See _SUBSCRIPTION_GRACE_S.
+        """
+        pending: dict[tuple[str, str], float] | None = getattr(self, "_unsubscribed_since", None)
+        if pending is None:
+            pending = {}
+            self._unsubscribed_since = pending
+        now = self._now()
+        seen: set[tuple[str, str]] = set()
+        repaired = 0
+        for participant in room.remote_participants.values():
+            if _is_ai_bot_identity(participant.identity):
+                continue
+            for pub in participant.track_publications.values():
+                if pub.kind != rtc.TrackKind.KIND_AUDIO or not _carries_speech(pub):
+                    continue
+                if pub.track is not None:
+                    continue
+                key = (room_name, pub.sid)
+                seen.add(key)
+                first_seen = pending.setdefault(key, now)
+                if now - first_seen < _SUBSCRIPTION_GRACE_S:
+                    continue
+                try:
+                    # Off then on: a plain `True` repeats the desired state the server already
+                    # holds for an auto-subscribed track and is free to ignore it again.
+                    pub.set_subscribed(False)
+                    pub.set_subscribed(True)
+                except Exception:
+                    self.logger.warning(
+                        "audio_subscription_force_failed",
+                        room=room_name,
+                        participant=participant.identity,
+                        track=pub.sid,
+                        exc_info=True,
+                    )
+                    continue
+                # Restarts the grace, so a server that is slow to answer is asked again every
+                # few seconds rather than on every tick.
+                pending[key] = now
+                repaired += 1
+                self.logger.warning(
+                    "audio_subscription_forced",
+                    room=room_name,
+                    participant=participant.identity,
+                    track=pub.sid,
+                    unsubscribed_ms=int((now - first_seen) * 1000),
+                    muted=bool(pub.muted),
+                )
+        for key in [k for k in pending if k[0] == room_name and k not in seen]:
+            pending.pop(key, None)
+        return repaired
+
+    def _schedule_subscription_checks(self, room_name: str) -> None:
+        """Re-check this room's microphones a few times in the seconds after a join/publish."""
+        task = asyncio.create_task(self._subscription_checks(room_name))
+        self._event_tasks.add(task)
+        task.add_done_callback(self._event_tasks.discard)
+
+    async def _subscription_checks(self, room_name: str) -> None:
+        elapsed = 0.0
+        for delay in _SUBSCRIPTION_REPAIR_DELAYS_S:
+            await asyncio.sleep(delay - elapsed)
+            elapsed = delay
+            room = self.rooms.get(room_name)
+            if room is None:
+                return
+            try:
+                if not room.isconnected():
+                    return
+                self._start_pending_audio_tasks(room_name, room)
+                self._repair_missing_subscriptions(room_name, room)
+            except Exception:
+                self.logger.warning(
+                    "audio_subscription_check_failed", room=room_name, exc_info=True
+                )
+                return
+
     def _cancel_room_audio_tasks(self, room_name: str) -> None:
         """Cancel only THIS room's pipelines — never another live meeting's."""
         for key, task in list(self.audio_tasks.items()):
@@ -1367,6 +1467,9 @@ class LiveKitIngressWorker(BaseWorker):
                 # Idempotent by construction: `_start_audio_task` returns False for a live reader
                 # on the same track, so this only ever fills a genuine gap.
                 reattached = self._start_pending_audio_tasks(room_name, room)
+                # And the microphones that never got a track to reattach: the backstop for a
+                # join or publish event this replica never saw.
+                self._repair_missing_subscriptions(room_name, room)
                 if reattached:
                     reattached_readers += reattached
                     self.logger.warning(

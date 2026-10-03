@@ -51,6 +51,10 @@ class _ScriptedRedis:
 def _worker(clones: list[bytes], **overrides: Any) -> tuple[TTSWorker, list[bytes]]:
     worker = TTSWorker.__new__(TTSWorker)
     worker.settings = WorkerSettings()
+    # These tests pin the score-margin upgrade that FOLLOWS the progressive ladder; an empty
+    # ladder is exactly that path (one clone at min_seconds, then upgrades by margin). The ladder
+    # itself is covered in test_clone_progressive_ladder.py.
+    overrides.setdefault("voice_clone_ladder_seconds", ())
     worker.tts_settings = TTSSettings(**overrides)
     worker.logger = MagicMock()
     worker._route_states = {}
@@ -71,6 +75,7 @@ def _worker(clones: list[bytes], **overrides: Any) -> tuple[TTSWorker, list[byte
         _language: str = "en",
         _sample_rate: int = 16000,
         _score: float | None = None,
+        **_kwargs: Any,
     ) -> None:
         cloned_from.append(audio)
         voice_id.append("voice-1")
