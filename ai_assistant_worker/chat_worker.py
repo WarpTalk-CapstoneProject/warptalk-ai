@@ -972,7 +972,14 @@ class ChatAssistantWorker(BaseWorker):
         meet_time_zones: dict[str, str] = {}
         final_text = ""
 
-        for _ in range(self.chat_settings.max_tool_iterations):
+        # max_tool_iterations rounds may call tools; one more round may not, so the turn ends with
+        # an answer built from what the tools already returned. Without it, the round that finally
+        # fetched the data was the last one: prod 3 Oct 2026, "@Linear lấy workspace ticket đi" —
+        # three list_issues calls rejected for their arguments, list_custom_views, then a
+        # list_issues that SUCCEEDED, and the user got "please try rephrasing" over the data.
+        answer_round = self.chat_settings.max_tool_iterations
+        for iteration in range(answer_round + 1):
+            tools_allowed = iteration < answer_round
             buffer = ""
             full_text = ""
             output_items: list[Any] = []
@@ -987,6 +994,11 @@ class ChatAssistantWorker(BaseWorker):
             # under the reader is worse than the sentence arriving a moment later.
             summary_buffer = ""
 
+            # The schemas stay on the answer round: they describe the function_call items already
+            # in `conversation`, and the model reads those results by them.
+            answer_round_options: dict[str, Any] = (
+                {} if tools_allowed or not tool_schemas else {"tool_choice": "none"}
+            )
             assert self._openai is not None, "OpenAI client must be initialized"
             stream = await self._openai.responses.create(
                 model=self.chat_settings.model,
@@ -999,6 +1011,7 @@ class ChatAssistantWorker(BaseWorker):
                 instructions=instructions,
                 input=cast(Any, conversation),
                 tools=cast(Any, tool_schemas),
+                **answer_round_options,
                 stream=True,
             )
 
@@ -1111,6 +1124,20 @@ class ChatAssistantWorker(BaseWorker):
             function_calls = [
                 item for item in output_items if getattr(item, "type", "") == "function_call"
             ]
+            if function_calls and not tools_allowed:
+                # tool_choice="none" was ignored. Nothing more can be fetched, so answer with
+                # whatever text came with the call, or the fallback.
+                self.logger.warning(
+                    "chat_answer_round_requested_tools",
+                    request_id=request.request_id,
+                    tools=[getattr(call, "name", "") for call in function_calls],
+                )
+                final_text = (
+                    full_text
+                    or "I wasn't able to finish looking that up — please try rephrasing your "
+                    "question."
+                )
+                break
             if not function_calls:
                 # A turn that produced a message rather than a call is the final answer.
                 final_text = full_text
@@ -1257,7 +1284,8 @@ class ChatAssistantWorker(BaseWorker):
                     )
                 )
         else:
-            # Hit max_tool_iterations while the model still wanted another tool.
+            # Unreachable while the answer round breaks out of the loop either way; kept so a
+            # future edit to that round cannot hand the user an empty turn.
             final_text = (
                 final_text
                 or "I wasn't able to finish looking that up — please try rephrasing your question."

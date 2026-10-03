@@ -896,7 +896,11 @@ class ChatAssistantSettings(BaseSettings):
     # `temperature` with a 400 on this endpoint. Kept configured so pointing the worker back at a
     # gpt-4 model still behaves as before.
     temperature: float = 0.4
-    max_tool_iterations: int = 5
+    # Rounds that may call tools; the loop adds one tool-free round after them to answer from
+    # what was fetched. 8, not 5: a plugin call the model gets the arguments wrong for costs a
+    # round, and on prod (3 Oct 2026) three rejected list_issues calls left two rounds for the
+    # work itself. Only a turn that needs them spends them.
+    max_tool_iterations: int = 8
     # OpenAI's HOSTED web_search tool, added to the /v1/responses tool list.
     #
     # No new vendor and no new key: it runs on the same credentials this worker already uses,
