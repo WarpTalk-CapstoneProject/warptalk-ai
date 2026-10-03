@@ -76,7 +76,7 @@ def _chunks(pcm: bytes, count: int) -> list[AudioChunkMessage]:
 def _worker() -> tuple[TTSWorker, list[str], list[int]]:
     worker = TTSWorker.__new__(TTSWorker)
     worker.settings = WorkerSettings()
-    worker.tts_settings = TTSSettings(voice_clone_min_seconds=10.0)
+    worker.tts_settings = TTSSettings(voice_clone_min_seconds=10.0, voice_clone_ladder_seconds=())
     worker.logger = MagicMock()
     worker._route_states = {}
     worker._room_routes = {"m1": [{"SourceUserId": "s1", "VoiceCloneEnabled": True}]}

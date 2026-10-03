@@ -23,13 +23,13 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from shared import isochrony
-from shared.base_worker import BaseWorker
+from shared.base_worker import TERMINAL_ROOM_STATUSES, BaseWorker
 from shared.config import TTSSettings
 from shared.control_markers import EXTERNAL_BRIDGE_SPEAKER_ID, is_external_bridge_speaker
 from shared.far_speaker import CaptionHintTracker, SegmentWindow
@@ -103,6 +103,11 @@ _CLONE_RESULT_TTL_SECONDS = 7 * 24 * 60 * 60
 # being disposable.
 _IN_MEETING_VOICE_PREFIX = "speaker-"
 _UPLOAD_VOICE_PREFIX = "profile-"
+
+# How much WORSE a longer ladder rung's clip may score than the shorter one in use and still
+# replace it. The score is a pitch-range estimate; a longer reference of the same person is the
+# better clone even when that estimate wobbles down a little.
+_LADDER_SCORE_TOLERANCE = 0.1
 
 # WT-D — "what will I actually sound like in a meeting?"
 #
@@ -304,6 +309,12 @@ def _clone_failure(exc: BaseException) -> tuple[str, str]:
 _PERMANENT_CLONE_REFUSALS = frozenset(
     {"PROVIDER_PLAN_REQUIRED", "PROVIDER_QUOTA_EXCEEDED", "PROVIDER_REJECTED"}
 )
+
+
+def _discard_on_done(
+    pending: set[tuple[str, str]], key: tuple[str, str], _task: asyncio.Task[Any]
+) -> None:
+    pending.discard(key)
 
 
 def _settle_live_clone(
@@ -768,6 +779,53 @@ class TTSWorker(BaseWorker):
             VOICE_CLONE_MIN_SECONDS, float(self.tts_settings.voice_clone_min_seconds)
         )
 
+    def _clone_ladder(self, min_seconds: float) -> tuple[float, ...]:
+        """Every rung a voice-less speaker is cloned at, ascending; min_seconds is always one."""
+        rungs = {float(s) for s in self.tts_settings.voice_clone_ladder_seconds if s > 0}
+        rungs.add(float(min_seconds))
+        return tuple(sorted(rungs))
+
+    def _first_clone_waits(self) -> dict[tuple[str, str], tuple[asyncio.Task[Any], float]]:
+        waits: dict[tuple[str, str], tuple[asyncio.Task[Any], float]] | None = getattr(
+            self, "_first_clone_wait_tasks", None
+        )
+        if waits is None:
+            waits = {}
+            self._first_clone_wait_tasks = waits
+        return waits
+
+    def _mark_first_clone_pending(self, key: tuple[str, str], task: asyncio.Task[Any]) -> None:
+        deadline = time.monotonic() + self.tts_settings.voice_clone_first_wait_ms / 1000.0
+        waits = self._first_clone_waits()
+        waits[key] = (task, deadline)
+        task.add_done_callback(lambda _t: waits.pop(key, None))
+
+    async def _await_first_clone(self, meeting_id: str, speaker_id: str) -> None:
+        """Hold a dub, briefly, for a speaker whose very first voice is at the vendor right now.
+
+        Bounded by voice_clone_first_wait_ms from when the clone STARTED, not from now — the
+        clip was taken from the same chunk this dub translates, so most of the budget has
+        usually been spent by STT and translation before this is reached. A clone that fails or
+        overruns costs at most that budget, and the dub goes out in the catalog voice as before.
+        """
+        entry = self._first_clone_waits().get((meeting_id, speaker_id))
+        if entry is None:
+            return
+        task, deadline = entry
+        remaining = deadline - time.monotonic()
+        if task.done() or remaining <= 0:
+            return
+        started = time.monotonic()
+        with suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+        self.logger.info(
+            "dub_waited_for_first_clone",
+            meeting_id=meeting_id,
+            speaker_id=speaker_id,
+            waited_ms=int((time.monotonic() - started) * 1000),
+            ready=task.done(),
+        )
+
     async def _clone_upgrade_margin(self) -> float:
         """`meetings.voice_clone.upgrade_margin`, falling back to TTS_VOICE_CLONE_UPGRADE_MARGIN."""
         return await self.platform_settings().get_float(
@@ -1199,6 +1257,20 @@ class TTSWorker(BaseWorker):
                         meeting_id, speaker_id, lang, reason
                     )
         return retired
+
+    async def _on_route_status_changed(self, room_id: str, new_status: str) -> None:
+        await super()._on_route_status_changed(room_id, new_status)
+        # Interpreter bots now stay warm for minutes between sentences (see LiveKitSettings.
+        # tts_bot_idle_timeout_s). A room that stopped being translated must not keep them: a
+        # present interpreter track mutes the speaker's own microphone for listeners.
+        if (
+            new_status == "PAUSED"
+            or new_status in TERMINAL_ROOM_STATUSES
+            or self._translation_active.get(room_id) is False
+        ):
+            publisher = getattr(self, "livekit_publisher", None)
+            if publisher is not None:
+                publisher.retire_meeting(room_id, reason=new_status.lower())
 
     def _cleanup_room(self, room_id: str) -> None:
         super()._cleanup_room(room_id)
@@ -1906,6 +1978,9 @@ class TTSWorker(BaseWorker):
         # the profile as active, and the dub came back in a stock catalogue voice — because the
         # only voice this function ever looked for was one cloned from the meeting's microphone.
         chosen_voice_id = self.chosen_dub_voice(meeting_id, speaker_id)
+        if not chosen_voice_id:
+            # Progressive clone: their first voice may be seconds away. See _await_first_clone.
+            await self._await_first_clone(meeting_id, speaker_id)
         cloned_voice_id = (
             None if chosen_voice_id else await self._get_voice_id(meeting_id, speaker_id)
         )
@@ -3075,6 +3150,14 @@ class TTSWorker(BaseWorker):
         # WT-874: speakers the vendor has refused to clone for a reason another clip cannot fix
         # (the account's plan, its credits, its credentials). See _settle_live_clone.
         clone_refused: set[tuple[str, str]] = set()
+        # PROGRESSIVE CLONE (see TTSSettings.voice_clone_ladder_seconds). `ladder_rung` is the
+        # index of the next rung for a speaker who started this meeting with no voice at all;
+        # absent for everyone else, who keep the score-margin upgrade path below unchanged.
+        ladder_rung: dict[tuple[str, str], int] = {}
+        # One clone call per speaker at a time. A short rung's clone still in flight when the
+        # buffer crosses the next rung would otherwise race it, and whichever answered LAST would
+        # win — the 3-second voice overwriting the 8-second one.
+        clone_in_flight: set[tuple[str, str]] = set()
 
         while self._running:
             # Clone sampling buffers live speech; a stale chunk would be appended out of order.
@@ -3125,6 +3208,7 @@ class TTSWorker(BaseWorker):
                             buffer_lang.pop(key, None)
                             cloned_score.pop(key, None)
                             upgrades_used.pop(key, None)
+                            ladder_rung.pop(key, None)
                             # Discarded with the rest, so granting consent again re-seeds the
                             # carried bar. Left behind, a speaker who toggled the switch off and
                             # on would spend the remainder of the meeting with no bar at all and
@@ -3223,6 +3307,17 @@ class TTSWorker(BaseWorker):
                                     f"relanguage:{cloned_language}->{resolved_language}",
                                 )
 
+                        # A speaker with no voice of any kind — not live, not carried, not made by
+                        # another replica — climbs the progressive ladder instead of waiting for
+                        # min_seconds. Entered once; a speaker who already has a voice never does.
+                        if (
+                            existing_voice is None
+                            and key not in cloned_score
+                            and key not in ladder_rung
+                            and key not in clone_in_flight
+                        ):
+                            ladder_rung[key] = 0
+
                         # WT-371 #9: this used to be `if already cloned: continue` — the worker
                         # stopped listening the moment it had any clone at all, so the voice was
                         # locked to whatever register the speaker opened the meeting in. Change
@@ -3274,8 +3369,11 @@ class TTSWorker(BaseWorker):
                         # to find. It is reported rather than done silently, for the same reason
                         # every other exit on this path is.
                         best_so_far = cloned_score.get(key)
+                        # Not while climbing: a 3-second clip can score 1.0 too, and a longer
+                        # reference is the point of the next rung whatever the score says.
                         if (
                             not language_is_stale
+                            and key not in ladder_rung
                             and best_so_far is not None
                             and best_so_far + upgrade_margin > MAX_SAMPLE_SCORE
                         ):
@@ -3293,6 +3391,10 @@ class TTSWorker(BaseWorker):
                         buffer_seconds[key] = buffer_seconds.get(key, 0.0) + duration_s
                         buffer_lang[key] = chunk.language
 
+                        rungs = self._clone_ladder(float(min_seconds))
+                        on_ladder = key in ladder_rung and ladder_rung[key] < len(rungs)
+                        threshold = rungs[ladder_rung[key]] if on_ladder else float(min_seconds)
+
                         # WT-420: the bar needs something to fill with. Nothing before this
                         # reported that capture was even happening — "ủa nó ko tự thu hở" was the
                         # reasonable conclusion, and it was wrong the whole time.
@@ -3300,10 +3402,14 @@ class TTSWorker(BaseWorker):
                             key,
                             "capturing",
                             seconds=buffer_seconds[key],
-                            required_seconds=float(min_seconds),
+                            required_seconds=threshold,
                         )
 
-                        if buffer_seconds[key] >= min_seconds:
+                        if buffer_seconds[key] >= threshold and key in clone_in_flight:
+                            # The previous rung is still at the vendor. Keep listening; the
+                            # buffer it leaves behind is only longer by the time it answers.
+                            self._trim_clone_buffer(key, buffers, buffer_seconds, chunk.sample_rate)
+                        elif buffer_seconds[key] >= threshold:
                             # NOT UNDER A GUESS ABOUT THE LANGUAGE.
                             #
                             # `_resolve_clone_language` returns None while the speaker's language
@@ -3366,19 +3472,40 @@ class TTSWorker(BaseWorker):
                                 # the wrong language, and a better English voice is not a fix for
                                 # a Vietnamese speaker.
                                 worth_cloning = True
+                            elif on_ladder:
+                                # Climbing: the clip is LONGER than the one in use, which is the
+                                # improvement. It only has to not be clearly worse.
+                                worth_cloning = (
+                                    assessment.score >= previous_score - _LADDER_SCORE_TOLERANCE
+                                )
                             else:
                                 worth_cloning = assessment.score >= previous_score + upgrade_margin
                             if worth_cloning:
-                                audio_snapshot = bytes(buffers.pop(key))
-                                del buffer_seconds[key]
-                                buffer_lang.pop(key, None)
+                                last_rung = not on_ladder or ladder_rung[key] + 1 >= len(rungs)
+                                if last_rung:
+                                    audio_snapshot = bytes(buffers.pop(key))
+                                    del buffer_seconds[key]
+                                    buffer_lang.pop(key, None)
+                                else:
+                                    # Kept, and kept growing: the next rung is this same speech
+                                    # plus whatever they say next.
+                                    audio_snapshot = bytes(buffers[key])
+                                if on_ladder:
+                                    ladder_rung[key] += 1
+                                    if ladder_rung[key] >= len(rungs):
+                                        ladder_rung.pop(key, None)
+                                provisional = threshold < float(min_seconds)
                                 cloned_score[key] = assessment.score
                                 # A re-clone forced by a language correction does not spend an
                                 # upgrade. The budget bounds how often the voice people are
                                 # listening to may change for a BETTER likeness; being in the
                                 # right language is not that, and charging it here would let one
                                 # mistimed language hint use up the speaker's only improvement.
-                                spent_upgrade = is_upgrade and not language_is_stale
+                                # Nor does a ladder rung: that budget is for the score-margin
+                                # upgrades that follow the ladder.
+                                spent_upgrade = (
+                                    is_upgrade and not language_is_stale and not on_ladder
+                                )
                                 if spent_upgrade:
                                     upgrades_used[key] = upgrades_used.get(key, 0) + 1
                                 self.logger.info(
@@ -3392,6 +3519,8 @@ class TTSWorker(BaseWorker):
                                     pitch_semitones=round(assessment.pitch_semitone_range, 2),
                                     score=round(assessment.score, 3),
                                     upgrade=is_upgrade,
+                                    rung_seconds=threshold,
+                                    provisional=provisional,
                                 )
                                 await self._note_clone_state(
                                     key,
@@ -3411,8 +3540,17 @@ class TTSWorker(BaseWorker):
                                         # clone comes back chipmunked rather than refused.
                                         chunk.sample_rate,
                                         assessment.score,
+                                        offer_carry_over=not provisional,
                                     )
                                 )
+                                clone_in_flight.add(key)
+                                clone_task.add_done_callback(
+                                    functools.partial(_discard_on_done, clone_in_flight, key)
+                                )
+                                if previous_score is None:
+                                    # The speaker's FIRST voice is on its way: their next dub may
+                                    # wait for it briefly instead of going out as a stranger.
+                                    self._mark_first_clone_pending(key, clone_task)
                                 clone_task.add_done_callback(
                                     functools.partial(
                                         _settle_live_clone,
@@ -3992,8 +4130,14 @@ class TTSWorker(BaseWorker):
         score: float | None = None,
         *,
         far_field: str | None = None,
+        offer_carry_over: bool = True,
     ) -> str:
         """Clone voice via Cartesia and cache voice_id in Redis.
+
+        `offer_carry_over=False` is a provisional ladder rung (TTSSettings.voice_clone_ladder_
+        seconds): used in this meeting at once, never promoted into the next one, so a 3-second
+        reference cannot become somebody's voice for good. Left unpromoted, the orphan sweep
+        collects it like any in-meeting clone.
 
         `far_field` (WT-933) is set only for a Meet-side person's clone: `speaker_id` is then the
         stand-in seat and the voice is recorded under that person's consent field instead of at
@@ -4063,7 +4207,8 @@ class TTSWorker(BaseWorker):
                 event_type="voice_clone_ready",
                 payload={"speakerId": speaker_id, "voiceId": voice_id},
             )
-            await self._offer_carry_over(speaker_id, language, voice_id, score)
+            if offer_carry_over:
+                await self._offer_carry_over(speaker_id, language, voice_id, score)
             return ""
         except Exception as e:
             self.logger.error(

@@ -188,8 +188,8 @@ class TestLiveKitTTSPublisher:
         key = ("room-1", "s1", "vi", "")
         assert key in publisher._bots
 
-        # Simulate SESSION_IDLE_TIMEOUT_S elapsing without touching real time.
-        publisher._bots[key]["last_used"] -= SESSION_IDLE_TIMEOUT_S + 1
+        # Simulate the idle timeout elapsing without touching real time.
+        publisher._bots[key]["last_used"] -= publisher.settings.tts_bot_idle_timeout_s + 1
 
         # _get_or_create_bot() sweeps opportunistically on every call — any subsequent
         # publish (even for an unrelated key) triggers it.
@@ -198,6 +198,50 @@ class TestLiveKitTTSPublisher:
 
         assert key not in publisher._bots
         mock_livekit_sdk["room"].disconnect.assert_awaited()
+
+    async def test_a_minute_of_silence_keeps_the_bot_warm(self, mock_livekit_sdk) -> None:
+        """Prod 3 Oct: a 60s timeout made every sentence after a pause pay a 2.5-3.6s join."""
+        publisher = LiveKitTTSPublisher(_settings())
+        pcm = b"\x00\x01" * 320
+
+        await publisher.publish_pcm("room-1", "s1", "vi", pcm, sample_rate=16000)
+        key = ("room-1", "s1", "vi", "")
+        publisher._bots[key]["last_used"] -= SESSION_IDLE_TIMEOUT_S + 1
+
+        await publisher.publish_pcm("room-1", "s2", "ja", pcm, sample_rate=16000)
+        await asyncio.sleep(0)
+
+        assert key in publisher._bots
+
+    async def test_retire_meeting_releases_only_that_meetings_bots(self, mock_livekit_sdk) -> None:
+        publisher = LiveKitTTSPublisher(_settings())
+        pcm = b"\x00\x01" * 320
+        await publisher.publish_pcm("room-1", "s1", "vi", pcm, sample_rate=16000)
+        await publisher.publish_pcm("room-2", "s1", "vi", pcm, sample_rate=16000)
+
+        retired = publisher.retire_meeting("room-1", reason="paused")
+        await asyncio.sleep(0)
+
+        assert retired == 1
+        assert ("room-1", "s1", "vi", "") not in publisher._bots
+        assert ("room-2", "s1", "vi", "") in publisher._bots
+
+    async def test_retire_meeting_lets_a_sentence_in_progress_finish(
+        self, mock_livekit_sdk
+    ) -> None:
+        publisher = LiveKitTTSPublisher(_settings())
+        pcm = b"\x00\x01" * 320
+        await publisher.publish_pcm("room-1", "s1", "vi", pcm, sample_rate=16000)
+        key = ("room-1", "s1", "vi", "")
+        lock = publisher._locks.setdefault(key, asyncio.Lock())
+
+        async with lock:
+            assert publisher.retire_meeting("room-1", reason="paused") == 0
+            assert key in publisher._bots
+        # Expired rather than closed: the next sweep takes it once the sentence is done.
+        publisher._sweep_idle_bots()
+        await asyncio.sleep(0)
+        assert key not in publisher._bots
 
     async def test_active_bot_survives_sweep(self, mock_livekit_sdk) -> None:
         publisher = LiveKitTTSPublisher(_settings())

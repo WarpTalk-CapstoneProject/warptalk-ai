@@ -87,6 +87,12 @@ class LiveKitSettings(BaseSettings):
     url: str = "ws://localhost:7880"
     api_key: str = "YOUR_LIVEKIT_API_KEY"
     api_secret: str = "YOUR_LIVEKIT_API_SECRET"
+    # How long an interpreter bot with nothing to say stays in the room (LIVEKIT_TTS_BOT_IDLE_
+    # TIMEOUT_S). It was 60s, and every sentence after a minute's silence paid a fresh LiveKit
+    # join ahead of its audio: 2.5-3.6s on prod 3 Oct, 4.5-17.6s under CPU pressure. Ten minutes
+    # covers the pauses of an ordinary meeting; a room that pauses, ends or stops translating
+    # releases its bots at once instead (LiveKitTTSPublisher.retire_meeting).
+    tts_bot_idle_timeout_s: float = 600.0
 
 
 class WorkerSettings(BaseSettings):
@@ -656,6 +662,23 @@ class TTSSettings(BaseSettings):
     # seconds of ACCEPTED speech (see tts_worker/clone_sample_quality.py) is enough for the
     # clone to carry a person's timbre rather than their microphone check.
     voice_clone_min_seconds: float = 20.0
+    # PROGRESSIVE CLONE (owner, 3 Oct 2026: "cứ phát giọng chưa đạt chuẩn trước ... rồi từ từ bắt
+    # giọng tiếp để nói giọng càng chuẩn, không để chờ đủ 20s mới phát").
+    #
+    # Waiting for twenty accepted seconds meant the first half-minute to a minute of every new
+    # speaker went out in a stranger's catalog voice. So a speaker with no voice at all is cloned
+    # PROVISIONALLY at each rung below `voice_clone_min_seconds`, from the same growing buffer,
+    # and once more at each rung above it. Every rung is a longer reference than the last, so the
+    # voice converges on the person instead of jumping between strangers. Cartesia documents no
+    # hard minimum ("10 seconds is enough to get started", up to 60 for accent); the first rung
+    # trades likeness for being their own voice from the second sentence on.
+    #
+    # Provisional rungs (below min_seconds) are never carried into the next meeting; only a rung at
+    # or above min_seconds is good enough to be somebody's voice next time.
+    voice_clone_ladder_seconds: tuple[float, ...] = (3.0, 8.0, 45.0)
+    # How long the FIRST dub of a speaker whose first clone is in flight may wait for it, rather
+    # than going out in a catalog voice and switching one sentence later.
+    voice_clone_first_wait_ms: int = 2500
     # How much audio may be held while waiting for a clip that passes the quality gate. Rejected
     # audio slides out of the front of the buffer; without a cap a speaker in a noisy room would
     # accumulate the whole meeting in memory and never clone.

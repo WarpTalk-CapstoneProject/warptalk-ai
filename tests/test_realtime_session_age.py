@@ -77,14 +77,16 @@ class TestSttWarmPool:
         old_conn, live_conn = _Conn(), _Conn()
         old_manager = _Manager(old_conn)
         stt = _stt()
+        # The expired socket sits where a claim looks FIRST (claims take the right-hand end,
+        # where the refill appends the youngest), so it is met, judged and closed on the way.
         stt._warm_sessions = deque(
             [
+                {"manager": _Manager(live_conn), "conn": live_conn, "opened_at": time.monotonic()},
                 {
                     "manager": old_manager,
                     "conn": old_conn,
                     "opened_at": time.monotonic() - REALTIME_SESSION_MAX_AGE_S - 60,
                 },
-                {"manager": _Manager(live_conn), "conn": live_conn, "opened_at": time.monotonic()},
             ]
         )
 

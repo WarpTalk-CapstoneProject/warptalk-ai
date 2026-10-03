@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import re
 import time
 from collections import Counter, deque
@@ -33,6 +34,13 @@ from stt_worker.text_language_id import MIN_WORDS_TO_LEARN, identify_room_langua
 
 logger = get_logger(__name__)
 
+
+def _discard_on_done(
+    pending: set[tuple[str, str]], key: tuple[str, str], _task: asyncio.Task[Any]
+) -> None:
+    pending.discard(key)
+
+
 # Mirrors STTSettings.model — the value production code actually runs with
 # (stt_worker/worker.py always passes it explicitly). Sourcing the default from here
 # instead of a second hardcoded literal keeps direct/test instantiation in sync with
@@ -50,11 +58,36 @@ SESSION_IDLE_TIMEOUT_S = 300.0
 # WT-923. A warm socket is retired and replaced at this age, BEFORE the cap above makes a claim
 # discard it. Checked every WARM_POOL_MAINTENANCE_INTERVAL_S, so the pool never holds a socket
 # older than the sum of the two — 46 minutes, safely under REALTIME_SESSION_MAX_AGE_S.
-WARM_SOCKET_ROTATE_AGE_S = REALTIME_SESSION_MAX_AGE_S - 5 * 60.0
-WARM_POOL_MAINTENANCE_INTERVAL_S = 60.0
+#
+# 3 Oct 2026 — that bound was about the wrong thing. A socket rotated at 45 minutes could still be
+# CLAIMED at 44, and a claimed socket keeps the age it was opened with: room 01a100d8's host got
+# one at 15:19:41 that the max-age sweep closed at 15:24:58 (age_s 3000) — mid-meeting, five
+# minutes after "prewarming" it. The next turn's frames found no session (`append_failed`) and the
+# reconnect cost 2.8s inline. So the pool now rotates at half the cap and a claim refuses anything
+# with less than WARM_SOCKET_MIN_REMAINING_S left: whatever a speaker is handed has room for a
+# meeting, and the renewal below covers the rest.
+WARM_SOCKET_ROTATE_AGE_S = REALTIME_SESSION_MAX_AGE_S / 2
+WARM_SOCKET_MIN_REMAINING_S = 20 * 60.0
+WARM_POOL_MAINTENANCE_INTERVAL_S = 30.0
+# An ACTIVE speaker's session is replaced this long before the cap — on a fresh socket, configured
+# in the background, and swapped in at a moment their buffer holds nothing (no streamed turn, no
+# commit in flight). Before this the only exit was the max-age sweep, which closed the socket
+# under whoever was talking.
+SESSION_RENEW_LEAD_S = 10 * 60.0
+_RENEW_WAIT_FOR_QUIET_S = 120.0
+_RENEW_POLL_S = 0.25
+# A buffer nobody has appended to for this long belongs to a turn that was abandoned; it does not
+# block a renewal.
+_RENEW_STALE_BUFFER_S = 15.0
 
 # Guard against OpenAI never sending a completed/error event for a commit.
 TRANSCRIBE_EVENT_TIMEOUT_S = 15.0
+# Speech the ingress VAD measured in a turn, below which an empty streamed commit is believed
+# rather than retried — a cough, a breath, an "ừm".
+_EMPTY_STREAMED_RETRY_MIN_SPEECH_S = 0.8
+# How long a renewed-away socket stays open: a commit that started on it just before the swap
+# reads its completion from it, and that read is bounded by the timeout above.
+_RENEWED_SOCKET_GRACE_S = TRANSCRIBE_EVENT_TIMEOUT_S + 5.0
 # Items whose deltas arrived on a speaker's socket before (or without) their commit — see
 # _transcribe_via_session. Only the last few can still be committed; older ones were cleared.
 _MAX_PENDING_ITEMS = 8
@@ -1492,9 +1525,17 @@ class OpenAISTT:
             return None
 
         discarded = 0
+        now = time.monotonic()
         while warm_sessions:
-            candidate: dict[str, Any] = warm_sessions.popleft()
-            if not realtime_session_expired(candidate.get("opened_at")):
+            # The YOUNGEST first: the refill appends on the right, and the socket with the most
+            # life left is the one that will outlast this speaker's meeting.
+            candidate: dict[str, Any] = warm_sessions.pop()
+            opened_at = candidate.get("opened_at")
+            if (
+                opened_at is not None
+                and not realtime_session_expired(opened_at, now)
+                and REALTIME_SESSION_MAX_AGE_S - (now - opened_at) >= WARM_SOCKET_MIN_REMAINING_S
+            ):
                 if discarded:
                     logger.info("stt_warm_sockets_expired", discarded=discarded)
                 return candidate
@@ -1561,6 +1602,142 @@ class OpenAISTT:
             logger.info("stt_warm_sockets_rotated", retired=len(retired))
         self._schedule_warm_refill()
         return len(retired)
+
+    def renew_aging_sessions(self, now: float | None = None) -> int:
+        """Start replacing every live speaker session within SESSION_RENEW_LEAD_S of the cap.
+
+        Returns how many renewals it started. Each runs in the background — see _renew_session.
+        """
+        now = time.monotonic() if now is None else now
+        renewing: set[tuple[str, str]] | None = getattr(self, "_renewing", None)
+        if renewing is None:
+            renewing = set()
+            self._renewing = renewing
+        started = 0
+        for key, session in list(getattr(self, "_sessions", {}).items()):
+            opened_at = session.get("opened_at")
+            if opened_at is None or key in renewing:
+                continue
+            if now - opened_at < REALTIME_SESSION_MAX_AGE_S - SESSION_RENEW_LEAD_S:
+                continue
+            renewing.add(key)
+            task = asyncio.create_task(self._renew_session(key, session))
+            task.add_done_callback(functools.partial(_discard_on_done, renewing, key))
+            started += 1
+        return started
+
+    @staticmethod
+    def _buffer_is_quiet(session: dict[str, Any], now: float) -> bool:
+        if session.get("in_flight"):
+            return False
+        if not session.get("dirty"):
+            return True
+        return now - float(session.get("last_used", now)) >= _RENEW_STALE_BUFFER_S
+
+    async def _renew_session(self, key: tuple[str, str], old: dict[str, Any]) -> None:
+        """Open and configure a replacement socket, then swap it in between two turns.
+
+        THE SWAP NEVER SPLITS A TURN. The new socket's buffer is empty, so a swap while frames of
+        a turn sit in the old buffer would leave that turn's beginning on a socket nothing will
+        commit. So this waits — off every request path — for the buffer to hold nothing and no
+        commit to be reading, and swaps with no await between that check and the assignment.
+        The epoch is bumped like any new session's, so a commit that still names the old one
+        sends its audio itself (append_streamed_audio's rule): slower, never lost.
+        """
+        client = self._client
+        if client is None:
+            return
+        warm = await self._claim_warm_socket()
+        if warm is not None:
+            manager, conn, opened_at = warm["manager"], warm["conn"], warm["opened_at"]
+            self._schedule_warm_refill()
+        else:
+            manager = client.realtime.connect(extra_query={"intent": "transcription"})
+            conn = await manager.__aenter__()
+            opened_at = time.monotonic()
+        fresh = {"manager": manager}
+        try:
+            await self._configure_and_swap(key, old, manager, conn, opened_at)
+        except Exception:
+            # Whatever went wrong, the speaker keeps the session they have — and the max-age sweep
+            # remains the backstop it always was. Never leak the socket we opened for them.
+            await self._close_session(fresh)
+            logger.warning("realtime_session_renew_failed", meeting_id=key[0], exc_info=True)
+
+    async def _configure_and_swap(
+        self,
+        key: tuple[str, str],
+        old: dict[str, Any],
+        manager: Any,
+        conn: Any,
+        opened_at: float,
+    ) -> None:
+        fresh = {"manager": manager}
+        language = old.get("language")
+        prompt = old.get("prompt")
+        allowed_languages = old.get("allowed_languages")
+        keywords = list(old.get("keywords") or ())
+        noise_reduction = old.get("noise_reduction")
+        try:
+            await conn.session.update(
+                session=cast(
+                    Any,
+                    self._session_payload(
+                        language,
+                        prompt,
+                        allowed_languages,
+                        keywords,
+                        noise_reduction=noise_reduction,
+                    ),
+                )
+            )
+        except Exception as exc:
+            if _is_connection_error(exc) or not (language or prompt or keywords):
+                await self._close_session(fresh)
+                logger.warning("realtime_session_renew_failed", meeting_id=key[0], error=str(exc))
+                return
+            await self._degrade_session_config(
+                conn, language, prompt, allowed_languages, keywords, noise_reduction
+            )
+
+        deadline = time.monotonic() + _RENEW_WAIT_FOR_QUIET_S
+        while True:
+            if self._sessions.get(key) is not old:
+                # Replaced meanwhile (a language change, the idle sweep): nothing to renew.
+                await self._close_session(fresh)
+                return
+            now = time.monotonic()
+            if self._buffer_is_quiet(old, now):
+                break
+            if now >= deadline:
+                # A speaker who never paused for two minutes. Try again next maintenance tick.
+                await self._close_session(fresh)
+                logger.info("realtime_session_renew_deferred", meeting_id=key[0])
+                return
+            await asyncio.sleep(_RENEW_POLL_S)
+
+        self._session_epoch = getattr(self, "_session_epoch", 0) + 1
+        renewed = {
+            **{k: v for k, v in old.items() if k not in ("item_deltas",)},
+            "manager": manager,
+            "conn": conn,
+            "epoch": self._session_epoch,
+            "opened_at": opened_at,
+            "dirty": False,
+            "in_flight": False,
+        }
+        self._sessions[key] = renewed
+        logger.info(
+            "realtime_session_renewed",
+            meeting_id=key[0],
+            speaker_id=key[1],
+            old_age_s=round(time.monotonic() - float(old.get("opened_at") or 0.0), 1),
+        )
+        asyncio.create_task(self._close_session_later(old, _RENEWED_SOCKET_GRACE_S))
+
+    async def _close_session_later(self, session: dict[str, Any], delay_s: float) -> None:
+        await asyncio.sleep(delay_s)
+        await self._close_session(session)
 
     def _schedule_warm_refill(self) -> None:
         """Top the warm pool back up, off the caller's critical path.
@@ -1801,12 +1978,26 @@ class OpenAISTT:
 
         pcm_24k = _resample_pcm16(audio_bytes, sample_rate, REALTIME_SAMPLE_RATE)
 
+        # Counted so an empty completion can be told apart from one whose text all went out
+        # early, sentence by sentence — the latter is a complete turn, not a lost one.
+        emitted = 0
+        sentence_sink: Callable[[str], Awaitable[None]] | None = None
+        if on_sentence is not None:
+            inner_on_sentence = on_sentence
+
+            async def counting_on_sentence(sentence: str) -> None:
+                nonlocal emitted
+                emitted += 1
+                await inner_on_sentence(sentence)
+
+            sentence_sink = counting_on_sentence
+
         key = (meeting_id, speaker_id)
         try:
             text, avg_logprob = await self._transcribe_via_session(
                 key,
                 pcm_24k,
-                on_sentence,
+                sentence_sink,
                 lang_arg,
                 prompt,
                 allowed_languages,
@@ -1842,7 +2033,7 @@ class OpenAISTT:
                 text, avg_logprob = await self._transcribe_via_session(
                     key,
                     pcm_24k,
-                    on_sentence,
+                    sentence_sink,
                     lang_arg,
                     prompt,
                     allowed_languages,
@@ -1853,6 +2044,41 @@ class OpenAISTT:
             except Exception as e:
                 logger.error("openai_stt_error", error=str(e))
                 raise
+
+        if (
+            not text.strip()
+            and streamed_epoch is not None
+            and emitted == 0
+            and pcm_24k
+            and (speech_duration_s or 0.0) >= _EMPTY_STREAMED_RETRY_MIN_SPEECH_S
+        ):
+            # THE TURN WAS SPEECH AND THE STREAMED COMMIT CAME BACK WITH NOTHING. Room 01a100d8,
+            # 3 Oct: the host's first sentence (2.9s, rms 0.055) was committed against the
+            # prewarmed session's buffer and completed empty — no filter fired, so the opening of
+            # the meeting vanished without a line saying so. The chunk carries the whole turn's
+            # audio, so it is sent once more the pre-streaming way. Costs one round trip, and
+            # only on the path that would otherwise lose the sentence.
+            logger.warning(
+                "stt_streamed_commit_empty_retry",
+                meeting_id=meeting_id,
+                speaker_id=speaker_id,
+                speech_s=round(speech_duration_s or 0.0, 2),
+            )
+            try:
+                text, avg_logprob = await self._transcribe_via_session(
+                    key,
+                    pcm_24k,
+                    sentence_sink,
+                    lang_arg,
+                    prompt,
+                    allowed_languages,
+                    keywords,
+                    exclude_emitted_from_final=exclude_emitted_from_final,
+                    noise_reduction=noise_reduction,
+                )
+            except Exception as e:
+                logger.warning("stt_streamed_commit_retry_failed", error=str(e))
+                return []
 
         if not text.strip():
             return []
@@ -2211,164 +2437,173 @@ class OpenAISTT:
             noise_reduction=noise_reduction,
         )
         conn = session["conn"]
+        # Read by renew_aging_sessions: a socket a commit is still reading from is not swapped.
+        session["in_flight"] = True
+        try:
+            # ALREADY IN THE BUFFER? Then commit it rather than sending it twice.
+            #
+            # When STT_STREAMING_ENABLED is on, the frames of this turn were appended by
+            # `append_streamed_audio` while the speaker was still talking — so by the time this runs
+            # the model has already heard the utterance and the commit below is all that is left.
+            # That is the entire latency win: what used to be "send five seconds, then wait for the
+            # model to hear it" becomes "say go".
+            #
+            # The epoch check is what makes it safe. `append_streamed_audio` returns the epoch its
+            # audio landed in, and a session recreated since then — a language change, an idle
+            # sweep, a restart — took that buffer with it. A mismatch therefore falls through to the
+            # ordinary append below, which is exactly the behaviour this method had before streaming
+            # existed. Wrong here means slow; it never means silent.
+            already_buffered = streamed_epoch is not None and int(session.get("epoch", 0)) == int(
+                streamed_epoch
+            )
 
-        # ALREADY IN THE BUFFER? Then commit it rather than sending it twice.
-        #
-        # When STT_STREAMING_ENABLED is on, the frames of this turn were appended by
-        # `append_streamed_audio` while the speaker was still talking — so by the time this runs
-        # the model has already heard the utterance and the commit below is all that is left.
-        # That is the entire latency win: what used to be "send five seconds, then wait for the
-        # model to hear it" becomes "say go".
-        #
-        # The epoch check is what makes it safe. `append_streamed_audio` returns the epoch its
-        # audio landed in, and a session recreated since then — a language change, an idle
-        # sweep, a restart — took that buffer with it. A mismatch therefore falls through to the
-        # ordinary append below, which is exactly the behaviour this method had before streaming
-        # existed. Wrong here means slow; it never means silent.
-        already_buffered = streamed_epoch is not None and int(session.get("epoch", 0)) == int(
-            streamed_epoch
-        )
+            if not already_buffered:
+                # Ingress has already assembled a VAD-bounded speech utterance.
+                # Sending that as ten-to-fifteen separately awaited 100ms websocket messages
+                # added pure transport overhead before the model could start. Keep a conservative
+                # 2s raw-PCM cap for unusually long replay/test chunks; production uses one append.
+                append_bytes = REALTIME_SAMPLE_RATE * 2 * 2
+                for i in range(0, len(pcm_24k), append_bytes):
+                    frame = pcm_24k[i : i + append_bytes]
+                    await conn.input_audio_buffer.append(audio=base64.b64encode(frame).decode())
 
-        if not already_buffered:
-            # Ingress has already assembled a VAD-bounded speech utterance.
-            # Sending that as ten-to-fifteen separately awaited 100ms websocket messages
-            # added pure transport overhead before the model could start. Keep a conservative
-            # 2s raw-PCM cap for unusually long replay/test chunks; production uses one append.
-            append_bytes = REALTIME_SAMPLE_RATE * 2 * 2
-            for i in range(0, len(pcm_24k), append_bytes):
-                frame = pcm_24k[i : i + append_bytes]
-                await conn.input_audio_buffer.append(audio=base64.b64encode(frame).decode())
+            await conn.input_audio_buffer.commit()
+            session["last_used"] = time.monotonic()
+            # The commit took the buffer. Frames of the speaker's next turn may land on it again
+            # before this call returns, and they set it back.
+            session["dirty"] = False
 
-        await conn.input_audio_buffer.commit()
-        session["last_used"] = time.monotonic()
+            # DELTAS BELONG TO AN ITEM, AND NOT EVERY ITEM ON THIS SOCKET IS THIS COMMIT'S.
+            #
+            # gpt-live-transcribe transcribes audio AS IT IS APPENDED, so the connection carries
+            # deltas for audio this call never committed: a streamed turn that was abandoned and
+            # cleared after the model had already spoken its first words, or the opening of the
+            # speaker's next turn. Every event says which item it is about. This loop used to
+            # ignore that and add every delta to one buffer, so words from one turn were published
+            # as the start of another ("Ai Vậy mình cắt…", "…the onboarding flow Two more はい…"),
+            # the variety guard then discarded whole sentences as repetitions, and the completed
+            # transcript no longer started with what had been flushed — `stt_delta_final_mismatch`,
+            # whose answer is to drop the rest of the turn. Measured in tools/meeting_sim: within
+            # one item the deltas always add up to the completed transcript; mixed across items
+            # they did not, and that is where the lost sentences came from.
+            #
+            # So deltas are kept per item until `input_audio_buffer.committed` names the item this
+            # commit created, and only that item's text is ever flushed or compared. Deltas for any
+            # other item stay on the session for the call that commits it. An event with no item id
+            # (an older SDK, the tests' scripted events) is taken as this commit's, which is
+            # exactly what the loop did before.
+            pending_items: dict[str, str] = session.setdefault("item_deltas", {})
 
-        # DELTAS BELONG TO AN ITEM, AND NOT EVERY ITEM ON THIS SOCKET IS THIS COMMIT'S.
-        #
-        # gpt-live-transcribe transcribes audio AS IT IS APPENDED, so the connection carries
-        # deltas for audio this call never committed: a streamed turn that was abandoned and
-        # cleared after the model had already spoken its first words, or the opening of the
-        # speaker's next turn. Every event says which item it is about. This loop used to
-        # ignore that and add every delta to one buffer, so words from one turn were published
-        # as the start of another ("Ai Vậy mình cắt…", "…the onboarding flow Two more はい…"),
-        # the variety guard then discarded whole sentences as repetitions, and the completed
-        # transcript no longer started with what had been flushed — `stt_delta_final_mismatch`,
-        # whose answer is to drop the rest of the turn. Measured in tools/meeting_sim: within
-        # one item the deltas always add up to the completed transcript; mixed across items
-        # they did not, and that is where the lost sentences came from.
-        #
-        # So deltas are kept per item until `input_audio_buffer.committed` names the item this
-        # commit created, and only that item's text is ever flushed or compared. Deltas for any
-        # other item stay on the session for the call that commits it. An event with no item id
-        # (an older SDK, the tests' scripted events) is taken as this commit's, which is
-        # exactly what the loop did before.
-        pending_items: dict[str, str] = session.setdefault("item_deltas", {})
+            async def _collect() -> tuple[str, float]:
+                buffer = ""
+                flushed = ""
+                # The item this commit created. None until `input_audio_buffer.committed` says.
+                mine: str | None = None
+                # gpt-realtime-whisper occasionally gets stuck on trailing silence/noise and
+                # emits the same short sentence over and over in the delta stream instead of
+                # ever reaching "completed" — with no per-chunk confidence signal to catch
+                # this after the fact (see _filter_segments), each repeat gets flushed early
+                # and independently translated/spoken, which sounds like TTS stuck in a loop.
+                # Cut the turn short once the same sentence repeats 3x in a row.
+                last_sentence: str | None = None
+                repeat_count = 0
 
-        async def _collect() -> tuple[str, float]:
-            buffer = ""
-            flushed = ""
-            # The item this commit created. None until `input_audio_buffer.committed` says.
-            mine: str | None = None
-            # gpt-realtime-whisper occasionally gets stuck on trailing silence/noise and
-            # emits the same short sentence over and over in the delta stream instead of
-            # ever reaching "completed" — with no per-chunk confidence signal to catch
-            # this after the fact (see _filter_segments), each repeat gets flushed early
-            # and independently translated/spoken, which sounds like TTS stuck in a loop.
-            # Cut the turn short once the same sentence repeats 3x in a row.
-            last_sentence: str | None = None
-            repeat_count = 0
+                async def take_delta(delta: str) -> None:
+                    nonlocal buffer, flushed, last_sentence, repeat_count
+                    if on_sentence is None:
+                        return
+                    buffer += delta
+                    if not buffer:
+                        return
+                    ends_clean = buffer[-1] in ".!?"
+                    sentences = split_into_sentences(buffer)
+                    flush_count = len(sentences) if ends_clean else len(sentences) - 1
+                    if flush_count > 0:
+                        for sentence in sentences[:flush_count]:
+                            normalized = sentence.strip().casefold()
+                            if normalized and normalized == last_sentence:
+                                repeat_count += 1
+                            else:
+                                repeat_count = 0
+                            last_sentence = normalized
+                            if repeat_count >= 2:
+                                logger.warning(
+                                    "stt_repetition_loop_detected", sentence=sentence[:60]
+                                )
+                                raise RuntimeError("stt_repetition_loop_detected")
+                            await on_sentence(sentence)
+                            flushed += sentence + " "
+                        buffer = "" if ends_clean else sentences[-1]
 
-            async def take_delta(delta: str) -> None:
-                nonlocal buffer, flushed, last_sentence, repeat_count
-                if on_sentence is None:
-                    return
-                buffer += delta
-                if not buffer:
-                    return
-                ends_clean = buffer[-1] in ".!?"
-                sentences = split_into_sentences(buffer)
-                flush_count = len(sentences) if ends_clean else len(sentences) - 1
-                if flush_count > 0:
-                    for sentence in sentences[:flush_count]:
-                        normalized = sentence.strip().casefold()
-                        if normalized and normalized == last_sentence:
-                            repeat_count += 1
-                        else:
-                            repeat_count = 0
-                        last_sentence = normalized
-                        if repeat_count >= 2:
-                            logger.warning("stt_repetition_loop_detected", sentence=sentence[:60])
-                            raise RuntimeError("stt_repetition_loop_detected")
-                        await on_sentence(sentence)
-                        flushed += sentence + " "
-                    buffer = "" if ends_clean else sentences[-1]
-
-            async for event in conn:
-                etype = getattr(event, "type", "")
-                item_id = getattr(event, "item_id", None)
-                item_id = item_id if isinstance(item_id, str) and item_id else None
-                if etype == "input_audio_buffer.committed":
-                    if mine is None and item_id is not None:
-                        mine = item_id
-                        # What the model already said about this audio while it was being
-                        # streamed in — the reason flash mode is fast — is this commit's text.
-                        early = pending_items.pop(mine, "")
-                        if early:
-                            await take_delta(early)
-                    continue
-                if etype == "conversation.item.input_audio_transcription.delta":
-                    delta = getattr(event, "delta", "") or ""
-                    if item_id is not None and item_id != mine:
-                        pending_items[item_id] = pending_items.get(item_id, "") + delta
-                        while len(pending_items) > _MAX_PENDING_ITEMS:
-                            pending_items.pop(next(iter(pending_items)))
+                async for event in conn:
+                    etype = getattr(event, "type", "")
+                    item_id = getattr(event, "item_id", None)
+                    item_id = item_id if isinstance(item_id, str) and item_id else None
+                    if etype == "input_audio_buffer.committed":
+                        if mine is None and item_id is not None:
+                            mine = item_id
+                            # What the model already said about this audio while it was being
+                            # streamed in — the reason flash mode is fast — is this commit's text.
+                            early = pending_items.pop(mine, "")
+                            if early:
+                                await take_delta(early)
                         continue
-                    await take_delta(delta)
-                elif etype == "conversation.item.input_audio_transcription.completed":
-                    if item_id is not None and item_id != mine:
-                        # Another item finishing. The server confirms a commit before it
-                        # transcribes it, so a completion that arrives ahead of this commit's
-                        # `committed` — or for any other item — is not this call's to report.
-                        pending_items.pop(item_id, None)
-                        continue
-                    final_text = (getattr(event, "transcript", "") or "").strip()
-                    token_logprobs = [
-                        float(value)
-                        for item in (getattr(event, "logprobs", None) or [])
-                        if (
-                            value := (
-                                item.get("logprob")
-                                if isinstance(item, dict)
-                                else getattr(item, "logprob", None)
+                    if etype == "conversation.item.input_audio_transcription.delta":
+                        delta = getattr(event, "delta", "") or ""
+                        if item_id is not None and item_id != mine:
+                            pending_items[item_id] = pending_items.get(item_id, "") + delta
+                            while len(pending_items) > _MAX_PENDING_ITEMS:
+                                pending_items.pop(next(iter(pending_items)))
+                            continue
+                        await take_delta(delta)
+                    elif etype == "conversation.item.input_audio_transcription.completed":
+                        if item_id is not None and item_id != mine:
+                            # Another item finishing. The server confirms a commit before it
+                            # transcribes it, so a completion that arrives ahead of this commit's
+                            # `committed` — or for any other item — is not this call's to report.
+                            pending_items.pop(item_id, None)
+                            continue
+                        final_text = (getattr(event, "transcript", "") or "").strip()
+                        token_logprobs = [
+                            float(value)
+                            for item in (getattr(event, "logprobs", None) or [])
+                            if (
+                                value := (
+                                    item.get("logprob")
+                                    if isinstance(item, dict)
+                                    else getattr(item, "logprob", None)
+                                )
                             )
+                            is not None
+                        ]
+                        avg_logprob = (
+                            sum(token_logprobs) / len(token_logprobs) if token_logprobs else -1.0
                         )
-                        is not None
-                    ]
-                    avg_logprob = (
-                        sum(token_logprobs) / len(token_logprobs) if token_logprobs else -1.0
-                    )
-                    if not exclude_emitted_from_final:
-                        return final_text, avg_logprob
-                    flushed_stripped = flushed.strip()
-                    if not flushed_stripped:
-                        return final_text, avg_logprob
-                    rest = _after_flushed_prefix(final_text, flushed_stripped)
-                    if rest is not None:
-                        return rest, avg_logprob
-                    # Model revised something inside the already-flushed prefix — we
-                    # can't safely recompute the diff (would risk re-publishing text
-                    # that was already billed/translated). Drop the trailing part
-                    # rather than risk a duplicate charge or duplicate translation.
-                    logger.warning(
-                        "stt_delta_final_mismatch",
-                        flushed=flushed_stripped[:60],
-                        final=final_text[:60],
-                    )
-                    return "", avg_logprob
-                elif etype == "error":
-                    raise RuntimeError(f"realtime_transcription_error: {event}")
-            raise RuntimeError("realtime_connection_closed_before_completed")
+                        if not exclude_emitted_from_final:
+                            return final_text, avg_logprob
+                        flushed_stripped = flushed.strip()
+                        if not flushed_stripped:
+                            return final_text, avg_logprob
+                        rest = _after_flushed_prefix(final_text, flushed_stripped)
+                        if rest is not None:
+                            return rest, avg_logprob
+                        # Model revised something inside the already-flushed prefix — we
+                        # can't safely recompute the diff (would risk re-publishing text
+                        # that was already billed/translated). Drop the trailing part
+                        # rather than risk a duplicate charge or duplicate translation.
+                        logger.warning(
+                            "stt_delta_final_mismatch",
+                            flushed=flushed_stripped[:60],
+                            final=final_text[:60],
+                        )
+                        return "", avg_logprob
+                    elif etype == "error":
+                        raise RuntimeError(f"realtime_transcription_error: {event}")
+                raise RuntimeError("realtime_connection_closed_before_completed")
 
-        return await asyncio.wait_for(_collect(), timeout=TRANSCRIBE_EVENT_TIMEOUT_S)
+            return await asyncio.wait_for(_collect(), timeout=TRANSCRIBE_EVENT_TIMEOUT_S)
+        finally:
+            session["in_flight"] = False
 
     async def _degrade_session_config(
         self,
@@ -2706,8 +2941,14 @@ class OpenAISTT:
             "language": language,
             "prompt": prompt,
             "languages": languages,
+            "allowed_languages": set(allowed_languages) if allowed_languages else None,
             "keywords": normalized_keywords,
             "noise_reduction": noise_reduction,
+            # Whether the input buffer holds appended audio no commit has taken yet, and
+            # whether a commit is reading its completion right now. A renewal swaps the socket
+            # only when both are false — see renew_aging_sessions.
+            "dirty": False,
+            "in_flight": False,
         }
         self._sessions[key] = session
         logger.info(
@@ -2758,6 +2999,7 @@ class OpenAISTT:
             return None
 
         session["last_used"] = time.monotonic()
+        session["dirty"] = True
         return int(session.get("epoch", 0))
 
     async def discard_streamed_audio(self, key: tuple[str, str]) -> None:
@@ -2773,6 +3015,7 @@ class OpenAISTT:
             return
         try:
             await session["conn"].input_audio_buffer.clear()
+            session["dirty"] = False
         except Exception:
             logger.debug("stt_stream_clear_failed", meeting_id=key[0], exc_info=True)
 
