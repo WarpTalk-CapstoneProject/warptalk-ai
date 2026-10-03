@@ -494,6 +494,15 @@ class STTSettings(BaseSettings):
     # retention stops improving. ViMedCSS (Vietnamese-English code-switching, 34.6h),
     # CanVEC and the relevant FLEURS split are suitable sources.
     min_avg_logprob_by_language: dict[str, float] = {}
+    # TEXT LANGUAGE-ID (stt_worker/text_language_id.py). The Realtime model returns no language,
+    # so between two Latin-script room languages (vi/en) a line used to carry the speaker's
+    # DECLARED language unless it held a Vietnamese-unique letter — "Anh làm gì?" from a host
+    # declared en was English, "Morning is great." from a Meet side declared vi was Vietnamese
+    # (bridge room 01a10069). With this on, such a line is identified among the ROOM's own
+    # Latin-script languages only, and relabelled only above a confidence floor and a minimum
+    # length. Env: STT_TEXT_LANGUAGE_ID_ENABLED (the kill switch).
+    text_language_id_enabled: bool = True
+    text_language_id_min_confidence: float = 0.9
     # Warm WebSockets are claimed by the first active speakers so their first utterance
     # does not pay the ~1–2s Realtime connection handshake.
     realtime_pool_size: int = 4
@@ -554,7 +563,10 @@ class STTSettings(BaseSettings):
     # attached to stand-in segments as far_speaker_name/source/confidence. Env: STT_FAR_SPEAKER_*.
     far_speaker_hints_enabled: bool = True
     # How long after the words a caption is observed. Hints are shifted back by this much.
-    far_speaker_hint_lag_ms: int = 500
+    # 1000 (was 500, bug B3): Meet's captions trail speech by ~0.5-1.5 s (desktop
+    # meet-captions.ts), so 500 put most hints after the words they name. Change together with
+    # TTS_FAR_SPEAKER_CLONE_HINT_LAG_MS.
+    far_speaker_hint_lag_ms: int = 1000
     # A hint outside the segment window but within this gap still names it, at reduced confidence.
     far_speaker_hint_max_gap_ms: int = 1500
 
@@ -837,7 +849,7 @@ class TTSSettings(BaseSettings):
     # The same shift stt_worker applies to a hint's timestamp (STT_FAR_SPEAKER_HINT_LAG_MS), so
     # the capture and the transcript agree about who a stretch of audio belongs to. This worker
     # does not read the STT_ settings; change the two together.
-    far_speaker_clone_hint_lag_ms: int = 500
+    far_speaker_clone_hint_lag_ms: int = 1000
     # How often the consent hash is compared with the clones that exist. Withdrawal is also
     # noticed on every sentence and every chunk of that person; this is for the person who
     # withdraws and then says nothing more.
