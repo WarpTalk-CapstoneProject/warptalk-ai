@@ -2141,8 +2141,29 @@ class STTWorker(BaseWorker):
                 "far_speaker_attribution_failed", meeting_id=result.meeting_id, exc_info=True
             )
             return result
+        # Bug B3 observability: one line per stand-in segment, hit or miss, so a test call shows
+        # whether the caption names reached this worker and with what confidence (the gateway
+        # shows a name only at Bridge:FarSpeakerNameMinConfidence, 0.6 by default).
         if attribution is None:
+            self.logger.info(
+                "far_speaker_unattributed",
+                meeting_id=result.meeting_id,
+                segment_id=result.segment_id,
+                is_early=result.is_early,
+                window_start_ms=window.start_ms,
+                window_end_ms=window.end_ms,
+            )
             return result
+        self.logger.info(
+            "far_speaker_attributed",
+            meeting_id=result.meeting_id,
+            segment_id=result.segment_id,
+            is_early=result.is_early,
+            far_speaker_name=attribution.name,
+            far_speaker_confidence=attribution.confidence,
+            window_start_ms=window.start_ms,
+            window_end_ms=window.end_ms,
+        )
         return result.model_copy(
             update={
                 "far_speaker_name": attribution.name,

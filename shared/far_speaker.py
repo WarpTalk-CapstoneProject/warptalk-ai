@@ -46,6 +46,17 @@ SOURCE_MEET_CAPTION = "meet_caption"
 #: boundary, and must never outrank the former.
 _NEAREST_HINT_MAX_CONFIDENCE = 0.5
 
+#: Confidence band for a nearest hint whose name is the ONLY name near the window AND which has a
+#: hint lying after the window's end (bug B3). Meet's captions trail speech and the desktop's hints
+#: trail the captions, so a short line often has no hint inside its window yet - only the same
+#: speaker's hints just before and/or after it. Capped at 0.5 those were always below the 0.6 the
+#: gateway needs, and the line said "Google Meet participants" although only one person was
+#: talking. Requiring a hint AFTER the window keeps the hand-over case out: when Lan stops and Minh
+#: starts, Minh's first line has only Lan's hints BEFORE it until Minh's own arrive, and that
+#: stays a low-confidence guess.
+_SOLE_NEAR_HINT_MIN_CONFIDENCE = 0.6
+_SOLE_NEAR_HINT_MAX_CONFIDENCE = 0.85
+
 
 def far_speaker_hints_key(room_id: str) -> str:
     return FAR_SPEAKER_HINTS_KEY.format(room=room_id)
@@ -124,7 +135,9 @@ def attribute_far_speaker(
       the votes — 1.0 when every hint in the window agrees, lower when the window spans a
       hand-over.
     * Otherwise the hint NEAREST the window wins if it is within `max_gap_ms`, with a confidence
-      that decays from 0.5 to 0 across that gap.
+      that decays from 0.5 to 0 across that gap - unless every hint within `max_gap_ms` of the
+      window carries that same name and at least one of them lies AFTER the window: then nobody
+      else could have said it, and the confidence decays from 0.85 to 0.6 instead.
     * Otherwise None — no hint is a guess nobody should store.
     """
     start, end = segment_window.start_ms, segment_window.end_ms
@@ -133,14 +146,19 @@ def attribute_far_speaker(
 
     inside: list[FarSpeakerHint] = []
     nearest: tuple[int, FarSpeakerHint] | None = None
+    near_names: set[str] = set()
+    near_after = False
     for hint in hints:
         spoken_at = hint.t_ms - lag_ms
         if start <= spoken_at <= end:
             inside.append(hint)
             continue
         gap = start - spoken_at if spoken_at < start else spoken_at - end
-        if gap <= max_gap_ms and (nearest is None or gap < nearest[0]):
-            nearest = (gap, hint)
+        if gap <= max_gap_ms:
+            near_names.add(hint.name.casefold())
+            near_after = near_after or spoken_at > end
+            if nearest is None or gap < nearest[0]:
+                nearest = (gap, hint)
 
     if inside:
         votes: dict[str, list[FarSpeakerHint]] = {}
@@ -159,6 +177,13 @@ def attribute_far_speaker(
     if nearest is not None:
         gap, hint = nearest
         span = max(1, max_gap_ms)
+        if len(near_names) == 1 and near_after:
+            confidence = _SOLE_NEAR_HINT_MIN_CONFIDENCE + (
+                _SOLE_NEAR_HINT_MAX_CONFIDENCE - _SOLE_NEAR_HINT_MIN_CONFIDENCE
+            ) * (1.0 - gap / span)
+            return FarSpeakerAttribution(
+                name=hint.name, source=hint.source, confidence=round(confidence, 3)
+            )
         confidence = _NEAREST_HINT_MAX_CONFIDENCE * (1.0 - gap / span)
         if confidence <= 0:
             return None

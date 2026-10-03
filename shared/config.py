@@ -554,7 +554,10 @@ class STTSettings(BaseSettings):
     # attached to stand-in segments as far_speaker_name/source/confidence. Env: STT_FAR_SPEAKER_*.
     far_speaker_hints_enabled: bool = True
     # How long after the words a caption is observed. Hints are shifted back by this much.
-    far_speaker_hint_lag_ms: int = 500
+    # 1000 (was 500, bug B3): Meet's captions trail speech by ~0.5-1.5 s (desktop
+    # meet-captions.ts), so 500 put most hints after the words they name. Change together with
+    # TTS_FAR_SPEAKER_CLONE_HINT_LAG_MS.
+    far_speaker_hint_lag_ms: int = 1000
     # A hint outside the segment window but within this gap still names it, at reduced confidence.
     far_speaker_hint_max_gap_ms: int = 1500
 
@@ -837,7 +840,7 @@ class TTSSettings(BaseSettings):
     # The same shift stt_worker applies to a hint's timestamp (STT_FAR_SPEAKER_HINT_LAG_MS), so
     # the capture and the transcript agree about who a stretch of audio belongs to. This worker
     # does not read the STT_ settings; change the two together.
-    far_speaker_clone_hint_lag_ms: int = 500
+    far_speaker_clone_hint_lag_ms: int = 1000
     # How often the consent hash is compared with the clones that exist. Withdrawal is also
     # noticed on every sentence and every chunk of that person; this is for the person who
     # withdraws and then says nothing more.

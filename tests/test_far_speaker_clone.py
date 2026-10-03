@@ -48,7 +48,7 @@ AN = "Trần  An"
 LAN = "Lan Pham"
 AN_FIELD = consent_field(AN) or ""
 LAN_FIELD = consent_field(LAN) or ""
-HINT_LAG_MS = 500
+HINT_LAG_MS = 1000  # TTSSettings.far_speaker_clone_hint_lag_ms default
 
 EN: list[dict[str, Any]] = [
     {"id": f"en-{name}", "name": name, "gender": gender}

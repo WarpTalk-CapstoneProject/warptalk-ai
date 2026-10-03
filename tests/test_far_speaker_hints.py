@@ -81,6 +81,34 @@ class TestAttributeFarSpeaker:
     def test_hint_too_far_away_is_no_answer(self) -> None:
         assert attribute_far_speaker(W, [_h("Lan", 20_000)], lag_ms=0, max_gap_ms=1_500) is None
 
+    def test_b3_sole_name_around_the_window_clears_the_live_threshold(self) -> None:
+        # A short line with no hint inside it yet: only Lan's caption, just before AND just after.
+        # Nobody else was named near it, so the gateway (>= 0.6) must show "Lan", not the fallback.
+        hints = [_h("Lan", 9_400), _h("Lan", 12_500)]
+        got = attribute_far_speaker(W, hints, lag_ms=0, max_gap_ms=1_500)
+        assert got is not None and got.name == "Lan"
+        assert 0.6 <= got.confidence <= 0.85
+
+    def test_b3_hand_over_with_only_the_previous_speaker_before_stays_low(self) -> None:
+        # Lan stopped, Minh's first line has no hint of its own yet: only Lan's hints BEFORE it.
+        # That must not be a confident "Lan".
+        hints = [_h("Lan", 9_000), _h("Lan", 9_600)]
+        got = attribute_far_speaker(W, hints, lag_ms=0, max_gap_ms=1_500)
+        assert got is not None and got.name == "Lan" and got.confidence < 0.5
+
+    def test_b3_two_names_near_the_window_stay_low(self) -> None:
+        hints = [_h("Lan", 9_500), _h("Minh", 12_400)]
+        got = attribute_far_speaker(W, hints, lag_ms=0, max_gap_ms=1_500)
+        assert got is not None and got.confidence < 0.5
+
+    def test_b3_default_lag_matches_meet_caption_delay(self) -> None:
+        # Meet's captions trail the words by ~0.5-1.5 s; a caption seen 1.4 s after the window
+        # ended still lands inside it with the default lag.
+        lag = STTSettings().far_speaker_hint_lag_ms
+        assert lag == 1_000
+        got = attribute_far_speaker(W, [_h("Lan", 12_900)], lag_ms=lag, max_gap_ms=0)
+        assert got is not None and got.name == "Lan" and got.confidence == 1.0
+
     def test_source_is_carried_from_the_winning_hint(self) -> None:
         got = attribute_far_speaker(W, [_h("Lan", 11_000, source="diarizer")], lag_ms=0)
         assert got is not None and got.source == "diarizer"
