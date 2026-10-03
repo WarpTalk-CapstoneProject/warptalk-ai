@@ -612,6 +612,19 @@ class TranslationResultMessage(BaseModel):
     workspace_id: str | None = None
     requested_by_user_id: str | None = None
     transcript_id: str | None = None
+    # Bridge stand-in segments only: the Meet-side person this line was attributed to, carried
+    # unchanged from STTResultMessage.far_speaker_name / far_speaker_confidence. Everyone on the
+    # Meet side is published under ONE stand-in speaker_id, so speaker_id cannot tell tts_worker
+    # whose voice to dub this line in; the caption name is the only thing that can (WT-932).
+    #
+    # The translation worker is the courier here, as it is for prosody — it attributes nothing.
+    # Both None, and absent on the wire, on every native segment, every stand-in segment no
+    # caption hint named, every older producer and every post-meeting backfill, so a message
+    # without a name is byte-for-byte what it was before this field existed.
+    far_speaker_name: str | None = None
+    # 0..1, the STT worker's number untouched: 1.0 = every hint inside the segment named this
+    # person; lower at a hand-over between speakers or on the nearest-hint path (capped at 0.5).
+    far_speaker_confidence: float | None = None
 
     def to_redis(self) -> dict[str, str]:
         payload = {
@@ -658,6 +671,12 @@ class TranslationResultMessage(BaseModel):
             payload["requested_by_user_id"] = self.requested_by_user_id
         if self.transcript_id:
             payload["transcript_id"] = self.transcript_id
+        # Only with a name: a confidence without one is not an attribution. Same rule as
+        # STTResultMessage.to_redis.
+        if self.far_speaker_name:
+            payload["far_speaker_name"] = self.far_speaker_name
+            if self.far_speaker_confidence is not None:
+                payload["far_speaker_confidence"] = str(self.far_speaker_confidence)
         return payload
 
     @classmethod
@@ -694,6 +713,9 @@ class TranslationResultMessage(BaseModel):
             workspace_id=d.get("workspace_id") or None,
             requested_by_user_id=d.get("requested_by_user_id") or None,
             transcript_id=d.get("transcript_id") or None,
+            # Absent on every native segment and on everything published before WT-932.
+            far_speaker_name=d.get("far_speaker_name") or None,
+            far_speaker_confidence=optional_confidence(d.get("far_speaker_confidence")),
         )
 
 

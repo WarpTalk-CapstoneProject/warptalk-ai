@@ -405,6 +405,75 @@ class TestTranslationResultMessage:
         assert "latency_ms" not in payload
         assert TranslationResultMessage.from_redis(payload).latency_ms is None
 
+    @staticmethod
+    def _bridge_msg(
+        far_speaker_name: str | None = None, far_speaker_confidence: float | None = None
+    ) -> TranslationResultMessage:
+        return TranslationResultMessage(
+            segment_id="seg-123",
+            meeting_id="meeting-123",
+            speaker_id="00000000-0000-0000-0000-00000000b21d",
+            original_text="Hello",
+            translated_text="Xin chao",
+            source_lang="en",
+            target_lang="vi",
+            timestamp_ms=1_000,
+            far_speaker_name=far_speaker_name,
+            far_speaker_confidence=far_speaker_confidence,
+        )
+
+    def test_far_speaker_survives_the_round_trip(self) -> None:
+        """WT-932: tts_worker reads the Meet-side caption name off this message and nothing else,
+        so it must reach it exactly as stt_worker attributed it."""
+        payload = self._bridge_msg("Lan Nguyen", 0.5).to_redis()
+
+        assert payload["far_speaker_name"] == "Lan Nguyen"
+        assert payload["far_speaker_confidence"] == "0.5"
+        restored = TranslationResultMessage.from_redis(payload)
+        assert restored.far_speaker_name == "Lan Nguyen"
+        assert restored.far_speaker_confidence == pytest.approx(0.5)
+
+    def test_no_far_speaker_leaves_the_wire_byte_identical(self) -> None:
+        """A native segment has no name, and its payload must be exactly what it was before the
+        field existed — absent, not empty."""
+        payload = self._bridge_msg().to_redis()
+
+        assert not any(k.startswith("far_speaker") for k in payload)
+        restored = TranslationResultMessage.from_redis(payload)
+        assert restored.far_speaker_name is None
+        assert restored.far_speaker_confidence is None
+        assert restored.to_redis() == payload
+
+    def test_far_speaker_confidence_without_a_name_is_not_sent(self) -> None:
+        """Same rule as STTResultMessage: a confidence that names nobody is not an attribution."""
+        payload = self._bridge_msg(far_speaker_confidence=0.9).to_redis()
+
+        assert "far_speaker_confidence" not in payload
+
+    def test_far_speaker_name_without_confidence_round_trips(self) -> None:
+        payload = self._bridge_msg("Lan Nguyen").to_redis()
+
+        assert payload["far_speaker_name"] == "Lan Nguyen"
+        assert "far_speaker_confidence" not in payload
+        assert TranslationResultMessage.from_redis(payload).far_speaker_confidence is None
+
+    def test_payload_from_before_the_field_parses_to_none(self) -> None:
+        """An older producer's message (or a backfill) simply has no such keys."""
+        legacy = {
+            "segment_id": "seg-123",
+            "meeting_id": "meeting-123",
+            "speaker_id": "speaker-1",
+            "original_text": "Hello",
+            "translated_text": "Xin chao",
+            "source_lang": "en",
+            "target_lang": "vi",
+        }
+
+        restored = TranslationResultMessage.from_redis(legacy)
+
+        assert restored.far_speaker_name is None
+        assert restored.far_speaker_confidence is None
+
 
 class TestOptionalConfidence:
     """WT-277: every flavour of "the producer told us nothing" must collapse to None."""

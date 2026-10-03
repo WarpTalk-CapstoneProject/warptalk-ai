@@ -8,7 +8,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from shared.config import TranslationSettings, WorkerSettings
-from shared.schemas import STT_UNKNOWN_CONFIDENCE, ProsodyEnvelope, STTResultMessage
+from shared.control_markers import EXTERNAL_BRIDGE_SPEAKER_ID
+from shared.schemas import (
+    STT_UNKNOWN_CONFIDENCE,
+    ProsodyEnvelope,
+    STTResultMessage,
+    TranslationResultMessage,
+)
 from translation_worker.translator import (
     OpenAITranslator,
     _build_glossary_block,
@@ -940,6 +946,110 @@ class TestTranslationWorker:
         for data in published:
             assert "confidence" not in data
             assert "source_stt_confidence" not in data
+
+    def _published(self, mock_redis_client) -> list[dict[str, str]]:
+        # The global stream only: BaseWorker.publish writes every message to it AND to the
+        # per-room stream, and the two copies are identical.
+        return [
+            c.args[1]
+            for c in mock_redis_client._redis.xadd.call_args_list
+            if str(c.args[0]) == "translate:results"
+        ]
+
+    async def test_meet_side_speaker_name_is_carried_to_every_translated_sentence(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """WT-932: everyone on the Meet side of a bridge shares ONE stand-in speaker_id, so the
+        caption name stt_worker attached is the only thing that tells tts_worker whose voice to
+        dub a line in. This stage used to drop it, and every Meet participant sounded alike.
+
+        Two sentences in one segment: both inherit the segment's attribution, the batched one as
+        much as the first.
+        """
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
+        worker.translator.translate_batch = AsyncMock(return_value=["Ban khoe khong?"])
+        stt = STTResultMessage(
+            meeting_id="m1",
+            speaker_id=EXTERNAL_BRIDGE_SPEAKER_ID,
+            text="Hello world. How are you?",
+            language="en",
+            confidence=0.95,
+            far_speaker_name="Lan Nguyen",
+            far_speaker_source="meet_caption",
+            far_speaker_confidence=0.75,
+        )
+
+        await worker.process(b"msg-1", stt.to_redis())
+
+        published = self._published(mock_redis_client)
+        assert len(published) == 2
+        for payload in published:
+            assert payload["speaker_id"] == EXTERNAL_BRIDGE_SPEAKER_ID
+            assert payload["far_speaker_name"] == "Lan Nguyen"
+            assert payload["far_speaker_confidence"] == "0.75"
+            restored = TranslationResultMessage.from_redis(payload)
+            assert restored.far_speaker_name == "Lan Nguyen"
+            assert restored.far_speaker_confidence == pytest.approx(0.75)
+
+    async def test_meet_side_speaker_name_rides_the_empty_turn_closing_marker(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """The filler-only final chunk publishes an empty marker instead of a translation. It
+        closes the same person's turn, so it carries the same name."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
+        stt = STTResultMessage(
+            meeting_id="m1",
+            speaker_id=EXTERNAL_BRIDGE_SPEAKER_ID,
+            text="Ummm",
+            clean_text="",
+            language="en",
+            confidence=0.95,
+            is_final_chunk=True,
+            far_speaker_name="Lan Nguyen",
+            far_speaker_confidence=1.0,
+        )
+
+        await worker.process(b"msg-1", stt.to_redis())
+
+        published = self._published(mock_redis_client)
+        assert len(published) == 1
+        assert published[0]["translated_text"] == ""
+        assert published[0]["far_speaker_name"] == "Lan Nguyen"
+        assert published[0]["far_speaker_confidence"] == "1.0"
+
+    async def test_native_segment_payload_is_unchanged_by_far_speaker_fields(
+        self, mock_redis_client, worker_settings: WorkerSettings
+    ) -> None:
+        """A native speaker has no caption name, and translate:results must carry exactly the
+        fields it carried before WT-932 — no far_speaker key, not even an empty one."""
+        worker = self._make_worker(mock_redis_client, worker_settings)
+        mock_redis_client._redis.hgetall.return_value = {b"listener-1": b"vi"}
+
+        await worker.process(b"msg-1", self._make_stt_msg(language="en").to_redis())
+
+        published = self._published(mock_redis_client)
+        assert len(published) == 1
+        assert set(published[0]) == {
+            "segment_id",
+            "meeting_id",
+            "speaker_id",
+            "original_text",
+            "translated_text",
+            "source_lang",
+            "target_lang",
+            "start_ms",
+            "end_ms",
+            "is_final_chunk",
+            "is_early",
+            "timestamp_ms",
+            "translator_model",
+            "source_segment_id",
+            "chunk_index",
+            "source_stt_confidence",
+            "latency_ms",
+        }
 
     async def test_skips_paused_room(
         self, mock_redis_client, worker_settings: WorkerSettings

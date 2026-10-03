@@ -626,6 +626,10 @@ class TranslationWorker(BaseWorker):
                         chunk_id=stt_result.chunk_id,
                         chunk_duration_ms=stt_result.chunk_duration_ms,
                         prosody=stt_result.prosody,
+                        # Carried for the same reason as on a translated sentence below: the
+                        # turn-closing marker belongs to the same Meet-side person (WT-932).
+                        far_speaker_name=stt_result.far_speaker_name,
+                        far_speaker_confidence=stt_result.far_speaker_confidence,
                     )
                     await self._publish_once(stt_result.meeting_id, result)
             return
@@ -966,6 +970,13 @@ class TranslationWorker(BaseWorker):
                 # row ever written, which is why "translation is sometimes slow" has never been
                 # answerable after the fact.
                 latency_ms=sentence_latency_ms,
+                # Bridge stand-in only (None on every native segment): which Meet-side person
+                # said this, as stt_worker attributed it from the Meet captions. Every Meet
+                # participant shares one stand-in speaker_id, so this name is what lets
+                # tts_worker give each of them their own voice (WT-932). Carried, not judged —
+                # every sentence split out of the segment inherits the segment's attribution.
+                far_speaker_name=stt_result.far_speaker_name,
+                far_speaker_confidence=stt_result.far_speaker_confidence,
             )
 
             # Publish IMMEDIATELY so TTS can synthesize while next chunk is translated
