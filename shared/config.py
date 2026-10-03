@@ -818,6 +818,23 @@ class TTSSettings(BaseSettings):
     # reach it by any path. This is that bound doubled, so the sweep is wrong only if the TTL
     # above changes without this changing with it.
     orphan_voice_min_age_seconds: int = 86400  # 24h
+    # WT-933. Clone the voice of a Meet-side person (bridge stand-in) who consented for
+    # themselves. OFF by default, and with it off nothing below is read and the worker behaves
+    # byte-for-byte as before. See tts_worker/far_speaker_clone.py. Env:
+    # TTS_FAR_SPEAKER_CLONE_ENABLED.
+    far_speaker_clone_enabled: bool = False
+    # How long a stand-in chunk is held, counted from its own timestamp, before it is attributed
+    # to a caption name. Caption hints trail the speech by roughly 0.3-1.2 s, so a chunk
+    # attributed on arrival would be judged on hints that have not been written yet.
+    far_speaker_clone_hint_wait_ms: int = 2000
+    # The same shift stt_worker applies to a hint's timestamp (STT_FAR_SPEAKER_HINT_LAG_MS), so
+    # the capture and the transcript agree about who a stretch of audio belongs to. This worker
+    # does not read the STT_ settings; change the two together.
+    far_speaker_clone_hint_lag_ms: int = 500
+    # How often the consent hash is compared with the clones that exist. Withdrawal is also
+    # noticed on every sentence and every chunk of that person; this is for the person who
+    # withdraws and then says nothing more.
+    far_speaker_clone_consent_poll_seconds: float = 5.0
     # Deliver the dub the way the speaker delivered it, using the prosody measured upstream
     # (STT_PROSODY_ENABLED) and carried on the translation message. Independent of the STT flag
     # so the measurement and its use can be turned off separately — which is what makes an A/B
