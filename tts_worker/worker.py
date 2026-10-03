@@ -1077,7 +1077,9 @@ class TTSWorker(BaseWorker):
                 f"translationRoom:{meeting_id}:speak_languages", EXTERNAL_BRIDGE_SPEAKER_ID
             )
         except Exception:
+            # Cached like a "no": while Redis is down this would otherwise warn every pass.
             self.logger.warning("dub_bridge_room_unreadable", meeting_id=meeting_id, exc_info=True)
+            cache[meeting_id] = time.monotonic()
             return False
         if seat is not None:
             cache[meeting_id] = None
@@ -1165,17 +1167,22 @@ class TTSWorker(BaseWorker):
                     for user_id, value in listen.items()
                     if user_id != speaker_id and (code := known_language_code(value))
                 } or {"en"}
-                own = (speak.get(speaker_id) or "").strip().lower()
-                if own == "auto":
-                    own = ""
+                declared = (speak.get(speaker_id) or "").strip().lower()
                 previous = declared_seen.get((meeting_id, speaker_id))
-                if previous is None:
-                    changed_at: float | None = None
-                elif previous[0] != own:
-                    changed_at = now
+                if not declared:
+                    # No entry: the speaker is between a leave and a rejoin (a page reload). Not a
+                    # change of language; keep what was seen so a rejoin in the same language
+                    # does not read as "just switched" and retire a track at once.
+                    changed_at: float | None = previous[1] if previous else None
                 else:
-                    changed_at = previous[1]
-                declared_seen[(meeting_id, speaker_id)] = (own, changed_at)
+                    if previous is None:
+                        changed_at = None
+                    elif previous[0] != declared:
+                        changed_at = now
+                    else:
+                        changed_at = previous[1]
+                    declared_seen[(meeting_id, speaker_id)] = (declared, changed_at)
+                own = "" if declared in ("", "auto") else declared
                 for lang, last_used in langs.items():
                     if not any(is_same_language(lang, target) for target in wanted):
                         reason = "no_listener_in_target_language"

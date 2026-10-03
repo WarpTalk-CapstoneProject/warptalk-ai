@@ -143,6 +143,21 @@ class TestReconcileDubTargets:
         assert await worker._reconcile_dub_targets() == 0
         assert ("m", "host", "en", "") in publisher._bots
 
+    async def test_a_reload_gap_in_speak_languages_is_not_a_change(self) -> None:
+        # Review on #244: the host reloads; their speak_languages entry is gone for one pass,
+        # then back with the SAME language. That must not read as "switched to en" and retire
+        # the en track the moment they rejoin.
+        publisher = _publisher_with({("m", "host", "en", ""): time.monotonic() - 10})
+        speak = {"host": "en", STANDIN: "vi"}
+        listen = {"host": "vi", STANDIN: "en"}
+        worker = _worker(publisher, listen=listen, speak=speak)
+        assert await worker._reconcile_dub_targets() == 0
+        del speak["host"]
+        assert await worker._reconcile_dub_targets() == 0
+        speak["host"] = "en"
+        assert await worker._reconcile_dub_targets() == 0
+        assert ("m", "host", "en", "") in publisher._bots
+
     async def test_far_side_language_change_moves_the_stand_in_dub(self) -> None:
         # SetExternalMeetingLanguage(en -> fr): the host's en dub into Meet has no listener.
         publisher = _publisher_with({("m", "host", "en", ""): time.monotonic()})
