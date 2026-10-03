@@ -58,6 +58,7 @@ from tts_worker.livekit_publisher import (
     FRAME_MS,
     LiveKitTTSPublisher,
     TrackStream,
+    interpreter_identity,
 )
 from tts_worker.prosody_context import ProsodyContext, wav_header
 from tts_worker.synthesizer import CartesiaSynthesizer, GenerationLease
@@ -169,6 +170,15 @@ def far_speaker_voice_key(
     if not name:
         return None
     return f"{EXTERNAL_BRIDGE_SPEAKER_ID}:{name}"
+
+
+def far_speaker_voice_field(far_key: str) -> str:
+    """What stands for a far-speaker key in Redis and in logs: a short hash, never the name.
+
+    This is a person's display name from someone else's call, and neither Redis keys nor logs
+    are a place for it.
+    """
+    return hashlib.sha256(far_key.encode()).hexdigest()[:12]
 
 
 # What the preview says, per language.
@@ -1786,6 +1796,7 @@ class TTSWorker(BaseWorker):
 
         route_status = self._route_states.get(translation.meeting_id, "AUDIO_ROUTING_ACTIVE")
         if route_status == "PAUSED":
+            self._note_far_side_dub(translation, "skip", reason="room_paused")
             return
 
         current_timestamp_ms = int(time.time() * 1000)
@@ -1814,6 +1825,7 @@ class TTSWorker(BaseWorker):
                 segment_id=translation.segment_id,
                 lang=translation.target_lang,
             )
+            self._note_far_side_dub(translation, "skip", reason="same_language")
             if translation.is_final_chunk:
                 await self.redis.publish_system_event(
                     room_id=translation.meeting_id,
@@ -1839,6 +1851,13 @@ class TTSWorker(BaseWorker):
             )
 
         if route_status == "TEXT_ONLY_MODE" or text_only_dub or not text.strip():
+            # Not for the empty turn-closing marker: there was no sentence to dub.
+            if text.strip():
+                self._note_far_side_dub(
+                    translation,
+                    "skip",
+                    reason="text_only_route" if text_only_dub else "room_text_only_mode",
+                )
             if translation.is_final_chunk:
                 await self.redis.publish_system_event(
                     room_id=translation.meeting_id,
@@ -1886,6 +1905,17 @@ class TTSWorker(BaseWorker):
                 translation_latency_ms=translation.latency_ms,
             )
 
+        self._note_far_side_dub(
+            translation,
+            "speak",
+            identities=[
+                interpreter_identity(translation.target_lang, translation.speaker_id, voice_key)
+                for _voice_id, _voice_type, voice_key in variants
+            ],
+            voice_type=variants[0][1],
+            lag_ms=lag_ms,
+        )
+
         for voice_id, voice_type, voice_key in variants:
             await self._synthesize_and_publish(
                 translation,
@@ -1906,6 +1936,50 @@ class TTSWorker(BaseWorker):
                 room_id=translation.meeting_id,
                 event_type="final_chunk_processed",
                 payload={"segmentId": translation.segment_id},
+            )
+
+    def _note_far_side_dub(
+        self, translation: TranslationResultMessage, decision: str, **fields: Any
+    ) -> None:
+        """Say what became of one Meet-side sentence's dub. Bridge stand-in only; one line each.
+
+        WHY THE STAND-IN GETS A LINE OF ITS OWN
+            "The Meet side speaks and I hear no dub" (prod 2026-10-03, rooms 01a103e0 and
+            01a103ef) could not be settled from the logs. Two of process()'s exits said nothing
+            at all (a paused room, a room in TEXT_ONLY_MODE), the other skips each had an event
+            of their own, and nothing named the LiveKit identity the dub was published under —
+            which is the only thing the listener's client matches on
+            (`ai-interpreter-{its own listen language}-{stand-in}`). So a dub synthesized into a
+            language the listener is not tuned to, and no dub at all, read the same.
+
+        `decision` is "speak" or "skip"; a skip carries `reason`, a speak the `identities` it is
+        published under. `audio_synthesized` for the same `segment_id` is the outcome. Nothing
+        is said for a native speaker, or for the empty turn-closing marker.
+
+        The caption name is never logged: its hash (the one far_speaker_voice_assigned carries)
+        when the voice is keyed by it, its confidence, and its LENGTH — a caption sentence
+        mistaken for a participant name shows as a long name whose hash changes every line.
+        Never raises: a log line must not cost the sentence.
+        """
+        if not is_external_bridge_speaker(translation.speaker_id):
+            return
+        with suppress(Exception):
+            far_key = far_speaker_voice_key(
+                translation.speaker_id,
+                translation.far_speaker_name,
+                translation.far_speaker_confidence,
+            )
+            self.logger.info(
+                "far_side_dub_decision",
+                meeting_id=translation.meeting_id,
+                segment_id=translation.segment_id,
+                source_lang=translation.source_lang,
+                target_lang=translation.target_lang,
+                decision=decision,
+                far_speaker_hash=far_speaker_voice_field(far_key) if far_key else None,
+                far_speaker_confidence=translation.far_speaker_confidence,
+                far_speaker_name_chars=len(translation.far_speaker_name or ""),
+                **fields,
             )
 
     async def _resolve_voice_variants(
@@ -2305,9 +2379,7 @@ class TTSWorker(BaseWorker):
             return CartesiaSynthesizer._default_voice_id(language)
 
         hash_key = f"{_FAR_SPEAKER_VOICES_PREFIX}{meeting_id}:{language}"
-        # A short hash, never the name: this is a person's display name from someone else's
-        # call, and neither Redis keys nor logs are a place for it.
-        field = hashlib.sha256(far_key.encode()).hexdigest()[:12]
+        field = far_speaker_voice_field(far_key)
         try:
             raw = await self.redis.hgetall(hash_key)
         except Exception:

@@ -120,6 +120,26 @@ def _apply_fade(pcm_s16le: bytes, sample_rate: int) -> bytes:
 # extra track for listeners who explicitly picked that voice via SetVoicePreference.
 _BotKey = tuple[str, str, str, str]
 
+
+def interpreter_identity(target_lang: str, speaker_id: str, voice_key: str = "") -> str:
+    """The LiveKit participant identity a dub of `speaker_id` into `target_lang` joins under.
+
+    Language first so the frontend can match by a stable prefix (`ai-interpreter-{lang}-`) —
+    speaker_id is a GUID that contains its own hyphens, so putting it last keeps the language
+    token unambiguous. voice_key (when set — "voice-{id8}") sits between language and speaker; a
+    GUID never starts with "voice-", so the frontend can tell a voice-suffixed identity apart
+    from a bare default one unambiguously. The `ai-interpreter-` prefix still matches
+    livekit_ingress_worker's _is_ai_bot_identity filter, so this bot's own track is never
+    re-ingested.
+
+    Spelled once, here: the bot joins under it and tts_worker logs it (far_side_dub_decision), and
+    a log line naming an identity the room never saw would be worse than no line.
+    """
+    if voice_key:
+        return f"ai-interpreter-{target_lang}-{voice_key}-{speaker_id}"
+    return f"ai-interpreter-{target_lang}-{speaker_id}"
+
+
 #: The LiveKit participant attribute each dub bot carries saying WHOSE voice it speaks in:
 #: "cloned" (cloned from the speaker), "profile" (a voice the speaker picked), "default" (a
 #: stock catalogue voice assigned to them) or "preference" (a listener's pick). The meeting
@@ -607,19 +627,7 @@ class LiveKitTTSPublisher:
         if cached is not None:
             return cached
 
-        # Language first so the frontend can match by a stable prefix
-        # (`ai-interpreter-{lang}-`) — speaker_id is a GUID that contains its own
-        # hyphens, so putting it last keeps the language token unambiguous. voice_key
-        # (when set — "voice-{id8}") sits between language and speaker; a GUID never
-        # starts with "voice-", so the frontend can tell a voice-suffixed identity
-        # apart from a bare default one unambiguously. The `ai-interpreter-` prefix
-        # still matches livekit_ingress_worker's _is_ai_bot_identity filter, so this
-        # bot's own track is never re-ingested.
-        identity = (
-            f"ai-interpreter-{target_lang}-{voice_key}-{speaker_id}"
-            if voice_key
-            else f"ai-interpreter-{target_lang}-{speaker_id}"
-        )
+        identity = interpreter_identity(target_lang, speaker_id, voice_key)
         token = (
             api.AccessToken(self.settings.api_key, self.settings.api_secret)
             .with_identity(identity)
