@@ -108,6 +108,26 @@ from shared.schemas import ChatRequestMessage, ChatResultMessage
 
 SIBLING_SERVICE_TIMEOUT_SECONDS = 15.0
 
+#: Set by AssistantService when the user presses Stop (3 Oct 2026); read here, never written.
+CHAT_CANCEL_KEY_PREFIX = "assistant:chat_cancel:"
+
+#: How often a streaming turn looks for that key. Once per delta would be a GET per few tokens;
+#: half a second is faster than anyone can notice and costs two reads a second at most.
+STOP_POLL_SECONDS = 0.5
+
+#: The failed result for a turn stopped before it wrote anything. The web drops failures for a
+#: turn it stopped, so this is only ever read in logs and in the stored message.
+STOPPED_BEFORE_ANSWER = "Stopped before WarpBot answered."
+
+
+class TurnStopped(Exception):  # noqa: N818 - a stop the user asked for, not an error
+    """The user pressed Stop. Carries what this turn had written so far, which is kept."""
+
+    def __init__(self, partial: str) -> None:
+        super().__init__("stopped by the user")
+        self.partial = partial
+
+
 #: What the reader sees when the model's stream goes silent past the read timeout (WT-881).
 STREAM_STALLED_MESSAGE = (
     "WarpBot stopped receiving a reply from the model, so this answer was cut short. "
@@ -596,6 +616,18 @@ _PLATFORM_PLUGIN_INSTRUCTION = (
 )
 
 
+async def _close_stream(stream: Any) -> None:
+    """Close a Responses stream we are abandoning, so the HTTP response stops downloading tokens.
+    Best effort: the SDK's stream has `close()`, a test double may not."""
+    close = getattr(stream, "close", None)
+    if close is None:
+        return
+    with contextlib.suppress(Exception):
+        result = close()
+        if asyncio.iscoroutine(result):
+            await result
+
+
 def _is_platform_turn(request: Any) -> bool:
     """Whether this turn belongs to a system admin's platform-scope conversation.
 
@@ -783,7 +815,24 @@ class ChatAssistantWorker(BaseWorker):
         )
 
         try:
-            final_text, tool_call_log = await self._run_agent_loop(request, history, tool_context)
+            try:
+                final_text, tool_call_log = await self._run_agent_loop(
+                    request, history, tool_context
+                )
+            except TurnStopped as stopped:
+                # What the user already watched arrive is kept, as an answer they cut short; a turn
+                # stopped before it wrote anything is failed, so it never enters the next turn's
+                # history as an empty assistant message.
+                partial = strip_markers(stopped.partial).strip()
+                self.logger.info(
+                    "chat_turn_stopped", request_id=request.request_id, kept_chars=len(partial)
+                )
+                await self._publish_result(
+                    request,
+                    type_="completed" if partial else "failed",
+                    content=partial or STOPPED_BEFORE_ANSWER,
+                )
+                return
 
             # The intersection: sources genuinely retrieved this turn AND pointed at by the
             # answer. A marker the model invented resolves to nothing and is dropped in silence.
@@ -1003,6 +1052,9 @@ class ChatAssistantWorker(BaseWorker):
         # list_issues that SUCCEEDED, and the user got "please try rephrasing" over the data.
         answer_round = self.chat_settings.max_tool_iterations
         for iteration in range(answer_round + 1):
+            # Before every model call: a stop pressed during a tool call lands here.
+            if await self._stop_requested(request):
+                raise TurnStopped(final_text)
             tools_allowed = iteration < answer_round
             buffer = ""
             full_text = ""
@@ -1039,7 +1091,13 @@ class ChatAssistantWorker(BaseWorker):
                 stream=True,
             )
 
+            last_stop_check = time.monotonic()
             async for event in stream:
+                if time.monotonic() - last_stop_check >= STOP_POLL_SECONDS:
+                    last_stop_check = time.monotonic()
+                    if await self._stop_requested(request):
+                        await _close_stream(stream)
+                        raise TurnStopped(full_text)
                 etype = getattr(event, "type", "")
 
                 # Text arrives as response.output_text.delta. Streaming it out as it
@@ -1172,6 +1230,11 @@ class ChatAssistantWorker(BaseWorker):
                     for title, url, position in _web_citations(output_items):
                         tool_context.citations.note_cited("web", title, url, at=position)
                 break
+
+            # Not after the model asked for tools and before they run: a write must not go out
+            # once the user has said stop.
+            if await self._stop_requested(request):
+                raise TurnStopped(full_text)
 
             for call in function_calls:
                 call_id = getattr(call, "call_id", None) or f"call_{uuid.uuid4().hex}"
@@ -1516,6 +1579,14 @@ class ChatAssistantWorker(BaseWorker):
             return json.dumps(_redact_mcp_tool_payload_for_model(normalized))
 
         return handler
+
+    async def _stop_requested(self, request: ChatRequestMessage) -> bool:
+        """Whether the user pressed Stop on this turn. A Redis failure answers no: a stop that
+        cannot be read must not end a turn that nobody asked to end."""
+        try:
+            return bool(await self.redis.get(f"{CHAT_CANCEL_KEY_PREFIX}{request.request_id}"))
+        except Exception:
+            return False
 
     async def _publish_result(
         self,
