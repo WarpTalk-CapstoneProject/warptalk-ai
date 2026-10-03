@@ -1440,6 +1440,11 @@ class OpenAISTT:
         # Consecutive lines showing a speaker is back on their declared language while an
         # override pins them elsewhere — see _learn_release_evidence.
         self._release_evidence: dict[tuple[str, str], int] = {}
+        # The declaration each speaker's previous chunk carried — see _note_declaration. A change
+        # here is the only signal this process gets that the person re-picked their language
+        # mid-meeting (SetSpeakLanguage / SetExternalMeetingLanguage write the speak_languages
+        # hash, which livekit_ingress_worker reads per utterance into AudioChunkMessage.language).
+        self._declared_language: dict[tuple[str, str], str | None] = {}
         self._warm_sessions: deque[dict[str, Any]] = deque()
         # How many warm sockets to keep ready. Set by warm_up() and used by
         # _schedule_warm_refill to replace every socket a speaker claims.
@@ -1930,6 +1935,7 @@ class OpenAISTT:
         join-time declaration does. If they are still actually speaking something else, the
         evidence loop simply re-learns — two unambiguous segments, same as the first time.
         """
+        self._note_declaration(key, declared)
         overrides: dict[tuple[str, str], tuple[str, str | None]] | None = getattr(
             self, "_language_override", None
         )
@@ -1971,6 +1977,45 @@ class OpenAISTT:
             return learned
 
         return declared
+
+    def _note_declaration(self, key: tuple[str, str], declared: str | None) -> None:
+        """Forget everything learned against the previous declaration when it changes.
+
+        A NEW DECLARATION IS A FRESH START, NOT ONLY FOR THE OVERRIDE.
+
+        _apply_language_override already drops an override whose declaration no longer stands.
+        What it could not see is the evidence still COUNTING toward one: a speaker declared en
+        with one Vietnamese line on the counter who then picks ja keeps that (vi, 1), and their
+        next stray vi-looking line re-pins them to Vietnamese — learned against a declaration
+        they withdrew. The release counter has the same shape. Both are cleared here, so a
+        mid-meeting pick (bridge host via SetSpeakLanguage, the Meet side via
+        SetExternalMeetingLanguage) gets exactly the initial trust a join-time pick gets.
+
+        The first chunk a speaker sends records their declaration and clears nothing: there is
+        no previous claim to withdraw.
+        """
+        declarations: dict[tuple[str, str], str | None] | None = getattr(
+            self, "_declared_language", None
+        )
+        if declarations is None:
+            declarations = {}
+            self._declared_language = declarations
+        seen = key in declarations
+        previous = declarations.get(key)
+        declarations[key] = declared
+        if not seen or previous == declared:
+            return
+        for name in ("_language_evidence", "_release_evidence"):
+            counters = getattr(self, name, None)
+            if counters is not None:
+                counters.pop(key, None)
+        logger.info(
+            "stt_declared_language_changed",
+            meeting_id=key[0],
+            speaker_id=key[1],
+            old_declaration=previous,
+            new_declaration=declared,
+        )
 
     def _learn_language_evidence(
         self,

@@ -274,3 +274,76 @@ class TestReleaseVerdict:
 
     def test_a_regional_declaration_is_compared_on_its_base(self):
         assert _release_verdict("I use it for reports.", "vi", "en-US") is True
+
+
+class TestMidMeetingDeclarationChange:
+    """A mid-meeting re-pick (SetSpeakLanguage for a participant or the bridge host,
+    SetExternalMeetingLanguage for the Meet stand-in) reaches this model only as a different
+    `language` on the speaker's next chunk. It must wipe everything learned against the old
+    declaration, not only a finished override."""
+
+    def _model(self) -> OpenAISTT:
+        model = OpenAISTT.__new__(OpenAISTT)
+        model._language_evidence = {}
+        model._language_override = {}
+        model._release_evidence = {}
+        model._declared_language = {}
+        return model
+
+    def test_half_counted_evidence_does_not_survive_a_new_pick(self):
+        model = self._model()
+        key = ("m", "s")
+        assert model._apply_language_override(key, "en") == "en"
+        model._learn_language_evidence(key, "en", [_segment("Chào anh", "vi")])
+        assert model._language_evidence[key] == ("vi", 1)
+
+        # The speaker re-picks ja. No override existed, so the old code kept (vi, 1) and the
+        # next vi-looking line re-pinned a ja speaker to Vietnamese.
+        assert model._apply_language_override(key, "ja") == "ja"
+        assert key not in model._language_evidence
+        model._learn_language_evidence(key, "ja", [_segment("Đổi tên đi", "vi")])
+        assert model._language_override == {}
+
+    def test_half_counted_release_does_not_survive_a_new_pick(self):
+        model = self._model()
+        key = ("m", "s")
+        model._apply_language_override(key, "en")
+        model._learn_language_evidence(
+            key, "en", [_segment("Chào anh", "vi"), _segment("Đổi tên đi", "vi")]
+        )
+        model._release_evidence[key] = 1
+        assert model._apply_language_override(key, "fr") == "fr"
+        assert key not in model._release_evidence
+        assert key not in model._language_override
+
+    def test_the_same_declaration_again_changes_nothing(self):
+        model = self._model()
+        key = ("m", "s")
+        model._apply_language_override(key, "en")
+        model._learn_language_evidence(key, "en", [_segment("Chào anh", "vi")])
+        model._apply_language_override(key, "en")
+        assert model._language_evidence[key] == ("vi", 1)
+
+    def test_the_first_chunk_clears_nothing(self):
+        model = self._model()
+        key = ("m", "s")
+        model._language_evidence[key] = ("vi", 1)
+        model._apply_language_override(key, "en")
+        assert model._language_evidence[key] == ("vi", 1)
+
+    def test_speakers_are_independent(self):
+        model = self._model()
+        model._apply_language_override(("m", "host"), "vi")
+        model._apply_language_override(("m", "standin"), "en")
+        model._language_evidence[("m", "host")] = ("en", 1)
+        model._apply_language_override(("m", "standin"), "fr")
+        assert model._language_evidence[("m", "host")] == ("en", 1)
+
+    def test_works_on_an_instance_built_without_the_new_attribute(self):
+        model = OpenAISTT.__new__(OpenAISTT)
+        model._language_evidence = {}
+        model._language_override = {}
+        assert model._apply_language_override(("m", "s"), "en") == "en"
+        model._language_evidence[("m", "s")] = ("vi", 1)
+        assert model._apply_language_override(("m", "s"), "ja") == "ja"
+        assert ("m", "s") not in model._language_evidence

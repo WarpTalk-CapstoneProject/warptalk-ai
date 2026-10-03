@@ -82,9 +82,14 @@ def _extract_speaker_key(
 
 
 # The room language set is derived from participants' declared speak-languages, which
-# change as people join/leave. Cache it briefly rather than per room-lifetime (unlike the
-# prompt) so a newly joined speaker's language is picked up within a few seconds.
-_ROOM_LANGUAGES_TTL_S = 15.0
+# change as people join/leave AND as they re-pick mid-meeting (TranslationRoomHub
+# SetSpeakLanguage / SetExternalMeetingLanguage write the same hash). Cache it briefly rather
+# than per room-lifetime (unlike the prompt) so a change is picked up within a few seconds.
+# 5s, not the 15s it was: in a bridge room this set is the candidate list the text language-ID
+# labels Latin-script lines from, and a list missing the language somebody just switched to
+# labels their sentences as one of the old languages — evidence _learn_language_evidence then
+# re-pins them with. The speaker's OWN new pick does not wait even 5s (see _get_room_languages).
+_ROOM_LANGUAGES_TTL_S = 5.0
 
 # Denoising modes the provider accepts. An unrecognised string fails the WHOLE session update,
 # taking the language hint and the keywords down with it — _degrade_session_config exists because
@@ -160,6 +165,44 @@ def _language_hint_for_stt(language: str) -> str | None:
     if not normalized or normalized == "auto":
         return None
     return normalized
+
+
+def _route_update_room_id(message: dict[str, Any]) -> str | None:
+    """The room an AUDIO_ROUTES_UPDATED pub/sub message is about, or None for anything else.
+
+    Same parsing as BaseWorker._handle_route_update_message: channel
+    `translationRoom:{roomId}:events`, falling back to the payload's roomId.
+    """
+    if message.get("type") != "pmessage":
+        return None
+    try:
+        data = json.loads(message["data"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("type") != "AUDIO_ROUTES_UPDATED":
+        return None
+    channel = message.get("channel", "")
+    if isinstance(channel, bytes):
+        channel = channel.decode("utf-8", errors="replace")
+    parts = str(channel).split(":")
+    room_id = parts[1] if len(parts) > 1 else data.get("roomId")
+    return room_id if isinstance(room_id, str) and room_id else None
+
+
+def _room_language_code(value: str | None) -> str:
+    """One room-language entry as a bare code, or "" for nothing/"auto".
+
+    "auto" is compared BEFORE normalising: _normalize_language cuts anything longer than two
+    letters to its first two, so the old `normalize(...) != "auto"` check let "auto" through as
+    "au". That value is real in bridge rooms — TranslationRoomHub writes "auto" as the Meet
+    stand-in's speak language when the far side speaks several languages (WT-909) — and it put
+    a non-language into the room set, the session's language list and the text language-ID's
+    candidates.
+    """
+    stripped = (value or "").strip()
+    if not stripped or stripped.lower() == "auto":
+        return ""
+    return _normalize_language(stripped)
 
 
 def _chunk_audio_duration_ms(chunk: AudioChunkMessage) -> int:
@@ -717,7 +760,9 @@ class STTWorker(BaseWorker):
                 meeting_id=meeting_id,
                 speaker_id=speaker_id,
             )
-        allowed_languages = await self._get_room_languages(meeting_id)
+        allowed_languages = await self._get_room_languages(
+            meeting_id, _language_hint_for_stt(declared_language) if declared_language else None
+        )
         keywords = await self._get_stt_keywords(meeting_id)
         await self._require_model().prepare_session(
             meeting_id,
@@ -816,6 +861,23 @@ class STTWorker(BaseWorker):
         # Through the speaker's lock like any other chunk: two commits on one speaker's session
         # at once would interleave its transcription stream.
         await self._run_in_speaker_order(message_id, data)
+
+    async def _handle_route_update_message(self, message: dict[str, Any]) -> None:
+        """Base handling, then drop this room's cached language set on AUDIO_ROUTES_UPDATED.
+
+        A participant_language_changed (SetSpeakLanguage / SetListenLanguage /
+        SetExternalMeetingLanguage) makes translation-room rebuild the mesh, rewrite
+        `translationRoom:{id}:audio_routes` — whose `room_languages` is half of
+        _get_room_languages, and in a bridge room carries the Meet side's current language even
+        when its speak_languages entry is "auto" — and publish AUDIO_ROUTES_UPDATED on
+        `translationRoom:{id}:events`. The next chunk then re-reads both halves instead of
+        serving the old set for the rest of the TTL. The TTL stays as the backstop: pub/sub has
+        no replay, and a speak-language change that leaves the routes unchanged publishes nothing.
+        """
+        await super()._handle_route_update_message(message)
+        room_id = _route_update_room_id(message)
+        if room_id:
+            self._room_languages.pop(room_id, None)
 
     def _cleanup_room(self, room_id: str) -> None:
         super()._cleanup_room(room_id)
@@ -1054,7 +1116,7 @@ class STTWorker(BaseWorker):
         # _cached_transcript_anchor.
         anchor_ms = self._cached_transcript_anchor(chunk.meeting_id)
         language_hint = _language_hint_for_stt(chunk.language)
-        allowed_languages = await self._get_room_languages(chunk.meeting_id)
+        allowed_languages = await self._get_room_languages(chunk.meeting_id, language_hint)
         keywords = await self._get_stt_keywords(chunk.meeting_id)
         noise_reduction = await self._get_noise_reduction(chunk.meeting_id, chunk.speaker_id)
         recent_dub_texts = await self._get_recent_dub_texts(chunk.meeting_id)
@@ -2244,8 +2306,17 @@ class STTWorker(BaseWorker):
             if cleaned:
                 window.append(cleaned)
 
-    async def _get_room_languages(self, meeting_id: str) -> set[str]:
+    async def _get_room_languages(self, meeting_id: str, declared: str | None = None) -> set[str]:
         """Every language this meeting may contain.
+
+        `declared` is the language THIS chunk's speaker declared (AudioChunkMessage.language,
+        which livekit_ingress_worker reads fresh from `speak_languages` per utterance). A
+        declaration the cached set does not contain is a pick made since the cache was filled —
+        a mid-meeting SetSpeakLanguage / SetExternalMeetingLanguage — so the cache is refetched
+        at once instead of serving the old set for the rest of the TTL. It is also unioned into
+        a non-empty result: the ingress read it from the very hash this set is built from, so
+        it IS one of the room's languages even if this read raced the write. An empty set stays
+        empty ("nothing declared" has its own handling in _filter_segments).
 
         TWO SOURCES, AND THE SECOND ONE IS THE ANSWER TO A REAL BUG
             `speak_languages` is what the people currently in the room are SPEAKING —
@@ -2268,24 +2339,30 @@ class STTWorker(BaseWorker):
         Empty set ⇒ nothing declared yet, and _filter_segments then filters nothing rather
         than filtering on an assumption.
         """
+        declared_code = _room_language_code(declared)
         now = time.monotonic()
         cached = self._room_languages.get(meeting_id)
-        if cached is not None and now - cached[1] < _ROOM_LANGUAGES_TTL_S:
-            return cached[0]
+        if (
+            cached is not None
+            and now - cached[1] < _ROOM_LANGUAGES_TTL_S
+            and (not declared_code or declared_code in cached[0])
+        ):
+            return set(cached[0])
 
         langs: set[str] = set()
 
         raw = await self.redis.hgetall(f"translationRoom:{meeting_id}:speak_languages")
         for value in (raw or {}).values():
-            code = value.decode() if isinstance(value, bytes) else value
-            code = _normalize_language(code.strip()) if code else ""
-            if code and code != "auto":
+            code = _room_language_code(value.decode() if isinstance(value, bytes) else value)
+            if code:
                 langs.add(code)
 
         langs |= await self._get_configured_room_languages(meeting_id)
+        if langs and declared_code:
+            langs.add(declared_code)
 
         self._room_languages[meeting_id] = (langs, now)
-        return langs
+        return set(langs)
 
     async def _get_configured_room_languages(self, meeting_id: str) -> set[str]:
         """The room's own language configuration, from the audio_routes payload.
@@ -2306,8 +2383,8 @@ class STTWorker(BaseWorker):
             for value in configured:
                 if not isinstance(value, str):
                     continue
-                code = _normalize_language(value.strip())
-                if code and code != "auto":
+                code = _room_language_code(value)
+                if code:
                     langs.add(code)
             return langs
         except Exception:
