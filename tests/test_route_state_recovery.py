@@ -89,6 +89,19 @@ async def test_a_paused_room_is_still_paused_after_recovery() -> None:
     assert ROOM in worker._paused_rooms
 
 
+async def test_a_snapshot_that_says_resumed_clears_a_pause_this_worker_still_holds() -> None:
+    # The resume broadcast was missed. The snapshot is written before every broadcast, so when it
+    # says IN_PROGRESS the pause held in memory is the stale one — and since text-only and consent
+    # checks now re-read it routinely, keeping the pause would make those re-reads lie.
+    worker = _worker(LIVE_SNAPSHOT)
+    worker._paused_rooms.add(ROOM)
+
+    assert await worker._load_route_snapshot(ROOM, quiet=True) is True
+
+    assert ROOM not in worker._paused_rooms
+    worker.logger.info.assert_not_called()
+
+
 async def test_a_room_that_really_is_not_translating_stays_off() -> None:
     """Recovery must not become "translate everything". The production snapshot for the WT-373
     room said `translation_active: False` with the room IN_PROGRESS — a live meeting nobody had
