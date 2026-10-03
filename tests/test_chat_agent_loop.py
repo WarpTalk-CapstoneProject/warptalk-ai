@@ -635,6 +635,47 @@ class TestAgentLoop:
         assert text, "the loop must not return an empty answer"
         assert len(tool_log) == 3
 
+    async def test_answer_round_turns_the_last_tool_result_into_an_answer(
+        self, counting_tool: list[dict[str, Any]]
+    ) -> None:
+        """Prod 3 Oct: the round that finally fetched the data was the last one, and the user got
+        "please try rephrasing" instead of an answer built from it."""
+        rounds = [[_completed(_function_call("get_active_meeting_count", "{}"))] for _ in range(3)]
+        rounds.append([_text_delta("There are 2 active meetings."), _completed(_message_item())])
+        worker, _ = _build_worker(rounds)
+        worker.chat_settings = ChatAssistantSettings(model="gpt-4o-mini", max_tool_iterations=3)
+
+        text, tool_log = await worker._run_agent_loop(_request(), [], MagicMock())
+
+        assert text == "There are 2 active meetings."
+        assert len(tool_log) == 3
+        calls = worker._openai.responses.create.await_args_list
+        assert len(calls) == 4
+        assert all("tool_choice" not in call.kwargs for call in calls[:3])
+        assert calls[3].kwargs["tool_choice"] == "none"
+        # The schemas stay, so the model can read the function_call items it is answering from.
+        assert calls[3].kwargs["tools"]
+
+    async def test_answer_round_never_runs_a_tool(
+        self, counting_tool: list[dict[str, Any]]
+    ) -> None:
+        rounds = [[_completed(_function_call("get_active_meeting_count", "{}"))] for _ in range(4)]
+        worker, _ = _build_worker(rounds)
+        worker.chat_settings = ChatAssistantSettings(model="gpt-4o-mini", max_tool_iterations=3)
+
+        text, tool_log = await worker._run_agent_loop(_request(), [], MagicMock())
+
+        assert len(tool_log) == 3, "a call returned on the answer round must not be executed"
+        assert "rephrasing" in text
+
+    async def test_a_turn_answered_early_gets_no_answer_round(self) -> None:
+        worker, _ = _build_worker([[_text_delta("hi"), _completed(_message_item())]])
+
+        await worker._run_agent_loop(_request(), [{"role": "user", "content": "hi"}], MagicMock())
+
+        assert worker._openai.responses.create.await_count == 1
+        assert "tool_choice" not in worker._openai.responses.create.await_args.kwargs
+
 
 class TestResponsesOptions:
     def test_reasoning_model_gets_no_temperature(self) -> None:
