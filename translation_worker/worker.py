@@ -22,7 +22,11 @@ from typing import Any, cast
 
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
-from shared.control_markers import is_control_marker, is_system_speaker
+from shared.control_markers import (
+    is_control_marker,
+    is_external_bridge_speaker,
+    is_system_speaker,
+)
 from shared.integration_status import OPENAI, IntegrationReport, credential_report
 from shared.lang import is_same_language
 from shared.languages import known_language_code
@@ -1031,6 +1035,9 @@ class TranslationWorker(BaseWorker):
         """
         all_languages = await self.redis.hgetall(f"translationRoom:{meeting_id}:languages")
         targets: set[str] = set()
+        # How many OTHER participants listen in each language. Only read by the bridge line at
+        # the end of this method.
+        listeners: dict[str, int] = {}
         for raw_user_id, raw_lang in all_languages.items():
             user_id = raw_user_id.decode() if isinstance(raw_user_id, bytes) else raw_user_id
             if user_id == speaker_id:
@@ -1049,8 +1056,10 @@ class TranslationWorker(BaseWorker):
                 self._warn_unknown_target_once(meeting_id, lang)
                 continue
             targets.add(known)
+            listeners[known] = listeners.get(known, 0) + 1
 
         # No other participant registered yet — avoid assuming Vietnamese for all users.
+        fallback_english = not targets
         targets = targets or {"en"}
 
         # S6. The speaker's OWN language is not a translation target, and this is the only
@@ -1083,6 +1092,28 @@ class TranslationWorker(BaseWorker):
                     dropped=sorted(echoes),
                 )
                 targets -= echoes
+
+        # GOOGLE MEET BRIDGE STAND-IN ONLY: one line per Meet-side sentence saying which
+        # languages it will be translated and dubbed into, and from what.
+        #
+        # This set is the whole decision — tts_worker dubs every target it is sent and nothing
+        # else — and it could not be read back afterwards: an empty set (the only listener
+        # hears the language the Meet side spoke, so no dub is correct) logged a drop, a
+        # non-empty one only showed up later as chunk_translated's target_lang, and the "en"
+        # fallback for a room whose listener is missing from the hash (their hub socket is
+        # down, or never joined) looked exactly like a real English listener. The dub is
+        # published as `ai-interpreter-{target}-{stand-in}`, and a listener's client only plays
+        # the one in its own listen language, so "translated into the wrong language" and "not
+        # dubbed" are the same silence to the person in the call.
+        if is_external_bridge_speaker(speaker_id):
+            self.logger.info(
+                "far_side_dub_targets",
+                meeting_id=meeting_id,
+                source_lang=source_lang,
+                targets=sorted(targets),
+                listeners=listeners,
+                fallback_english=fallback_english,
+            )
 
         return targets
 
