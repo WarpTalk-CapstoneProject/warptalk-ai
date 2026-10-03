@@ -25,6 +25,9 @@ WIRE CONTRACT (read by warptalk-backend)
     The answer travels on `stt:results:{room}` as three OPTIONAL fields of STTResultMessage —
     `far_speaker_name`, `far_speaker_source`, `far_speaker_confidence` — absent when there is no
     answer, so a message without one is byte-for-byte what it was before.
+
+    A line published WITHOUT a name it could show may get one about a second later, on a stream
+    of its own — `stt:far_speaker_late:{room}`, never stt:results. See shared/far_speaker_late.py.
 """
 
 from __future__ import annotations
@@ -60,6 +63,17 @@ _NEAREST_HINT_MAX_CONFIDENCE = 0.5
 _SOLE_NEAR_HINT_MIN_CONFIDENCE = 0.45
 _SOLE_NEAR_HINT_MAX_CONFIDENCE = 0.85
 
+#: WHICH RULE produced an attribution (FarSpeakerAttribution.basis). The confidence alone does not
+#: say: the hand-over guess is capped at 0.5 only because of the constant above, and a display
+#: threshold configured below that would let it through. The late-name path
+#: (shared/far_speaker_late.py) refuses BASIS_NEAREST by name, whatever its score.
+#:   inside     - hints landed inside the window and voted.
+#:   sole_near  - no hint inside, but every near hint names one person and one lies after the end.
+#:   nearest    - the hand-over guess: the nearest hint, with other names near or none after.
+BASIS_INSIDE = "inside"
+BASIS_SOLE_NEAR = "sole_near"
+BASIS_NEAREST = "nearest"
+
 
 def far_speaker_hints_key(room_id: str) -> str:
     return FAR_SPEAKER_HINTS_KEY.format(room=room_id)
@@ -87,6 +101,9 @@ class FarSpeakerAttribution:
     name: str
     source: str
     confidence: float
+    # BASIS_* above. "" from a tracker that does not say (WT-677's diarizer, until it does) - and
+    # "" is not a basis the late-name path accepts, so such a tracker cannot rename a line late.
+    basis: str = ""
 
 
 class FarSpeakerTracker(Protocol):
@@ -175,6 +192,7 @@ def attribute_far_speaker(
             name=latest.name,
             source=latest.source,
             confidence=round(len(winners) / len(inside), 3),
+            basis=BASIS_INSIDE,
         )
 
     if nearest is not None:
@@ -185,13 +203,19 @@ def attribute_far_speaker(
                 _SOLE_NEAR_HINT_MAX_CONFIDENCE - _SOLE_NEAR_HINT_MIN_CONFIDENCE
             ) * (1.0 - gap / span)
             return FarSpeakerAttribution(
-                name=hint.name, source=hint.source, confidence=round(confidence, 3)
+                name=hint.name,
+                source=hint.source,
+                confidence=round(confidence, 3),
+                basis=BASIS_SOLE_NEAR,
             )
         confidence = _NEAREST_HINT_MAX_CONFIDENCE * (1.0 - gap / span)
         if confidence <= 0:
             return None
         return FarSpeakerAttribution(
-            name=hint.name, source=hint.source, confidence=round(confidence, 3)
+            name=hint.name,
+            source=hint.source,
+            confidence=round(confidence, 3),
+            basis=BASIS_NEAREST,
         )
     return None
 

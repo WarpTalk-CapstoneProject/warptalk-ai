@@ -575,6 +575,20 @@ class STTSettings(BaseSettings):
     far_speaker_hint_lag_ms: int = 1000
     # A hint outside the segment window but within this gap still names it, at reduced confidence.
     far_speaker_hint_max_gap_ms: int = 1500
+    # The confidence from which the gateway SHOWS a live name: Bridge:FarSpeakerNameMinConfidence
+    # in warptalk-backend (WarpTalk.Shared.FarSpeakerNames, 0.6). Keep the two equal - this one
+    # decides which lines went out unnamed and so get a late name (below), and which late answers
+    # are good enough to send.
+    far_speaker_name_min_confidence: float = 0.6
+    # LATE NAMES (shared/far_speaker_late.py, PO 2026-10-03). A stand-in line published without a
+    # shown name is asked about again this many ms after it was finalized, stopping at the first
+    # confident answer, which goes out on stt:far_speaker_late keyed by segment_id. The publish of
+    # the line itself is never delayed. Empty () turns it off. Env (JSON):
+    # STT_FAR_SPEAKER_LATE_DELAYS_MS='[1000,2500]'. Bounded to 4 attempts within 10 s.
+    far_speaker_late_delays_ms: tuple[int, ...] = (1000, 2500)
+    # Lines waiting for a late name at once, across all rooms on this replica. A line beyond this
+    # is not scheduled (and logs far_speaker_late_skipped). 0 turns it off.
+    far_speaker_late_max_pending: int = 256
 
 
 class TranslationSettings(BaseSettings):
@@ -1189,6 +1203,8 @@ DEFAULT_GLOBAL_STREAMS: tuple[str, ...] = (
     "audio:frames",
     "audio:chunks",
     "stt:results",
+    # Late far-side speaker names for lines already on stt:results (shared/far_speaker_late.py).
+    "stt:far_speaker_late",
     "translate:results",
     "tts:results",
     # Assistant, suggestions, knowledge.
