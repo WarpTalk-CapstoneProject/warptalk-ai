@@ -51,8 +51,11 @@ _PUBLISH_SETTLE_S = 0.2
 # for that key. Nothing previously told this bot to disconnect, so it — and its LiveKit
 # room connection — would otherwise leak for the rest of the process's lifetime.
 # Cloud counts every connected interpreter bot toward concurrent participants and
-# participant minutes. One minute retains the handshake-reuse benefit without leaving
-# unused speaker/language/voice variants connected for five extra minutes.
+# participant minutes.
+#
+# Only the FALLBACK now: the live value is LiveKitSettings.tts_bot_idle_timeout_s (600s). One
+# minute made every sentence after a pause pay a fresh LiveKit join ahead of its audio, and the
+# leak this guards against is bounded by retire_meeting as well as by the timer.
 SESSION_IDLE_TIMEOUT_S = 60.0
 
 # Sweeping only from _get_or_create_bot is not enough on its own: that is the one place a
@@ -617,10 +620,13 @@ class LiveKitTTSPublisher:
 
     def _sweep_idle_bots(self) -> None:
         now = time.monotonic()
+        idle_timeout = float(
+            getattr(self.settings, "tts_bot_idle_timeout_s", SESSION_IDLE_TIMEOUT_S)
+        )
         stale = [
             k
             for k, b in self._bots.items()
-            if now - b["last_used"] > SESSION_IDLE_TIMEOUT_S and not self._is_publishing(k)
+            if now - b["last_used"] > idle_timeout and not self._is_publishing(k)
         ]
         for k in stale:
             bot = self._bots.pop(k)
@@ -633,6 +639,33 @@ class LiveKitTTSPublisher:
                 target_lang=k[2],
                 voice_key=k[3],
             )
+
+    def retire_meeting(self, meeting_id: str, reason: str) -> int:
+        """Release every bot of a meeting that has paused, ended or stopped translating.
+
+        The long idle timeout is only safe because of this. The web client treats a present
+        interpreter track as "this speaker is dubbed" and keeps the speaker's own microphone
+        muted for cross-language listeners, so a bot left behind after translation stops would
+        leave them hearing nothing at all. A bot mid-sentence is marked expired instead and the
+        reaper takes it the moment that sentence ends.
+        """
+        retired = 0
+        for key in [k for k in self._bots if k[0] == meeting_id]:
+            if self._is_publishing(key):
+                self._bots[key]["last_used"] = float("-inf")
+                continue
+            bot = self._bots.pop(key)
+            self._locks.pop(key, None)
+            asyncio.create_task(self._close_bot(bot))
+            retired += 1
+        if retired:
+            logger.info(
+                "livekit_tts_bots_retired_for_meeting",
+                meeting_id=meeting_id,
+                bots=retired,
+                reason=reason,
+            )
+        return retired
 
     def retire_voice_variants(
         self, meeting_id: str, speaker_id: str, target_lang: str, keep: set[str]

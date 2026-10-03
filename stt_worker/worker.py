@@ -661,7 +661,11 @@ class STTWorker(BaseWorker):
         while not self._shutdown_event.is_set():
             try:
                 await asyncio.sleep(WARM_POOL_MAINTENANCE_INTERVAL_S)
-                await self._require_model().rotate_warm_pool()
+                model = self._require_model()
+                await model.rotate_warm_pool()
+                # The sockets people are TALKING into age too; replace them between turns
+                # rather than letting the max-age sweep close one under a sentence.
+                model.renew_aging_sessions()
             except asyncio.CancelledError:
                 raise
             except Exception:
