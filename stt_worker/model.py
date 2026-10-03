@@ -859,8 +859,15 @@ def _expected_languages(
             ordered.append(normalized)
 
     add(primary_language)
-    for language in sorted(allowed_languages or ()):
-        add(language)
+    # The room's other languages only when the speaker has NOT declared one. Measured 4 Oct 2026:
+    # a speaker declared Japanese in a vi/ja room got `languages: [ja, en, vi]`, and the model took
+    # the invitation — "ấy ai" for "AI", "Xíu tô gà hayakuになります" — 6 of their 13 lines mixed
+    # Vietnamese into Japanese, and translation carried it through. Across prod, Japanese lines with
+    # Vietnamese in them ran 14-24% a day since 1 Oct. A declaration is the speaker telling us what
+    # they speak; the rest of the room is what OTHER people speak.
+    if not ordered:
+        for language in sorted(allowed_languages or ()):
+            add(language)
     # Product meetings frequently embed English product and engineering terms in an
     # otherwise non-English utterance. Advertising English as expected prevents the
     # model from forcing those terms into a phonetic translation of the primary language.
