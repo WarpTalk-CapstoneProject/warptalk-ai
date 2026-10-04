@@ -78,7 +78,7 @@ from typing import Any
 from billing_worker.db import BillingRepository, SettlementOutcome
 from shared.config import BillingSettings, RedisSettings, WorkerSettings
 from shared.control_markers import is_system_speaker
-from shared.health_probe import heartbeat_key
+from shared.health_probe import heartbeat_key, touch_heartbeat_file
 from shared.logger import get_logger
 from shared.redis_client import BILLING_UNBILLED_KEY, BILLING_UNBILLED_REASONS, RedisStreamClient
 from shared.schemas import (
@@ -426,6 +426,7 @@ class BillingSettlementWorker:
             ),
             self.heartbeat_ttl_seconds,
         )
+        touch_heartbeat_file("billing")
 
     async def _heartbeat_loop(self) -> None:
         while not self._shutdown_event.is_set():
@@ -809,20 +810,24 @@ class BillingSettlementWorker:
         msg = TranslationResultMessage.from_redis(data)
         if not msg.translated_text.strip():
             return
-        # An early sentence — one the STT model finished mid-chunk and published before the
-        # turn closed — is NOT free work, but it is already paid for by the completed segment
-        # of the same chunk, which carries that chunk's WHOLE duration however much text went
-        # out early (stt_worker/model.py: `"end": duration_s`). Charging both would bill the
-        # same seconds twice.
+        # THE MONEY FOLLOWS THE AUDIO CHUNK, AND A CHUNK IS CHARGED ONCE PER TARGET LANGUAGE.
         #
-        # Charging it on its own terms would be worse than double-billing, in the other
-        # direction: an early segment has start_ms == end_ms, so it falls into the
-        # zero-duration fallback below and bills a flat 1.0s. A fifteen-second turn split into
-        # four early sentences would be priced as four seconds.
+        # stt_worker publishes each sentence the model finishes mid-chunk ("early") and then the
+        # completed segment with whatever text is left. All of them came out of the same seconds
+        # of audio, so all of them name the same chunk (chunk_id, chunk_duration_ms) and the
+        # idempotency key below is the chunk's: whichever arrives first pays for the whole
+        # chunk and the rest replay.
         #
-        # So the money still follows the audio, exactly as it did before early publishing
-        # existed. This is the only place that reads the flag.
-        if msg.is_early:
+        # It used to be "skip every early sentence, the completed segment pays". That assumed a
+        # completed segment always exists, and in flash mode it often does not: when every
+        # sentence went out early the remainder is empty and is never published, so the chunk
+        # was translated and dubbed for nothing — 136 of 664 translated chunks on prod over
+        # three days (2 Oct).
+        chunk_billed = bool(msg.chunk_id) and msg.chunk_duration_ms > 0
+        # A producer older than chunk_id (rolling deploy) still gets the old rule, where the
+        # skip is the only thing keeping an early sentence — start_ms == end_ms — out of the
+        # flat 1.0s fallback, which would price a fifteen-second turn as four seconds.
+        if msg.is_early and not chunk_billed:
             self.logger.debug(
                 "skipped_early_segment",
                 translation_room_id=msg.meeting_id,
@@ -847,7 +852,17 @@ class BillingSettlementWorker:
         if underlying_segment_id is None:
             self.logger.warning("segment_id_extraction_failed", raw_segment_id=msg.segment_id)
 
-        quantity_s = _translation_quantity_seconds(msg)
+        billing_segment = underlying_segment_id or msg.segment_id
+        if chunk_billed:
+            quantity_s = max(msg.chunk_duration_ms / 1000.0, 0.1)
+            # chunk_id is the audio stream entry id, which only orders entries — the room is
+            # what makes it name one chunk.
+            idempotency_key = (
+                f"{TRANSLATION_CHARGE_TYPE}:chunk:{msg.meeting_id}:{msg.chunk_id}:{msg.target_lang}"
+            )
+        else:
+            quantity_s = _translation_quantity_seconds(msg)
+            idempotency_key = f"{TRANSLATION_CHARGE_TYPE}:{billing_segment}:{msg.target_lang}"
         # ONE CHARGE PER (STT SEGMENT, TARGET LANGUAGE) — NOT PER TRANSLATED CHUNK.
         #
         # translation_worker splits one STT segment into sentences and publishes each as its own
@@ -860,7 +875,6 @@ class BillingSettlementWorker:
         # The same key is what makes a duplicate harmless whatever produced it — a redelivery, a
         # retry that republished a chunk, two replicas racing a reclaimed entry: all of them name
         # the same (segment, language, service) and settle_usage_charge replays the second.
-        billing_segment = underlying_segment_id or msg.segment_id
         outcome = await self.db.record_usage_and_charge(
             subscription_id=subscription_id,
             user_id=msg.speaker_id,
@@ -875,7 +889,7 @@ class BillingSettlementWorker:
             source_language_code=msg.source_lang,
             target_language_code=msg.target_lang,
             transcript_segment_id=underlying_segment_id,
-            idempotency_key=f"{TRANSLATION_CHARGE_TYPE}:{billing_segment}:{msg.target_lang}",
+            idempotency_key=idempotency_key,
             # WT-446. Rides in `details` rather than as a new settle_usage_charge argument: the
             # column on usage_records is GENERATED from exactly this key, so the 200-line
             # settlement function — which decides whether a workspace can pay at all — is not

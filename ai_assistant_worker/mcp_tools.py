@@ -72,6 +72,37 @@ def split_mcp_tool_arguments(arguments: dict[str, Any]) -> tuple[dict[str, Any],
     return clean_arguments, None
 
 
+def drop_blank_optional_arguments(
+    arguments: dict[str, Any], parameters: dict[str, Any] | None
+) -> dict[str, Any]:
+    """The arguments without optional strings the model filled with nothing.
+
+    The model fills every property it is offered (it does not omit optional ones), so a plain
+    "list my Linear issues" arrives as ``team: ""``, ``cursor: ""``, ``customView: " "``. Most
+    servers shrug at ``""``; some refuse it, and where the schema forbids ``""`` (Linear's
+    ``customView`` has ``minLength: 1``) the model reaches for ``" "``, then "all", then "x". Prod,
+    2 and 3 Oct 2026: 12 of 20 Linear calls failed with ``tool_error`` this way, each answer
+    arriving only after several rounds.
+
+    Only a top-level property the schema does NOT list as required, whose value is a string that
+    is empty or whitespace, is dropped. A required one is kept for the server to judge, and so is
+    every non-string: ``0`` and ``false`` are real values as often as they are filler.
+    """
+    if not arguments:
+        return arguments
+    required_raw = (parameters or {}).get("required")
+    required = (
+        {name for name in required_raw if isinstance(name, str)}
+        if isinstance(required_raw, list)
+        else set()
+    )
+    return {
+        name: value
+        for name, value in arguments.items()
+        if name in required or not (isinstance(value, str) and not value.strip())
+    }
+
+
 def read_mcp_always_allow(arguments: dict[str, Any]) -> bool:
     """WT-687: the user chose Always allow on the card. Only a real ``true`` counts."""
     return arguments.get("alwaysAllow") is True
@@ -167,6 +198,17 @@ def normalize_mcp_tool_payload(payload: Any) -> dict[str, Any]:
         normalized["userAction"] = {
             "type": "workspace_policy_blocked",
             "message": "Tell the user this workspace does not allow personal plugins in WarpBot.",
+        }
+    elif error_code == "workspace_tool_blocked":
+        # The workspace Owner's rule, not the member's: reconnecting or changing their own plugin
+        # settings would not help, and saying so sends them round in circles.
+        normalized["userAction"] = {
+            "type": "workspace_tool_blocked",
+            "message": (
+                "Tell the user the workspace Owner has turned this action off for WarpBot in this "
+                "workspace, and that only the Owner can turn it back on. Do not suggest "
+                "reconnecting the plugin or changing their own plugin settings."
+            ),
         }
 
     return normalized
@@ -345,31 +387,38 @@ def build_mcp_confirmation_questions(
     token = str(payload.get("confirmationToken") or "").strip()
     action = (tool_label or "").strip() or tool_name
 
+    options: list[dict[str, str]] = [
+        {
+            "label": "Yes",
+            "value": (f"Yes\n\nConfirm the {tool_name} plugin action. confirmationToken: {token}"),
+        },
+    ]
+    # WT-687. Runs this call and stops asking for this tool. The token still has to validate
+    # before AssistantService records the choice. Left out when the workspace's Owner requires a
+    # confirmation every time (``alwaysAllowOffered: false``): the member's "don't ask again"
+    # would be stored and change nothing, and the card would be promising something untrue.
+    if payload.get("alwaysAllowOffered") is not False:
+        options.append(
+            {
+                "label": "Yes, and don't ask again for this tool",
+                "value": (
+                    f"Always allow\n\nConfirm the {tool_name} plugin action and always "
+                    f"allow it from now on. confirmationToken: {token} alwaysAllow: true"
+                ),
+            }
+        )
+    options.append(
+        {
+            "label": "No, and tell WarpBot what to do differently",
+            "value": f"Cancel\n\nDo not run the {tool_name} plugin action.",
+        }
+    )
+
     return {
         "permission": {
             "kind": "tool",
             "action": action,
             "toolName": tool_name,
-            "options": [
-                {
-                    "label": "Yes",
-                    "value": (
-                        f"Yes\n\nConfirm the {tool_name} plugin action. confirmationToken: {token}"
-                    ),
-                },
-                {
-                    # WT-687. Runs this call and stops asking for this tool. The token still has
-                    # to validate before AssistantService records the choice.
-                    "label": "Yes, and don't ask again for this tool",
-                    "value": (
-                        f"Always allow\n\nConfirm the {tool_name} plugin action and always "
-                        f"allow it from now on. confirmationToken: {token} alwaysAllow: true"
-                    ),
-                },
-                {
-                    "label": "No, and tell WarpBot what to do differently",
-                    "value": f"Cancel\n\nDo not run the {tool_name} plugin action.",
-                },
-            ],
+            "options": options,
         }
     }

@@ -21,8 +21,14 @@ from livekit import api, rtc
 from redis.exceptions import RedisError
 
 from livekit_ingress_worker.audio_archive import MeetingAudioArchive, describe
+from livekit_ingress_worker.far_side_gate import (
+    FarSideGateConfig,
+    FarSideOverlapGate,
+    zero_frames,
+)
 from livekit_ingress_worker.near_field_gate import NearFieldGate
-from shared.base_worker import BaseWorker
+from livekit_ingress_worker.speech_level_floor import SpeechLevelFloor
+from shared.base_worker import TERMINAL_ROOM_STATUSES, BaseWorker
 from shared.control_markers import is_external_bridge_speaker
 from shared.integration_status import LIVEKIT, IntegrationReport, livekit_report
 from shared.object_storage import ObjectStorage, ObjectStorageSettings
@@ -63,6 +69,11 @@ VAD_WINDOW_SAMPLES = VAD_FRAME_SAMPLES * VAD_WINDOW_FRAMES
 VAD_WINDOW_MS = VAD_WINDOW_SAMPLES * 1000 // 16000
 # 2 bytes per sample. The unit the hangover is now counted and trimmed in.
 VAD_FRAME_BYTES = VAD_FRAME_SAMPLES * 2
+
+
+def _frames_to_ms(frames: int) -> int:
+    """Silero frames (512 samples at 16kHz) -> milliseconds."""
+    return frames * VAD_FRAME_SAMPLES * 1000 // 16000
 
 
 def _hangover_frames(hangover_samples: int) -> int:
@@ -190,6 +201,34 @@ _STORM_COUNTER_KEY_PREFIX = "livekit:ingress:connects:"
 # across the pipeline — and bounds the overshoot past the grace period to one tick.
 _IDLE_SWEEP_INTERVAL_S = 15.0
 
+# A microphone the bot can SEE but has never been handed. Production 3 Oct 2026, room 01a1009e:
+# the census counted three humans from 14:19:10, yet Ngọc Kỳ's microphone was subscribed at
+# 14:24:47 — six minutes of speech nobody heard — and Tuấn's 44 seconds after he joined. The
+# sweep could not help: `_start_pending_audio_tasks` only looks at publications that already
+# have a track, and nothing ever asked LiveKit to subscribe one that did not. Auto-subscribe is
+# a request the server is allowed to drop; nothing re-sends it.
+#
+# So the bot re-asks. Grace first, because an ordinary auto-subscribe takes a second or two and
+# re-requesting inside that window would only race it.
+_SUBSCRIPTION_GRACE_S = 2.0
+# Checked this long after every join and publish event, not merely on the 15s sweep: the first
+# sentence somebody says is usually within ten seconds of joining.
+_SUBSCRIPTION_REPAIR_DELAYS_S = (1.0, 3.0, 6.0, 10.0)
+
+# THE INGRESS OOM, prod 3 Oct 2026. Every reader that stopped — a mute, a republished track that
+# replaced it, a cancel — left its rtc.AudioStream open: nothing called aclose(), so the native
+# side kept delivering 48 kHz frames into the stream's queue, which is UNBOUNDED by default, and
+# nobody was reading it any more. Memory climbed 300-500 MiB per meeting and never came back
+# (Prometheus: 446 -> 858 MiB across one meeting, flat for an hour after), until the pod hit its
+# 1536Mi limit and was OOMKilled at 09:31:32 UTC in the middle of a bridge meeting — after eight
+# minutes in which it published nothing at all.
+#
+# Two guards. Every stream is closed when its reader ends (_close_audio_stream). And the queue
+# is bounded, so even a reader that falls behind costs at most this much audio, dropped oldest
+# first, instead of the process: 3000 frames of 10 ms is 30 s.
+_AUDIO_STREAM_CAPACITY_FRAMES = 3000
+_AUDIO_STREAM_CLOSE_TIMEOUT_S = 5.0
+
 # Room lifecycle states that mean "this meeting is happening right now", used by
 # _rediscover_active_rooms to decide which snapshots are worth reclaiming after a restart.
 #
@@ -219,6 +258,42 @@ def _is_ai_bot_identity(identity: str) -> bool:
     return identity.startswith(_AI_BOT_IDENTITY_PREFIXES)
 
 
+# WT-631 — the declared track sources that mean "a person talking into this".
+#
+# An allow-list on the source the publisher DECLARED, not a blocklist of the sources seen so
+# far: a blocklist is only as current as the last producer somebody remembered.
+#
+# SOURCE_UNKNOWN is on it deliberately, and it is not a hole. It is the external bridge:
+# warptalk-web's bridge-inbound-connection.ts publishes the far side of a Google Meet call as
+# `publishTrack(new LocalAudioTrack(...))` with no `source`, which LiveKit records as unknown.
+# A strict microphone-only rule would deafen the bridge — the far side would talk for a whole
+# meeting and never produce one line of transcript, with nothing logged to say why. What has
+# to be strict is refusing a source the publisher explicitly says is NOT a microphone.
+_SPEECH_TRACK_SOURCES = frozenset(
+    {
+        rtc.TrackSource.SOURCE_MICROPHONE,
+        rtc.TrackSource.SOURCE_UNKNOWN,
+    }
+)
+
+
+def _carries_speech(publication: rtc.TrackPublication) -> bool:
+    """Whether this audio publication is somebody talking, as opposed to something playing.
+
+    WT-631 — reported as "the native meeting may transcribe audio from other browser tabs".
+    This worker attached a reader to every human audio track it could see and asked only
+    whether the kind was audio, so anything a participant PLAYED became that participant's
+    speech: a screen share's audio, a shared browser tab. STT transcribed it, translation
+    translated it, TTS dubbed it in their voice and billing charged for all three, attributed to
+    somebody who had not said a word.
+
+    It also cost them their real voice. Readers are keyed per (room, participant), so a screen
+    share's audio subscribed after the microphone REPLACED the microphone's reader as a "stale"
+    track, and muting the share's audio cancelled the microphone's reader until the next sweep.
+    """
+    return publication.source in _SPEECH_TRACK_SOURCES
+
+
 def _is_rate_limited_error(error: BaseException) -> bool:
     """Whether LiveKit refused this connect because we are being rate-limited.
 
@@ -228,6 +303,22 @@ def _is_rate_limited_error(error: BaseException) -> bool:
     """
     text = f"{getattr(error, 'message', '')} {error}".lower()
     return "429" in text or "too many requests" in text or "rate limit" in text
+
+
+_TRACK_PUBLISHED_CHANNEL = "meeting.track_published"
+
+# WT-923 — what summons the bot BEFORE anybody has a microphone.
+#
+# track_published alone summoned it at the first microphone. A person who joins muted publishes
+# nothing until they unmute, and they unmute to speak — so the bot started its webhook → token →
+# WebRTC dial at the very moment the first sentence began, and that sentence was gone before the
+# bot was subscribed. The host saw an empty transcript for the opening of every such meeting.
+#
+# participant_joined arrives when the person connects, seconds or minutes before they speak. The
+# bot joins then; the later unmute is just a subscription on a connection it already holds.
+# track_published is still subscribed and still connects — it covers a lost pub/sub message and
+# rooms where the join event raced a restart.
+_PARTICIPANT_JOINED_CHANNEL = "meeting.participant_joined"
 
 
 def _parse_track_published_event(
@@ -255,6 +346,28 @@ def _parse_track_published_event(
     if not isinstance(track_id, str) or not track_id:
         return None
     return room_name, participant_identity, track_id
+
+
+def _parse_participant_joined_event(envelope: dict[str, Any]) -> tuple[str, str] | None:
+    """Validate and extract the versioned meeting.participant_joined contract (WT-923)."""
+    if (
+        envelope.get("event_type") != _PARTICIPANT_JOINED_CHANNEL
+        or envelope.get("schema_version") != 1
+        or envelope.get("producer") != "meeting-service"
+    ):
+        return None
+
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    room_name = payload.get("room_name")
+    participant_identity = payload.get("participant_identity")
+    if not isinstance(room_name, str) or not room_name:
+        return None
+    if not isinstance(participant_identity, str) or not participant_identity:
+        return None
+    return room_name, participant_identity
 
 
 # WT-B/flash mode — the per-room switch for streaming audio during speech.
@@ -323,6 +436,8 @@ class LiveKitIngressWorker(BaseWorker):
     # default would turn "archiving is off" into an AttributeError raised from the middle of
     # the audio path — the one place that must not raise.
     _archive: MeetingAudioArchive | None = None
+    # Built lazily (see _far_side_overlap_gate) for the same __new__-in-tests reason as above.
+    _far_side_gate: FarSideOverlapGate | None = None
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -344,6 +459,13 @@ class LiveKitIngressWorker(BaseWorker):
         # rather than being refused as a duplicate of it.
         self.audio_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self.audio_task_tracks: dict[tuple[str, str], str] = {}
+        # The Track OBJECT each reader is bound to, beside its sid — because the sid alone cannot
+        # tell a live subscription from a dead one. When the LiveKit connection resumes, the SDK
+        # re-subscribes every track: same sid, new FFI handle, and the reader still bound to the
+        # old handle receives nothing ever again while looking perfectly alive. Production room
+        # 01a0fbe6 (2026-10-02): two of three speakers went unheard from the 16:27:41 resume to
+        # the end of the meeting, because the sid matched and the "duplicate" was refused.
+        self._audio_task_track_objects: dict[tuple[str, str], rtc.Track] = {}
         # WT-529: in-flight speaker-name writes, held so the event loop cannot collect a task
         # nobody awaits. Discarded on completion — see _remember_speaker_name.
         self._speaker_name_tasks: set[asyncio.Task[None]] = set()
@@ -382,6 +504,8 @@ class LiveKitIngressWorker(BaseWorker):
         self._room_last_occupied: dict[str, float] = {}
         self._idle_sweeper: asyncio.Task[None] | None = None
         self._idle_releases_total = 0
+        # (room, track sid) -> when that visible microphone was first seen without a track.
+        self._unsubscribed_since: dict[tuple[str, str], float] = {}
         # S1. Rooms another replica currently owns. We hold no connection for these, but we
         # remember them so the sweeper can retry the claim — otherwise a replica dying
         # mid-meeting would silently end audio ingestion for its rooms until the next
@@ -527,12 +651,15 @@ class LiveKitIngressWorker(BaseWorker):
         # meeting already in progress, has already been published and will not repeat.
         await self._rediscover_active_rooms()
 
-        self.logger.info("Starting Redis Pub/Sub listener for meeting.track_published")
+        self.logger.info(
+            "Starting Redis Pub/Sub listener",
+            channels=[_TRACK_PUBLISHED_CHANNEL, _PARTICIPANT_JOINED_CHANNEL],
+        )
 
         while not self._shutdown_event.is_set():
             pubsub = self.redis.redis.pubsub()
             try:
-                await pubsub.subscribe("meeting.track_published")
+                await pubsub.subscribe(_TRACK_PUBLISHED_CHANNEL, _PARTICIPANT_JOINED_CHANNEL)
                 self.logger.info("track_published_listener_started")
                 while not self._shutdown_event.is_set():
                     # get_message timeout prevents blocking indefinitely
@@ -542,10 +669,15 @@ class LiveKitIngressWorker(BaseWorker):
                     )
                     if message:
                         payload = json.loads(message["data"])
+                        handler = (
+                            self.handle_participant_joined
+                            if self._as_text(message.get("channel")) == _PARTICIPANT_JOINED_CHANNEL
+                            else self.handle_track_published
+                        )
                         # asyncio keeps only a weak reference to a running task, so a
                         # bare create_task() can be collected mid-await and take its
                         # exception with it. Hold it until it finishes.
-                        task = asyncio.create_task(self.handle_track_published(payload))
+                        task = asyncio.create_task(handler(payload))
                         self._event_tasks.add(task)
                         task.add_done_callback(self._event_tasks.discard)
             except asyncio.CancelledError:
@@ -579,16 +711,47 @@ class LiveKitIngressWorker(BaseWorker):
             participant=participant_identity,
             track=track_id,
         )
+        await self._ensure_room_connected(room_name, "track_published", track=track_id)
+        self._schedule_subscription_checks(room_name)
 
+    async def handle_participant_joined(self, payload: dict[str, Any]) -> None:
+        """WT-923: be in the room before the person who just joined says anything."""
+        parsed = _parse_participant_joined_event(payload)
+        if parsed is None:
+            self.logger.warning("invalid_participant_joined_event")
+            return
+        room_name, participant_identity = parsed
+        # The backend already drops these; checked again because our own join must never be
+        # what keeps our own bot in a room.
+        if _is_ai_bot_identity(participant_identity):
+            return
+        self._ensure_idle_sweeper()
+        await self._hydrate_room_status(room_name)
+
+        self.logger.info(
+            "received_participant_joined",
+            room=room_name,
+            participant=participant_identity,
+        )
+        await self._ensure_room_connected(
+            room_name, "participant_joined", participant=participant_identity
+        )
+        self._schedule_subscription_checks(room_name)
+
+    async def _ensure_room_connected(self, room_name: str, trigger: str, **context: Any) -> None:
+        """Connect this replica's bot to the room unless it is already there or owned elsewhere.
+
+        `trigger` prefixes the log events, so track_published keeps the names it always had.
+        """
         async with self._room_lock(room_name):
             # S1: fan-out means the other replica is running this exact handler for this
             # exact room right now. Exactly one of us may hold "AIBot_{room_name}".
             if not await self._claim_room_ownership(room_name):
                 self._deferred_rooms.add(room_name)
                 self.logger.info(
-                    "track_published_room_owned_by_other_replica",
+                    f"{trigger}_room_owned_by_other_replica",
                     room=room_name,
-                    track=track_id,
+                    **context,
                 )
                 return
 
@@ -600,10 +763,10 @@ class LiveKitIngressWorker(BaseWorker):
                 # the room down to pick up one new track is what caused the 429 storm.
                 started = self._start_pending_audio_tasks(room_name, room)
                 self.logger.info(
-                    "track_published_reusing_connection",
+                    f"{trigger}_reusing_connection",
                     room=room_name,
-                    track=track_id,
                     audio_tasks_started=started,
+                    **context,
                     connected_rooms=len(self.rooms),
                 )
                 return
@@ -685,7 +848,30 @@ class LiveKitIngressWorker(BaseWorker):
             )
 
     async def _connect_room(self, room_name: str) -> None:
-        """Join this room's bot, honouring any backoff a previous failure imposed."""
+        """Join this room's bot, honouring any backoff a previous failure imposed.
+
+        A ROOM THAT WAS NOT JOINED IS PUT BACK IN THE QUEUE (2026-10-03, room 01a1010c)
+            Every caller reaches this having just WON the room's claim, and winning the claim
+            removes the room from `_deferred_rooms` (see _claim_room_ownership). So when this
+            returned without a connection — a backoff still running, or a dial that failed — the
+            room was in neither `self.rooms` nor `_deferred_rooms`, and nothing in this process
+            would ever try it again: the sweep only renews rooms it holds and only re-dials
+            rooms it has deferred. The lease, which nobody renewed, lapsed 45 seconds later,
+            and the other replica would take over only if it happened to have deferred the
+            room itself. Otherwise the meeting was recovered by nothing but the next
+            `meeting.track_published`, which in a room where everyone has already published
+            never comes.
+
+            That is exactly the moment a LiveKit hiccup produces: the connection drops, the
+            sweep requeues it, the very first re-dial fails or lands inside the backoff — and
+            the room stops being transcribed for good, for the host and the far side at once.
+
+            So both exits defer the room again, and the claim is KEPT rather than released: the
+            next sweep re-claims it from this replica (which renews the lease) and retries the
+            moment the backoff allows. Releasing it instead would hand a room that LiveKit is
+            rate-limiting straight to the other replica, whose own backoff knows nothing about
+            it — the WT-269 storm, one replica removed.
+        """
         now = asyncio.get_running_loop().time()
         not_before = self._connect_not_before.get(room_name, 0.0)
         if now < not_before:
@@ -695,6 +881,7 @@ class LiveKitIngressWorker(BaseWorker):
                 retry_in_s=round(not_before - now, 2),
                 consecutive_failures=self._connect_failures.get(room_name, 0),
             )
+            self._retry_connect_later(room_name)
             return
 
         await self._record_connect_attempt(room_name)
@@ -707,6 +894,29 @@ class LiveKitIngressWorker(BaseWorker):
             # sure something is actually watching it.
             self._room_last_occupied[room_name] = self._now()
             self._ensure_idle_sweeper()
+            return
+
+        self._retry_connect_later(room_name)
+
+    def _retry_connect_later(self, room_name: str) -> None:
+        """Keep a room this replica could not join in the sweep's re-dial queue. See _connect_room.
+
+        Not for a room the backend has already ended: the queue is left only by a claim or by
+        `_cleanup_room`, and a finished meeting that was not joined would otherwise be dialled
+        once per backoff for the life of the process.
+        """
+        if self._route_states.get(room_name) in TERMINAL_ROOM_STATUSES:
+            return
+        if room_name not in self._deferred_rooms:
+            self.logger.warning(
+                "livekit_room_connect_requeued",
+                room=room_name,
+                consecutive_failures=self._connect_failures.get(room_name, 0),
+            )
+        self._deferred_rooms.add(room_name)
+        # The sweep is what retries it, and it is started lazily. A process whose very first
+        # dial failed has never started one.
+        self._ensure_idle_sweeper()
 
     async def _record_connect_attempt(self, room_name: str) -> None:
         """Log every LiveKit dial, and shout when one room is dialling far too often.
@@ -839,23 +1049,37 @@ class LiveKitIngressWorker(BaseWorker):
 
         if existing is not None and not existing.done():
             if self.audio_task_tracks.get(key) == track.sid:
-                # Same microphone, already being read. Nothing to do.
-                return False
-            # A new sid for a speaker who already has a live reader means they republished:
-            # the old track is stale and its reader must go, or both will publish the same
-            # speech under two chunk counters.
-            self.logger.info(
-                "replacing_stale_audio_reader",
-                room=room_name,
-                speaker_id=speaker_id,
-                previous_track=self.audio_task_tracks.get(key),
-                new_track=track.sid,
-            )
+                if self._audio_task_track_objects.get(key) is track:
+                    # Same subscription, already being read. Nothing to do.
+                    return False
+                # Same sid, different Track object: LiveKit re-subscribed this microphone (a
+                # connection resume does it to every track) and the reader is bound to the
+                # handle that subscription replaced. That reader is not "already reading"; it
+                # will never receive another frame. Warning, because a resume is the event
+                # that silently deafened a meeting before this branch existed.
+                self.logger.warning(
+                    "replacing_resubscribed_audio_reader",
+                    room=room_name,
+                    speaker_id=speaker_id,
+                    track=track.sid,
+                )
+            else:
+                # A new sid for a speaker who already has a live reader means they republished:
+                # the old track is stale and its reader must go, or both will publish the same
+                # speech under two chunk counters.
+                self.logger.info(
+                    "replacing_stale_audio_reader",
+                    room=room_name,
+                    speaker_id=speaker_id,
+                    previous_track=self.audio_task_tracks.get(key),
+                    new_track=track.sid,
+                )
             existing.cancel()
 
         task = asyncio.create_task(self.process_audio_track(room_name, speaker_id, track))
         self.audio_tasks[key] = task
         self.audio_task_tracks[key] = track.sid
+        self._audio_task_track_objects[key] = track
         task.add_done_callback(lambda finished: self._forget_audio_task(key, finished))
         return True
 
@@ -865,6 +1089,28 @@ class LiveKitIngressWorker(BaseWorker):
         if self.audio_tasks.get(key) is task:
             del self.audio_tasks[key]
             self.audio_task_tracks.pop(key, None)
+            self._audio_task_track_objects.pop(key, None)
+
+    def _is_resubscription_of_live_reader(
+        self, room_name: str, speaker_id: str, track_sid: str
+    ) -> bool:
+        """Whether this muted-looking track is one we are reading RIGHT NOW, by sid.
+
+        WT-542 refuses to read a muted publication, and it learns about a mute from exactly one
+        place: the `track_muted` event, whose handler cancels the reader. So a reader that is
+        still live means no mute ever arrived for that microphone. If the same sid then turns
+        up flagged muted, the flag was not delivered as an event — it rode in on a
+        re-subscription, and the last thing LiveKit actually TOLD us was "unmuted".
+
+        That is the 01a0fbe6 resume: every track came back `muted`, the owners' microphones
+        were on, and no `track_unmuted` followed for two of them. Believing the flag left them
+        unheard for the rest of the meeting; trusting the last event instead costs, at worst,
+        reading a microphone that was genuinely muted during the outage — which delivers
+        silence, and silence is refused twice before STT (VAD, then the WT-422 energy floor).
+        """
+        key = (room_name, speaker_id)
+        task = self.audio_tasks.get(key)
+        return task is not None and not task.done() and self.audio_task_tracks.get(key) == track_sid
 
     def _cancel_audio_task(self, room_name: str, speaker_id: str) -> bool:
         """Stop reading one speaker, leaving the rest of the room untouched.
@@ -882,14 +1128,35 @@ class LiveKitIngressWorker(BaseWorker):
         # who unmutes in that window would get no reader at all.
         self.audio_tasks.pop(key, None)
         self.audio_task_tracks.pop(key, None)
+        self._audio_task_track_objects.pop(key, None)
         return True
 
     def _start_pending_audio_tasks(self, room_name: str, room: rtc.Room) -> int:
-        """Attach to every already-published, UNMUTED human audio track we are not reading yet."""
+        """Attach to every already-published, UNMUTED human audio track we are not reading yet.
+
+        ONE MICROPHONE PER PERSON, CHOSEN ONCE PER SWEEP (2026-10-03, room 01a1010c)
+            Readers are keyed per (room, participant), so a participant with TWO live speech
+            publications cannot have both read — and this used to try. Each publication went to
+            `_start_audio_task` in turn, which replaces a reader on any other sid, so every sweep
+            cancelled the reader and started it again on the first, then on the second: two
+            restarts every fifteen seconds, each one throwing away the utterance in progress and
+            resetting the VAD, for as long as the second publication stayed.
+
+            That state is not exotic. A client whose full reconnect fails to remove its old
+            microphone ("failed to remove track") and then publishes a new one — which is
+            exactly what the web's mic re-publish does — leaves both on the server.
+
+            So the choice is made per participant: a reader already on one of their eligible
+            publications stays there (moved onto a fresh handle if the SDK re-subscribed it), and
+            only somebody with no reader on any of them is attached — to the last one listed.
+            The event handlers still follow the newest publish or unmute immediately; this sweep
+            no longer undoes them.
+        """
         started = 0
         for participant in room.remote_participants.values():
             if _is_ai_bot_identity(participant.identity):
                 continue
+            eligible: list[tuple[rtc.TrackPublication, rtc.Track]] = []
             for pub in participant.track_publications.values():
                 track = pub.track
                 if track is None or track.kind != rtc.TrackKind.KIND_AUDIO:
@@ -897,18 +1164,128 @@ class LiveKitIngressWorker(BaseWorker):
                 # WT-542. Without this the reaper sweep undoes the mute: it re-attaches any
                 # track with no live reader, which after on_track_muted is precisely the
                 # muted one, and the hallucinations resume one sweep later.
-                if pub.muted:
+                #
+                # Except a muted flag on a microphone we are still reading: no mute event ever
+                # stopped that reader, so the flag came with a re-subscription and the reader
+                # is bound to the handle it replaced. See _is_resubscription_of_live_reader;
+                # this is the backstop for when the subscribe event did not get there first.
+                if pub.muted and not self._is_resubscription_of_live_reader(
+                    room_name, participant.identity, track.sid
+                ):
                     continue
-                self._remember_speaker_name(room_name, participant)
-                if self._start_audio_task(room_name, participant.identity, track):
-                    self.logger.info(
-                        "subscribing_existing_audio_track",
+                # WT-631. The sweep re-attaches anything without a live reader, so leaving the
+                # source check out here would quietly undo the one on_track_subscribed makes,
+                # one sweep later — the same shape as the WT-542 mute bug directly above.
+                if not _carries_speech(pub):
+                    continue
+                eligible.append((pub, track))
+            if not eligible:
+                continue
+
+            key = (room_name, participant.identity)
+            reader = self.audio_tasks.get(key)
+            reading_sid = (
+                self.audio_task_tracks.get(key)
+                if reader is not None and not reader.done()
+                else None
+            )
+            chosen = next(
+                (track for _pub, track in eligible if track.sid == reading_sid),
+                eligible[-1][1],
+            )
+            self._remember_speaker_name(room_name, participant)
+            if self._start_audio_task(room_name, participant.identity, chosen):
+                self.logger.info(
+                    "subscribing_existing_audio_track",
+                    room=room_name,
+                    participant=participant.identity,
+                    track=chosen.sid,
+                    speech_publications=len(eligible),
+                )
+                started += 1
+        return started
+
+    def _repair_missing_subscriptions(self, room_name: str, room: rtc.Room) -> int:
+        """Re-request every visible human microphone that LiveKit never handed us.
+
+        Muted ones included: subscribing starts no reader (on_track_subscribed refuses a muted
+        track), it only means the reader can start the instant they unmute instead of after a
+        subscription nobody is going to re-send. See _SUBSCRIPTION_GRACE_S.
+        """
+        pending: dict[tuple[str, str], float] | None = getattr(self, "_unsubscribed_since", None)
+        if pending is None:
+            pending = {}
+            self._unsubscribed_since = pending
+        now = self._now()
+        seen: set[tuple[str, str]] = set()
+        repaired = 0
+        for participant in room.remote_participants.values():
+            if _is_ai_bot_identity(participant.identity):
+                continue
+            for pub in participant.track_publications.values():
+                if pub.kind != rtc.TrackKind.KIND_AUDIO or not _carries_speech(pub):
+                    continue
+                if pub.track is not None:
+                    continue
+                key = (room_name, pub.sid)
+                seen.add(key)
+                first_seen = pending.setdefault(key, now)
+                if now - first_seen < _SUBSCRIPTION_GRACE_S:
+                    continue
+                try:
+                    # Off then on: a plain `True` repeats the desired state the server already
+                    # holds for an auto-subscribed track and is free to ignore it again.
+                    pub.set_subscribed(False)
+                    pub.set_subscribed(True)
+                except Exception:
+                    self.logger.warning(
+                        "audio_subscription_force_failed",
                         room=room_name,
                         participant=participant.identity,
-                        track=track.sid,
+                        track=pub.sid,
+                        exc_info=True,
                     )
-                    started += 1
-        return started
+                    continue
+                # Restarts the grace, so a server that is slow to answer is asked again every
+                # few seconds rather than on every tick.
+                pending[key] = now
+                repaired += 1
+                self.logger.warning(
+                    "audio_subscription_forced",
+                    room=room_name,
+                    participant=participant.identity,
+                    track=pub.sid,
+                    unsubscribed_ms=int((now - first_seen) * 1000),
+                    muted=bool(pub.muted),
+                )
+        for key in [k for k in pending if k[0] == room_name and k not in seen]:
+            pending.pop(key, None)
+        return repaired
+
+    def _schedule_subscription_checks(self, room_name: str) -> None:
+        """Re-check this room's microphones a few times in the seconds after a join/publish."""
+        task = asyncio.create_task(self._subscription_checks(room_name))
+        self._event_tasks.add(task)
+        task.add_done_callback(self._event_tasks.discard)
+
+    async def _subscription_checks(self, room_name: str) -> None:
+        elapsed = 0.0
+        for delay in _SUBSCRIPTION_REPAIR_DELAYS_S:
+            await asyncio.sleep(delay - elapsed)
+            elapsed = delay
+            room = self.rooms.get(room_name)
+            if room is None:
+                return
+            try:
+                if not room.isconnected():
+                    return
+                self._start_pending_audio_tasks(room_name, room)
+                self._repair_missing_subscriptions(room_name, room)
+            except Exception:
+                self.logger.warning(
+                    "audio_subscription_check_failed", room=room_name, exc_info=True
+                )
+                return
 
     def _cancel_room_audio_tasks(self, room_name: str) -> None:
         """Cancel only THIS room's pipelines — never another live meeting's."""
@@ -918,6 +1295,7 @@ class LiveKitIngressWorker(BaseWorker):
             task.cancel()
             self.audio_tasks.pop(key, None)
             self.audio_task_tracks.pop(key, None)
+            self._audio_task_track_objects.pop(key, None)
 
     async def _finish_archive(self, room_id: str) -> None:
         """Seal one meeting's audio tracks, put them somewhere durable, free the disk.
@@ -986,6 +1364,8 @@ class LiveKitIngressWorker(BaseWorker):
         LiveKit evicting that stale identity, one more avoidable reconnect.
         """
         super()._cleanup_room(room_id)
+        if self._far_side_gate is not None:
+            self._far_side_gate.forget_room(room_id)
         self._cancel_room_audio_tasks(room_id)
         self._connect_failures.pop(room_id, None)
         self._connect_not_before.pop(room_id, None)
@@ -1184,6 +1564,9 @@ class LiveKitIngressWorker(BaseWorker):
                 # Idempotent by construction: `_start_audio_task` returns False for a live reader
                 # on the same track, so this only ever fills a genuine gap.
                 reattached = self._start_pending_audio_tasks(room_name, room)
+                # And the microphones that never got a track to reattach: the backstop for a
+                # join or publish event this replica never saw.
+                self._repair_missing_subscriptions(room_name, room)
                 if reattached:
                     reattached_readers += reattached
                     self.logger.warning(
@@ -1330,12 +1713,37 @@ class LiveKitIngressWorker(BaseWorker):
                 participant.identity
             ):
                 if publication.muted:
-                    # WT-542. Somebody who joined muted is not speaking, and reading them
-                    # anyway is what put words in their mouth — see on_track_muted.
-                    self.logger.info(
-                        "audio_track_subscribed_muted",
+                    if not self._is_resubscription_of_live_reader(
+                        room_name, participant.identity, track.sid
+                    ):
+                        # WT-542. Somebody who joined muted is not speaking, and reading them
+                        # anyway is what put words in their mouth — see on_track_muted.
+                        self.logger.info(
+                            "audio_track_subscribed_muted",
+                            participant=participant.identity,
+                            track=track.sid,
+                        )
+                        return
+                    # A microphone we are reading, re-subscribed with a muted flag that no
+                    # track_muted event ever delivered — a connection resume. Fall through and
+                    # move the reader onto the new handle; see _is_resubscription_of_live_reader.
+                    self.logger.warning(
+                        "audio_track_resubscribed_muted_while_reading",
+                        room=room_name,
                         participant=participant.identity,
                         track=track.sid,
+                    )
+                if not _carries_speech(publication):
+                    # WT-631. A screen share's audio, a shared tab — audio the participant is
+                    # PLAYING, not speech they are producing. Read as speech it is transcribed,
+                    # translated, dubbed and billed under their name, and it replaces the reader
+                    # on their real microphone. Logged once here, not on every sweep.
+                    self.logger.info(
+                        "audio_track_ignored_not_speech",
+                        room=room_name,
+                        participant=participant.identity,
+                        track=track.sid,
+                        source=int(publication.source),
                     )
                     return
                 self.logger.info(
@@ -1367,6 +1775,27 @@ class LiveKitIngressWorker(BaseWorker):
                 participant.identity
             ):
                 return
+            # WT-631. Readers are keyed per participant, not per track, so without this the
+            # participant pausing their screen share's audio would stop the reader on their
+            # MICROPHONE — a track that is still live and still unmuted.
+            if not _carries_speech(publication):
+                return
+            # The same per-participant keying, one step further: the muted publication must be
+            # the one being READ. A participant can briefly hold two microphones — the old one a
+            # failed full reconnect could not remove, and the one the client re-published — and
+            # the old one being muted on its way out cancelled the reader on the new, live one.
+            # Nothing re-attached it until the next idle sweep, so up to fifteen seconds of the
+            # speaker were dropped at the very moment they had just come back.
+            reading = self.audio_task_tracks.get((room_name, participant.identity))
+            if reading is not None and reading != publication.sid:
+                self.logger.info(
+                    "audio_track_muted_not_being_read",
+                    room=room_name,
+                    participant=participant.identity,
+                    track=publication.sid,
+                    reading_track=reading,
+                )
+                return
             if self._cancel_audio_task(room_name, participant.identity):
                 self.logger.info(
                     "audio_reader_stopped_on_mute",
@@ -1394,6 +1823,9 @@ class LiveKitIngressWorker(BaseWorker):
             track = publication.track
             if track is None:
                 return
+            # WT-631. Unmuting a screen share's audio is still not somebody speaking.
+            if not _carries_speech(publication):
+                return
             if self._start_audio_task(room_name, participant.identity, track):
                 self.logger.info(
                     "audio_reader_resumed_on_unmute",
@@ -1407,6 +1839,39 @@ class LiveKitIngressWorker(BaseWorker):
             # The only signal that a rejoin is legitimately needed. Logged so a room that
             # keeps dropping is visible next to the connect attempts it causes.
             self.logger.warning("livekit_room_disconnected", room=room_name, reason=str(reason))
+
+        # THE BOT'S OWN RECONNECT WAS INVISIBLE (2026-10-03, room 01a1010c). A LiveKit hiccup
+        # that made the host's client do a full reconnect at 09:23:36 may well have taken this
+        # connection through one too, and nothing here said so: `isconnected()` reads True all
+        # the way through RECONNECTING, so neither the census nor the sweep could tell. Both
+        # edges are logged now, so "did the bot drop as well" is a grep, not a guess.
+        @room.on("reconnecting")
+        def on_reconnecting() -> None:
+            self.logger.warning("livekit_room_reconnecting", room=room_name)
+
+        @room.on("reconnected")
+        def on_reconnected() -> None:
+            # A reconnect re-subscribes every microphone on new handles. `track_subscribed`
+            # normally moves each reader across, but a reader the SDK did not re-announce sits on
+            # a dead handle until the 15s sweep finds it — so run the same post-join checks a
+            # publish gets (+1/3/6/10s), which re-attach and re-request within a second.
+            self.logger.warning("livekit_room_reconnected", room=room_name)
+            self._schedule_subscription_checks(room_name)
+
+        @room.on("participant_disconnected")
+        def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
+            # Logged, deliberately not acted on. A client's full reconnect is this followed by
+            # the same identity connecting again, and the order of the two is not guaranteed:
+            # cancelling the speaker's reader here could cancel the one already moved onto the
+            # new session's microphone. The old reader ends with its stream on its own.
+            if _is_ai_bot_identity(participant.identity):
+                return
+            self.logger.info(
+                "livekit_participant_disconnected",
+                room=room_name,
+                participant=participant.identity,
+                reading_track=self.audio_task_tracks.get((room_name, participant.identity)),
+            )
 
         try:
             await room.connect(self.settings.livekit.url, token)
@@ -1476,8 +1941,18 @@ class LiveKitIngressWorker(BaseWorker):
 
     async def process_audio_track(self, room_name: str, speaker_id: str, track: rtc.Track) -> None:
         """Stream audio from LiveKit, gate with VAD, publish only speech chunks."""
-        audio_stream = rtc.AudioStream(track)
         sample_rate = self.SAMPLE_RATE
+        # Resampled and downmixed by LiveKit's native side, not here. Asked for at the 48 kHz the
+        # track carries, every 10 ms frame crossed into Python three times larger than the VAD and
+        # STT ever use, and then crossed back out again through a second FFI call to
+        # rtc.AudioResampler — per frame, per speaker, for the whole meeting. The resampler below
+        # stays as a fallback for a stream that does not honour the request.
+        audio_stream = rtc.AudioStream(
+            track,
+            capacity=_AUDIO_STREAM_CAPACITY_FRAMES,
+            sample_rate=sample_rate,
+            num_channels=1,
+        )
         # Distinguishes a reader somebody stopped from one that stopped itself — see the finally
         # block. Without it both ended on the same INFO line and WT-404 was invisible.
         cancelled = False
@@ -1558,12 +2033,24 @@ class LiveKitIngressWorker(BaseWorker):
         # feed carries clean digital audio, not a far-field voice bleeding into a mic.
         bridge_speaker = is_external_bridge_speaker(speaker_id)
         near_field_gate = None if bridge_speaker else NearFieldGate(self.settings)
+        # One energy floor per track, for the same reason: its baseline is this speaker's own
+        # history (speech_level_floor.py). Kept for the bridge stand-in too — it only ever LOWERS
+        # the absolute floor, so it cannot silence a quiet far-side voice the way a raised bar can.
+        energy_floor = SpeechLevelFloor.from_settings(self.settings, _ENERGY_FLOOR_RMS)
         if bridge_speaker:
             self.logger.info(
                 "near_field_gate_disabled_for_bridge",
                 room=room_name,
                 speaker_id=speaker_id,
             )
+        # FAR-SIDE SAME-SOURCE GATE (far_side_gate.py). Human tracks FEED it their raw 16kHz
+        # windows; the stand-in track ASKS it which of its frames are a WarpTalk participant's
+        # own voice coming back through Meet — and only those, never a Meet-side person talking
+        # at the same time — and zeroes them before VAD and STT ever see them.
+        far_side_gate = self._far_side_overlap_gate()
+        # Frames zeroed since the current turn began — reported on the chunk as
+        # suppressed_overlap_ms so the STT side and the logs can see the gate working.
+        suppressed_frames = 0
         # Silero VAD carries recurrent state. Sharing one model across concurrently
         # iterated participant tracks interleaves unrelated audio histories and causes
         # missed/fragmented speech. Each track owns an independent cloned state machine.
@@ -1647,14 +2134,17 @@ class LiveKitIngressWorker(BaseWorker):
                     )
                     first_frame_logged = True
 
-                if resampler is None:
-                    resampler = rtc.AudioResampler(
-                        input_rate=frame.sample_rate,
-                        output_rate=sample_rate,
-                        num_channels=frame.num_channels,
-                    )
-
-                resampled_frames = resampler.push(frame)
+                if frame.sample_rate == sample_rate and frame.num_channels == 1:
+                    # The ordinary case now: LiveKit already delivered 16 kHz mono.
+                    resampled_frames = [frame]
+                else:
+                    if resampler is None:
+                        resampler = rtc.AudioResampler(
+                            input_rate=frame.sample_rate,
+                            output_rate=sample_rate,
+                            num_channels=frame.num_channels,
+                        )
+                    resampled_frames = resampler.push(frame)
 
                 for r_frame in resampled_frames:
                     data = bytes(r_frame.data)
@@ -1670,6 +2160,26 @@ class LiveKitIngressWorker(BaseWorker):
                 while len(raw_buffer) >= window_bytes:
                     window_data = bytes(raw_buffer[:window_bytes])
                     raw_buffer = raw_buffer[window_bytes:]
+
+                    if far_side_gate is not None:
+                        # This window's last sample arrived before whatever is still queued
+                        # behind it in raw_buffer.
+                        window_end_s = far_side_gate.now() - len(raw_buffer) / 2 / sample_rate
+                        if bridge_speaker:
+                            mask = far_side_gate.process_standin(
+                                room_name,
+                                window_data,
+                                window_end_s,
+                                frame_samples=VAD_FRAME_SAMPLES,
+                                exclude=(speaker_id,),
+                            )
+                            if any(mask):
+                                window_data = zero_frames(window_data, mask, VAD_FRAME_BYTES)
+                                suppressed_frames += sum(mask)
+                        else:
+                            far_side_gate.push_reference(
+                                room_name, speaker_id, window_data, window_end_s
+                            )
 
                     # Score every frame in this ~96ms window once. Both questions below are
                     # answered from that one pass — whether the window is speech, and how many
@@ -1695,6 +2205,9 @@ class LiveKitIngressWorker(BaseWorker):
                             is_speaking = True
                             speech_buffer = bytearray()
                             speech_samples = 0
+                            # Frames zeroed while the stand-in was silent belong to no chunk;
+                            # count this turn's afresh.
+                            suppressed_frames = 0
                             streaming = await self._flash_mode_enabled(room_name)
                             # Re-read per onset, like flash mode: a console change to the chunk cap
                             # applies to the next utterance, not to the next track that opens.
@@ -1753,7 +2266,10 @@ class LiveKitIngressWorker(BaseWorker):
                                 near_field_gate=near_field_gate,
                                 turn_id=turn_id,
                                 speech_samples=speech_samples,
+                                suppressed_overlap_ms=_frames_to_ms(suppressed_frames),
+                                energy_floor=energy_floor,
                             )
+                            suppressed_frames = 0
                             chunk_index += 1
                             published_this_turn = True
                             # The SPEAKER has not stopped, but the commit boundary has moved:
@@ -1830,6 +2346,8 @@ class LiveKitIngressWorker(BaseWorker):
                                         near_field_gate=near_field_gate,
                                         turn_id=turn_id,
                                         speech_samples=speech_samples,
+                                        suppressed_overlap_ms=_frames_to_ms(suppressed_frames),
+                                        energy_floor=energy_floor,
                                     )
                                     chunk_index += 1
                                 else:
@@ -1856,6 +2374,7 @@ class LiveKitIngressWorker(BaseWorker):
                                 speech_buffer = bytearray()
                                 speech_samples = 0
                                 silence_frames = 0
+                                suppressed_frames = 0
                                 # WT-371 #7: the VAD state is NOT reset here any more.
                                 #
                                 # Silero is recurrent. Resetting it discards everything it has
@@ -1884,6 +2403,9 @@ class LiveKitIngressWorker(BaseWorker):
         except Exception:
             self.logger.exception("process_audio_track_error", track_sid=track.sid)
         finally:
+            # FIRST, and off this task: see _AUDIO_STREAM_CAPACITY_FRAMES. Scheduled rather than
+            # awaited so a cancelled reader is not held open by its own teardown.
+            self._schedule_audio_stream_close(audio_stream, track.sid)
             # Publish any remaining speech buffer. Gated on the speech in it, for the same reason
             # the end-of-utterance path is: the track can end on a hangover tail, and buffer
             # length would count that padding as somebody having spoken.
@@ -1896,7 +2418,13 @@ class LiveKitIngressWorker(BaseWorker):
                     sample_rate,
                     near_field_gate=near_field_gate,
                     speech_samples=speech_samples,
+                    suppressed_overlap_ms=_frames_to_ms(suppressed_frames),
+                    energy_floor=energy_floor,
                 )
+            # The gate's reference for this speaker is deliberately NOT forgotten here: a
+            # republished track replaces this reader while the new one is already feeding it,
+            # and its history ages out of the ring anyway. The room's memory goes in
+            # _cleanup_room.
             if cancelled:
                 self.logger.info("stopped_audio_stream_processing", track_sid=track.sid)
             else:
@@ -1917,6 +2445,39 @@ class LiveKitIngressWorker(BaseWorker):
                     detail="the reader stopped without being cancelled; "
                     "the idle sweep re-attaches if the track is still published",
                 )
+
+    def _schedule_audio_stream_close(self, audio_stream: Any, track_sid: str) -> None:
+        task = asyncio.create_task(self._close_audio_stream(audio_stream, track_sid))
+        tasks: set[asyncio.Task[Any]] | None = getattr(self, "_event_tasks", None)
+        if tasks is not None:
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+    async def _close_audio_stream(self, audio_stream: Any, track_sid: str) -> None:
+        """Release the native stream and its frame queue. Bounded: aclose waits for the stream's
+        own task to see end-of-stream, and a stream that never says so must not leak a waiter."""
+        try:
+            await asyncio.wait_for(audio_stream.aclose(), timeout=_AUDIO_STREAM_CLOSE_TIMEOUT_S)
+        except TimeoutError:
+            run_task = getattr(audio_stream, "_task", None)
+            if isinstance(run_task, asyncio.Task):
+                run_task.cancel()
+            self.logger.warning("audio_stream_close_timed_out", track_sid=track_sid)
+        except Exception:
+            self.logger.debug("audio_stream_close_failed", track_sid=track_sid, exc_info=True)
+
+    def _far_side_overlap_gate(self) -> FarSideOverlapGate | None:
+        """The per-process same-source gate, or None when FAR_SIDE_GATE_ENABLED is off.
+
+        One per process because one process owns a room (see _claim_room_ownership): every
+        track of the room is read here, so their arrival times share one monotonic clock.
+        """
+        if self._far_side_gate is None:
+            config = FarSideGateConfig.from_settings(getattr(self, "settings", None))
+            if not config.enabled:
+                return None
+            self._far_side_gate = FarSideOverlapGate(config)
+        return self._far_side_gate
 
     def _require_vad_model(self) -> Any:
         if self._vad_model is None:
@@ -2083,6 +2644,8 @@ class LiveKitIngressWorker(BaseWorker):
         near_field_gate: NearFieldGate | None = None,
         turn_id: str = "",
         speech_samples: int | None = None,
+        suppressed_overlap_ms: int = 0,
+        energy_floor: SpeechLevelFloor | None = None,
     ) -> None:
         # Transcription is NOT translation, and this gate used to conflate them.
         #
@@ -2129,23 +2692,57 @@ class LiveKitIngressWorker(BaseWorker):
         # segment carries STT_UNKNOWN_CONFIDENCE and `min_avg_logprob` — and every per-language
         # floor beneath it — is skipped by construction. This gate and the language/script
         # evidence are what actually stand between marginal audio and a fluent invented caption.
+        #
+        # PER SPEAKER, AND NEVER SILENT. The floor is lowered — never raised — for a speaker whose
+        # own voice has proven quiet (speech_level_floor.py: a 0.027-RMS speaker lost 14.5 s of
+        # real sentences per meeting to it), and what it still drops is logged at INFO with the
+        # speech it carried. It used to log at DEBUG, which production does not emit.
         total_samples = len(pcm)
-        floor = _ENERGY_FLOOR_RMS
-        if speech_samples is not None and 0 < speech_samples < total_samples:
-            floor *= float(np.sqrt(speech_samples / total_samples))
-        if raw_rms < floor:
-            self.logger.debug(
-                "skipped_low_energy_chunk",
-                chunk_index=chunk_index,
-                raw_rms=round(float(raw_rms), 6),
-                floor=round(float(floor), 6),
-                speech_share=(
-                    round(speech_samples / total_samples, 3)
-                    if speech_samples is not None and total_samples
-                    else None
-                ),
+        speech_share = (
+            speech_samples / total_samples
+            if speech_samples is not None and 0 < speech_samples < total_samples
+            else None
+        )
+        # No track floor means no history, so no baseline either: the absolute floor alone,
+        # exactly as before.
+        floor_gate = (
+            energy_floor if energy_floor is not None else SpeechLevelFloor(_ENERGY_FLOOR_RMS)
+        )
+        verdict = floor_gate.judge(float(raw_rms), speech_share)
+        if not verdict.accept or verdict.relative:
+            speech_ms = (
+                (speech_samples if speech_samples is not None else total_samples)
+                * 1000
+                // sample_rate
             )
-            return
+            fields: dict[str, Any] = {
+                "room": room_name,
+                "speaker_id": speaker_id,
+                "chunk_index": chunk_index,
+                "speech_ms": speech_ms,
+                "duration_ms": duration_ms,
+                "raw_rms": round(float(raw_rms), 6),
+                "speech_rms": round(verdict.speech_rms, 6),
+                "absolute_floor": verdict.absolute_floor,
+                "baseline_speech_rms": (
+                    round(verdict.baseline, 6) if verdict.baseline is not None else None
+                ),
+                "relative_floor": (
+                    round(verdict.relative_floor, 6) if verdict.relative_floor is not None else None
+                ),
+            }
+            if not verdict.accept:
+                floor_gate.note_dropped(speech_ms)
+                self.logger.info(
+                    "ingress_low_energy_dropped",
+                    **fields,
+                    # Running totals for this track: a microphone the floor is failing reads as a
+                    # climbing count here rather than as captions that never appear.
+                    dropped_chunks=floor_gate.dropped_chunks,
+                    dropped_speech_ms=floor_gate.dropped_speech_ms,
+                )
+                return
+            self.logger.info("ingress_low_energy_admitted", **fields, rule="speaker_relative")
 
         # Near-field gate: reject a chunk that's much quieter than this track's own
         # established near-field peak — a far-away/muffled voice, not the primary
@@ -2186,7 +2783,17 @@ class LiveKitIngressWorker(BaseWorker):
             # rolling deploy, and the STT side reads it as unknown rather than as silence.
             speech_ms=(speech_samples * 1000 // sample_rate) if speech_samples else 0,
             timestamp_ms=int(time.time() * 1000),
+            suppressed_overlap_ms=max(0, int(suppressed_overlap_ms)),
         )
+        if suppressed_overlap_ms > 0:
+            self.logger.info(
+                "far_side_overlap_suppressed",
+                room=room_name,
+                speaker_id=speaker_id,
+                chunk_index=chunk_index,
+                suppressed_overlap_ms=int(suppressed_overlap_ms),
+                duration_ms=duration_ms,
+            )
 
         # Tapped here, from the bytes this message carries, so a second pass is handed
         # exactly what the first pass was handed. Archiving from anywhere else would make a

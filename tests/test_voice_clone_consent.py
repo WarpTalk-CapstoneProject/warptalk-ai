@@ -32,7 +32,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from shared.base_worker import BaseWorker
+from shared.base_worker import ROUTE_SNAPSHOT_MAX_AGE_SECONDS, BaseWorker
 
 ROOM = "room-1"
 SPEAKER = "019f0d00-0de0-7000-9000-000000000001"
@@ -57,7 +57,7 @@ def _worker(routes: dict[str, list[dict[str, Any]]], snapshot: dict | None = Non
     worker: BaseWorker = _Worker.__new__(_Worker)
     worker._room_routes = routes  # type: ignore[attr-defined]
 
-    async def _load(room_id: str) -> bool:
+    async def _load(room_id: str, *, quiet: bool = False) -> bool:
         if snapshot is None:
             return False
         routes[room_id] = snapshot.get("routes", [])
@@ -114,16 +114,62 @@ async def test_an_unknown_room_recovers_consent_from_the_redis_snapshot() -> Non
     assert (consented, reason) == (True, "consented")
 
 
-async def test_the_snapshot_is_not_consulted_when_routes_are_already_known() -> None:
-    # A speaker who has opted out must stay opted out. Re-reading Redis on every chunk would
-    # also be a request per audio chunk per speaker, which is the hot path.
+async def test_the_snapshot_is_not_consulted_when_routes_are_fresh() -> None:
+    # Re-reading Redis on every chunk would be a request per audio chunk per speaker, which is
+    # the hot path. Routes the backend sent a moment ago are answered from memory.
     worker = _worker({ROOM: [_route(False)]})
+    worker._note_routes_seen(ROOM)
     worker._load_route_snapshot = AsyncMock(return_value=True)  # type: ignore[assignment]
 
     consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
 
     assert (consented, reason) == (False, "not_opted_in")
     worker._load_route_snapshot.assert_not_awaited()
+
+
+def _age_routes(worker: BaseWorker) -> None:
+    worker._room_routes_seen_at[ROOM] -= ROUTE_SNAPSHOT_MAX_AGE_SECONDS + 1  # type: ignore[attr-defined]
+
+
+async def test_a_missed_opt_in_is_picked_up_from_the_snapshot_once_the_routes_are_old() -> None:
+    """2026-10-03, room 01a1010c: the bridge host's dub into Google Meet must be in their voice.
+
+    "My voice" reaches this worker as an AUDIO_ROUTES_UPDATED broadcast. Miss that one message
+    and a known room used to be answered from memory for the rest of the meeting: the host's
+    audio refused as `not_opted_in`, no clone ever made, every dub in a stock voice.
+    """
+    worker = _worker({ROOM: [_route(False)]}, snapshot={"routes": [_route(True)]})
+    worker._note_routes_seen(ROOM)
+    _age_routes(worker)
+
+    consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert (consented, reason) == (True, "consented")
+
+
+async def test_a_missed_withdrawal_is_honoured_once_the_routes_are_old() -> None:
+    # The direction that matters most for biometric data: a speaker who said stop.
+    worker = _worker({ROOM: [_route(True)]}, snapshot={"routes": [_route(False)]})
+    worker._note_routes_seen(ROOM)
+    _age_routes(worker)
+
+    consented, reason = await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert (consented, reason) == (False, "not_opted_in")
+    assert worker.is_voice_clone_consented(ROOM, SPEAKER) is False, (
+        "the synthesis path reads the same cache and must stop using the clone too"
+    )
+
+
+async def test_a_missing_snapshot_is_not_asked_for_again_on_every_chunk() -> None:
+    worker = _worker({ROOM: [_route(False)]})
+    worker._load_route_snapshot = AsyncMock(return_value=False)  # type: ignore[assignment]
+
+    await worker.voice_clone_consent_state(ROOM, SPEAKER)
+    await worker.voice_clone_consent_state(ROOM, SPEAKER)
+    await worker.voice_clone_consent_state(ROOM, SPEAKER)
+
+    assert worker._load_route_snapshot.await_count == 1
 
 
 async def test_a_snapshot_that_grants_nobody_consent_is_not_read_as_consent() -> None:

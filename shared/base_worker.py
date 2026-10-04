@@ -16,19 +16,20 @@ import signal
 import socket
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from redis.asyncio.client import PubSub
 
 from shared.config import RedisSettings, WorkerSettings
-from shared.health_probe import heartbeat_key
+from shared.health_probe import heartbeat_key, touch_heartbeat_file
 from shared.integration_status import (
     REPORT_INTERVAL_SECONDS,
     IntegrationReport,
     publish_integration_status,
 )
+from shared.lang import is_same_language
 from shared.logger import get_logger
 from shared.platform_settings import PlatformSettings, reader_for
 from shared.provider_calls import bind_provider_calls
@@ -47,6 +48,11 @@ from shared.transcript_pause import is_transcript_paused as _read_transcript_pau
 # was missing here, so an expired room's bot was never released; "TIMEOUT" is not a status
 # the backend has ever published, so that entry never matched anything.
 TERMINAL_ROOM_STATUSES = frozenset({"FAILED", "ENDED", "CANCELLED", "EXPIRED"})
+
+# How old this worker's copy of a room's routes may get before the voice-clone consent gate
+# re-reads the durable snapshot. See `voice_clone_consent_state`: one GET per room per this many
+# seconds, on a path that otherwise reads the routes once per audio chunk.
+ROUTE_SNAPSHOT_MAX_AGE_SECONDS = 15.0
 
 
 @dataclass
@@ -136,6 +142,9 @@ class BaseWorker(ABC):
         self._translation_active: dict[str, bool] = {}
         self._paused_rooms: set[str] = set()
         self._room_routes: dict[str, list[dict[str, Any]]] = {}
+        # Monotonic time `_room_routes[room]` was last set from the backend — a broadcast or a
+        # snapshot read. See `_routes_are_stale`.
+        self._room_routes_seen_at: dict[str, float] = {}
         self._pubsub: PubSub | None = None
         self._listener_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -227,6 +236,7 @@ class BaseWorker(ABC):
             ),
             self.heartbeat_ttl_seconds,
         )
+        touch_heartbeat_file(self.worker_name)
         await self._report_integrations()
 
     # ------------------------------------------------------------------
@@ -337,6 +347,7 @@ class BaseWorker(ABC):
 
             if room_id and isinstance(inner.get("routes"), list):
                 self._room_routes[room_id] = inner["routes"]
+                self._note_routes_seen(room_id)
 
             # The backend's own answer to "is translation running", computed from the room's
             # active TranslationRoomSession. Recorded separately from the room status below, and
@@ -361,7 +372,7 @@ class BaseWorker(ABC):
         except Exception as error:
             self.logger.warning("failed_to_parse_route_event", error=str(error))
 
-    async def _load_route_snapshot(self, room_id: str) -> bool:
+    async def _load_route_snapshot(self, room_id: str, *, quiet: bool = False) -> bool:
         """Re-read a room's route state from Redis, into the in-memory caches.
 
         WHY THIS EXISTS
@@ -386,6 +397,11 @@ class BaseWorker(ABC):
             `room_status`, same `translation_active` — and `_get_target_languages` has always read
             its own state from Redis rather than waiting to be told. This closes the asymmetry.
 
+        `quiet` is for the callers that re-read on purpose to CONFIRM what they already hold
+        (`text_only_dub_for`, `voice_clone_consent_state`): they do it every few seconds, and an
+        INFO line saying "recovered" each time would bury the one that means a worker really
+        had lost a room.
+
         Returns True when a snapshot was found and applied.
         """
         try:
@@ -408,24 +424,53 @@ class BaseWorker(ABC):
 
         if isinstance(snapshot.get("routes"), list):
             self._room_routes[room_id] = snapshot["routes"]
+            self._note_routes_seen(room_id)
 
         status = snapshot.get("room_status")
         if isinstance(status, str) and status:
             self._route_states[room_id] = status
+            # Both directions, as the broadcast handler does. This only ever ADDED the room, so a
+            # worker that missed the resume broadcast stayed paused however often it re-read a
+            # snapshot that said IN_PROGRESS — and it re-reads it far more often now. The key is
+            # written before every broadcast, so it is never older than one this worker heard.
+            paused: set[str] | None = getattr(self, "_paused_rooms", None)
+            if paused is None:
+                # Workers built with __new__ in tests, which set only what they exercise.
+                paused = set()
+                self._paused_rooms = paused
             if status == "PAUSED":
-                self._paused_rooms.add(room_id)
+                paused.add(room_id)
+            else:
+                paused.discard(room_id)
 
         translation_active = snapshot.get("translation_active")
         if isinstance(translation_active, bool):
             self._translation_active[room_id] = translation_active
 
-        self.logger.info(
+        (self.logger.debug if quiet else self.logger.info)(
             "route_snapshot_recovered",
             room_id=room_id,
             room_status=status,
             translation_active=translation_active,
         )
         return True
+
+    def _note_routes_seen(self, room_id: str) -> None:
+        seen: dict[str, float] | None = getattr(self, "_room_routes_seen_at", None)
+        if seen is None:
+            seen = {}
+            self._room_routes_seen_at = seen
+        seen[room_id] = time.monotonic()
+
+    def _routes_are_stale(self, room_id: str) -> bool:
+        """Whether this worker's routes for the room are older than ROUTE_SNAPSHOT_MAX_AGE_SECONDS.
+
+        Routes that arrived by any path that did not stamp them count as stale: re-reading costs
+        one GET, and trusting an undated copy is how a missed broadcast becomes a meeting-long
+        wrong answer.
+        """
+        seen_at = getattr(self, "_room_routes_seen_at", {}).get(room_id)
+        return seen_at is None or time.monotonic() - seen_at >= ROUTE_SNAPSHOT_MAX_AGE_SECONDS
 
     async def _translation_active_for(self, room_id: str) -> bool:
         """`_is_translation_active`, but allowed to go and find out.
@@ -506,6 +551,7 @@ class BaseWorker(ABC):
         self._translation_active.pop(room_id, None)
         self._paused_rooms.discard(room_id)
         self._room_routes.pop(room_id, None)
+        getattr(self, "_room_routes_seen_at", {}).pop(room_id, None)
 
     def is_voice_clone_consented(self, room_id: str, speaker_user_id: str) -> bool:
         """True if `speaker_user_id` has at least one current outgoing route (they are the
@@ -587,6 +633,71 @@ class BaseWorker(ABC):
             return str(voice_id), score
         return None, None
 
+    def is_text_only_dub(self, room_id: str, speaker_user_id: str, target_lang: str) -> bool:
+        """Whether a dub of this speaker into `target_lang` would be played into nothing.
+
+        TEXT-ONLY GOOGLE MEET BRIDGE (PO 2026-10-01)
+            A bridge participant in text-only mode sits in the Meet call with their REAL mic and
+            speakers. Their dub into the far side's language exists only to be played into Meet
+            through a virtual cable, and there is no cable — Meet already hears their own voice.
+            The backend marks exactly those routes (speaker -> far-side stand-in) `TextOnly`.
+
+        PER ROUTE, AND ONLY WHEN EVERY ROUTE AGREES
+            tts_worker renders one track per (speaker, target language) and every listener in
+            that language shares it. So the dub is skipped only when ALL of this speaker's routes
+            into this language are text-only: another WarpTalk participant who listens in the far
+            side's language still needs the track. The room-level TEXT_ONLY_MODE status is not
+            used for this — it would also silence the inbound side and every other speaker.
+
+        Fails open (False -> synthesize) on an unknown room, a speaker with no route into this
+        language, or a backend that does not send the field yet: a wrong False costs credits, a
+        wrong True silences someone whose cable is there.
+        """
+        matching = [
+            route
+            for route in self._room_routes.get(room_id, [])
+            if str(route.get("SourceUserId") or "").lower() == speaker_user_id.lower()
+            and is_same_language(str(route.get("TargetLanguage") or ""), target_lang)
+        ]
+        return bool(matching) and all(route.get("TextOnly") is True for route in matching)
+
+    async def text_only_dub_for(self, room_id: str, speaker_user_id: str, target_lang: str) -> bool:
+        """`is_text_only_dub`, recovering the route snapshot first when this worker has never been
+        told about the room (it restarted mid-meeting; pub/sub has no replay).
+
+        A SKIP IS CONFIRMED AGAINST THE DURABLE SNAPSHOT
+            The in-memory routes change only when an AUDIO_ROUTES_UPDATED broadcast reaches this
+            worker. One that is missed — the route listener reconnecting, a publish lost on the
+            way — leaves a speaker who switched text -> voice marked TextOnly here for the rest of
+            the meeting. Their dub is then never synthesized, and Meet hears their untranslated
+            voice instead (the web plays the raw mic into the cable while no dub exists), with
+            nothing anywhere saying why (2026-10-03, room 01a1010c).
+
+            So "skip" is never answered from memory alone: the backend writes
+            `translationRoom:{id}:audio_routes` BEFORE it publishes, so that key is never older
+            than any broadcast, and re-reading it is one GET on a path that synthesizes nothing.
+            "Synthesize" is still answered from memory: a wrong False costs credits, a wrong True
+            silences a speaker, and only the second needs the extra read.
+        """
+        if room_id not in self._room_routes:
+            await self._load_route_snapshot(room_id)
+            return self.is_text_only_dub(room_id, speaker_user_id, target_lang)
+
+        if not self.is_text_only_dub(room_id, speaker_user_id, target_lang):
+            return False
+
+        if await self._load_route_snapshot(room_id, quiet=True) and not self.is_text_only_dub(
+            room_id, speaker_user_id, target_lang
+        ):
+            self.logger.warning(
+                "text_only_routes_were_stale",
+                room_id=room_id,
+                speaker_id=speaker_user_id,
+                lang=target_lang,
+            )
+            return False
+        return self.is_text_only_dub(room_id, speaker_user_id, target_lang)
+
     async def voice_clone_consent_state(
         self, room_id: str, speaker_user_id: str
     ) -> tuple[bool, str]:
@@ -620,7 +731,31 @@ class BaseWorker(ABC):
             "routes_unknown"        — no routes for this room, and no snapshot to recover them
                                       from. Still fails closed, but now says so instead of
                                       looking identical to a deliberate opt-out.
+
+        A KNOWN ROOM IS RE-CHECKED TOO, AT MOST EVERY ROUTE_SNAPSHOT_MAX_AGE_SECONDS
+            The snapshot used to be read only for a room this worker had never heard of. A room it
+            HAD heard of was answered from memory for the rest of the meeting, so a single missed
+            AUDIO_ROUTES_UPDATED — the route listener reconnecting after a Redis blip — froze the
+            answer at whatever it was before. Pressing "My voice" then never reached this gate:
+            the speaker's audio was refused as `not_opted_in` and every dub went out in a stock
+            voice, including the one a bridge host's desktop plays into Google Meet. The other
+            direction is worse: a withdrawal that is missed keeps a voice being cloned after its
+            owner said stop.
+
+            The `text_only_dub_for` gate closes the same hole for the text-only flag. Here the
+            gate runs once per audio chunk per speaker, so the re-read is rate-limited per room
+            rather than done on every call: one GET per room every few seconds, whatever the
+            answer. Both answers are re-checked, because both can be the stale one.
         """
+        if (
+            room_id in self._room_routes
+            and self._routes_are_stale(room_id)
+            and not await self._load_route_snapshot(room_id, quiet=True)
+        ):
+            # No snapshot (evicted, or Redis is down): keep what we have, and do not ask again on
+            # the very next chunk — the rate limit has to hold on the failure path as well.
+            self._note_routes_seen(room_id)
+
         if self.is_voice_clone_consented(room_id, speaker_user_id):
             return True, "consented"
 
@@ -889,8 +1024,12 @@ class BaseWorker(ABC):
             min_idle_ms=self._reclaim_min_idle_ms(),
         )
         for message_id, data in messages:
+            if self._is_in_flight(message_id):
+                # Still being handled by this process — only queued long enough to look idle.
+                # Running it again would run it twice; acking it would ack unfinished work.
+                continue
             try:
-                await self._process_and_log_errors(message_id, data)
+                await self._process_reclaimed(message_id, data)
             except Exception:
                 attempts = await self.redis.pending_delivery_count(
                     self.input_stream,
@@ -898,44 +1037,15 @@ class BaseWorker(ABC):
                     message_id,
                 )
                 if attempts >= self.max_delivery_attempts:
-                    original_payload = {
-                        (
-                            key.decode("utf-8", errors="replace")
-                            if isinstance(key, bytes)
-                            else str(key)
-                        ): (
-                            value.decode("utf-8", errors="replace")
-                            if isinstance(value, bytes)
-                            else str(value)
-                        )
-                        for key, value in data.items()
-                    }
-                    await self.redis.publish(
-                        f"{self.input_stream}:dead-letter",
-                        {
-                            "original_message_id": message_id.decode(
-                                "utf-8",
-                                errors="replace",
-                            ),
-                            "consumer_group": self.consumer_group,
-                            "worker": self.worker_name,
-                            "delivery_attempts": attempts,
-                            "failed_at_unix_ms": int(time.time() * 1000),
-                            "payload": json.dumps(original_payload),
-                        },
+                    await self._dead_letter(
+                        message_id, data, attempts=attempts, reason="delivery_attempts_exhausted"
                     )
                     await self.redis.redis.xack(
                         self.input_stream,
                         self.consumer_group,
                         message_id,
                     )
-                    await self._record_outcome("dead_letter")
-                    self.logger.error(
-                        "message_dead_lettered",
-                        message_id=message_id,
-                        stream=self.input_stream,
-                        attempts=attempts,
-                    )
+                    continue
                 # Under the limit, keep it pending. XAUTOCLAIM resets idle time,
                 # preventing a hot loop while scheduling another bounded retry.
                 continue
@@ -948,6 +1058,71 @@ class BaseWorker(ABC):
         # live one first, or it still holds them and is (correctly) skipped.
         if self._housekeeping_due(self.input_stream, self.consumer_group):
             await self._prune_idle_consumers(self.input_stream, self.consumer_group)
+
+    async def _dead_letter(
+        self,
+        message_id: bytes,
+        data: Mapping[Any, Any],
+        *,
+        attempts: int,
+        reason: str,
+        details: Mapping[str, str] | None = None,
+    ) -> None:
+        """Park a message on `<input_stream>:dead-letter`, with why. Does NOT acknowledge it.
+
+        The one writer of the dead-letter convention, so every parked entry carries the same
+        fields: the original id and payload (replayable as-is), who parked it, how many attempts
+        it had, and — new with the TTS retry policy — a `reason`, because "it failed five times"
+        and "the vendor refused it on the first try" are different things to do something about.
+
+        Acknowledging stays with the caller: the reclaim path acks the parked entry itself, while
+        a worker that dead-letters ONE PART of a message from inside `process()` (a voice variant
+        Cartesia refused) lets the message's normal completion ack it.
+        """
+        original_payload = {
+            (key.decode("utf-8", errors="replace") if isinstance(key, bytes) else str(key)): (
+                value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+            )
+            for key, value in data.items()
+        }
+        entry: dict[str, Any] = {
+            "original_message_id": message_id.decode("utf-8", errors="replace"),
+            "consumer_group": self.consumer_group,
+            "worker": self.worker_name,
+            "delivery_attempts": attempts,
+            "reason": reason,
+            "failed_at_unix_ms": int(time.time() * 1000),
+            "payload": json.dumps(original_payload),
+        }
+        if details:
+            entry.update(details)
+        await self.redis.publish(f"{self.input_stream}:dead-letter", entry)
+        await self._record_outcome("dead_letter")
+        self.logger.error(
+            "message_dead_lettered",
+            message_id=message_id,
+            stream=self.input_stream,
+            attempts=attempts,
+            reason=reason,
+        )
+
+    def _is_in_flight(self, message_id: bytes) -> bool:
+        """Whether this process has already dispatched `message_id` and not yet finished it.
+
+        Always False for the default one-at-a-time loop, which never reclaims while anything is
+        running. A worker that keeps reading while earlier messages run (TTSWorker) overrides it:
+        a message queued behind a long-running one for its key sits in the pending list looking
+        exactly like an abandoned one, and XAUTOCLAIM cannot tell the difference.
+        """
+        return False
+
+    async def _process_reclaimed(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        """Run one reclaimed message. Raise to leave it pending (and count toward dead-letter).
+
+        A hook so a worker whose normal path wraps processing — TTSWorker's per-key ordering
+        lock — can put a reclaimed message through the same wrapper instead of around it.
+        """
+        await self._process_and_log_errors(message_id, data)
 
     def note_attempt_outcome(self, outcome: str) -> None:
         """Mark the message being processed as failed even though `process()` will return.

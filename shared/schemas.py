@@ -57,11 +57,23 @@ class AudioChunkMessage(BaseModel):
     #: and it is also what an older ingress keeps sending through a rolling deploy.
     turn_id: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    #: Bridge stand-in only: milliseconds of this chunk the ingress zeroed because they
+    #: overlapped (within the Meet path-delay window) with a WarpTalk participant's own mic —
+    #: their voice coming back through Meet. See livekit_ingress_worker/far_side_gate.py.
+    #: 0 (and absent on the wire) for every other chunk and for an older ingress.
+    suppressed_overlap_ms: int = 0
 
     model_config = {"arbitrary_types_allowed": True}
 
     def to_redis(self) -> dict[str, str]:
         """Serialize to Redis Stream fields (all str values)."""
+        payload = self._base_redis_fields()
+        # Omitted when 0 so every non-bridge chunk is byte-for-byte what it was before.
+        if self.suppressed_overlap_ms > 0:
+            payload["suppressed_overlap_ms"] = str(self.suppressed_overlap_ms)
+        return payload
+
+    def _base_redis_fields(self) -> dict[str, str]:
         return {
             "meeting_id": self.meeting_id,
             "speaker_id": self.speaker_id,
@@ -102,6 +114,7 @@ class AudioChunkMessage(BaseModel):
             is_final_chunk=d.get("is_final_chunk") == "1",
             turn_id=d.get("turn_id", ""),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
+            suppressed_overlap_ms=int(d.get("suppressed_overlap_ms", "0") or "0"),
         )
 
 
@@ -305,6 +318,20 @@ class STTResultMessage(BaseModel):
     #
     # Consumers that render or translate should IGNORE this flag; only money cares.
     is_early: bool = False
+    # THE AUDIO CHUNK THIS SEGMENT CAME OUT OF, AND HOW LONG IT IS — what billing charges by.
+    #
+    # The invariant on `is_early` above assumed every chunk has a completed segment to pay for it.
+    # In flash mode it often does not: when every sentence went out early, the completed event
+    # carries an empty remainder, `_filter_segments` drops it, and the chunk had nothing billable
+    # at all. On prod, 2 Oct, that was 136 of 664 translated chunks over three days — about a
+    # fifth of all translated speech, translated and dubbed for free.
+    #
+    # So the chunk is named on every segment it produced, early or completed, with its PCM
+    # duration (the same number the completed segment's `end` has always been), and billing
+    # charges the CHUNK once, on whichever of its segments arrives first. "" / 0 is what an
+    # older producer sends, and billing then falls back to the old per-segment rule.
+    chunk_id: str = ""
+    chunk_duration_ms: int = 0
     # How the speaker sounded saying this, measured from the audio chunk this segment came out
     # of — the only point in the pipeline where the audio still exists. None when nothing could
     # be measured; see ProsodyEnvelope.
@@ -321,6 +348,18 @@ class STTResultMessage(BaseModel):
     # shared.disfluency flags for `clean_text`: filler_only, fillers_removed, stutter_removed,
     # escalate. Empty when nothing was flagged.
     clean_flags: tuple[str, ...] = ()
+    # Bridge stand-in segments only: WHICH person on the far side of the call said this line,
+    # when something could tell (shared/far_speaker.py). The stand-in's speaker_id stays the
+    # stand-in GUID — these name a person inside it, they do not replace the seat.
+    #
+    # All three None (and absent on the wire) when there is no answer — every non-bridge segment,
+    # every bridge segment with no hint near it, every older producer. The persisting consumer
+    # stores them as far_speaker_key / far_speaker_source / far_speaker_confidence.
+    far_speaker_name: str | None = None
+    # "meet_caption" for phase-1 caption hints; a diarization tracker (WT-677) names its own.
+    far_speaker_source: str | None = None
+    # 0..1. 1.0 = every hint inside the segment named this person.
+    far_speaker_confidence: float | None = None
 
     @property
     def display_text(self) -> str:
@@ -346,6 +385,11 @@ class STTResultMessage(BaseModel):
             "is_early": "1" if self.is_early else "0",
             "timestamp_ms": str(self.timestamp_ms),
         }
+        # Omitted when unknown, so an older producer's message is unchanged on the wire.
+        if self.chunk_id:
+            payload["chunk_id"] = self.chunk_id
+        if self.chunk_duration_ms > 0:
+            payload["chunk_duration_ms"] = str(self.chunk_duration_ms)
         # Omitted rather than sent as a neutral placeholder — "not measured" and "measured as
         # ordinary" are different instructions to the synthesizer.
         if self.prosody is not None:
@@ -356,6 +400,13 @@ class STTResultMessage(BaseModel):
             payload["clean_text"] = self.clean_text
         if self.clean_flags:
             payload["clean_flags"] = ",".join(self.clean_flags)
+        # Only with a name: a source or confidence without one is not an attribution.
+        if self.far_speaker_name:
+            payload["far_speaker_name"] = self.far_speaker_name
+            if self.far_speaker_source:
+                payload["far_speaker_source"] = self.far_speaker_source
+            if self.far_speaker_confidence is not None:
+                payload["far_speaker_confidence"] = str(self.far_speaker_confidence)
         return payload
 
     @classmethod
@@ -378,17 +429,23 @@ class STTResultMessage(BaseModel):
             # Absent on anything published before this field existed, which reads as False —
             # the safe direction, since a pre-existing message was a completed segment.
             is_early=d.get("is_early") == "1",
+            chunk_id=d.get("chunk_id", ""),
+            chunk_duration_ms=int(d.get("chunk_duration_ms") or "0"),
             timestamp_ms=int(d.get("timestamp_ms", "0")),
             prosody=ProsodyEnvelope.from_wire(d.get("prosody")),
             # Absent on everything published before WT-716: no clean version was computed.
             clean_text=d.get("clean_text"),
             clean_flags=_split_flags(d.get("clean_flags")),
+            far_speaker_name=d.get("far_speaker_name") or None,
+            far_speaker_source=d.get("far_speaker_source") or None,
+            far_speaker_confidence=optional_confidence(d.get("far_speaker_confidence")),
         )
 
 
 # Where CleanSentenceMessage travels. Published through BaseWorker.publish like every result
 # stream, so it lands on the global `transcript:clean` AND on `transcript:clean:{meeting_id}`
-# — the per-meeting key is the one the backend reads.
+# — but the global stream is what both backend consumers actually read. The per-meeting key is
+# a by-product of BaseWorker.publish (written with a TTL); nothing reads it today.
 TRANSCRIPT_CLEAN_STREAM = "transcript:clean"
 
 
@@ -510,6 +567,10 @@ class TranslationResultMessage(BaseModel):
     # already carries that chunk's whole duration, so charging both bills the same audio
     # twice. See STTResultMessage.is_early for the full invariant.
     is_early: bool = False
+    # Carried unchanged from the STT segment — the audio chunk billing charges once. See
+    # STTResultMessage.chunk_id.
+    chunk_id: str = ""
+    chunk_duration_ms: int = 0
     # Carried unchanged from the STT segment this was translated from. The translation worker
     # measures nothing — it is the courier. Every sentence split out of one STT segment inherits
     # the same envelope, because the measurement's granularity is the audio chunk, not the
@@ -551,6 +612,19 @@ class TranslationResultMessage(BaseModel):
     workspace_id: str | None = None
     requested_by_user_id: str | None = None
     transcript_id: str | None = None
+    # Bridge stand-in segments only: the Meet-side person this line was attributed to, carried
+    # unchanged from STTResultMessage.far_speaker_name / far_speaker_confidence. Everyone on the
+    # Meet side is published under ONE stand-in speaker_id, so speaker_id cannot tell tts_worker
+    # whose voice to dub this line in; the caption name is the only thing that can (WT-932).
+    #
+    # The translation worker is the courier here, as it is for prosody — it attributes nothing.
+    # Both None, and absent on the wire, on every native segment, every stand-in segment no
+    # caption hint named, every older producer and every post-meeting backfill, so a message
+    # without a name is byte-for-byte what it was before this field existed.
+    far_speaker_name: str | None = None
+    # 0..1, the STT worker's number untouched: 1.0 = every hint inside the segment named this
+    # person; lower at a hand-over between speakers or on the nearest-hint path (capped at 0.5).
+    far_speaker_confidence: float | None = None
 
     def to_redis(self) -> dict[str, str]:
         payload = {
@@ -570,6 +644,10 @@ class TranslationResultMessage(BaseModel):
             "source_segment_id": self.source_segment_id,
             "chunk_index": str(self.chunk_index),
         }
+        if self.chunk_id:
+            payload["chunk_id"] = self.chunk_id
+        if self.chunk_duration_ms > 0:
+            payload["chunk_duration_ms"] = str(self.chunk_duration_ms)
         # Redis stream fields are strings, so "unknown" cannot be encoded as a value — omit the
         # field entirely. Consumers treat an absent field as NULL (WT-277); writing "None" or a
         # placeholder number here is exactly the failure this ticket removed.
@@ -593,6 +671,12 @@ class TranslationResultMessage(BaseModel):
             payload["requested_by_user_id"] = self.requested_by_user_id
         if self.transcript_id:
             payload["transcript_id"] = self.transcript_id
+        # Only with a name: a confidence without one is not an attribution. Same rule as
+        # STTResultMessage.to_redis.
+        if self.far_speaker_name:
+            payload["far_speaker_name"] = self.far_speaker_name
+            if self.far_speaker_confidence is not None:
+                payload["far_speaker_confidence"] = str(self.far_speaker_confidence)
         return payload
 
     @classmethod
@@ -618,6 +702,8 @@ class TranslationResultMessage(BaseModel):
             translator_model=d.get("translator_model", ""),
             source_segment_id=d.get("source_segment_id", ""),
             chunk_index=int(d.get("chunk_index", "0")),
+            chunk_id=d.get("chunk_id", ""),
+            chunk_duration_ms=int(d.get("chunk_duration_ms") or "0"),
             prosody=ProsodyEnvelope.from_wire(d.get("prosody")),
             # Absent means "not measured", which is a different fact from zero — a producer
             # that did no translation work reports nothing rather than claiming it was instant.
@@ -627,6 +713,9 @@ class TranslationResultMessage(BaseModel):
             workspace_id=d.get("workspace_id") or None,
             requested_by_user_id=d.get("requested_by_user_id") or None,
             transcript_id=d.get("transcript_id") or None,
+            # Absent on every native segment and on everything published before WT-932.
+            far_speaker_name=d.get("far_speaker_name") or None,
+            far_speaker_confidence=optional_confidence(d.get("far_speaker_confidence")),
         )
 
 

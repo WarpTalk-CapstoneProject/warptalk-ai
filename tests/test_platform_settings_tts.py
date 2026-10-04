@@ -63,7 +63,9 @@ class _Harness:
     def __init__(self, clock: FakeClock, **env: Any) -> None:
         worker = TTSWorker.__new__(TTSWorker)
         worker.settings = WorkerSettings()
-        worker.tts_settings = TTSSettings(**env)
+        # The thresholds under test are min_seconds and the margin; the progressive ladder
+        # would clone below them by design (see test_clone_progressive_ladder.py).
+        worker.tts_settings = TTSSettings(**{"voice_clone_ladder_seconds": (), **env})
         worker.logger = MagicMock()
         worker._route_states = {}
         worker._room_routes = {

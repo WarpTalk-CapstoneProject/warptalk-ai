@@ -1,4 +1,6 @@
 import json
+import re
+import unicodedata
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -15,15 +17,29 @@ RESULT_TTL_SECONDS = 300
 def keywords_present_in(content: str, keywords: list[str]) -> tuple[str, ...]:
     """The blacklist entries this document actually contains.
 
-    Exact, case-insensitive, over the WHOLE document — not the truncated slice the model is shown.
-    This is the DLP verdict; nothing else is.
+    Case-insensitive, normalized, whole-word/phrase matched over the WHOLE document.
+    Avoids false positives on substrings of larger words
+    (e.g. 'cat' in 'category', 'thu' in 'thu thập').
     """
-    lowered = content.lower()
-    return tuple(
-        keyword
-        for keyword in keywords
-        if isinstance(keyword, str) and keyword.strip() and keyword.lower() in lowered
-    )
+    if not content or not keywords:
+        return ()
+
+    normalized_content = unicodedata.normalize("NFC", content)
+    matched: list[str] = []
+
+    for keyword in keywords:
+        if not isinstance(keyword, str) or not keyword.strip():
+            continue
+        clean_kw = unicodedata.normalize("NFC", keyword.strip())
+        parts = clean_kw.split()
+        if not parts:
+            continue
+        escaped_parts = [re.escape(part) for part in parts]
+        pattern_str = r"(?<!\w)" + r"\s+".join(escaped_parts) + r"(?!\w)"
+        if re.search(pattern_str, normalized_content, flags=re.IGNORECASE):
+            matched.append(keyword)
+
+    return tuple(matched)
 
 
 def split_claims_by_evidence(
@@ -32,13 +48,26 @@ def split_claims_by_evidence(
     """Split the model's claimed DLP hits into (in the text, not in the text).
 
     A claim the document does not contain is a hallucination, and the second half of this tuple
-    exists so it gets said out loud. Before this, an invented match was indistinguishable from a
-    real one the moment it left the scanner, and it silently killed the document.
+    exists so it gets said out loud.
     """
-    lowered = content.lower()
-    supported = tuple(term for term in claimed if term.lower() in lowered)
-    unsupported = tuple(term for term in claimed if term.lower() not in lowered)
-    return supported, unsupported
+    if not content or not claimed:
+        return (), claimed
+    normalized = unicodedata.normalize("NFC", content)
+    supported: list[str] = []
+    unsupported: list[str] = []
+    for term in claimed:
+        if not isinstance(term, str) or not term.strip():
+            continue
+        clean_term = unicodedata.normalize("NFC", term.strip())
+        parts = clean_term.split()
+        if not parts:
+            continue
+        pattern_str = r"(?<!\w)" + r"\s+".join(re.escape(p) for p in parts) + r"(?!\w)"
+        if re.search(pattern_str, normalized, flags=re.IGNORECASE):
+            supported.append(term)
+        else:
+            unsupported.append(term)
+    return tuple(supported), tuple(unsupported)
 
 
 class SecurityWorker(BaseWorker):
@@ -245,3 +274,9 @@ class SecurityWorker(BaseWorker):
             "dlp_flagged_terms": list(dlp_flagged_terms),
         }
         await self.redis.set_with_ttl(key, json.dumps(result_payload), RESULT_TTL_SECONDS)
+        try:
+            raw_client = getattr(self.redis, "redis", None)
+            if raw_client:
+                await raw_client.publish(f"security:scan_completed:{scan_id}", "done")
+        except Exception:
+            pass

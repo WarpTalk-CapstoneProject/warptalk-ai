@@ -1,0 +1,277 @@
+"""Who on the far side of a bridged call said a stand-in segment.
+
+THE PROBLEM
+    In an EXTERNAL_BRIDGE room every person on the Google Meet side is transcribed under ONE
+    LiveKit identity — the stand-in seat (shared.control_markers.EXTERNAL_BRIDGE_SPEAKER_ID).
+    The transcript can say "Google Meet participants" and nothing more, because the audio is a
+    single mixed feed.
+
+THE PHASE-1 ANSWER: HINTS, NOT A MODEL
+    Meet already knows who is talking — its live captions name the speaker. The WarpTalk desktop
+    that captures the Meet tab will publish what it reads there as a stream of hints:
+
+        XADD meeting:{room}:far_speaker_hints *
+             name "Lan Pham" t_ms 1759300000123 source meet_caption
+
+    `t_ms` is the unix-epoch millisecond the desktop SAW the caption, which is always somewhat
+    after the words were spoken. `attribute_far_speaker` shifts each hint back by a configurable
+    lag and asks which name lands inside the segment's time window.
+
+    Nothing here downloads or runs a diarization model. `FarSpeakerTracker` is the seam WT-677
+    plugs one into: the STT worker only ever asks a tracker "who said this window", so swapping
+    the caption-hint tracker for an embedding tracker (or chaining the two) changes no caller.
+
+WIRE CONTRACT (read by warptalk-backend)
+    The answer travels on `stt:results:{room}` as three OPTIONAL fields of STTResultMessage —
+    `far_speaker_name`, `far_speaker_source`, `far_speaker_confidence` — absent when there is no
+    answer, so a message without one is byte-for-byte what it was before.
+
+    A line published WITHOUT a name it could show may get one about a second later, on a stream
+    of its own — `stt:far_speaker_late:{room}`, never stt:results. See shared/far_speaker_late.py.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+#: Redis stream the desktop writes caption hints to. `{room}` is the translation room id — the
+#: same id every other `meeting:{room}:*` key in the ingress worker uses.
+FAR_SPEAKER_HINTS_KEY = "meeting:{room}:far_speaker_hints"
+
+#: The only source phase 1 produces. A diarization tracker (WT-677) will report its own.
+SOURCE_MEET_CAPTION = "meet_caption"
+
+#: Confidence ceiling for a hint that only lands NEAR the window rather than inside it. A name
+#: inside the window is evidence about the window; a name next to it is a guess about a turn
+#: boundary, and must never outrank the former.
+_NEAREST_HINT_MAX_CONFIDENCE = 0.5
+
+#: Confidence band for a nearest hint whose name is the ONLY name near the window AND which has a
+#: hint lying after the window's end (bug B3). Meet's captions trail speech and the desktop's hints
+#: trail the captions, so a short line often has no hint inside its window yet - only the same
+#: speaker's hints just before and/or after it. Capped at 0.5 those were always below the 0.6 the
+#: gateway needs, and the line said "Google Meet participants" although only one person was
+#: talking. Requiring a hint AFTER the window keeps the hand-over case out: when Lan stops and Minh
+#: starts, Minh's first line has only Lan's hints BEFORE it until Minh's own arrive, and that
+#: stays a low-confidence guess. The band decays with the gap and crosses the 0.6 display
+#: threshold at ~60% of max_gap: a name only that close clears the gateway, so a hint seen late
+#: (caption lag varies 0.5-1.5 s against a fixed 1 s shift) or a short interjection Meet folded
+#: into another speaker's caption is less likely to put the wrong name on screen.
+_SOLE_NEAR_HINT_MIN_CONFIDENCE = 0.45
+_SOLE_NEAR_HINT_MAX_CONFIDENCE = 0.85
+
+#: WHICH RULE produced an attribution (FarSpeakerAttribution.basis). The confidence alone does not
+#: say: the hand-over guess is capped at 0.5 only because of the constant above, and a display
+#: threshold configured below that would let it through. The late-name path
+#: (shared/far_speaker_late.py) refuses BASIS_NEAREST by name, whatever its score.
+#:   inside     - hints landed inside the window and voted.
+#:   sole_near  - no hint inside, but every near hint names one person and one lies after the end.
+#:   nearest    - the hand-over guess: the nearest hint, with other names near or none after.
+BASIS_INSIDE = "inside"
+BASIS_SOLE_NEAR = "sole_near"
+BASIS_NEAREST = "nearest"
+
+
+def far_speaker_hints_key(room_id: str) -> str:
+    return FAR_SPEAKER_HINTS_KEY.format(room=room_id)
+
+
+@dataclass(frozen=True)
+class FarSpeakerHint:
+    """One "this person was talking at t_ms" observation."""
+
+    name: str
+    t_ms: int
+    source: str = SOURCE_MEET_CAPTION
+
+
+@dataclass(frozen=True)
+class SegmentWindow:
+    """A segment's span in unix-epoch milliseconds, the clock hints are stamped in."""
+
+    start_ms: int
+    end_ms: int
+
+
+@dataclass(frozen=True)
+class FarSpeakerAttribution:
+    name: str
+    source: str
+    confidence: float
+    # BASIS_* above. "" from a tracker that does not say (WT-677's diarizer, until it does) - and
+    # "" is not a basis the late-name path accepts, so such a tracker cannot rename a line late.
+    basis: str = ""
+
+
+class FarSpeakerTracker(Protocol):
+    """Answers "who on the far side said this window". The seam WT-677 implements.
+
+    Implementations must fail open (return None) rather than raise: an attribution is a label
+    on a line that is going to be published either way.
+    """
+
+    async def attribute(
+        self, meeting_id: str, window: SegmentWindow
+    ) -> FarSpeakerAttribution | None: ...
+
+
+def parse_hint(fields: Mapping[Any, Any]) -> FarSpeakerHint | None:
+    """One stream entry -> a hint, or None when it is not a usable one."""
+    data = {
+        (k.decode() if isinstance(k, bytes) else str(k)): (
+            v.decode() if isinstance(v, bytes) else str(v)
+        )
+        for k, v in fields.items()
+    }
+    name = " ".join(data.get("name", "").split())
+    if not name:
+        return None
+    try:
+        t_ms = int(float(data.get("t_ms", "")))
+    except ValueError:
+        return None
+    if t_ms <= 0:
+        return None
+    source = data.get("source", "").strip() or SOURCE_MEET_CAPTION
+    return FarSpeakerHint(name=name, t_ms=t_ms, source=source)
+
+
+def attribute_far_speaker(
+    segment_window: SegmentWindow,
+    hints: Iterable[FarSpeakerHint],
+    lag_ms: int,
+    max_gap_ms: int = 1500,
+) -> FarSpeakerAttribution | None:
+    """Pick the far-side speaker for one segment from caption hints. Pure.
+
+    Each hint is moved back by `lag_ms` (captions trail speech) to estimate when the words were
+    spoken. Then:
+
+    * Hints that land INSIDE the window vote; the name with the most votes wins (ties go to the
+      latest one, which is the speaker the window ends on). Confidence is that name's share of
+      the votes — 1.0 when every hint in the window agrees, lower when the window spans a
+      hand-over.
+    * Otherwise the hint NEAREST the window wins if it is within `max_gap_ms`, with a confidence
+      that decays from 0.5 to 0 across that gap - unless every hint within `max_gap_ms` of the
+      window carries that same name and at least one of them lies AFTER the window: then nobody
+      else could have said it, and the confidence decays from 0.85 to 0.6 instead.
+    * Otherwise None — no hint is a guess nobody should store.
+    """
+    start, end = segment_window.start_ms, segment_window.end_ms
+    if end < start:
+        start, end = end, start
+
+    inside: list[FarSpeakerHint] = []
+    nearest: tuple[int, FarSpeakerHint] | None = None
+    near_names: set[str] = set()
+    near_after = False
+    for hint in hints:
+        spoken_at = hint.t_ms - lag_ms
+        if start <= spoken_at <= end:
+            inside.append(hint)
+            continue
+        gap = start - spoken_at if spoken_at < start else spoken_at - end
+        if gap <= max_gap_ms:
+            near_names.add(hint.name.casefold())
+            near_after = near_after or spoken_at > end
+            if nearest is None or gap < nearest[0]:
+                nearest = (gap, hint)
+
+    if inside:
+        votes: dict[str, list[FarSpeakerHint]] = {}
+        for hint in inside:
+            votes.setdefault(hint.name.casefold(), []).append(hint)
+        _key, winners = max(
+            votes.items(), key=lambda item: (len(item[1]), max(h.t_ms for h in item[1]))
+        )
+        latest = max(winners, key=lambda h: h.t_ms)
+        return FarSpeakerAttribution(
+            name=latest.name,
+            source=latest.source,
+            confidence=round(len(winners) / len(inside), 3),
+            basis=BASIS_INSIDE,
+        )
+
+    if nearest is not None:
+        gap, hint = nearest
+        span = max(1, max_gap_ms)
+        if len(near_names) == 1 and near_after:
+            confidence = _SOLE_NEAR_HINT_MIN_CONFIDENCE + (
+                _SOLE_NEAR_HINT_MAX_CONFIDENCE - _SOLE_NEAR_HINT_MIN_CONFIDENCE
+            ) * (1.0 - gap / span)
+            return FarSpeakerAttribution(
+                name=hint.name,
+                source=hint.source,
+                confidence=round(confidence, 3),
+                basis=BASIS_SOLE_NEAR,
+            )
+        confidence = _NEAREST_HINT_MAX_CONFIDENCE * (1.0 - gap / span)
+        if confidence <= 0:
+            return None
+        return FarSpeakerAttribution(
+            name=hint.name,
+            source=hint.source,
+            confidence=round(confidence, 3),
+            basis=BASIS_NEAREST,
+        )
+    return None
+
+
+class CaptionHintTracker:
+    """FarSpeakerTracker over `meeting:{room}:far_speaker_hints`.
+
+    `read_hints(key, count)` returns newest-first stream entries — `redis.xrevrange` bound to a
+    client, in production. Injected so the tracker has no Redis dependency of its own and tests
+    can hand it a list.
+    """
+
+    def __init__(
+        self,
+        read_hints: Callable[[str, int], Awaitable[Sequence[tuple[Any, Mapping[Any, Any]]]]],
+        *,
+        lag_ms: int,
+        max_gap_ms: int,
+        scan_count: int = 64,
+        cache_ttl_s: float = 0.5,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._read_hints = read_hints
+        self._lag_ms = lag_ms
+        self._max_gap_ms = max_gap_ms
+        self._scan_count = scan_count
+        self._cache_ttl_s = cache_ttl_s
+        self._clock = clock
+        self._cache: dict[str, tuple[list[FarSpeakerHint], float]] = {}
+
+    async def _hints(self, meeting_id: str) -> list[FarSpeakerHint]:
+        now = self._clock()
+        cached = self._cache.get(meeting_id)
+        if cached is not None and now - cached[1] < self._cache_ttl_s:
+            return cached[0]
+        hints: list[FarSpeakerHint] = []
+        try:
+            entries = await self._read_hints(far_speaker_hints_key(meeting_id), self._scan_count)
+        except Exception:
+            entries = []
+        for _entry_id, fields in entries or []:
+            if not fields:
+                continue
+            hint = parse_hint(fields)
+            if hint is not None:
+                hints.append(hint)
+        self._cache[meeting_id] = (hints, now)
+        return hints
+
+    async def attribute(
+        self, meeting_id: str, window: SegmentWindow
+    ) -> FarSpeakerAttribution | None:
+        hints = await self._hints(meeting_id)
+        if not hints:
+            return None
+        return attribute_far_speaker(window, hints, self._lag_ms, self._max_gap_ms)
+
+    def forget(self, meeting_id: str) -> None:
+        self._cache.pop(meeting_id, None)

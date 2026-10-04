@@ -468,11 +468,19 @@ class AIAssistantWorker(BaseWorker):
             summary,
         )
 
-        # Publish to stream for gateway to consume via SignalR
+        # Publish to stream for gateway to consume via SignalR.
+        #
+        # `meeting_id` MUST be in the payload, not only in the stream key. BaseWorker.publish
+        # writes this same dict to `ai_assistant:results:{meeting_id}` AND to the flat
+        # `ai_assistant:results`, and the flat one is what the gateway's AiResultConsumerService
+        # reads — it routes by the `meeting_id` field, and an entry without one is skipped and
+        # never acked. Every summary ever published sat pending in `gateway-consumers` for that
+        # reason (WarpTalkAiPendingStuck). SuggestionResultMessage.to_redis() already carries it.
         await self.publish(
             "ai_assistant:results",
             meeting_id,
             {
+                "meeting_id": meeting_id,
                 "type": "summary",
                 "content": summary,
                 "timestamp_ms": str(int(time.time() * 1000)),
@@ -490,11 +498,12 @@ class AIAssistantWorker(BaseWorker):
             action_items,
         )
 
-        # Publish action items to stream
+        # Publish action items to stream — `meeting_id` in the payload for the same reason.
         await self.publish(
             "ai_assistant:results",
             meeting_id,
             {
+                "meeting_id": meeting_id,
                 "type": "action_items",
                 "content": action_items,
                 "timestamp_ms": str(int(time.time() * 1000)),

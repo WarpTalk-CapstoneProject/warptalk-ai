@@ -89,7 +89,9 @@ class FakeTranscriptService:
 
 def _ctx(service: FakeTranscriptService, registry: SourceRegistry | None = None) -> ToolContext:
     room_client = AsyncMock()
-    room_client.get.return_value = _response(200, {"id": MEETING_ID, "title": "Client call"})
+    room_client.get.return_value = _response(
+        200, {"id": MEETING_ID, "workspaceId": "ws-1", "title": "Client call"}
+    )
     transcript_client = AsyncMock()
     transcript_client.get.side_effect = service.get
     return ToolContext(
@@ -213,15 +215,26 @@ class TestBeforeSequencePaging:
         assert result["omittedEarlier"] is False
         assert "note" not in result
 
-    async def test_nothing_precedes_the_first_segment(self) -> None:
+    async def test_filler_positions_read_by_range_instead(self) -> None:
+        """Prod, 3 Oct 2026: the model sends before_sequence=0 (a type-shaped blank) and, once
+        that is refused, 1 — "before the first segment", which is always nothing. Every
+        in-meeting transcript question returned `segments: []` beside `totalSegments: 40`."""
+        for filler in (0, 1, "0", "1"):
+            service = FakeTranscriptService(_segments(list(range(1, 41))))
+
+            latest = await _call(service, before_sequence=filler)
+
+            assert _numbers(latest) == list(range(1, 41)), filler
+            assert "error" not in latest
+
         service = FakeTranscriptService(_segments(list(range(1, 501))))
-
-        result = await _call(service, before_sequence=1)
-
-        assert result["segments"] == []
-        assert result["returnedFrom"] is None
-        assert result["omittedEarlier"] is False
-        assert "marker" not in result
+        assert _numbers(await _call(service, range="latest", before_sequence=0)) == list(
+            range(301, 501)
+        )
+        service = FakeTranscriptService(_segments(list(range(1, 501))))
+        assert _numbers(await _call(service, range="beginning", before_sequence=1)) == list(
+            range(1, 201)
+        )
 
     async def test_holes_in_the_numbering_still_give_a_full_exact_window(self) -> None:
         """A failed save burns a sequence number, so index arithmetic overshoots; the window is
@@ -258,7 +271,7 @@ class TestBeforeSequencePaging:
         assert _numbers(await _call(service, before_sequence="301")) == list(range(101, 301))
 
     async def test_invalid_positions_are_refused_before_any_request(self) -> None:
-        for bad in (0, -5, "soon", True, 1.5j):
+        for bad in (-5, "soon", True, 1.5j):
             service = FakeTranscriptService(_segments([1, 2, 3]))
 
             result = await _call(service, before_sequence=bad)

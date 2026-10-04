@@ -33,6 +33,8 @@ THE RULE
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 # The value MeetingRoomService.EndMeetingAsync publishes. A wire constant: changing it means
 # changing that publisher in the same release.
 MEETING_END_MARKER = "__MEETING_END__"
@@ -92,3 +94,20 @@ def is_external_bridge_speaker(speaker_id: str | None) -> bool:
     if not speaker_id:
         return False
     return speaker_id.strip().lower() == EXTERNAL_BRIDGE_SPEAKER_ID
+
+
+def is_external_bridge_room(speak_languages: Iterable[str | bytes] | None) -> bool:
+    """True when a room's `translationRoom:{id}:speak_languages` hash seats the stand-in.
+
+    Pass the hash (or just its field names). TranslationRoomHub keys that hash by participant
+    identity, and only an EXTERNAL_BRIDGE (Google Meet) room ever has the stand-in seat in it,
+    so its presence is what tells a bridge room from a native meeting room — no separate room
+    type reaches the AI workers. Before the stand-in has joined the answer is False, so callers
+    must re-check rather than remember a negative.
+    """
+    for field in speak_languages or ():
+        if isinstance(field, bytes):
+            field = field.decode("utf-8", errors="replace")
+        if is_external_bridge_speaker(field):
+            return True
+    return False

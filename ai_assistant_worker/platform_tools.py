@@ -394,6 +394,13 @@ _INSIGHT_ENDPOINTS: dict[str, tuple[str, str]] = {
 }
 
 
+# Every money figure billing reports is USD, the accounting currency since 2026-10-02 (VND payments
+# arrive converted at their day's Stripe rate). Said in the payload, because a bare 741.0 next to
+# "revenue" is a number the model will otherwise label with whatever currency it guesses — and it
+# guessed VND, the platform's old currency, from the Vietnamese context around it.
+MONEY_CURRENCY = "USD"
+
+
 def _metrics(body: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for metric in body.get("metrics") or []:
@@ -406,6 +413,8 @@ def _metrics(body: dict[str, Any]) -> list[dict[str, Any]]:
             "unit": metric.get("unit"),
             "higher_is_better": metric.get("higherIsBetter"),
         }
+        if metric.get("unit") == "money":
+            row["currency"] = MONEY_CURRENCY
         if metric.get("note"):
             row["note"] = metric["note"]
         out.append(row)
@@ -458,6 +467,7 @@ async def _get_platform_insights(ctx: ToolContext, arguments: dict[str, Any]) ->
             else "the equally long period just before"
         ),
         "time_zone": PLATFORM_TIME_ZONE,
+        "money_currency": MONEY_CURRENCY,
     }
     payload = _cited(ctx, f"Insights · {window['label']}", link, payload)
 
@@ -830,6 +840,7 @@ async def _billing_snapshot(ctx: ToolContext, _arguments: dict[str, Any]) -> dic
         "Insights · Right now",
         "/admin",
         {
+            "money_currency": MONEY_CURRENCY,
             "revenue_today": body.get("revenueToday"),
             "revenue_yesterday": body.get("revenueYesterday"),
             "mrr": body.get("mrr"),

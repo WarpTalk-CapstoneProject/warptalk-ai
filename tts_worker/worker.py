@@ -20,14 +20,19 @@ import functools
 import hashlib
 import json
 import time
-from collections.abc import Mapping
+import unicodedata
+import uuid
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from shared import isochrony
-from shared.base_worker import BaseWorker
+from shared.base_worker import TERMINAL_ROOM_STATUSES, BaseWorker
 from shared.config import TTSSettings
+from shared.control_markers import EXTERNAL_BRIDGE_SPEAKER_ID, is_external_bridge_speaker
+from shared.far_speaker import CaptionHintTracker, SegmentWindow
 from shared.integration_status import (
     CARTESIA,
     LIVEKIT,
@@ -36,6 +41,7 @@ from shared.integration_status import (
     livekit_report,
 )
 from shared.lang import base_language, is_same_language
+from shared.languages import known_language_code
 from shared.platform_settings import (
     FLAG_VOICE_CLONE,
     VOICE_CLONE_MIN_SECONDS,
@@ -44,10 +50,18 @@ from shared.platform_settings import (
 from shared.prosody import SPEED_MAX, Arousal, Delivery, Valence, to_generation_config
 from shared.provider_calls import classify_exception, record_provider_call
 from shared.schemas import AudioChunkMessage, TranslationResultMessage, TTSResultMessage
+from tts_worker import far_speaker_clone, prosody_context
 from tts_worker.clone_sample_quality import MAX_SAMPLE_SCORE, assess_clone_sample
-from tts_worker.livekit_publisher import LiveKitTTSPublisher, TrackStream
+from tts_worker.far_speaker_clone import FarCloneState, FarKey
+from tts_worker.livekit_publisher import (
+    AUDIO_SOURCE_QUEUE_MS,
+    FRAME_MS,
+    LiveKitTTSPublisher,
+    TrackStream,
+    interpreter_identity,
+)
 from tts_worker.prosody_context import ProsodyContext, wav_header
-from tts_worker.synthesizer import CartesiaSynthesizer
+from tts_worker.synthesizer import CartesiaSynthesizer, GenerationLease
 
 # Standard WAV header size for the pcm_s16le format CartesiaSynthesizer requests —
 # used to strip the header before feeding audio into the LiveKit track (which wants
@@ -91,6 +105,11 @@ _CLONE_RESULT_TTL_SECONDS = 7 * 24 * 60 * 60
 _IN_MEETING_VOICE_PREFIX = "speaker-"
 _UPLOAD_VOICE_PREFIX = "profile-"
 
+# How much WORSE a longer ladder rung's clip may score than the shorter one in use and still
+# replace it. The score is a pitch-range estimate; a longer reference of the same person is the
+# better clone even when that estimate wobbles down a little.
+_LADDER_SCORE_TOLERANCE = 0.1
+
 # WT-D — "what will I actually sound like in a meeting?"
 #
 # Same shape as the clone hand-off above and for the same reason: the Cartesia key lives only on
@@ -107,6 +126,60 @@ _PREVIEW_RESULT_PREFIX = "voice:preview:"
 # deleted takes its preview with it at the next expiry. A day keeps repeat plays free without
 # holding audio for a voice nobody has touched in a week.
 _PREVIEW_RESULT_TTL_SECONDS = 24 * 60 * 60
+
+# WT-932 — one stock voice per person on the Meet side of a bridge room.
+#
+# Everyone in the Meet call is published under ONE stand-in speaker_id, so the hashed default
+# voice gave the whole far side a single voice. The caption name translation_worker now forwards
+# (TranslationResultMessage.far_speaker_name) is the only thing that can tell two of them apart,
+# and it is a guess: STT matched caption hints to the segment's audio window.
+#
+# Only a certain guess is acted on. 1.0 means every caption hint inside the segment named this
+# person; anything lower is a hand-over between speakers or the nearest-hint path (capped at 0.5).
+# Acting on those would be worse than doing nothing: a wrong name puts one person's words in
+# ANOTHER person's voice, which a listener reads as that other person saying them, whereas the
+# shared stand-in voice is merely uninformative. Below this the segment keeps today's voice.
+FAR_SPEAKER_VOICE_MIN_CONFIDENCE = 1.0
+# field = short hash of the far-speaker key, value = the catalog voice it was given. Keyed by
+# meeting AND language because catalogs are per language. See _far_speaker_voice_id.
+_FAR_SPEAKER_VOICES_PREFIX = "tts:far_speaker_voices:"
+# hset has no TTL of its own. Refreshed whenever a new name is given a voice, so it outlives any
+# meeting that is still meeting new people and is gone a day after the last one.
+_FAR_SPEAKER_VOICES_TTL_SECONDS = 24 * 60 * 60
+
+
+def far_speaker_voice_key(
+    speaker_id: str, far_speaker_name: str | None, far_speaker_confidence: float | None
+) -> str | None:
+    """The per-person key a bridge stand-in segment's stock voice is chosen for, or None.
+
+    None is "today's voice", and it is the answer for everything except a stand-in segment whose
+    caption name is certain: a native speaker (the gate is the stand-in id — stray far_speaker
+    fields on anyone else are ignored), a segment nobody named, and a name below
+    FAR_SPEAKER_VOICE_MIN_CONFIDENCE.
+
+    The name is folded (NFKC, casefold, whitespace collapsed) so "Trần  An" and "trần an" are one
+    person with one voice. The key starts with the stand-in id so it can never equal a real
+    participant's id in the persona hash.
+    """
+    if not is_external_bridge_speaker(speaker_id):
+        return None
+    if far_speaker_confidence is None or far_speaker_confidence < FAR_SPEAKER_VOICE_MIN_CONFIDENCE:
+        return None
+    name = " ".join(unicodedata.normalize("NFKC", far_speaker_name or "").casefold().split())
+    if not name:
+        return None
+    return f"{EXTERNAL_BRIDGE_SPEAKER_ID}:{name}"
+
+
+def far_speaker_voice_field(far_key: str) -> str:
+    """What stands for a far-speaker key in Redis and in logs: a short hash, never the name.
+
+    This is a person's display name from someone else's call, and neither Redis keys nor logs
+    are a place for it.
+    """
+    return hashlib.sha256(far_key.encode()).hexdigest()[:12]
+
 
 # What the preview says, per language.
 #
@@ -248,6 +321,12 @@ _PERMANENT_CLONE_REFUSALS = frozenset(
 )
 
 
+def _discard_on_done(
+    pending: set[tuple[str, str]], key: tuple[str, str], _task: asyncio.Task[Any]
+) -> None:
+    pending.discard(key)
+
+
 def _settle_live_clone(
     task: asyncio.Task[Any],
     *,
@@ -287,6 +366,26 @@ def _settle_live_clone(
     if outcome in _PERMANENT_CLONE_REFUSALS:
         clone_refused.add(key)
 
+
+def _settle_far_clone(
+    task: asyncio.Task[Any], *, key: FarKey, in_flight: set[FarKey], refused: set[FarKey]
+) -> None:
+    """A far-speaker clone call has ended: let that name be captured again, or never (WT-933).
+
+    The far path has no upgrade and so no score to walk back, which is all of what
+    _settle_live_clone does beyond this. A refusal no later clip can change stops the capture for
+    that name; anything else (a clip the vendor could not use, consent withdrawn mid-call, an
+    outage) simply lets the next clip try.
+    """
+    in_flight.discard(key)
+    if task.cancelled() or task.exception() is not None:
+        return
+    if task.result() in _PERMANENT_CLONE_REFUSALS:
+        refused.add(key)
+
+
+# What `_clone_and_cache` answers when the person withdrew while Cartesia was still cloning them.
+_FAR_CLONE_CONSENT_WITHDRAWN = "CONSENT_WITHDRAWN"
 
 # WT-B — a clone that outlives the meeting it was made in.
 #
@@ -402,6 +501,18 @@ def _clone_language(hint: str) -> str:
 #: one (see the 2.6s hub window this repeatedly loses).
 _UNRESOLVED_LANGUAGES = {"", "auto", "unknown", "und"}
 
+#: How often dub tracks are checked against the room's current languages — see
+#: TTSWorker._reconcile_dub_targets. Two HGETALLs per GOOGLE MEET BRIDGE room with a live dub
+#: track, per pass; native meeting rooms are never reconciled.
+_DUB_TARGET_RECONCILE_S = 3.0
+#: How long a room found NOT to be a bridge room (no stand-in seat in speak_languages yet) is
+#: trusted before one HGET re-checks it — the stand-in may join after the first dub track. A
+#: positive answer is kept for the room's lifetime.
+_BRIDGE_ROOM_RECHECK_S = 30.0
+#: A sentence already in flight when the speaker re-picked may still publish on the old track a
+#: moment after the change was seen; that is not translation still feeding it.
+_DUB_TARGET_CHANGE_GRACE_S = 5.0
+
 
 def _resolve_clone_language(hint: str) -> str | None:
     """The language to clone in, or None when we do not yet know one.
@@ -427,6 +538,67 @@ def _resolve_clone_language(hint: str) -> str | None:
     if normalized in _UNRESOLVED_LANGUAGES:
         return None
     return _clone_language(normalized)
+
+
+class SentencePartiallySpokenError(RuntimeError):
+    """Synthesis failed after part of the sentence had already reached the listener.
+
+    Never retried: whatever comes back would start from the sentence's first word again. The
+    vendor's own error is the `__cause__`, and that is what gets classified and reported.
+    """
+
+
+# Failures about the moment rather than the request — worth one more try. Everything else,
+# notably every 4xx (`quota` 402, `auth` 401/403, `rate_limited` 429, `client_error`), answers the
+# same way next time, and an unclassifiable `error` is more likely a bug than a blip.
+_RETRYABLE_SYNTHESIS_OUTCOMES = frozenset({"network_error", "server_error", "timeout"})
+
+
+def _vendor_error(error: BaseException) -> BaseException:
+    """The provider's own exception, unwrapped from the partially-spoken marker if present."""
+    if isinstance(error, SentencePartiallySpokenError) and error.__cause__ is not None:
+        return error.__cause__
+    return error
+
+
+# A wait for a Cartesia slot shorter than this is the event loop, not the gate, and is not logged.
+# One audio frame: nothing below it is audible. Every wait is still recorded as `tts_slot_wait`.
+_SLOT_WAIT_LOG_MS = 20
+
+
+@dataclass(slots=True, eq=False)
+class _OpenContext:
+    """A Cartesia prosody context this worker holds open, and what has to end with it.
+
+    `slot` is the context's claim on the plan's concurrency: taken just before its first push and
+    given back only when its end is confirmed (`_end_context`). Cartesia counts an open context
+    whether it is generating or sitting idle between two sentences (measured 2026-10-01, see
+    tts_worker/prosody_context.py), so the claim lives exactly as long as the context does — one
+    per context, never one per sentence.
+    """
+
+    prosody: ProsodyContext
+    connection: Any
+    slot: GenerationLease
+    #: Pending while the context waits, idle, for a sentence already queued; see _after_flush.
+    idle_timer: asyncio.TimerHandle | None = None
+    #: Taken out of service. Ending is idempotent, and a retired context is never spoken on.
+    retired: bool = False
+
+    def cancel_idle_timer(self) -> None:
+        if self.idle_timer is not None:
+            self.idle_timer.cancel()
+            self.idle_timer = None
+
+
+def _decode_hash(raw: Mapping[Any, Any] | None) -> dict[str, str]:
+    """A Redis hash as the client returns it (bytes or str, either side) -> str to str."""
+    return {
+        (k.decode() if isinstance(k, bytes) else str(k)): (
+            v.decode() if isinstance(v, bytes) else str(v)
+        )
+        for k, v in (raw or {}).items()
+    }
 
 
 def _decode_field(data: Mapping[Any, Any], key: str) -> str:
@@ -462,6 +634,14 @@ class SynthesizedSentence:
     voice_id: str
     already_spoken: bool = False
     first_audio_at: float | None = None
+    #: How long this sentence waited for a Cartesia concurrency slot. Zero for a sentence spoken
+    #: on a context that was already open (it holds that context's slot) and whenever a slot was
+    #: free. Non-zero is queueing in this process — the one kind of Cartesia queueing that can
+    #: be seen at all, since the vendor's own makes no noise.
+    slot_wait_ms: int = 0
+    #: Spoken on a context that was already open — a prosodic continuation of the sentence
+    #: before it, rather than a fresh context.
+    continued: bool = False
 
 
 def _extract_tts_key(
@@ -520,6 +700,9 @@ class TTSWorker(BaseWorker):
     # a clone, a preview, or a meeting's audio.
     _voice_delete_group = "tts-voice-delete-workers"
     _running = True
+    # How many translate:results messages one process may hold dispatched-and-unacknowledged.
+    # See _consume_loop for why this is not the Cartesia limit and not small.
+    _MAX_IN_FLIGHT = 32
 
     def __init__(
         self,
@@ -533,15 +716,28 @@ class TTSWorker(BaseWorker):
         # (meeting_id, speaker_id, target_lang) -> lock serializing that key's own
         # messages — see _consume_loop for why.
         self._key_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        # Message ids consume_pipelined has dispatched and not yet finished; see _is_in_flight.
+        self._in_flight_ids: set[bytes] = set()
         # The furthest-along sentence this key has already SPOKEN, by its position in the
         # speaker's own timeline. Read and written only while that key's lock is held, so a
-        # plain dict is safe for the same reason `_turns` below is.
+        # plain dict is safe for the same reason `_contexts` below is.
         self._spoken_start_ms: dict[tuple[str, str, str], int] = {}
-        # One in-flight spoken turn per (meeting, speaker, language, voice). The per-key lock
-        # above is what makes a plain dict safe here: a key's sentences are processed one at a
-        # time, so a turn can never be pushed into concurrently.
-        self._turns: dict[tuple[str, ...], ProsodyContext] = {}
-        self._turn_connections: dict[tuple[str, ...], Any] = {}
+        # (start_ms, chunk_index) of the furthest sentence each key has started dubbing — what a
+        # reclaimed message is checked against so it cannot play after newer lines. Same lock
+        # discipline as _spoken_start_ms. See _process_reclaimed.
+        self._dub_position_by_key: dict[tuple[str, str, str], tuple[int, int]] = {}
+        # At most one open Cartesia context per (meeting, speaker, language, voice key, voice).
+        # Normally empty between sentences: a context is ended at its sentence's flush_done
+        # unless the next sentence for the same key is already queued — see _after_flush. The
+        # per-key lock above is what makes a plain dict safe here: a key's sentences are
+        # processed one at a time, so a context can never be pushed into concurrently.
+        self._contexts: dict[tuple[str, ...], _OpenContext] = {}
+        # Messages per (meeting, speaker, target_lang) that this process has in hand: dispatched
+        # and not yet finished, the one holding the key's lock included. More than one means the
+        # next sentence is already queued behind the current one. See _sentence_waiting.
+        self._key_backlog: dict[tuple[str, str, str], int] = {}
+        # Contexts being ended off the sentence path: close, wait for `done`, release the slot.
+        self._retiring: set[asyncio.Task[None]] = set()
         # Isochrony state, per (meeting, speaker, target language): how this speaker's dubs have
         # been running against the clock, and the turn currently being accumulated.
         self._dub_fits: dict[tuple[str, str, str], isochrony.DubFit] = {}
@@ -564,6 +760,9 @@ class TTSWorker(BaseWorker):
         asyncio.create_task(self._consume_upload_clone_requests())
         asyncio.create_task(self._consume_preview_requests())
         asyncio.create_task(self._consume_voice_delete_requests())
+        asyncio.create_task(self._reconcile_dub_targets_loop())
+        if self.tts_settings.far_speaker_clone_enabled:
+            asyncio.create_task(self._watch_far_clone_consents())
         if self.tts_settings.orphan_voice_sweep_enabled:
             asyncio.create_task(self._sweep_orphan_voices())
         if self.tts_settings.voice_catalog_warm_enabled:
@@ -588,6 +787,53 @@ class TTSWorker(BaseWorker):
         """`meetings.voice_clone.min_sample_seconds`; falls back to the TTS_ env value."""
         return await self.platform_settings().get_float(
             VOICE_CLONE_MIN_SECONDS, float(self.tts_settings.voice_clone_min_seconds)
+        )
+
+    def _clone_ladder(self, min_seconds: float) -> tuple[float, ...]:
+        """Every rung a voice-less speaker is cloned at, ascending; min_seconds is always one."""
+        rungs = {float(s) for s in self.tts_settings.voice_clone_ladder_seconds if s > 0}
+        rungs.add(float(min_seconds))
+        return tuple(sorted(rungs))
+
+    def _first_clone_waits(self) -> dict[tuple[str, str], tuple[asyncio.Task[Any], float]]:
+        waits: dict[tuple[str, str], tuple[asyncio.Task[Any], float]] | None = getattr(
+            self, "_first_clone_wait_tasks", None
+        )
+        if waits is None:
+            waits = {}
+            self._first_clone_wait_tasks = waits
+        return waits
+
+    def _mark_first_clone_pending(self, key: tuple[str, str], task: asyncio.Task[Any]) -> None:
+        deadline = time.monotonic() + self.tts_settings.voice_clone_first_wait_ms / 1000.0
+        waits = self._first_clone_waits()
+        waits[key] = (task, deadline)
+        task.add_done_callback(lambda _t: waits.pop(key, None))
+
+    async def _await_first_clone(self, meeting_id: str, speaker_id: str) -> None:
+        """Hold a dub, briefly, for a speaker whose very first voice is at the vendor right now.
+
+        Bounded by voice_clone_first_wait_ms from when the clone STARTED, not from now — the
+        clip was taken from the same chunk this dub translates, so most of the budget has
+        usually been spent by STT and translation before this is reached. A clone that fails or
+        overruns costs at most that budget, and the dub goes out in the catalog voice as before.
+        """
+        entry = self._first_clone_waits().get((meeting_id, speaker_id))
+        if entry is None:
+            return
+        task, deadline = entry
+        remaining = deadline - time.monotonic()
+        if task.done() or remaining <= 0:
+            return
+        started = time.monotonic()
+        with suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+        self.logger.info(
+            "dub_waited_for_first_clone",
+            meeting_id=meeting_id,
+            speaker_id=speaker_id,
+            waited_ms=int((time.monotonic() - started) * 1000),
+            ready=task.done(),
         )
 
     async def _clone_upgrade_margin(self) -> float:
@@ -632,35 +878,54 @@ class TTSWorker(BaseWorker):
         little same-key pipelining (sentence 2 can't start synthesizing until sentence
         1's audio has fully been pushed to the track) for guaranteed in-order playback —
         the right trade-off, since real speech itself paces how fast new same-key
-        sentences even arrive.
+        sentences even arrive. asyncio.Lock is FIFO and consume_pipelined starts handlers
+        in stream order, so a key's sentences take the lock in the order they arrived.
 
-        RedisStreamClient.consume_concurrent ties XACK to successful handler
-        completion. Failed work remains pending for BaseWorker's reclaim/DLQ path.
+        KEEPS READING WHILE DUBS PLAY. This used consume_concurrent(), which reads 8 and
+        waits for all 8 before reading again — and a TTS message lasts as long as its dub
+        takes to PLAY, because the audio is streamed onto the track in real time. Speaker B's
+        new sentence therefore waited, unread, behind the last sentence of speaker A's whole
+        batch. consume_pipelined() reads again as soon as a place frees up.
+
+        `_MAX_IN_FLIGHT` is larger than the old batch on purpose: most in-flight messages are
+        not doing anything — they are queued behind their own key's lock while that key's
+        previous sentence plays. Counting those against a small bound would let one fast
+        speaker's backlog fill every place and block a different speaker's first sentence
+        from being read at all. Cartesia itself is bounded separately and much more tightly
+        (generation_slot), so this bound is only about how much unacknowledged work one
+        process may hold.
+
+        WHAT IS QUEUED BEHIND A KEY IS ALSO WHAT DECIDES ITS CARTESIA CONTEXT. A message that is
+        dispatched and waiting for its key's lock is the next sentence "already in hand", and
+        only then is the key's context left open past a sentence (see _after_flush): an open
+        context holds a Cartesia concurrency slot whether or not it is generating.
+
+        XACK is still tied to each handler's own successful completion; failed work remains
+        pending for BaseWorker's reclaim/dead-letter path, which runs between reads and puts a
+        reclaimed message through the same per-key lock (_process_reclaimed) and skips one that
+        is merely queued here (_is_in_flight).
         """
         self.logger.info(
             "consume_loop_started",
             stream=self.input_stream,
             group=self.consumer_group,
             consumer=self._consumer_name,
+            max_in_flight=self._MAX_IN_FLIGHT,
         )
-
-        async def _run(message_id: bytes, data: dict[bytes, bytes]) -> None:
-            key = _extract_tts_key(data)
-            lock = self._key_locks.setdefault(key, asyncio.Lock())
-            async with lock:
-                await self._process_and_log_errors(message_id, data)
 
         while not self._shutdown_event.is_set():
             try:
-                await self._recover_stale_messages()
-                await self.redis.consume_concurrent(
+                await self.redis.consume_pipelined(
                     stream=self.input_stream,
                     group=self.consumer_group,
-                    handler=_run,
+                    handler=self._run_in_key_order,
+                    keep_running=lambda: not self._shutdown_event.is_set(),
                     consumer=self._consumer_name,
                     block_ms=2000,
                     count=8,
-                    concurrency=8,
+                    max_in_flight=self._MAX_IN_FLIGHT,
+                    in_flight_ids=self._in_flight_message_ids(),
+                    between_reads=self._recover_stale_messages,
                 )
             except asyncio.CancelledError:
                 raise
@@ -668,40 +933,632 @@ class TTSWorker(BaseWorker):
                 self.logger.exception("consume_loop_error")
                 await asyncio.sleep(1.0)
 
+    def _key_lock(self, data: Mapping[Any, Any]) -> asyncio.Lock:
+        key = _extract_tts_key(data)
+        return self._key_locks.setdefault(key, asyncio.Lock())
+
+    async def _run_in_key_order(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        key = _extract_tts_key(data)
+        # Counted BEFORE waiting for the lock: a message queued behind the one speaking is
+        # exactly the "next sentence already in hand" that may keep a context open.
+        with self._in_hand(key):
+            async with self._key_lock(data):
+                try:
+                    await self._process_and_log_errors(message_id, data)
+                finally:
+                    self._close_drained_contexts(key)
+
+    def _key_backlog_counts(self) -> dict[tuple[str, str, str], int]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        backlog: dict[tuple[str, str, str], int] | None = getattr(self, "_key_backlog", None)
+        if backlog is None:
+            backlog = {}
+            self._key_backlog = backlog
+        return backlog
+
+    @contextmanager
+    def _in_hand(self, key: tuple[str, str, str]) -> Iterator[None]:
+        """Count one message for `key` from dispatch until it has finished."""
+        backlog = self._key_backlog_counts()
+        backlog[key] = backlog.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = backlog.get(key, 1) - 1
+            if remaining > 0:
+                backlog[key] = remaining
+            else:
+                backlog.pop(key, None)
+
+    def _sentence_waiting(self, key: tuple[str, str, str]) -> bool:
+        """Whether another message for this (meeting, speaker, target_lang) is already in hand
+        behind the one being processed.
+
+        "In hand" is precise and deliberately narrow: dispatched by the consume loop and waiting
+        for this key's lock (or a reclaimed one doing the same). Not "likely to arrive soon" — a
+        guess would mean holding a Cartesia slot on spec, and that is the bug this replaces. A
+        message read from Redis in the same instant as the check, whose task has not taken its
+        first step yet, is missed; that costs one continuation, never a sentence.
+        """
+        return self._key_backlog_counts().get(key, 0) > 1
+
+    def _close_drained_contexts(self, key: tuple[str, str, str]) -> None:
+        """End every context of this key once nothing more is queued for it.
+
+        Runs as each message finishes, still under the key's lock. The flush_done decision
+        (_after_flush) already ends a context the moment its sentence has been generated; this
+        catches what that cannot see — a context kept open for a queued message that then never
+        spoke on it (a cache hit, a skip, a voice variant that changed, a failure before
+        synthesis), which would otherwise sit holding a slot until its idle expiry.
+        """
+        if self._sentence_waiting(key):
+            return
+        for context_key, context in list(self._open_contexts().items()):
+            if context_key[:3] == key:
+                self._retire_context(context_key, context)
+
+    def _in_flight_message_ids(self) -> set[bytes]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        ids: set[bytes] | None = getattr(self, "_in_flight_ids", None)
+        if ids is None:
+            ids = set()
+            self._in_flight_ids = ids
+        return ids
+
+    def _is_in_flight(self, message_id: bytes) -> bool:
+        return message_id in self._in_flight_message_ids()
+
+    async def _process_reclaimed(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        # Through the key's lock like any other message: reclaiming now happens while other
+        # messages are still running, and a reclaimed sentence must not be pushed onto a track
+        # in the middle of another sentence for the same key.
+        key = _extract_tts_key(data)
+        with self._in_hand(key):
+            async with self._key_lock(data):
+                try:
+                    await self._process_reclaimed_in_order(message_id, data)
+                finally:
+                    self._close_drained_contexts(key)
+
+    async def _process_reclaimed_in_order(
+        self, message_id: bytes, data: dict[bytes, bytes]
+    ) -> None:
+        """_process_reclaimed's body, under the key's lock."""
+        newer = self._newer_dub_already_started(data)
+        if newer is not None:
+            # A LATE RETRY MUST NOT PLAY OUT OF ORDER. A reclaimed message is at least
+            # _reclaim_min_idle_ms old — minutes, in a live meeting — and if this speaker has
+            # been dubbed past it since, speaking it now would drop a stale line into the
+            # middle of the conversation. Parked instead (returning acks it), so it is
+            # recorded and replayable rather than spoken in the wrong place.
+            attempts = await self.redis.pending_delivery_count(
+                self.input_stream, self.consumer_group, message_id
+            )
+            await self._dead_letter(
+                message_id,
+                data,
+                attempts=attempts,
+                reason="superseded",
+                details={"superseded_by_position": f"{newer[0]}:{newer[1]}"},
+            )
+            return
+        await self._process_and_log_errors(message_id, data)
+
+    def _dub_positions(self) -> dict[tuple[str, str, str], tuple[int, int]]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        positions: dict[tuple[str, str, str], tuple[int, int]] | None = getattr(
+            self, "_dub_position_by_key", None
+        )
+        if positions is None:
+            positions = {}
+            self._dub_position_by_key = positions
+        return positions
+
+    @staticmethod
+    def _dub_position(translation: TranslationResultMessage) -> tuple[int, int]:
+        """Where a sentence sits in its speaker's own timeline: the turn's start, then which
+        sentence of that turn. start_ms alone is shared by every sentence of one turn."""
+        return translation.start_ms, translation.chunk_index
+
+    def _note_dub_started(self, translation: TranslationResultMessage) -> None:
+        """Record the furthest-along sentence this key has started dubbing. Under the key lock."""
+        positions = self._dub_positions()
+        key = self._fit_key(translation)
+        position = self._dub_position(translation)
+        if position > positions.get(key, (-1, -1)):
+            positions[key] = position
+
+    def _newer_dub_already_started(self, data: Mapping[Any, Any]) -> tuple[int, int] | None:
+        """The position of a LATER sentence of this key that has already been dubbed, or None.
+
+        Only knows what this process has seen: after a restart the map is empty and a reclaimed
+        message is dubbed as before. A malformed payload answers None and is left to process(),
+        which fails it the way it always has.
+        """
+        try:
+            translation = TranslationResultMessage.from_redis(dict(data))
+        except Exception:
+            return None
+        if translation.start_ms <= 0:
+            # No timeline position (an older producer, or a test message): chunk_index alone
+            # restarts every turn, so it cannot say what is newer. Not judged, not parked.
+            return None
+        newest = self._dub_positions().get(self._fit_key(translation))
+        if newest is not None and newest > self._dub_position(translation):
+            return newest
+        return None
+
     async def _cleanup(self) -> None:
-        """Drain the Cartesia connection pool on shutdown.
+        """End every open Cartesia context, then drain the connection pool, on shutdown.
 
         Without this a redeploy leaves however many sockets the pool held open on the vendor's
         side until they time out — small, but it is the kind of leak this worker has already
-        been caught doing once with cloned voices.
+        been caught doing once with cloned voices. Contexts first, because each holds a socket
+        of its own that the pool knows nothing about.
         """
+        for key, context in list(self._open_contexts().items()):
+            self._retire_context(key, context, abandon=True)
+        retiring = set(self._retiring_contexts())
+        if retiring:
+            await asyncio.wait(retiring, timeout=prosody_context.CONTEXT_CLOSE_ACK_SECONDS * 2)
         cartesia = getattr(self, "cartesia", None)
         if cartesia is not None:
             await cartesia.close()
+
+    async def _reconcile_dub_targets_loop(self) -> None:
+        """Run _reconcile_dub_targets every _DUB_TARGET_RECONCILE_S until shutdown."""
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(_DUB_TARGET_RECONCILE_S)
+            try:
+                await self._reconcile_dub_targets()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A missed pass costs what this exists to remove, at most one idle timeout.
+                self.logger.exception("dub_target_reconcile_failed")
+
+    async def _is_bridge_room(self, meeting_id: str, speaker_ids: Iterable[str]) -> bool:
+        """Whether this meeting is a Google Meet EXTERNAL_BRIDGE room, cached per room.
+
+        Free when this process already dubs the stand-in (a speaker id is the stand-in's);
+        otherwise one HGET of the stand-in's field in `speak_languages` — only an
+        EXTERNAL_BRIDGE room seats it (shared.control_markers.is_external_bridge_room). A
+        positive is kept until _cleanup_room; a negative is re-checked after
+        _BRIDGE_ROOM_RECHECK_S, so a room whose stand-in joins late is picked up. An
+        unreadable answer counts as "not bridge" for this pass and is not cached.
+        """
+        cache: dict[str, float | None] | None = getattr(self, "_dub_bridge_rooms", None)
+        if cache is None:
+            cache = {}
+            self._dub_bridge_rooms = cache
+        if meeting_id in cache:
+            checked_at = cache[meeting_id]
+            if checked_at is None:
+                return True
+            if time.monotonic() - checked_at < _BRIDGE_ROOM_RECHECK_S:
+                return False
+        if any(is_external_bridge_speaker(speaker_id) for speaker_id in speaker_ids):
+            cache[meeting_id] = None
+            return True
+        try:
+            seat = await self.redis.hget(
+                f"translationRoom:{meeting_id}:speak_languages", EXTERNAL_BRIDGE_SPEAKER_ID
+            )
+        except Exception:
+            # Cached like a "no": while Redis is down this would otherwise warn every pass.
+            self.logger.warning("dub_bridge_room_unreadable", meeting_id=meeting_id, exc_info=True)
+            cache[meeting_id] = time.monotonic()
+            return False
+        if seat is not None:
+            cache[meeting_id] = None
+            return True
+        cache[meeting_id] = time.monotonic()
+        return False
+
+    async def _reconcile_dub_targets(self) -> int:
+        """Retire dub tracks whose (speaker, target language) stopped being a target.
+
+        GOOGLE MEET BRIDGE ROOMS ONLY (_is_bridge_room). A native meeting room is skipped before
+        any of the reads below and keeps the previous behaviour: its tracks leave on the idle
+        sweep and nothing else.
+
+        A MID-MEETING LANGUAGE CHANGE REACHES THIS WORKER ONLY AS THE ABSENCE OF MESSAGES
+            Translation fans out per utterance from the room's hashes (translation_worker
+            _get_target_languages), so a change is followed on the next sentence: a NEW target
+            gets a bot on its first message. A target that DISAPPEARS just stops receiving
+            messages, and its bot used to sit in the room until the idle sweep — up to
+            SESSION_IDLE_TIMEOUT_S plus a reaper interval. While it is there the web client
+            mutes the speaker's microphone for that language's listeners. So the bridge host
+            who switches from vi to en, in a room whose Meet side listens in en, went silent on
+            the Meet side for over a minute: no dub (same language) and no microphone (a dub
+            track still existed).
+
+        THE CONTRACT (TranslationRoomHub, written by SetSpeakLanguage / SetListenLanguage /
+        SetExternalMeetingLanguage, keyed by participant identity — the stand-in's is
+        00000000-0000-0000-0000-00000000b21d):
+            translationRoom:{id}:languages        listen language per participant
+            translationRoom:{id}:speak_languages  speak language per participant ("auto" = unpinned)
+        Polled, because nothing on a channel this worker hears announces a language change.
+
+        TWO REASONS A TARGET STOPS BEING ONE
+            * nobody else listens in it any more — translation_worker's own rule, mirrored:
+              every distinct known listen language among the OTHER participants ("en" when there
+              are none). Translation cannot produce such a target whatever was said, so this is
+              exact.
+            * the speaker now SPEAKS it. Translation drops a target equal to each SEGMENT's
+              language, which is not always the declaration (a learned override, the text
+              language-ID), so the declaration alone cannot say a target is dead: a speaker
+              declared en who is audibly speaking vi still feeds the en track. It is therefore
+              only acted on after the speaker's declaration CHANGED to that language (seen by
+              this loop) and the track has not published since — a track translation still
+              feeds keeps its bot. The first observation of a speaker is not a change.
+
+        A room whose listen hash is empty or unreadable is left alone — there is nothing
+        trustworthy to compare against, and the idle sweep still applies.
+        """
+        publisher = getattr(self, "livekit_publisher", None)
+        if publisher is None:
+            return 0
+        declared_seen: dict[tuple[str, str], tuple[str, float | None]] | None = getattr(
+            self, "_dub_declared_speak", None
+        )
+        if declared_seen is None:
+            declared_seen = {}
+            self._dub_declared_speak = declared_seen
+        by_room: dict[str, dict[str, dict[str, float]]] = {}
+        for (meeting_id, speaker_id), langs in publisher.dub_targets().items():
+            by_room.setdefault(meeting_id, {})[speaker_id] = langs
+        for key in [key for key in declared_seen if key[0] not in by_room]:
+            declared_seen.pop(key, None)
+        now = time.monotonic()
+        retired = 0
+        for meeting_id, speakers in by_room.items():
+            if not await self._is_bridge_room(meeting_id, speakers):
+                continue
+            try:
+                listen = _decode_hash(
+                    await self.redis.hgetall(f"translationRoom:{meeting_id}:languages")
+                )
+                speak = _decode_hash(
+                    await self.redis.hgetall(f"translationRoom:{meeting_id}:speak_languages")
+                )
+            except Exception:
+                self.logger.warning(
+                    "dub_target_languages_unreadable", meeting_id=meeting_id, exc_info=True
+                )
+                continue
+            if not listen:
+                continue
+            for speaker_id, langs in speakers.items():
+                wanted = {
+                    code
+                    for user_id, value in listen.items()
+                    if user_id != speaker_id and (code := known_language_code(value))
+                } or {"en"}
+                declared = (speak.get(speaker_id) or "").strip().lower()
+                previous = declared_seen.get((meeting_id, speaker_id))
+                if not declared:
+                    # No entry: the speaker is between a leave and a rejoin (a page reload). Not a
+                    # change of language; keep what was seen so a rejoin in the same language
+                    # does not read as "just switched" and retire a track at once.
+                    changed_at: float | None = previous[1] if previous else None
+                else:
+                    if previous is None:
+                        changed_at = None
+                    elif previous[0] != declared:
+                        changed_at = now
+                    else:
+                        changed_at = previous[1]
+                    declared_seen[(meeting_id, speaker_id)] = (declared, changed_at)
+                own = "" if declared in ("", "auto") else declared
+                for lang, last_used in langs.items():
+                    if not any(is_same_language(lang, target) for target in wanted):
+                        reason = "no_listener_in_target_language"
+                    elif (
+                        own
+                        and changed_at is not None
+                        and is_same_language(lang, own)
+                        and last_used <= changed_at + _DUB_TARGET_CHANGE_GRACE_S
+                    ):
+                        reason = "speaker_now_speaks_target_language"
+                    else:
+                        continue
+                    retired += publisher.retire_target_language(
+                        meeting_id, speaker_id, lang, reason
+                    )
+        return retired
+
+    async def _on_route_status_changed(self, room_id: str, new_status: str) -> None:
+        await super()._on_route_status_changed(room_id, new_status)
+        # Interpreter bots now stay warm for minutes between sentences (see LiveKitSettings.
+        # tts_bot_idle_timeout_s). A room that stopped being translated must not keep them: a
+        # present interpreter track mutes the speaker's own microphone for listeners.
+        if (
+            new_status == "PAUSED"
+            or new_status in TERMINAL_ROOM_STATUSES
+            or self._translation_active.get(room_id) is False
+        ):
+            publisher = getattr(self, "livekit_publisher", None)
+            if publisher is not None:
+                publisher.retire_meeting(room_id, reason=new_status.lower())
 
     def _cleanup_room(self, room_id: str) -> None:
         super()._cleanup_room(room_id)
         stale_keys = [key for key in self._key_locks if key[0] == room_id]
         for key in stale_keys:
             self._key_locks.pop(key, None)
+        getattr(self, "_dub_bridge_rooms", {}).pop(room_id, None)
         # Same lifetime as the locks. A room that ends and is somehow seen again must not judge
         # its first sentence as late against a timeline from the previous meeting.
         #
-        # getattr for the same reason `_turns` below uses it: the tests build workers with
+        # getattr for the same reason _open_contexts uses it: the tests build workers with
         # __new__ and never run __init__.
         spoken: dict[tuple[str, str, str], int] = getattr(self, "_spoken_start_ms", {})
         for key in [key for key in spoken if key[0] == room_id]:
             spoken.pop(key, None)
-        # getattr, because the tests build workers with __new__ and never run __init__ — the
-        # same guard the rest of this codebase uses for that pattern. A worker with no turns
-        # dict has no turns to abandon.
-        turns: dict[tuple[str, ...], ProsodyContext] = getattr(self, "_turns", {})
-        for turn_key in [k for k in turns if k[0] == room_id]:
-            turn = turns.pop(turn_key, None)
-            if turn is not None:
-                # Fire-and-forget: _cleanup_room is sync (it is called from the route-state
-                # broadcast handler), and a room that has ended is not waiting on a socket.
-                asyncio.create_task(turn.abandon())
+        positions = self._dub_positions()
+        for key in [key for key in positions if key[0] == room_id]:
+            positions.pop(key, None)
+        # Abandoned, not closed: a room that has ended is not waiting on a socket. Ending runs in
+        # the background (_cleanup_room is sync — it is called from the route-state broadcast
+        # handler) and gives the context's slot back and closes its connection, which the old
+        # fire-and-forget abandon() here never did.
+        contexts = self._open_contexts()
+        for context_key, context in [(k, c) for k, c in contexts.items() if k[0] == room_id]:
+            self._retire_context(context_key, context, abandon=True)
+        # WT-933: buffered Meet-side audio, held chunks and streaks of a room that has ended.
+        # Only touched when it exists, so a worker with the flag off never creates the state.
+        far_state: FarCloneState | None = getattr(self, "_far_clone_state_impl", None)
+        if far_state is not None:
+            far_state.forget_room(room_id)
+
+    # ------------------------------------------------------------------
+    # Cartesia contexts: open only while a sentence needs one
+    # ------------------------------------------------------------------
+
+    def _open_contexts(self) -> dict[tuple[str, ...], _OpenContext]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        contexts: dict[tuple[str, ...], _OpenContext] | None = getattr(self, "_contexts", None)
+        if contexts is None:
+            contexts = {}
+            self._contexts = contexts
+        return contexts
+
+    def _retiring_contexts(self) -> set[asyncio.Task[None]]:
+        retiring: set[asyncio.Task[None]] | None = getattr(self, "_retiring", None)
+        if retiring is None:
+            retiring = set()
+            self._retiring = retiring
+        return retiring
+
+    def _claim_context(self, key: tuple[str, ...]) -> _OpenContext | None:
+        """The open context a sentence for `key` may continue, or None to open a fresh one.
+
+        Claiming cancels the context's idle expiry in the same step — there is no await between
+        the lookup and the cancel — so a context cannot be ended under a sentence that has
+        already taken it.
+        """
+        contexts = self._open_contexts()
+        context = contexts.get(key)
+        if context is None:
+            return None
+        context.cancel_idle_timer()
+        # A context can retire itself without ever raising. `_collect` treats Cartesia's `done`
+        # as an ordinary end of stream: it marks the context closed, breaks, and returns the
+        # audio it collected — so `speak()` SUCCEEDS. WT-405: production 15 Aug, meeting
+        # 01a0033f, a spent context stayed in this map and the next sentence for the same key
+        # called `speak()` on it, which raised "ProsodyContext is closed" and cost a full
+        # one-shot re-synthesis — 12 of 47 sentences, up to 10.2s each.
+        #
+        # _after_flush now ends such a context the moment its sentence returns, so it should
+        # never be found here; the check stays at acquisition because this is the one place
+        # every reuse passes through, and it also covers the idle-expiry guard in `is_closed`
+        # for an expiry that a stalled event loop ran late.
+        if context.prosody.is_closed:
+            self._retire_context(key, context)
+            return None
+        return context
+
+    def _retire_context(
+        self, key: tuple[str, ...], context: _OpenContext, *, abandon: bool = False
+    ) -> None:
+        """Take a context out of service now, and end it in the background.
+
+        Synchronous on purpose: removing it from the map is what stops the next sentence from
+        claiming it, and that must not wait on the network. Ending it — close and wait for
+        `done`, or cancel — and giving its slot back run in `_end_context`, OFF the sentence's
+        path: the ~0.2s Cartesia takes to confirm a close is time the slot stays honestly held,
+        not time anybody waits to hear a dub.
+
+        `abandon` cancels instead of closing: for a context a sentence failed or was cancelled
+        on, the room ending, and shutdown. Idempotent.
+        """
+        contexts = self._open_contexts()
+        if contexts.get(key) is context:
+            del contexts[key]
+        if context.retired:
+            return
+        context.retired = True
+        context.cancel_idle_timer()
+        task = asyncio.create_task(self._end_context(context, abandon=abandon))
+        retiring = self._retiring_contexts()
+        retiring.add(task)
+        task.add_done_callback(retiring.discard)
+
+    async def _end_context(self, context: _OpenContext, *, abandon: bool) -> None:
+        """End a retired context; give its concurrency slot back once Cartesia has let go.
+
+        The slot is released after the close is confirmed (`aclose` waits for `done`, bounded by
+        CONTEXT_CLOSE_ACK_SECONDS) and BEFORE the connection is closed, whose closing handshake
+        has nothing to do with the plan's concurrency and has no bound of ours.
+        """
+        try:
+            if abandon:
+                await context.prosody.abandon()
+            else:
+                await context.prosody.aclose()
+        except Exception:
+            self.logger.debug("prosody_context_end_failed", exc_info=True)
+        finally:
+            context.slot.release()
+            try:
+                await context.connection.close()
+            except Exception:
+                self.logger.debug("prosody_connection_close_failed", exc_info=True)
+
+    def _expire_idle_context(self, key: tuple[str, ...], context: _OpenContext) -> None:
+        """A context kept open for a queued sentence that did not reach it in time.
+
+        Ended by us at CONTEXT_IDLE_EXPIRY_SECONDS, before the server would retire it on its own
+        (~4.7-5.2s, measured), so no sentence is ever pushed onto a context Cartesia has already
+        ended — the WT-874 stale-`done` drop — and its slot goes back when the vendor's does
+        rather than whenever the next sentence happens to look.
+        """
+        context.idle_timer = None
+        if context.retired:
+            return
+        self.logger.info(
+            "prosody_context_idle_expired",
+            meeting_id=key[0],
+            speaker_id=key[1],
+            target_lang=key[2],
+            idle_seconds=prosody_context.CONTEXT_IDLE_EXPIRY_SECONDS,
+        )
+        self._retire_context(key, context)
+
+    def _after_flush(
+        self,
+        key: tuple[str, ...],
+        context: _OpenContext,
+        translation: TranslationResultMessage,
+        *,
+        next_push_not_before: float | None,
+    ) -> None:
+        """At a sentence's flush_done: keep the context open for the next sentence, or end it.
+
+        Kept open ONLY when a continuation can actually happen:
+          * this is not the turn's final chunk — the turn ends where the SPEAKER stopped;
+          * the context is still alive — Cartesia did not end it with this sentence;
+          * the next sentence for this speaker and language is already in hand
+            (_sentence_waiting). Not expected, not likely: queued. An open context holds a
+            Cartesia concurrency slot whether or not it is generating (measured 2026-10-01), so
+            keeping one open on spec is exactly how a third speaker came to wait ~4s for a slot
+            the vendor never showed us was taken;
+          * that sentence can reach the context before its idle expiry. It cannot be pushed
+            until this one has been handed over to its track, which takes real time.
+
+        Kept, it gets an idle expiry (_expire_idle_context) in case the queued sentence never
+        speaks on it, and its slot stays held across the gap — Cartesia counts the context the
+        whole time, so the gate does too. Not kept, it is ended now, and the next sentence opens
+        a fresh one from the warm connection pool.
+
+        There is no grace period, deliberately: waiting "in case" a sentence arrives would hold a
+        slot that another speaker may be waiting for. A sentence that arrives a moment after this
+        decision gets a fresh context — the one continuation this gives up.
+        """
+        reason = self._context_end_reason(context, translation, next_push_not_before)
+        if reason is None:
+            context.idle_timer = asyncio.get_running_loop().call_later(
+                prosody_context.CONTEXT_IDLE_EXPIRY_SECONDS,
+                self._expire_idle_context,
+                key,
+                context,
+            )
+            return
+        self.logger.debug(
+            "prosody_context_ending",
+            reason=reason,
+            meeting_id=translation.meeting_id,
+            speaker_id=translation.speaker_id,
+            target_lang=translation.target_lang,
+        )
+        self._retire_context(key, context)
+
+    def _context_end_reason(
+        self,
+        context: _OpenContext,
+        translation: TranslationResultMessage,
+        next_push_not_before: float | None,
+    ) -> str | None:
+        """Why a context ends at this flush_done, or None to keep it for the queued sentence."""
+        if translation.is_final_chunk:
+            return "final_chunk"
+        if context.prosody.is_closed:
+            return "ended_by_server"
+        if not self._sentence_waiting(self._fit_key(translation)):
+            return "drained"
+        if (
+            next_push_not_before is not None
+            and next_push_not_before - time.monotonic()
+            >= prosody_context.CONTEXT_IDLE_EXPIRY_SECONDS
+        ):
+            # Provably idle past expiry before the next sentence could use it, so keeping it
+            # would only hold the slot for the expiry to release later.
+            return "next_sentence_out_of_reach"
+        return None
+
+    @staticmethod
+    def _earliest_next_push(handover_started_at: float, duration_ms: int) -> float:
+        """The soonest the next sentence of this key can be pushed onto the same context.
+
+        Not before this sentence has been handed over to its track: the key's lock covers the
+        hand-over, and the hand-over back-pressures to real time. A track buffers at most
+        AUDIO_SOURCE_QUEUE_MS ahead (plus the frame being captured), and no frame of this
+        sentence was captured before the stream opened, so the hand-over cannot end sooner than
+        `duration - buffer` after that. A LOWER bound by construction — anything that slows the
+        hand-over only makes the real push later — so a context closed on it could not have been
+        continued anyway.
+        """
+        return handover_started_at + max(0, duration_ms - AUDIO_SOURCE_QUEUE_MS - FRAME_MS) / 1000
+
+    async def _take_slot(
+        self, lease: GenerationLease, translation: TranslationResultMessage, *, purpose: str
+    ) -> int:
+        """Take a Cartesia concurrency slot, and say so when that meant waiting for one.
+
+        This is where in-process queueing for Cartesia becomes visible. Cartesia's own queueing
+        is silent — no 429, no log — so before this the only evidence of a gate that did not
+        match the plan was dubs that were late for no reason anyone could find.
+        """
+        await lease.acquire()
+        waited_ms = lease.waited_ms
+        if waited_ms >= _SLOT_WAIT_LOG_MS:
+            self.logger.info(
+                "cartesia_slot_waited",
+                waited_ms=waited_ms,
+                purpose=purpose,
+                meeting_id=translation.meeting_id,
+                speaker_id=translation.speaker_id,
+                segment_id=translation.segment_id,
+                target_lang=translation.target_lang,
+                open_contexts=len(self._open_contexts()),
+            )
+        return waited_ms
+
+    async def _one_shot(
+        self,
+        translation: TranslationResultMessage,
+        text: str,
+        voice_id: str | None,
+        generation_config: dict[str, float | str] | None,
+    ) -> tuple[bytes, int, str, int]:
+        """One HTTP generation, holding a slot for exactly its flight.
+
+        Returns (wav_bytes, duration_ms, resolved_voice_id, slot_wait_ms).
+        """
+        synthesizer = self._require_cartesia()
+        lease = GenerationLease(synthesizer.generation_slot())
+        try:
+            waited_ms = await self._take_slot(lease, translation, purpose="one_shot")
+            audio_bytes, duration_ms, resolved_voice_id = await synthesizer.synthesize(
+                text=text,
+                language=translation.target_lang,
+                voice_id=voice_id,
+                generation_config=generation_config,
+            )
+        finally:
+            lease.release()
+        return audio_bytes, duration_ms, resolved_voice_id, waited_ms
 
     async def _synthesize_sentence(
         self,
@@ -712,7 +1569,8 @@ class TTSWorker(BaseWorker):
         voice_key: str,
         generation_config: dict[str, float | str] | None,
     ) -> SynthesizedSentence:
-        """One sentence of a turn, spoken in prosodic continuity with the ones before it.
+        """One sentence, spoken in prosodic continuity with the one before it when that one is
+        still open, as a fresh context otherwise.
 
         WT-371 follow-up / Level 4. A spoken turn is routinely split into several sentences
         (chunk_index > 0), and each used to be an independent one-shot generation with no memory
@@ -720,9 +1578,16 @@ class TTSWorker(BaseWorker):
         the dub came back as a list of separately-read sentences. Cartesia's contexts exist for
         exactly this; see tts_worker/prosody_context.py.
 
+        A context is open only while a sentence needs it: from just before its first push until
+        its flush_done, and past that only for a sentence already queued (see _after_flush). It
+        holds a Cartesia concurrency slot for exactly that life, taken here before the first
+        push and given back when its end is confirmed — not per sentence, and not across the
+        sentence's playout. Measured 2026-10-01: an idle open context occupies a vendor slot as
+        surely as a generating one, and the vendor queues the excess silently.
+
         Falls back to the proven one-shot path on ANY failure, and when the feature is off. That
-        is not defensive padding: this WebSocket path has never run against the real API from
-        this codebase, and a dub that fails is silence in a live meeting.
+        is not defensive padding: a dub that fails is silence in a live meeting. The failed
+        context is ended first, so the fallback never holds two slots at once.
 
         See SynthesizedSentence for what comes back and why it is no longer just the audio.
         """
@@ -732,13 +1597,12 @@ class TTSWorker(BaseWorker):
         )
 
         if not self.tts_settings.prosody_continuity:
-            audio_bytes, duration_ms, one_shot_voice_id = await synthesizer.synthesize(
-                text=text,
-                language=translation.target_lang,
-                voice_id=voice_id,
-                generation_config=generation_config,
+            audio_bytes, duration_ms, one_shot_voice_id, waited_ms = await self._one_shot(
+                translation, text, voice_id, generation_config
             )
-            return SynthesizedSentence(audio_bytes, duration_ms, one_shot_voice_id)
+            return SynthesizedSentence(
+                audio_bytes, duration_ms, one_shot_voice_id, slot_wait_ms=waited_ms
+            )
 
         # Keyed by voice as well as by speaker and language: a clone upgrade replaces the voice
         # mid-meeting (voice_clone_max_upgrades), and continuing a turn into a different voice
@@ -752,44 +1616,63 @@ class TTSWorker(BaseWorker):
         )
 
         track: TrackStream | None = None
+        context: _OpenContext | None = None
+        slot_wait_ms = 0
+        continued = False
         try:
-            turn = self._turns.get(key)
-            # A context can retire itself without ever raising. `_collect` treats Cartesia's
-            # `done` as an ordinary end of stream: it marks the context closed, breaks, and
-            # returns the audio it collected — so `speak()` SUCCEEDS and the caller never
-            # reaches the except branch that would have called `_end_turn`. The spent context
-            # stayed in this map, and the next sentence for the same key fetched it, found it
-            # not-None, and called `speak()` on it, which raised "ProsodyContext is closed".
-            #
-            # One wasted sentence per `done`, every time — no streaming and a full one-shot
-            # re-synthesis, which is the p95 tail. Production 15 Aug, meeting 01a0033f: 12 of 47
-            # sentences, up to 10.2s each, clustered exactly where the two speakers alternated.
-            # Cartesia ends a context that has been idle, and with two people talking each
-            # speaker's context idles while the other one speaks — so the more natural the
-            # conversation, the more often this fired.
-            #
-            # Checked at acquisition rather than after `speak()` returns, because this is the
-            # one place every reuse passes through: it covers the `done` path and any other
-            # route to a closed context equally, instead of guarding the single case we know
-            # about today.
-            if turn is not None and turn.is_closed:
-                await self._end_turn(key)
-                turn = None
-            if turn is None:
-                turn, connection = await synthesizer.open_prosody_context(
-                    context_id=f"{translation.speaker_id}:{translation.target_lang}:{voice_key}",
+            context = self._claim_context(key)
+            continued = context is not None
+            if context is None:
+                prosody, connection = await synthesizer.open_prosody_context(
+                    # Unique per context, not per key: the previous context of this key may
+                    # still be waiting for its `done` on another socket when this one starts.
+                    context_id=(
+                        f"{translation.speaker_id}:{translation.target_lang}:{voice_key}:"
+                        f"{uuid.uuid4().hex[:12]}"
+                    ),
                     language=translation.target_lang,
                     voice_id=voice_id,
                 )
-                self._turns[key] = turn
-                self._turn_connections[key] = connection
+                context = _OpenContext(
+                    prosody, connection, GenerationLease(synthesizer.generation_slot())
+                )
+                self._open_contexts()[key] = context
+                # After the dial, before the first push: Cartesia counts the context from that
+                # push, and a cold dial is not worth holding a slot through.
+                try:
+                    slot_wait_ms = await self._take_slot(
+                        context.slot, translation, purpose="context"
+                    )
+                except BaseException:
+                    # Cancelled while waiting (the processing timeout). The context is mapped
+                    # but the gate never counted it, so it leaves the map HERE, before the next
+                    # sentence for this key can claim it as a continuation and speak on a
+                    # context with no slot behind it. The handler at the end of this method
+                    # does the same; this keeps the guard where the hazard is.
+                    if not context.slot.held:
+                        self._retire_context(key, context, abandon=True)
+                    raise
+                if context.retired:
+                    # Ended while it waited for the slot (the room closed). Its _end_context may
+                    # already have run its release, before this claim existed.
+                    context.slot.release()
+                    raise RuntimeError("prosody context was retired before its first sentence")
 
             # getattr, because some tests build workers with __new__ and never run __init__ —
             # the same guard the rest of this codebase uses for that pattern.
             publisher = getattr(self, "livekit_publisher", None)
             if publisher is None or not self.tts_settings.stream_to_livekit:
-                audio_bytes, duration_ms = await turn.speak(text, generation_config)
-                return SynthesizedSentence(audio_bytes, duration_ms, resolved_voice_id)
+                audio_bytes, duration_ms = await context.prosody.speak(text, generation_config)
+                # Nothing here says how soon the caller will publish, so no reach bound: a
+                # context kept open on this path is left to its idle expiry.
+                self._after_flush(key, context, translation, next_push_not_before=None)
+                return SynthesizedSentence(
+                    audio_bytes,
+                    duration_ms,
+                    resolved_voice_id,
+                    slot_wait_ms=slot_wait_ms,
+                    continued=continued,
+                )
 
             async with publisher.stream(
                 translation.meeting_id,
@@ -798,8 +1681,28 @@ class TTSWorker(BaseWorker):
                 self.tts_settings.sample_rate,
                 voice_key=voice_key,
             ) as track:
-                audio_bytes, duration_ms = await turn.speak(
-                    text, generation_config, on_pcm=track.feed
+                handover_started_at = time.monotonic()
+                try:
+                    audio_bytes, duration_ms = await context.prosody.speak(
+                        text, generation_config, on_pcm=track.feed
+                    )
+                except BaseException:
+                    # Ended here, not after leaving this block: leaving it waits for whatever
+                    # partial audio reached the track to finish playing, and a failed or
+                    # cancelled context must not hold its slot through that.
+                    self._retire_context(key, context, abandon=True)
+                    raise
+                # THE POINT WHERE GENERATION ENDS AND PLAYOUT BEGINS. speak() returns on
+                # Cartesia's flush_done — every chunk of this sentence has arrived and been
+                # queued on the track — but the track is still playing it, and leaving this
+                # block waits for that in real time. So the context's fate is decided now: ended
+                # (and its slot on the way back) unless the next sentence is already queued, and
+                # either way nothing here holds a slot because of the playout.
+                self._after_flush(
+                    key,
+                    context,
+                    translation,
+                    next_push_not_before=self._earliest_next_push(handover_started_at, duration_ms),
                 )
             # Read AFTER the stream closed: the pump is still draining while speak() returns,
             # so asking inside the block would undercount what the listener actually heard.
@@ -809,6 +1712,8 @@ class TTSWorker(BaseWorker):
                 resolved_voice_id,
                 already_spoken=track.spoken_bytes > 0,
                 first_audio_at=track.first_audio_at,
+                slot_wait_ms=slot_wait_ms,
+                continued=continued,
             )
         except Exception:
             already_spoken = track is not None and track.spoken_bytes > 0
@@ -818,13 +1723,28 @@ class TTSWorker(BaseWorker):
                 already_spoken=already_spoken,
                 exc_info=True,
             )
-            await self._end_turn(key)
-            audio_bytes, duration_ms, one_shot_voice_id = await synthesizer.synthesize(
-                text=text,
-                language=translation.target_lang,
-                voice_id=voice_id,
-                generation_config=generation_config,
-            )
+            # Before the fallback asks for a slot of its own: ending the context is what gives
+            # its slot back, so this sentence never holds two at once. Idempotent if the stream
+            # block above already did it.
+            if context is not None:
+                self._retire_context(key, context, abandon=True)
+            try:
+                (
+                    audio_bytes,
+                    duration_ms,
+                    one_shot_voice_id,
+                    fallback_wait_ms,
+                ) = await self._one_shot(translation, text, voice_id, generation_config)
+            except Exception as fallback_error:
+                if already_spoken:
+                    # The listener has heard the opening and nothing will complete it. Marked so
+                    # the caller does not RETRY it either: a retry would speak the opening twice,
+                    # the exact outcome the suppression below exists to prevent.
+                    raise SentencePartiallySpokenError(
+                        f"fallback failed after {track.spoken_bytes if track else 0} bytes "
+                        "of the sentence had already been spoken"
+                    ) from fallback_error
+                raise
             if already_spoken:
                 # THE ONE DECISION THIS FEATURE TURNS ON, recorded here rather than in a ticket.
                 #
@@ -855,23 +1775,15 @@ class TTSWorker(BaseWorker):
                 one_shot_voice_id,
                 already_spoken=already_spoken,
                 first_audio_at=track.first_audio_at if track else None,
+                slot_wait_ms=slot_wait_ms + fallback_wait_ms,
+                continued=continued,
             )
-        finally:
-            # The turn ends where the SPEAKER stopped, not where a chunk boundary fell —
-            # is_final_chunk is the only signal that carries that.
-            if translation.is_final_chunk:
-                await self._end_turn(key)
-
-    async def _end_turn(self, key: tuple[str, ...]) -> None:
-        turn = self._turns.pop(key, None)
-        connection = self._turn_connections.pop(key, None)
-        if turn is not None:
-            await turn.aclose()
-        if connection is not None:
-            try:
-                await connection.close()
-            except Exception:
-                self.logger.debug("prosody_connection_close_failed", exc_info=True)
+        except BaseException:
+            # Cancelled — the processing timeout cancels a wedged attempt. The context is in an
+            # unknown state mid-sentence, so it is abandoned, which also gives its slot back.
+            if context is not None:
+                self._retire_context(key, context, abandon=True)
+            raise
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Synthesize one translated text segment — into every DISTINCT voice this
@@ -884,6 +1796,7 @@ class TTSWorker(BaseWorker):
 
         route_status = self._route_states.get(translation.meeting_id, "AUDIO_ROUTING_ACTIVE")
         if route_status == "PAUSED":
+            self._note_far_side_dub(translation, "skip", reason="room_paused")
             return
 
         current_timestamp_ms = int(time.time() * 1000)
@@ -912,6 +1825,7 @@ class TTSWorker(BaseWorker):
                 segment_id=translation.segment_id,
                 lang=translation.target_lang,
             )
+            self._note_far_side_dub(translation, "skip", reason="same_language")
             if translation.is_final_chunk:
                 await self.redis.publish_system_event(
                     room_id=translation.meeting_id,
@@ -920,7 +1834,30 @@ class TTSWorker(BaseWorker):
                 )
             return
 
-        if route_status == "TEXT_ONLY_MODE" or not text.strip():
+        # Text-only Google Meet bridge: the speaker is in Meet with their real mic, so their dub
+        # into the far side's language has no cable to be played into. Skipped per route (see
+        # BaseWorker.is_text_only_dub), never room-wide — the inbound side and every other
+        # speaker keep their dub. Same bookkeeping as the empty-text skip below.
+        text_only_dub = bool(text.strip()) and await self.text_only_dub_for(
+            translation.meeting_id, translation.speaker_id, translation.target_lang
+        )
+        if text_only_dub:
+            self.logger.info(
+                "text_only_bridge_synthesis_skipped",
+                meeting_id=translation.meeting_id,
+                speaker_id=translation.speaker_id,
+                segment_id=translation.segment_id,
+                lang=translation.target_lang,
+            )
+
+        if route_status == "TEXT_ONLY_MODE" or text_only_dub or not text.strip():
+            # Not for the empty turn-closing marker: there was no sentence to dub.
+            if text.strip():
+                self._note_far_side_dub(
+                    translation,
+                    "skip",
+                    reason="text_only_route" if text_only_dub else "room_text_only_mode",
+                )
             if translation.is_final_chunk:
                 await self.redis.publish_system_event(
                     room_id=translation.meeting_id,
@@ -930,7 +1867,15 @@ class TTSWorker(BaseWorker):
             return
 
         variants = await self._resolve_voice_variants(
-            translation.meeting_id, translation.speaker_id, translation.target_lang
+            translation.meeting_id,
+            translation.speaker_id,
+            translation.target_lang,
+            far_speaker_name=translation.far_speaker_name,
+            far_speaker_confidence=translation.far_speaker_confidence,
+            far_segment_id=translation.segment_id,
+            far_duration_ms=far_speaker_clone.sentence_duration_ms(
+                translation.start_ms, translation.end_ms, translation.chunk_duration_ms
+            ),
         )
         # Before synthesizing: a listener is still subscribed to any variant track this speaker
         # no longer gets, and hears nothing on it. See LiveKitTTSPublisher.retire_voice_variants.
@@ -947,6 +1892,7 @@ class TTSWorker(BaseWorker):
         # rendered in different voices, so the second one must not be judged as arriving after
         # the first and read faster for it.
         lag_ms = self._catch_up_lag_ms(translation)
+        self._note_dub_started(translation)
         if lag_ms > 0:
             self.logger.info(
                 "dub_running_behind",
@@ -959,9 +1905,27 @@ class TTSWorker(BaseWorker):
                 translation_latency_ms=translation.latency_ms,
             )
 
+        self._note_far_side_dub(
+            translation,
+            "speak",
+            identities=[
+                interpreter_identity(translation.target_lang, translation.speaker_id, voice_key)
+                for _voice_id, _voice_type, voice_key in variants
+            ],
+            voice_type=variants[0][1],
+            lag_ms=lag_ms,
+        )
+
         for voice_id, voice_type, voice_key in variants:
             await self._synthesize_and_publish(
-                translation, text, voice_id, voice_type, voice_key, lag_ms=lag_ms
+                translation,
+                text,
+                voice_id,
+                voice_type,
+                voice_key,
+                lag_ms=lag_ms,
+                message_id=message_id,
+                raw=data,
             )
 
         # Exactly once per message regardless of how many voice variants rendered —
@@ -974,8 +1938,59 @@ class TTSWorker(BaseWorker):
                 payload={"segmentId": translation.segment_id},
             )
 
+    def _note_far_side_dub(
+        self, translation: TranslationResultMessage, decision: str, **fields: Any
+    ) -> None:
+        """Say what became of one Meet-side sentence's dub. Bridge stand-in only; one line each.
+
+        WHY THE STAND-IN GETS A LINE OF ITS OWN
+            "The Meet side speaks and I hear no dub" (prod 2026-10-03, rooms 01a103e0 and
+            01a103ef) could not be settled from the logs. Two of process()'s exits said nothing
+            at all (a paused room, a room in TEXT_ONLY_MODE), the other skips each had an event
+            of their own, and nothing named the LiveKit identity the dub was published under —
+            which is the only thing the listener's client matches on
+            (`ai-interpreter-{its own listen language}-{stand-in}`). So a dub synthesized into a
+            language the listener is not tuned to, and no dub at all, read the same.
+
+        `decision` is "speak" or "skip"; a skip carries `reason`, a speak the `identities` it is
+        published under. `audio_synthesized` for the same `segment_id` is the outcome. Nothing
+        is said for a native speaker, or for the empty turn-closing marker.
+
+        The caption name is never logged: its hash (the one far_speaker_voice_assigned carries)
+        when the voice is keyed by it, its confidence, and its LENGTH — a caption sentence
+        mistaken for a participant name shows as a long name whose hash changes every line.
+        Never raises: a log line must not cost the sentence.
+        """
+        if not is_external_bridge_speaker(translation.speaker_id):
+            return
+        with suppress(Exception):
+            far_key = far_speaker_voice_key(
+                translation.speaker_id,
+                translation.far_speaker_name,
+                translation.far_speaker_confidence,
+            )
+            self.logger.info(
+                "far_side_dub_decision",
+                meeting_id=translation.meeting_id,
+                segment_id=translation.segment_id,
+                source_lang=translation.source_lang,
+                target_lang=translation.target_lang,
+                decision=decision,
+                far_speaker_hash=far_speaker_voice_field(far_key) if far_key else None,
+                far_speaker_confidence=translation.far_speaker_confidence,
+                far_speaker_name_chars=len(translation.far_speaker_name or ""),
+                **fields,
+            )
+
     async def _resolve_voice_variants(
-        self, meeting_id: str, speaker_id: str, target_lang: str
+        self,
+        meeting_id: str,
+        speaker_id: str,
+        target_lang: str,
+        far_speaker_name: str | None = None,
+        far_speaker_confidence: float | None = None,
+        far_segment_id: str = "",
+        far_duration_ms: int = 0,
     ) -> list[tuple[str, str, str]]:
         """Every distinct (voice_id, voice_type, voice_key) this (speaker, target_lang)
         must be rendered into.
@@ -1001,6 +2016,22 @@ class TTSWorker(BaseWorker):
             the same voice is rendered once per distinct target language, so A speaking
             Vietnamese with a cloned voice is heard by B in English IN A'S VOICE.
 
+        THE BRIDGE STAND-IN IS SEVERAL PEOPLE (WT-932)
+            `far_speaker_name` / `far_speaker_confidence` only ever change WHICH catalogue voice
+            the "default" entry carries, and only for the stand-in seat with a certain name (see
+            far_speaker_voice_key). The entry is still the one default variant, voice_key "", on
+            the stand-in's own LiveKit identity — no new variant, no new track. A listener's
+            explicit pick below is untouched, and still collapses the whole far side into the
+            voice they picked.
+
+        ... AND ONE OF THEM MAY HAVE CONSENTED TO THEIR OWN VOICE (WT-933)
+            Behind TTS_FAR_SPEAKER_CLONE_ENABLED, the same default entry carries that person's
+            CLONE (voice_type "cloned") when _far_speaker_clone_voice says every condition holds,
+            and the WT-932 stock voice otherwise. `far_segment_id` / `far_duration_ms` exist only
+            for that decision. Still one default variant on the stand-in's identity, and a
+            listener's explicit pick is still rendered beside it: the stand-in seat itself has
+            no voice of its own, so the rule below about a speaker's own clone does not apply.
+
             It did not work that way. `_get_explicit_voice_choices` was applied to every
             speaker unconditionally, and the client accepts ONLY the preference track once
             a listener has one (see filtered-room-audio.tsx `dubbedSpeakerId`), so any
@@ -1021,6 +2052,9 @@ class TTSWorker(BaseWorker):
         # the profile as active, and the dub came back in a stock catalogue voice — because the
         # only voice this function ever looked for was one cloned from the meeting's microphone.
         chosen_voice_id = self.chosen_dub_voice(meeting_id, speaker_id)
+        if not chosen_voice_id:
+            # Progressive clone: their first voice may be seconds away. See _await_first_clone.
+            await self._await_first_clone(meeting_id, speaker_id)
         cloned_voice_id = (
             None if chosen_voice_id else await self._get_voice_id(meeting_id, speaker_id)
         )
@@ -1030,10 +2064,38 @@ class TTSWorker(BaseWorker):
         elif cloned_voice_id:
             default_voice_id, default_voice_type = cloned_voice_id, "cloned"
         else:
-            default_voice_id = await self._hashed_default_voice_id(
-                target_lang, speaker_id, meeting_id
+            # Only reached with no profile and no clone, so those two are untouched by this.
+            far_key = (
+                far_speaker_voice_key(speaker_id, far_speaker_name, far_speaker_confidence)
+                if meeting_id
+                else None
             )
-            default_voice_type = "default"
+            # Asked before the stock voice and for every stand-in sentence, not only the ones
+            # that end up cloned: it is also what counts the streak. None with the flag off.
+            far_clone_voice_id = (
+                await self._far_speaker_clone_voice(
+                    meeting_id,
+                    speaker_id,
+                    target_lang,
+                    far_speaker_name,
+                    far_speaker_confidence,
+                    far_segment_id,
+                    far_duration_ms,
+                )
+                if self.tts_settings.far_speaker_clone_enabled and meeting_id
+                else None
+            )
+            default_voice_type = "cloned" if far_clone_voice_id else "default"
+            if far_clone_voice_id:
+                default_voice_id = far_clone_voice_id
+            elif far_key:
+                default_voice_id = await self._far_speaker_voice_id(
+                    target_lang, meeting_id, speaker_id, far_key
+                )
+            else:
+                default_voice_id = await self._hashed_default_voice_id(
+                    target_lang, speaker_id, meeting_id
+                )
 
         variants: list[tuple[str, str, str]] = [(default_voice_id, default_voice_type, "")]
 
@@ -1268,6 +2330,119 @@ class TTSWorker(BaseWorker):
         roster.add(speaker_id)
         return str(self._assign_voice(catalog, sorted(roster), speaker_id)["id"])
 
+    async def _far_speaker_voice_id(
+        self, language: str, meeting_id: str, speaker_id: str, far_key: str
+    ) -> str:
+        """The stock voice ONE person on the Meet side of a bridge room is dubbed in (WT-932).
+
+        `far_key` comes from far_speaker_voice_key; `speaker_id` is the stand-in seat.
+
+        WHY THE KEY IS NOT SIMPLY ADDED TO THE ROSTER
+            _assign_voice walks the sorted roster and lets each id claim in turn, so a new id
+            shifts whoever sorts after it and wanted the same voice. A far-speaker key starts
+            with the stand-in GUID — all zeros — and therefore sorts ahead of nearly every real
+            participant: the first caption name would be free to take a voice somebody in the
+            room has been heard in since the meeting started. Names appear mid-meeting by
+            nature, so that reshuffle would be the normal case, not the rare one _assign_voice
+            accepts for a join.
+
+        WHAT IT DOES INSTEAD: FIRST CLAIM, REMEMBERED
+            The roster is resolved exactly as it is today, without the key in it. The key then
+            claims — with the same _claim_voice preference walk — the first voice that is not
+            held by anyone on the roster (the plain stand-in included, so a named person does not
+            sound like "somebody on the far side"), by another caption name, or by a listener's
+            explicit pick. The answer is written to a per-(meeting, language) Redis hash and read
+            back for every later sentence. So:
+
+            * nobody already in the room changes voice, because nothing about their resolution
+              changed;
+            * the same name keeps the same voice for the meeting even when the roster changes
+              under it, on every replica — which a stateless rule could not promise;
+            * two names differ whenever the catalogue has a voice left. When it has none they
+              share, deterministically, as speakers already do.
+
+            A participant who joins later can still land on a voice a caption name already
+            holds: they resolve statelessly and do not look here. That is the same trade
+            _assign_voice makes for joins, and it never moves anyone already speaking.
+
+            Not atomic across replicas: two workers meeting the same NEW name at the same
+            instant compute the same answer from the same state, and two different new names in
+            one instant could pick one voice. One audio feed says one thing at a time, so that
+            needs two people to be named for the first time within a round trip of each other.
+
+        Any failure to read the hash is answered with today's stand-in voice rather than a guess:
+        an unremembered choice could differ on the next sentence, and one shared voice is the
+        behaviour this feature started from.
+        """
+        catalog = await self._get_voice_catalog(language)
+        if not catalog:
+            return CartesiaSynthesizer._default_voice_id(language)
+
+        hash_key = f"{_FAR_SPEAKER_VOICES_PREFIX}{meeting_id}:{language}"
+        field = far_speaker_voice_field(far_key)
+        try:
+            raw = await self.redis.hgetall(hash_key)
+        except Exception:
+            self.logger.warning(
+                "far_speaker_voices_unavailable",
+                meeting_id=meeting_id,
+                lang=language,
+                exc_info=True,
+            )
+            return await self._hashed_default_voice_id(language, speaker_id, meeting_id)
+        remembered = {
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+            for k, v in (raw or {}).items()
+        }
+
+        # Still in the catalogue: a refresh can drop a voice, and a remembered id Cartesia no
+        # longer serves would fail every sentence this person says. Then they claim again.
+        existing = remembered.get(field)
+        if existing and any(str(voice["id"]) == existing for voice in catalog):
+            return existing
+
+        ordered_catalog = sorted(catalog, key=lambda voice: str(voice["id"]))
+        roster = await self._room_speaker_ids(meeting_id)
+        roster.add(speaker_id)
+        # The same walk _assign_voice does, kept whole: every voice the room resolves to today.
+        taken: set[str] = set()
+        for uid in sorted(roster):
+            taken.add(str(self._claim_voice(ordered_catalog, uid, taken)["id"]))
+        taken.update(voice for name, voice in remembered.items() if name != field)
+        # A listener's pick is rendered as its own variant unless the default already carries
+        # that voice. Keeping names off picked voices keeps that variant's track from being
+        # retired and reopened as the far side changes speaker.
+        try:
+            taken.update(await self._get_explicit_voice_choices(meeting_id, language))
+        except Exception:
+            self.logger.warning(
+                "voice_preferences_unavailable",
+                meeting_id=meeting_id,
+                lang=language,
+                exc_info=True,
+            )
+
+        voice_id = str(self._claim_voice(ordered_catalog, far_key, taken)["id"])
+        try:
+            await self.redis.hset(hash_key, field, voice_id)
+            await self.redis.expire(hash_key, _FAR_SPEAKER_VOICES_TTL_SECONDS)
+        except Exception:
+            self.logger.warning(
+                "far_speaker_voice_not_remembered",
+                meeting_id=meeting_id,
+                lang=language,
+                exc_info=True,
+            )
+        # Once per (meeting, name, language): every later sentence returns from the hash above.
+        self.logger.info(
+            "far_speaker_voice_assigned",
+            meeting_id=meeting_id,
+            lang=language,
+            voice_id=voice_id,
+            far_speaker_hash=field,
+        )
+        return voice_id
+
     async def _get_explicit_voice_choices(self, meeting_id: str, target_lang: str) -> set[str]:
         """Distinct voice_ids explicitly chosen (via TranslationRoomHub.
         SetVoicePreference) by listeners currently tuned to target_lang — cross-
@@ -1307,6 +2482,8 @@ class TTSWorker(BaseWorker):
         voice_type: str,
         voice_key: str,
         lag_ms: int = 0,
+        message_id: bytes | None = None,
+        raw: Mapping[Any, Any] | None = None,
     ) -> None:
         # Catch-up is folded in HERE rather than inside _generation_config, because that method
         # answers "what did we measure about this speaker's delivery" and the answer is often
@@ -1317,6 +2494,28 @@ class TTSWorker(BaseWorker):
         # generation_config, so a sped-up render and a normal one cannot collide, and a line
         # cached while the room was keeping up is not replayed at the wrong pace later.
         generation_config = self._with_catch_up(self._generation_config(translation), lag_ms)
+
+        # Says on the track whose voice this is, so the meeting client can play a speaker's dub
+        # only when it is in the speaker's own voice (see VOICE_KIND_ATTRIBUTE).
+        # Guarded here as well as inside the publisher: a label must never cost the sentence.
+        if self.livekit_publisher is not None:
+            try:
+                await self.livekit_publisher.set_voice_kind(
+                    translation.meeting_id,
+                    translation.speaker_id,
+                    translation.target_lang,
+                    voice_type,
+                    voice_key=voice_key,
+                )
+            except Exception:
+                self.logger.warning(
+                    "tts_voice_kind_not_announced",
+                    meeting_id=translation.meeting_id,
+                    speaker_id=translation.speaker_id,
+                    target_lang=translation.target_lang,
+                    voice_type=voice_type,
+                    exc_info=True,
+                )
 
         cache_key = self._cache_key(
             speaker_id=translation.speaker_id,
@@ -1384,12 +2583,19 @@ class TTSWorker(BaseWorker):
                     )
                 return
 
+        # From the FIRST attempt: a retried sentence kept the listener waiting through every try,
+        # so tts_synthesis and tts_first_audio below are measured from here, not from the retry.
         t0 = time.monotonic()
-        try:
-            # One Cartesia slot for the whole sentence, fallback included — see
-            # TTSSettings.cartesia_max_concurrency. Waiting here is counted in the latency on
-            # purpose: it is time the listener spends waiting too.
-            async with self._require_cartesia().generation_slot():
+        failures = 0
+        while True:
+            attempt_t0 = time.monotonic()
+            try:
+                # The Cartesia concurrency slot is taken INSIDE the attempt, by whatever it holds
+                # open at the vendor: a fresh context for that context's whole life, a one-shot
+                # request for its flight, nothing at all for a sentence continuing a context that
+                # already holds one. Never across this sentence's playout. See
+                # TTSSettings.cartesia_max_concurrency. Waiting for it is counted in the latency on
+                # purpose — the listener waits too — and reported on its own as `slot_wait_ms`.
                 sentence = await self._synthesize_sentence(
                     translation=translation,
                     text=text,
@@ -1397,36 +2603,73 @@ class TTSWorker(BaseWorker):
                     voice_key=voice_key,
                     generation_config=generation_config,
                 )
-        except Exception as e:
-            # Swallowed so the next sentence still plays; counted so a Cartesia outage (402 quota,
-            # 5xx) shows as a TTS success rate falling rather than as silence.
-            self.note_attempt_outcome("vendor_error")
-            await record_provider_call(
-                "cartesia",
-                "tts",
-                classify_exception(e),
-                int((time.monotonic() - t0) * 1000),
-                self.tts_settings.model,
-            )
-            # Carried the error and the voice and nothing else, so a failure could not be tied
-            # to the sentence that failed: the one question worth asking of this line — WHICH
-            # line went silent — was the one it could not answer.
-            self.logger.error(
-                "cartesia_synthesis_failed",
-                error=str(e),
-                meeting_id=translation.meeting_id,
-                speaker_id=translation.speaker_id,
-                segment_id=translation.segment_id,
-                target_lang=translation.target_lang,
-                text=text[:60],
-                voice_type=voice_type,
-            )
-            await self.redis.publish_system_event(
-                room_id=translation.meeting_id,
-                event_type="tts_unavailable",
-                payload={"error": str(e)},
-            )
-            return
+                break
+            except Exception as e:
+                # Nothing is held here through the backoff, the dead-letter write or the event: a
+                # failed attempt has already ended its context, which gives that slot back, and
+                # released any one-shot claim.
+                failures += 1
+                vendor_error = _vendor_error(e)
+                outcome = classify_exception(vendor_error)
+                await record_provider_call(
+                    "cartesia",
+                    "tts",
+                    outcome,
+                    int((time.monotonic() - attempt_t0) * 1000),
+                    self.tts_settings.model,
+                )
+                give_up_reason = self._synthesis_give_up_reason(e, outcome, failures, t0)
+                # Carried the error and the voice and nothing else, so a failure could not be
+                # tied to the sentence that failed: the one question worth asking of this line —
+                # WHICH line went silent — was the one it could not answer. Logged per ATTEMPT,
+                # with whether another follows, so a retried-then-spoken line is visible too.
+                self.logger.error(
+                    "cartesia_synthesis_failed",
+                    error=str(vendor_error),
+                    outcome=outcome,
+                    attempt=failures,
+                    will_retry=give_up_reason is None,
+                    meeting_id=translation.meeting_id,
+                    speaker_id=translation.speaker_id,
+                    segment_id=translation.segment_id,
+                    target_lang=translation.target_lang,
+                    text=text[:60],
+                    voice_type=voice_type,
+                    voice_key=voice_key,
+                )
+                if give_up_reason is None:
+                    # Inside the key's lock, deliberately: nothing newer for this speaker and
+                    # language can be spoken while this one is retried, so a retry can make the
+                    # line late but never out of order. TTSSettings.synthesis_retry_window_seconds
+                    # bounds how long that holds the next line back.
+                    await asyncio.sleep(
+                        self.tts_settings.synthesis_retry_backoff_seconds * (2 ** (failures - 1))
+                    )
+                    continue
+
+                # Given up. Counted so a Cartesia outage (402 quota, 5xx) shows as a TTS success
+                # rate falling rather than as silence; parked so the line is not simply gone —
+                # this used to log and return, the message was acked, and nothing anywhere
+                # recorded which sentence had been lost or let anyone replay it.
+                self.note_attempt_outcome("vendor_error")
+                await self._dead_letter(
+                    message_id or b"",
+                    raw if raw is not None else translation.to_redis(),
+                    attempts=failures,
+                    reason=give_up_reason,
+                    details={
+                        "segment_id": translation.segment_id,
+                        "voice_type": voice_type,
+                        "voice_key": voice_key,
+                        "error": str(vendor_error)[:300],
+                    },
+                )
+                await self.redis.publish_system_event(
+                    room_id=translation.meeting_id,
+                    event_type="tts_unavailable",
+                    payload={"error": str(vendor_error)},
+                )
+                return
 
         audio_bytes = sentence.audio
         duration_ms = sentence.duration_ms
@@ -1445,15 +2688,20 @@ class TTSWorker(BaseWorker):
         # rise. It is still the right measure of "how long the worker was busy with this
         # sentence"; it is no longer a measure of how long anyone waited to hear it.
         await self.redis.record_latency("tts_synthesis", synthesis_latency_ms)
+        # How long this sentence waited for a Cartesia concurrency slot, recorded for EVERY
+        # sentence, zeros included, so the stage's count is the sentence count and its p95 is a
+        # real answer to "how often does the gate make anyone wait". Cartesia queues the excess
+        # silently, so this gate's wait is the only queueing for Cartesia that can be seen.
+        await self.redis.record_latency("tts_slot_wait", sentence.slot_wait_ms)
         # Cartesia's latency is its time to first audio; with streaming on, the whole synthesis
         # time also contains playback (see above) and would make the vendor look 5x slower.
         await record_provider_call(
             "cartesia",
             "tts",
             "ok",
-            int((sentence.first_audio_at - t0) * 1000)
+            int((sentence.first_audio_at - attempt_t0) * 1000)
             if sentence.first_audio_at is not None
-            else synthesis_latency_ms,
+            else int((time.monotonic() - attempt_t0) * 1000),
             self.tts_settings.model,
         )
         if sentence.first_audio_at is not None:
@@ -1514,6 +2762,11 @@ class TTSWorker(BaseWorker):
             already_spoken=already_spoken,
             duration_ms=duration_ms,
             synthesis_latency_ms=synthesis_latency_ms,
+            # Time spent waiting for a Cartesia concurrency slot, inside synthesis_latency_ms.
+            slot_wait_ms=sentence.slot_wait_ms,
+            # Spoken on a context left open for it — a prosodic continuation of the sentence
+            # before — rather than a fresh context.
+            continued=sentence.continued,
             text=text[:60],
             is_final=translation.is_final_chunk,
             # Empty when the speaker's delivery was not measured — which is what makes
@@ -1521,6 +2774,25 @@ class TTSWorker(BaseWorker):
             # instead of by inspection.
             generation_config=generation_config or None,
         )
+
+    def _synthesis_give_up_reason(
+        self, error: BaseException, outcome: str, failures: int, first_attempt_at: float
+    ) -> str | None:
+        """Why a failed sentence is NOT retried, or None to try it again.
+
+        In this order, because the first reason that applies is the one worth reading in the
+        dead-letter entry: a line that was half-spoken or a request the vendor refused is never
+        retried however much budget is left.
+        """
+        if isinstance(error, SentencePartiallySpokenError):
+            return f"partially_spoken:{outcome}"
+        if outcome not in _RETRYABLE_SYNTHESIS_OUTCOMES:
+            return f"not_retryable:{outcome}"
+        if failures > self.tts_settings.synthesis_max_retries:
+            return f"retries_exhausted:{outcome}"
+        if time.monotonic() - first_attempt_at >= self.tts_settings.synthesis_retry_window_seconds:
+            return f"retry_window_exceeded:{outcome}"
+        return None
 
     async def _publish_result(
         self,
@@ -1972,6 +3244,14 @@ class TTSWorker(BaseWorker):
         # WT-874: speakers the vendor has refused to clone for a reason another clip cannot fix
         # (the account's plan, its credits, its credentials). See _settle_live_clone.
         clone_refused: set[tuple[str, str]] = set()
+        # PROGRESSIVE CLONE (see TTSSettings.voice_clone_ladder_seconds). `ladder_rung` is the
+        # index of the next rung for a speaker who started this meeting with no voice at all;
+        # absent for everyone else, who keep the score-margin upgrade path below unchanged.
+        ladder_rung: dict[tuple[str, str], int] = {}
+        # One clone call per speaker at a time. A short rung's clone still in flight when the
+        # buffer crosses the next rung would otherwise race it, and whichever answered LAST would
+        # win — the 3-second voice overwriting the 8-second one.
+        clone_in_flight: set[tuple[str, str]] = set()
 
         while self._running:
             # Clone sampling buffers live speech; a stale chunk would be appended out of order.
@@ -1987,6 +3267,22 @@ class TTSWorker(BaseWorker):
                     try:
                         chunk = AudioChunkMessage.from_redis(data)
                         key = (chunk.meeting_id, chunk.speaker_id)
+
+                        # WT-933, flag off by default. The bridge stand-in is several people on
+                        # one feed, so its audio never enters the per-speaker buffers below: it
+                        # is set aside, attributed to a caption name once the hints for it can
+                        # have arrived, and buffered per NAME only if that person consented.
+                        # Setting it aside is a deque append; nobody else's chunk waits on it.
+                        #
+                        # With the flag off the stand-in falls through to the consent gate
+                        # exactly as it always has (and is refused there: the seat has no
+                        # route that opts it in).
+                        if (
+                            self.tts_settings.far_speaker_clone_enabled
+                            and is_external_bridge_speaker(chunk.speaker_id)
+                        ):
+                            self._hold_far_chunk(chunk)
+                            continue
 
                         # Consent gate: never buffer/clone a speaker's voice (biometric
                         # data) unless they have at least one current outgoing route with
@@ -2006,6 +3302,7 @@ class TTSWorker(BaseWorker):
                             buffer_lang.pop(key, None)
                             cloned_score.pop(key, None)
                             upgrades_used.pop(key, None)
+                            ladder_rung.pop(key, None)
                             # Discarded with the rest, so granting consent again re-seeds the
                             # carried bar. Left behind, a speaker who toggled the switch off and
                             # on would spend the remainder of the meeting with no bar at all and
@@ -2104,6 +3401,17 @@ class TTSWorker(BaseWorker):
                                     f"relanguage:{cloned_language}->{resolved_language}",
                                 )
 
+                        # A speaker with no voice of any kind — not live, not carried, not made by
+                        # another replica — climbs the progressive ladder instead of waiting for
+                        # min_seconds. Entered once; a speaker who already has a voice never does.
+                        if (
+                            existing_voice is None
+                            and key not in cloned_score
+                            and key not in ladder_rung
+                            and key not in clone_in_flight
+                        ):
+                            ladder_rung[key] = 0
+
                         # WT-371 #9: this used to be `if already cloned: continue` — the worker
                         # stopped listening the moment it had any clone at all, so the voice was
                         # locked to whatever register the speaker opened the meeting in. Change
@@ -2155,8 +3463,11 @@ class TTSWorker(BaseWorker):
                         # to find. It is reported rather than done silently, for the same reason
                         # every other exit on this path is.
                         best_so_far = cloned_score.get(key)
+                        # Not while climbing: a 3-second clip can score 1.0 too, and a longer
+                        # reference is the point of the next rung whatever the score says.
                         if (
                             not language_is_stale
+                            and key not in ladder_rung
                             and best_so_far is not None
                             and best_so_far + upgrade_margin > MAX_SAMPLE_SCORE
                         ):
@@ -2174,6 +3485,10 @@ class TTSWorker(BaseWorker):
                         buffer_seconds[key] = buffer_seconds.get(key, 0.0) + duration_s
                         buffer_lang[key] = chunk.language
 
+                        rungs = self._clone_ladder(float(min_seconds))
+                        on_ladder = key in ladder_rung and ladder_rung[key] < len(rungs)
+                        threshold = rungs[ladder_rung[key]] if on_ladder else float(min_seconds)
+
                         # WT-420: the bar needs something to fill with. Nothing before this
                         # reported that capture was even happening — "ủa nó ko tự thu hở" was the
                         # reasonable conclusion, and it was wrong the whole time.
@@ -2181,10 +3496,14 @@ class TTSWorker(BaseWorker):
                             key,
                             "capturing",
                             seconds=buffer_seconds[key],
-                            required_seconds=float(min_seconds),
+                            required_seconds=threshold,
                         )
 
-                        if buffer_seconds[key] >= min_seconds:
+                        if buffer_seconds[key] >= threshold and key in clone_in_flight:
+                            # The previous rung is still at the vendor. Keep listening; the
+                            # buffer it leaves behind is only longer by the time it answers.
+                            self._trim_clone_buffer(key, buffers, buffer_seconds, chunk.sample_rate)
+                        elif buffer_seconds[key] >= threshold:
                             # NOT UNDER A GUESS ABOUT THE LANGUAGE.
                             #
                             # `_resolve_clone_language` returns None while the speaker's language
@@ -2247,19 +3566,40 @@ class TTSWorker(BaseWorker):
                                 # the wrong language, and a better English voice is not a fix for
                                 # a Vietnamese speaker.
                                 worth_cloning = True
+                            elif on_ladder:
+                                # Climbing: the clip is LONGER than the one in use, which is the
+                                # improvement. It only has to not be clearly worse.
+                                worth_cloning = (
+                                    assessment.score >= previous_score - _LADDER_SCORE_TOLERANCE
+                                )
                             else:
                                 worth_cloning = assessment.score >= previous_score + upgrade_margin
                             if worth_cloning:
-                                audio_snapshot = bytes(buffers.pop(key))
-                                del buffer_seconds[key]
-                                buffer_lang.pop(key, None)
+                                last_rung = not on_ladder or ladder_rung[key] + 1 >= len(rungs)
+                                if last_rung:
+                                    audio_snapshot = bytes(buffers.pop(key))
+                                    del buffer_seconds[key]
+                                    buffer_lang.pop(key, None)
+                                else:
+                                    # Kept, and kept growing: the next rung is this same speech
+                                    # plus whatever they say next.
+                                    audio_snapshot = bytes(buffers[key])
+                                if on_ladder:
+                                    ladder_rung[key] += 1
+                                    if ladder_rung[key] >= len(rungs):
+                                        ladder_rung.pop(key, None)
+                                provisional = threshold < float(min_seconds)
                                 cloned_score[key] = assessment.score
                                 # A re-clone forced by a language correction does not spend an
                                 # upgrade. The budget bounds how often the voice people are
                                 # listening to may change for a BETTER likeness; being in the
                                 # right language is not that, and charging it here would let one
                                 # mistimed language hint use up the speaker's only improvement.
-                                spent_upgrade = is_upgrade and not language_is_stale
+                                # Nor does a ladder rung: that budget is for the score-margin
+                                # upgrades that follow the ladder.
+                                spent_upgrade = (
+                                    is_upgrade and not language_is_stale and not on_ladder
+                                )
                                 if spent_upgrade:
                                     upgrades_used[key] = upgrades_used.get(key, 0) + 1
                                 self.logger.info(
@@ -2273,6 +3613,8 @@ class TTSWorker(BaseWorker):
                                     pitch_semitones=round(assessment.pitch_semitone_range, 2),
                                     score=round(assessment.score, 3),
                                     upgrade=is_upgrade,
+                                    rung_seconds=threshold,
+                                    provisional=provisional,
                                 )
                                 await self._note_clone_state(
                                     key,
@@ -2292,8 +3634,17 @@ class TTSWorker(BaseWorker):
                                         # clone comes back chipmunked rather than refused.
                                         chunk.sample_rate,
                                         assessment.score,
+                                        offer_carry_over=not provisional,
                                     )
                                 )
+                                clone_in_flight.add(key)
+                                clone_task.add_done_callback(
+                                    functools.partial(_discard_on_done, clone_in_flight, key)
+                                )
+                                if previous_score is None:
+                                    # The speaker's FIRST voice is on its way: their next dub may
+                                    # wait for it briefly instead of going out as a stranger.
+                                    self._mark_first_clone_pending(key, clone_task)
                                 clone_task.add_done_callback(
                                     functools.partial(
                                         _settle_live_clone,
@@ -2334,6 +3685,437 @@ class TTSWorker(BaseWorker):
             except Exception:
                 self.logger.exception("audio_consumer_error")
                 await asyncio.sleep(2)
+
+    # ------------------------------------------------------------------
+    # WT-933 — a consenting Meet-side person's own voice (flag off by default)
+    # ------------------------------------------------------------------
+    #
+    # Read tts_worker/far_speaker_clone.py first. Three paths meet here:
+    #
+    #   CAPTURE   _hold_far_chunk -> _drain_far_chunks -> _capture_far_chunk -> _clone_and_cache
+    #   USE       _resolve_voice_variants -> _far_speaker_clone_voice
+    #   WITHDRAW  any of the above, or _watch_far_clone_consents -> _withdraw_far_clone
+    #
+    # A name never appears below. It is hashed into the consent field as it is read and only
+    # the hash travels; logs carry `far_speaker_hash`, the field's first 12 hex characters.
+
+    def _far_clone_state(self) -> FarCloneState:
+        # getattr, like every other per-room cache here: the tests build workers with __new__.
+        state: FarCloneState | None = getattr(self, "_far_clone_state_impl", None)
+        if state is None:
+            state = FarCloneState()
+            self._far_clone_state_impl = state
+        return state
+
+    def _far_clone_tracker(self) -> CaptionHintTracker:
+        """The same caption-hint attribution stt_worker labels the transcript with.
+
+        Two differences from the STT tracker, both in the direction of refusing more:
+
+        * `max_gap_ms=0`. The nearest-hint path can answer at most 0.5 and capture needs 1.0,
+          so a hint that only lands NEAR a chunk is not looked for at all.
+        * a deeper scan. A chunk is attributed a couple of seconds after it was spoken, and a
+          scan too shallow to reach back to its beginning would see only the hints for its end:
+          a hand-over inside the chunk would then read as one unanimous speaker.
+        """
+        state = self._far_clone_state()
+        if state.tracker is None:
+            redis = self.redis.redis
+
+            async def read_hints(key: str, count: int) -> Any:
+                return await redis.xrevrange(key, count=count)
+
+            state.tracker = CaptionHintTracker(
+                read_hints,
+                lag_ms=self.tts_settings.far_speaker_clone_hint_lag_ms,
+                max_gap_ms=0,
+                scan_count=256,
+            )
+        return state.tracker
+
+    def _hold_far_chunk(self, chunk: AudioChunkMessage) -> None:
+        """Set a stand-in chunk aside until the caption hints for it can have been written.
+
+        WHY IT WAITS
+            The desktop reads a caption after the words were spoken, so the hints for a chunk
+            are still arriving when the chunk does. Attributed on arrival, the end of every
+            chunk would have no hint yet and a change of speaker there would go unseen.
+
+        WHY NOBODY ELSE WAITS
+            Nothing here awaits. The chunk goes on a bounded queue and one background task
+            (_drain_far_chunks) takes them off when they are due; the capture loop is already
+            on the next speaker's chunk.
+
+        The wait is counted from the chunk's own timestamp, so a chunk that already sat in the
+        stream for a while is not held for its full length again, and is capped at the setting
+        so a clock that disagrees with the ingress cannot park audio here.
+        """
+        state = self._far_clone_state()
+        state.watched.add(chunk.meeting_id)
+        # Decided before holding, so a short chunk's audio is never kept even for two seconds.
+        if far_speaker_clone.chunk_speech_ms(chunk) < far_speaker_clone.CLONE_MIN_SPEECH_MS:
+            return
+        wait_s = max(0, self.tts_settings.far_speaker_clone_hint_wait_ms) / 1000
+        age_s = max(0.0, time.time() - chunk.timestamp_ms / 1000)
+        state.hold(chunk, time.monotonic() + max(0.0, wait_s - age_s))
+        if state.drainer is None or state.drainer.done():
+            state.drainer = asyncio.create_task(self._drain_far_chunks())
+
+    async def _drain_far_chunks(self) -> None:
+        """Attribute held stand-in chunks as they come due. Ends when none are left."""
+        state = self._far_clone_state()
+        while state.pending:
+            wait_s = state.pending[0].due - time.monotonic()
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+                continue
+            held = state.pending.popleft()
+            try:
+                await self._capture_far_chunk(held.chunk)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The chunk is simply not used. One bad chunk must not end the drain and leave
+                # the rest of the queue holding audio with nothing to release it.
+                self.logger.exception(
+                    "far_speaker_clone_chunk_error", meeting_id=held.chunk.meeting_id
+                )
+
+    async def _capture_far_chunk(self, chunk: AudioChunkMessage) -> None:
+        """One stand-in chunk: whose is it, did they consent, and is there a clone to make.
+
+        THE AUDIO IS DROPPED UNLESS EVERY ANSWER IS YES
+            Not attributed, attributed below certainty, a name with no consent field, consent
+            that could not be read: the chunk is not appended to anything and is gone when this
+            returns. Only audio that passed all of it reaches a buffer, and the buffer is the
+            consenting person's own, keyed by their consent field.
+
+        ONE CLONE PER NAME PER MEETING
+            The native path may replace a clone with a better clip. This one does not: every
+            extra sample is another stretch of a mixed feed taken on the strength of captions,
+            and a clone that passed the quality gate once is good enough to keep.
+        """
+        state = self._far_clone_state()
+        meeting_id = chunk.meeting_id
+        end_ms = chunk.timestamp_ms
+        window = SegmentWindow(end_ms - far_speaker_clone.chunk_pcm_ms(chunk), end_ms)
+        attribution = await self._far_clone_tracker().attribute(meeting_id, window)
+        if attribution is None or attribution.confidence < far_speaker_clone.CLONE_MIN_CONFIDENCE:
+            return
+        field = far_speaker_clone.consent_field(attribution.name)
+        if field is None:
+            return
+        key: FarKey = (meeting_id, field)
+
+        consent = await self._far_clone_consent(meeting_id, field)
+        if consent is not True:
+            state.drop_buffer(key)
+            if consent is False:
+                # Present a moment ago, or never: either way nothing of theirs may remain.
+                await self._withdraw_far_clone(meeting_id, field)
+            return
+
+        # The platform kill switch narrows this exactly as it narrows a native speaker's clone.
+        if not await self._voice_clone_allowed(meeting_id):
+            state.drop_buffer(key)
+            return
+        if key in state.refused or key in state.in_flight:
+            state.drop_buffer(key)
+            return
+        if await self._far_clone_voice_id(meeting_id, field):
+            state.drop_buffer(key)
+            return
+
+        state.buffers.setdefault(key, bytearray()).extend(chunk.audio_data)
+        duration_s = len(chunk.audio_data) / 2 / max(chunk.sample_rate, 1)
+        state.buffer_seconds[key] = state.buffer_seconds.get(key, 0.0) + duration_s
+        state.buffer_lang[key] = chunk.language
+        if state.buffer_seconds[key] < await self._clone_min_seconds():
+            return
+
+        # From here on it is the native path's own gate, in the native path's own order: not
+        # under a guess about the language, and not from a clip that is not worth referring to.
+        clone_lang = _resolve_clone_language(state.buffer_lang.get(key, ""))
+        if clone_lang is None:
+            self._trim_clone_buffer(key, state.buffers, state.buffer_seconds, chunk.sample_rate)
+            return
+        assessment = assess_clone_sample(bytes(state.buffers[key]), chunk.sample_rate)
+        if not assessment.accepted:
+            self.logger.info(
+                "far_speaker_clone_sample_rejected",
+                meeting_id=meeting_id,
+                far_speaker_hash=far_speaker_clone.far_hash(field),
+                reason=assessment.reason,
+                active_speech_ratio=round(assessment.active_speech_ratio, 3),
+            )
+            self._trim_clone_buffer(key, state.buffers, state.buffer_seconds, chunk.sample_rate)
+            return
+
+        audio_snapshot = bytes(state.buffers[key])
+        state.drop_buffer(key)
+        state.in_flight.add(key)
+        self.logger.info(
+            "far_speaker_clone_sample_accepted",
+            meeting_id=meeting_id,
+            far_speaker_hash=far_speaker_clone.far_hash(field),
+            seconds=round(len(audio_snapshot) / 2 / max(chunk.sample_rate, 1), 1),
+            score=round(assessment.score, 3),
+        )
+        clone_task = asyncio.create_task(
+            self._clone_and_cache(
+                meeting_id,
+                chunk.speaker_id,
+                audio_snapshot,
+                clone_lang,
+                chunk.sample_rate,
+                assessment.score,
+                far_field=field,
+            )
+        )
+        clone_task.add_done_callback(
+            functools.partial(
+                _settle_far_clone, key=key, in_flight=state.in_flight, refused=state.refused
+            )
+        )
+
+    async def _far_clone_consent(self, meeting_id: str, field: str) -> bool | None:
+        """Is this person's consent field present right now? None when it could not be read.
+
+        Asked every time and never cached: the contract is "present right now", and a cached
+        yes is a withdrawal that has not taken effect.
+
+        THREE ANSWERS, BECAUSE TWO WOULD BE WRONG IN ONE DIRECTION OR THE OTHER
+            An unreadable hash must stop the clone being captured or spoken, like a no. It must
+            NOT delete the voice model, unlike a no: a Redis blip is not a person withdrawing,
+            and a deletion cannot be taken back.
+        """
+        try:
+            value = await self.redis.hget(far_speaker_clone.consents_key(meeting_id), field)
+        except Exception:
+            self.logger.warning(
+                "far_speaker_clone_consent_unreadable", meeting_id=meeting_id, exc_info=True
+            )
+            return None
+        return value is not None
+
+    async def _far_clone_voice_id(self, meeting_id: str, field: str) -> str | None:
+        cached = await self.redis.hget(far_speaker_clone.clones_key(meeting_id), field)
+        if not cached:
+            return None
+        return cached.decode() if isinstance(cached, bytes) else cached
+
+    async def _cache_far_clone(
+        self, meeting_id: str, field: str, voice_id: str, language: str, score: float | None
+    ) -> str:
+        """Record a just-made clone of a Meet-side person. The far half of _clone_and_cache.
+
+        WHAT IS DIFFERENT FROM A NATIVE SPEAKER'S CLONE, AND WHY
+
+        Where it is stored. Under the person's consent field in a hash of its own, never at
+        `voice:{meeting}:{stand-in}`: that key is "the speaker's voice", and the speaker here is
+        a seat several people share.
+
+        Consent is asked AGAIN. The clone call takes seconds and the person may have withdrawn
+        during them. A voice that arrives after its consent left is deleted here and never
+        becomes reachable.
+
+        No carry-over. _offer_carry_over renames a clone so the orphan sweep leaves it alone and
+        hands it to AuthService as a user's profile. This person is not a WarpTalk user, and
+        their consent is to this meeting. The voice keeps its `speaker-` name, so whatever
+        happens to this process the sweep still collects it.
+
+        No `voice_clone_ready` event and no clone-state: both address the person at a WarpTalk
+        microphone by speaker id, and this speaker id is the stand-in.
+        """
+        if await self._far_clone_consent(meeting_id, field) is not True:
+            await self._request_voice_delete(voice_id, "far_speaker_consent_withdrawn")
+            self.logger.info(
+                "far_speaker_clone_discarded",
+                meeting_id=meeting_id,
+                far_speaker_hash=far_speaker_clone.far_hash(field),
+                voice_id=voice_id,
+            )
+            return _FAR_CLONE_CONSENT_WITHDRAWN
+        cache_key = far_speaker_clone.clones_key(meeting_id)
+        await self.redis.hset(cache_key, field, voice_id)
+        # hset has no TTL of its own. The same lifetime a native clone's key has, which is the
+        # bound the orphan sweep's minimum age is derived from.
+        await self.redis.expire(cache_key, self.tts_settings.voice_clone_key_ttl_seconds)
+        self._far_clone_state().watched.add(meeting_id)
+        self.logger.info(
+            "far_speaker_voice_cloned",
+            meeting_id=meeting_id,
+            far_speaker_hash=far_speaker_clone.far_hash(field),
+            voice_id=voice_id,
+            language=base_language(language),
+            score=None if score is None else round(score, 3),
+        )
+        return ""
+
+    async def _far_speaker_clone_voice(
+        self,
+        meeting_id: str,
+        speaker_id: str,
+        target_lang: str,
+        far_speaker_name: str | None,
+        far_speaker_confidence: float | None,
+        segment_id: str,
+        duration_ms: int,
+    ) -> str | None:
+        """The clone to speak this stand-in sentence in, or None for the WT-932 stock voice.
+
+        Every condition of the contract, and the caller has already checked the flag:
+
+            the sentence is the stand-in's and names someone
+            its confidence is 1.0 and it is at least 1.5 s long        (it "qualifies")
+            it is at least the 3rd qualifying sentence in a row for that name
+            the platform has not switched cloning off
+            that person has a clone
+            their consent field is present right now
+
+        WHY THREE IN A ROW
+            A wrong name with a stock voice is one person's words in a stranger's voice. A wrong
+            name with a CLONE is one person's words in another real person's own voice, which a
+            listener hears as that person saying them. So a single certain sentence is not
+            enough: the attribution has to have held.
+
+        The streak is counted on every named stand-in sentence, cloned or not, so that it is
+        already there when the clone arrives. Every failure answers None: the stock voice is
+        always available and a dub must never wait on, or fail for, this.
+        """
+        if not is_external_bridge_speaker(speaker_id):
+            return None
+        state = self._far_clone_state()
+        state.watched.add(meeting_id)
+        field = far_speaker_clone.consent_field(far_speaker_name)
+        if field is None:
+            return None
+        streak = state.note_sentence(
+            meeting_id,
+            field,
+            target_lang,
+            segment_id,
+            far_speaker_clone.sentence_qualifies(far_speaker_confidence, duration_ms),
+        )
+        if streak < far_speaker_clone.CLONE_MIN_STREAK:
+            return None
+        try:
+            if not await self._voice_clone_allowed(meeting_id):
+                return None
+            voice_id = await self._far_clone_voice_id(meeting_id, field)
+            if not voice_id:
+                return None
+            consent = await self._far_clone_consent(meeting_id, field)
+            if consent is False:
+                await self._withdraw_far_clone(meeting_id, field)
+            return voice_id if consent is True else None
+        except Exception:
+            self.logger.warning(
+                "far_speaker_clone_unavailable",
+                meeting_id=meeting_id,
+                far_speaker_hash=far_speaker_clone.far_hash(field),
+                exc_info=True,
+            )
+            return None
+
+    async def _withdraw_far_clone(self, meeting_id: str, field: str) -> None:
+        """This person's consent field is gone: forget their audio and destroy their voice.
+
+        The pointer is removed FIRST, so the very next sentence cannot find the voice, and the
+        HDEL's own answer decides who asks for the deletion: three paths can notice a withdrawal
+        in the same second, and only the one whose HDEL removed the field goes on.
+
+        The voice model is then deleted through `voice:delete_requests`, the path withdrawn
+        consent already takes for a native speaker (_consume_voice_delete_requests). A stream
+        rather than a direct call so that a deletion this process dies in the middle of is
+        redelivered rather than lost.
+        """
+        self._far_clone_state().drop_buffer((meeting_id, field))
+        voice_id = await self._far_clone_voice_id(meeting_id, field)
+        if not voice_id:
+            return
+        removed = await self.redis.redis.hdel(far_speaker_clone.clones_key(meeting_id), field)
+        if not removed:
+            return
+        await self._request_voice_delete(voice_id, "far_speaker_consent_withdrawn")
+        self.logger.info(
+            "far_speaker_clone_withdrawn",
+            meeting_id=meeting_id,
+            far_speaker_hash=far_speaker_clone.far_hash(field),
+            voice_id=voice_id,
+        )
+
+    async def _request_voice_delete(self, voice_id: str, reason: str) -> None:
+        """Ask for a voice model to be destroyed, on the stream _handle_voice_delete_request reads.
+
+        Never raises. If the request cannot even be written the voice is still named `speaker-`,
+        so the orphan sweep deletes it; that is late, and it is said loudly for that reason.
+        """
+        try:
+            await self.redis.publish(_VOICE_DELETE_STREAM, {"voice_id": voice_id, "reason": reason})
+        except Exception:
+            self.logger.error(
+                "voice_delete_request_not_published",
+                voice_id=voice_id,
+                reason=reason,
+                exc_info=True,
+            )
+
+    async def _reconcile_far_clones(self, meeting_id: str) -> None:
+        """Compare what this room holds of Meet-side people with who still consents.
+
+        Withdrawal is an HDEL on the backend's side and nothing announces it, so it has to be
+        looked for. The capture and the dub both look, but only when that person speaks; this
+        is for the person who withdraws and then stays silent, whose voice model would otherwise
+        sit in the account until the orphan sweep.
+
+        A hash that cannot be read changes nothing (see _far_clone_consent). A hash that reads
+        as EMPTY is everybody withdrawn, which is what an expired or deleted hash means in the
+        contract.
+        """
+        state = self._far_clone_state()
+        buffered = [key for key in state.buffers if key[0] == meeting_id]
+        try:
+            clones = _decode_hash(
+                await self.redis.hgetall(far_speaker_clone.clones_key(meeting_id))
+            )
+            if not clones and not buffered:
+                return
+            consents = _decode_hash(
+                await self.redis.hgetall(far_speaker_clone.consents_key(meeting_id))
+            )
+        except Exception:
+            self.logger.warning(
+                "far_speaker_clone_consent_unreadable", meeting_id=meeting_id, exc_info=True
+            )
+            return
+        for key in buffered:
+            if key[1] not in consents:
+                state.drop_buffer(key)
+        for field in clones:
+            if field not in consents:
+                await self._withdraw_far_clone(meeting_id, field)
+
+    async def _watch_far_clone_consents(self) -> None:
+        """Run _reconcile_far_clones for every room a stand-in has been seen in. Flag on only.
+
+        The rooms are remembered in memory, so a restart forgets them until the far side says
+        something again. A room that stays silent after a restart keeps its clones until the
+        orphan sweep, which is the same backstop every in-meeting clone has.
+        """
+        interval = max(1.0, self.tts_settings.far_speaker_clone_consent_poll_seconds)
+        while not self._shutdown_event.is_set():
+            for meeting_id in list(self._far_clone_state().watched):
+                try:
+                    await self._reconcile_far_clones(meeting_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.logger.exception("far_speaker_clone_reconcile_failed")
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)
+            except TimeoutError:
+                pass
 
     async def _note_clone_state(
         self,
@@ -2440,8 +4222,20 @@ class TTSWorker(BaseWorker):
         language: str = "en",
         sample_rate: int = 16000,
         score: float | None = None,
+        *,
+        far_field: str | None = None,
+        offer_carry_over: bool = True,
     ) -> str:
         """Clone voice via Cartesia and cache voice_id in Redis.
+
+        `offer_carry_over=False` is a provisional ladder rung (TTSSettings.voice_clone_ladder_
+        seconds): used in this meeting at once, never promoted into the next one, so a 3-second
+        reference cannot become somebody's voice for good. Left unpromoted, the orphan sweep
+        collects it like any in-meeting clone.
+
+        `far_field` (WT-933) is set only for a Meet-side person's clone: `speaker_id` is then the
+        stand-in seat and the voice is recorded under that person's consent field instead of at
+        the speaker's own key. See _cache_far_clone for everything that differs.
 
         Returns "" once the voice is cached, else the `_clone_failure` code for why it is not.
         The capture loop reads it (see _settle_live_clone): until WT-874 it assumed every clone it
@@ -2481,6 +4275,8 @@ class TTSWorker(BaseWorker):
                 label,
                 language,
             )
+            if far_field is not None:
+                return await self._cache_far_clone(meeting_id, far_field, voice_id, language, score)
             cache_key = f"voice:{meeting_id}:{speaker_id}"
             await self.redis.hset(cache_key, "voice_id", voice_id)
             cached = True
@@ -2505,7 +4301,8 @@ class TTSWorker(BaseWorker):
                 event_type="voice_clone_ready",
                 payload={"speakerId": speaker_id, "voiceId": voice_id},
             )
-            await self._offer_carry_over(speaker_id, language, voice_id, score)
+            if offer_carry_over:
+                await self._offer_carry_over(speaker_id, language, voice_id, score)
             return ""
         except Exception as e:
             self.logger.error(
@@ -2514,6 +4311,10 @@ class TTSWorker(BaseWorker):
                 speaker_id=speaker_id,
                 error=str(e),
             )
+            if far_field is not None:
+                # No clone-state for the stand-in seat: that stream drives the progress bar of
+                # the person at a WarpTalk microphone, and nobody is sitting at this one.
+                return _clone_failure(e)[0]
             # The last silent exit on this path, and the one that hid the bug above for the whole
             # life of the feature. Every OTHER branch in _consume_audio_for_cloning publishes its
             # reason (WT-420), so the clone-state stream showed `capturing` → `cloning` → nothing,
@@ -2707,8 +4508,8 @@ class TTSWorker(BaseWorker):
 
         Zero is the normal answer and it means "make no adjustment".
         """
-        # getattr + assign back, matching `_turns`: the tests build workers with __new__ and
-        # never run __init__, and this one is written to as well as read.
+        # getattr + assign back, matching `_open_contexts`: the tests build workers with __new__
+        # and never run __init__, and this one is written to as well as read.
         timeline: dict[tuple[str, str, str], int] = getattr(self, "_spoken_start_ms", None) or {}
         self._spoken_start_ms = timeline
 

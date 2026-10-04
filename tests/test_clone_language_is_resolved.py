@@ -77,6 +77,7 @@ def _worker(**overrides: Any) -> tuple[TTSWorker, list[str]]:
         language: str = "en",
         _sample_rate: int = 16000,
         _score: float | None = None,
+        **_kwargs: Any,
     ) -> None:
         languages.append(language)
 

@@ -100,12 +100,46 @@ class ToolContext:
     page_entity_id: str | None = None
 
 
+#: Allowed values for a built-in tool's manifest metadata (see tools_manifest.py). The category ids
+#: are the ones the web's /{slug}/tools page groups by (warpbot-tools-catalog.ts), plus "other" as
+#: the contract's catch-all.
+TOOL_CATEGORIES = (
+    "meetings",
+    "knowledge",
+    "documents",
+    "glossary",
+    "translation",
+    "workspace",
+    "conversation",
+    "platform",
+    "other",
+)
+#: "write" means the tool changes data (creates, saves or shares something).
+TOOL_EFFECTS = ("read", "write")
+#: "member": everyone. "host": listed for everyone, but only a meeting's host can complete it.
+#: "platform_staff": answers only for a WarpTalk platform administrator.
+TOOL_AUDIENCES = ("member", "host", "platform_staff")
+
+
 @dataclass
 class ChatTool:
     name: str
     description: str
     parameters: dict[str, Any]
     handler: Callable[[ToolContext, dict[str, Any]], Awaitable[str]]
+    #: Manifest metadata, published to Redis so the backend can list WarpBot's tools. Declared on
+    #: every built-in in TOOLS, next to its schema, so the two cannot drift; a test fails if one is
+    #: missing. Optional only because plugin (MCP) and platform tools reuse this class and are not
+    #: in the manifest.
+    category: str | None = None
+    effect: str | None = None
+    audience: str | None = None
+    #: False keeps a built-in out of the manifest: internal plumbing a user never asks for (the
+    #: meeting-chat -> widget handoff). It is still given to the model wherever offered_on allows.
+    listed: bool = True
+    #: The plugin a dynamic MCP tool belongs to, from the backend's tool list. None for the
+    #: worker's own tools; it is how the tool-call log tells a plugin call from a built-in one.
+    plugin_key: str | None = None
 
     def to_openai_schema(self) -> dict[str, Any]:
         """Tool declaration in the shape /v1/responses expects.
@@ -823,8 +857,64 @@ class MeetingAccess:
     room: dict[str, Any]
 
 
-async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> MeetingAccess:
+#: Room statuses after which a meeting's record (summary, minutes) exists. Mirrors
+#: TranslationRoomConstants.TerminalStatuses in TranslationRoomService.
+TERMINAL_ROOM_STATUSES = frozenset({"ENDED", "CANCELLED", "EXPIRED"})
+
+
+async def _caller_took_part_in(ctx: ToolContext, meeting_id: str, room: dict[str, Any]) -> bool:
+    """Whether this caller is the room's host or on its roster. WT-929.
+
+    WHY THIS EXISTS
+        A bridge room ignores workspace for membership: every user sitting in the same Google
+        Meet joins ONE WarpTalk room, whichever workspace each of them works in. For those
+        people the room's workspace is somebody else's, and a bare workspace comparison would
+        refuse a participant the transcript of the meeting they are sitting in. So taking part
+        in the room is admitted regardless of workspace — and nothing weaker is: a standing
+        invitation, or being Owner/Admin of the OTHER workspace, both pass the room read and
+        neither counts here.
+
+    Asked of the service with the caller's own token, never derived from the room payload
+    alone, and FAILS CLOSED: any answer other than a roster naming this user is a "no".
+    """
+    user_id = (ctx.user_id or "").strip().lower()
+    if not user_id:
+        return False
+
+    for key in ("effectiveHostId", "hostId"):
+        if str(room.get(key) or "").strip().lower() == user_id:
+            return True
+
+    try:
+        response = await ctx.translation_room_client.get(
+            f"/api/v1/translation-rooms/{meeting_id}/participants",
+            headers=_auth_headers(ctx),
+        )
+        if response.status_code != 200:
+            return False
+        roster = response.json()
+    except Exception:
+        logger.warning("meeting_roster_lookup_failed", meeting_id=meeting_id)
+        return False
+
+    if not isinstance(roster, list):
+        return False
+    return any(
+        isinstance(row, dict) and str(row.get("userId") or "").strip().lower() == user_id
+        for row in roster
+    )
+
+
+async def _authorize_meeting_access(
+    ctx: ToolContext, meeting_id: str, *, subject: str = "meeting summary"
+) -> MeetingAccess:
     """A `denial` of None if this caller may read this meeting's derived data, else the error.
+
+    WT-929: the ONE gate for every tool that takes a model-supplied meeting id —
+    get_meeting_summary, get_room_detail and get_transcript. The last two used to forward the
+    token and compare nothing, so a meeting of another workspace the caller happened to have a
+    relation to (an email invitation, Owner/Admin over there) was readable from this
+    workspace's chat. `subject` only words the "try again" error.
 
     S2. `meeting_id` is a MODEL-SUPPLIED tool argument — the assistant will pass whatever id
     appears in the conversation, including one a user simply typed. Tools that answer out of
@@ -839,14 +929,15 @@ async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> Meetin
       is presently valid: this worker performs no signature verification and no expiry check
       of its own, so an unauthenticated (or expired) request must be refused by the .NET
       service, not by us.
-    - The room's workspace must be the workspace this chat turn is scoped to.
-      GET /api/v1/translation-rooms/{id} is [Authorize] but performs no workspace or
-      participant check of its own, so a 200 alone only proves the room EXISTS — any
-      authenticated user in any workspace gets one. Without the workspace comparison this
-      gate would still hand a user another workspace's meeting summary, which is the bug.
+    - The room's workspace must be the workspace this chat turn is scoped to — unless the
+      caller took part in the room (see _caller_took_part_in: bridge rooms span workspaces).
+      GET /api/v1/translation-rooms/{id} answers 200 for the host, a participant, an invitee
+      and an Owner/Admin of the ROOM's workspace, so a 200 alone says nothing about the
+      workspace this turn is scoped to. Without the comparison this gate would still hand a
+      user another workspace's meeting, which is the bug.
     """
     not_found = json.dumps({"error": "No meeting found with that id."})
-    unavailable = json.dumps({"error": "Could not look up the meeting summary right now."})
+    unavailable = json.dumps({"error": f"Could not look up the {subject} right now."})
 
     try:
         uuid.UUID(meeting_id)
@@ -901,7 +992,18 @@ async def _authorize_meeting_access(ctx: ToolContext, meeting_id: str) -> Meetin
     room_workspace_id = str(room.get("workspaceId") or "")
 
     # Fail closed: a room whose workspace we cannot read is a room we cannot clear.
-    if not room_workspace_id or room_workspace_id.lower() != (ctx.workspace_id or "").lower():
+    same_workspace = bool(room_workspace_id) and (
+        room_workspace_id.lower() == (ctx.workspace_id or "").lower()
+    )
+    # The bridge exemption needs a workspace-scoped turn AND a room that names its workspace: it
+    # widens "which workspace", never "is there one".
+    took_part = (
+        not same_workspace
+        and bool(room_workspace_id)
+        and bool(ctx.workspace_id)
+        and await _caller_took_part_in(ctx, meeting_id, cast(dict[str, Any], room))
+    )
+    if not same_workspace and not took_part:
         logger.warning(
             "meeting_summary_denied_cross_workspace",
             meeting_id=meeting_id,
@@ -923,50 +1025,152 @@ async def _get_meeting_summary(ctx: ToolContext, arguments: dict[str, Any]) -> s
     if access.denial is not None:
         return access.denial
 
-    try:
-        summary_hash = await ctx.redis.hgetall(f"meeting:{meeting_id}:summary")
-        if not summary_hash:
-            return json.dumps(
-                {
-                    "summary": None,
-                    "note": (
-                        "No summary has been generated for this meeting yet. Meeting summaries "
-                        "are only produced automatically as a meeting's transcript pipeline "
-                        "completes — there is currently no on-demand trigger."
-                    ),
-                }
-            )
-
-        decoded = {
-            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
-            for k, v in summary_hash.items()
+    no_summary = json.dumps(
+        {
+            "summary": None,
+            "note": (
+                "No summary has been generated for this meeting yet. Meeting summaries "
+                "are only produced automatically as a meeting's transcript pipeline "
+                "completes — there is currently no on-demand trigger."
+            ),
         }
-        # WT-647. The same summary reaches the model through two doors — this tool, and
-        # semantic_search over the chunks the summary was indexed into. Only the second one used
-        # to carry a marker, so whether the answer came out cited depended on which door the
-        # model happened to walk through, and the reader could not see which that was. One
-        # meeting is one source however it is reached; both doors issue the same kind now.
-        #
-        # The id is the room's own, not the model-supplied argument, so that a citation raised
-        # here and one raised by get_room_detail for the same meeting are the SAME source rather
-        # than two chips differing only in how somebody typed a UUID.
-        return json.dumps(
-            _with_marker(
-                {
-                    "summary": decoded.get("content"),
-                    "action_items": decoded.get("action_items"),
-                },
-                _cite(
-                    ctx,
-                    "meeting",
-                    access.room.get("title"),
-                    str(access.room.get("id") or meeting_id),
-                ),
-            )
-        )
+    )
+    unavailable = json.dumps({"error": "Could not look up the meeting summary right now."})
+
+    # A meeting still running has no published summary, and the artifact endpoints below would
+    # answer that as a refusal. Said plainly instead.
+    if str(access.room.get("status") or "").strip().upper() not in TERMINAL_ROOM_STATUSES:
+        return no_summary
+
+    try:
+        published = await _read_published_summary(ctx, meeting_id)
     except Exception:
         logger.exception("get_meeting_summary_error")
-        return json.dumps({"error": "Could not look up the meeting summary right now."})
+        return unavailable
+
+    if published.outcome == "denied":
+        logger.warning("meeting_summary_denied_by_artifact_access", meeting_id=meeting_id)
+        return json.dumps(
+            {
+                "error": (
+                    "This meeting's summary has not been shared with you. Only the host can "
+                    "read it until they share the meeting's record with its participants."
+                )
+            }
+        )
+    if published.outcome == "absent":
+        return no_summary
+    if published.outcome != "ready":
+        return unavailable
+
+    # WT-647. The same summary reaches the model through two doors — this tool, and
+    # semantic_search over the chunks the summary was indexed into. One meeting is one source
+    # however it is reached; both doors issue the same kind.
+    #
+    # The id is the room's own, not the model-supplied argument, so that a citation raised
+    # here and one raised by get_room_detail for the same meeting are the SAME source rather
+    # than two chips differing only in how somebody typed a UUID.
+    return json.dumps(
+        _with_marker(
+            {
+                "summary": published.content,
+                "templateKey": published.template_key,
+                "language": published.language or None,
+            },
+            _cite(
+                ctx,
+                "meeting",
+                access.room.get("title"),
+                str(access.room.get("id") or meeting_id),
+            ),
+        )
+    )
+
+
+@dataclass(frozen=True)
+class _PublishedSummary:
+    #: "ready" (content is set), "absent" (no summary exists), "denied" (ArtifactAccess said
+    #: no) or "unavailable" (anything this could not read — fails closed).
+    outcome: str
+    content: Any = None
+    template_key: str | None = None
+    language: str | None = None
+
+
+async def _read_published_summary(ctx: ToolContext, meeting_id: str) -> _PublishedSummary:
+    """The meeting's published summary, read through TranslationRoomService AS THE CALLER.
+
+    WT-929 — WHY NOT REDIS
+        This tool used to answer out of `meeting:{id}:summary`. Redis has no notion of who is
+        asking, so the only checks were the ones the gate above re-creates: room read and
+        workspace. The product's rule for a summary is stricter — ArtifactAccessHelper: the
+        host always, a participant or invitee only once the host has shared the record — and
+        a participant of a HOST_ONLY room, or a workspace Owner/Admin who hosts nothing, read
+        through WarpBot what the web refuses them. Re-implementing that rule here would be a
+        second copy of an authorization decision; asking the endpoint the web asks is not.
+        (The Redis copy is also the first draft: a host's rewrite never reached it.)
+
+    TWO READS, AND WHY
+        `/summary` is a GET that QUEUES a model call when asked for a (shape, language) pair
+        nobody has rendered yet. A tool must never cause that, so the renderings list is read
+        first to learn which pair the host published, and exactly that pair is asked for —
+        which the service answers from the stored artifact. Both reads sit behind the same
+        ArtifactAccess gate.
+    """
+    base = f"/api/v1/room-artifacts/rooms/{meeting_id}/summary"
+
+    listing = await ctx.translation_room_client.get(
+        f"{base}/renderings", headers=_auth_headers(ctx)
+    )
+    if listing.status_code in (401, 403):
+        return _PublishedSummary("denied")
+    if listing.status_code == 404:
+        return _PublishedSummary("absent")
+    if listing.status_code != 200:
+        logger.warning("meeting_summary_renderings_failed", status=listing.status_code)
+        return _PublishedSummary("unavailable")
+
+    renderings = listing.json()
+    canonical = next(
+        (
+            row
+            for row in (renderings if isinstance(renderings, list) else [])
+            if isinstance(row, dict) and row.get("isCanonical")
+        ),
+        None,
+    )
+    if canonical is None:
+        return _PublishedSummary("absent")
+
+    template_key = str(canonical.get("templateKey") or "general")
+    language = str(canonical.get("language") or "")
+    params: dict[str, Any] = {"template": template_key}
+    if language:
+        params["language"] = language
+
+    response = await ctx.translation_room_client.get(
+        base, params=params, headers=_auth_headers(ctx)
+    )
+    if response.status_code in (401, 403):
+        return _PublishedSummary("denied")
+    if response.status_code != 200:
+        # 202 lands here on purpose: the host rewrote the summary between the two reads and
+        # this pair is now being generated. "Try again" is the honest answer.
+        logger.warning("meeting_summary_read_failed", status=response.status_code)
+        return _PublishedSummary("unavailable")
+
+    body = response.json()
+    if not isinstance(body, dict) or body.get("status") != "ready":
+        return _PublishedSummary("unavailable")
+
+    raw = body.get("content")
+    if not isinstance(raw, str) or not raw.strip():
+        return _PublishedSummary("absent")
+    try:
+        content: Any = json.loads(raw)
+    except ValueError:
+        content = raw
+    return _PublishedSummary("ready", content, template_key, language)
 
 
 async def _get_room_detail(ctx: ToolContext, arguments: dict[str, Any]) -> str:
@@ -976,18 +1180,15 @@ async def _get_room_detail(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             {"error": "A room_id is required — call list_recent_meetings first to find one."}
         )
 
-    try:
-        response = await ctx.translation_room_client.get(
-            f"/api/v1/translation-rooms/{room_id}",
-            headers=_auth_headers(ctx),
-        )
-        if response.status_code == 404:
-            return json.dumps({"error": "No room found with that id."})
-        if response.status_code != 200:
-            logger.warning("get_room_detail_failed", status=response.status_code)
-            return json.dumps({"error": "Could not look up that room right now."})
+    # WT-929: through the same gate as the summary. This used to GET the room and return it,
+    # so the only check was the service's own room read — which a caller scoped to ANOTHER
+    # workspace passes for any room they hold an invitation to or administer over there.
+    access = await _authorize_meeting_access(ctx, room_id, subject="room")
+    if access.denial is not None:
+        return access.denial
 
-        room = response.json()
+    try:
+        room = access.room
         # WT-647, DELIBERATE: this one cites, and list_recent_meetings does not.
         #
         # The line is between a tool that ANSWERS ABOUT ONE NAMED MEETING and one that offers
@@ -1020,45 +1221,6 @@ async def _get_room_detail(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     except Exception:
         logger.exception("get_room_detail_error")
         return json.dumps({"error": "Could not look up that room right now."})
-
-
-async def _meeting_title(ctx: ToolContext, meeting_id: str) -> str | None:
-    """What to call this meeting on a chip, or None when it cannot be named.
-
-    WHY A TRANSCRIPT HAS TO ASK SOMEBODY ELSE WHAT IT IS CALLED
-        TranscriptDto carries ids, a status, languages and counts, and no title — the name a
-        reader would recognise ("Sprint review") lives on the translation room. So a transcript
-        either asks the room what it is called or says nothing, and saying nothing is the worse
-        of the two: a meeting-kind chip has no destination in the client, so its title is the
-        entire chip, and a row of chips all reading "Transcript" names no source at all.
-
-    WHY FAILING HERE IS NOT AN ERROR
-        None means no marker, which means an uncited answer — precisely the state the tool was
-        already in before this ticket. The transcript itself is unaffected; losing the transcript
-        because its footnote could not be labelled would be trading the answer for the citation.
-
-    WHY THIS IS NOT AN AUTHORIZATION CHECK, AND MUST NOT BE READ AS ONE
-        It declines to NAME; it never declines to READ. What decides whether this caller may see
-        the transcript is /api/v1/transcripts/..., answering the caller's own bearer token, the
-        same way every other HTTP-backed tool in this module inherits its authorization. Note the
-        asymmetry with get_meeting_summary, which answers out of Redis and therefore has to run
-        the S2 gate itself: this tool does not have that gate, and this function is not one.
-    """
-    try:
-        response = await ctx.translation_room_client.get(
-            f"/api/v1/translation-rooms/{meeting_id}",
-            headers=_auth_headers(ctx),
-        )
-        if response.status_code != 200:
-            return None
-        room = response.json()
-    except Exception:
-        logger.warning("meeting_title_lookup_failed", meeting_id=meeting_id)
-        return None
-
-    if not isinstance(room, dict):
-        return None
-    return str(room.get("title") or "").strip() or None
 
 
 class _SegmentReadError(Exception):
@@ -1185,6 +1347,19 @@ def _transcript_window_arguments(
         before = int(raw_before)
     except (TypeError, ValueError):
         return "before_sequence must be a positive integer."
+    # 0 AND 1 MEAN "NOT GIVEN" (prod, 3 Oct 2026, room 01a1016c).
+    #
+    # The model fills every property it is offered, optional or not, so a
+    # plain "what was said?" arrived as before_sequence=0. That was refused as not positive, the
+    # model "corrected" it to 1, and 1 means "the segments before the first one" — always none.
+    # Every in-meeting question about the transcript came back `segments: []` beside
+    # `totalSegments: 40`, and WarpBot told the room the transcript was not ready.
+    #
+    # Neither value is ever a real page: nothing precedes segment 1, and a page that starts at
+    # 1 reports omittedEarlier=false, so no hint ever asks for before_sequence=1. Both therefore
+    # fall through to `range`, which is what the caller meant.
+    if before in (0, 1):
+        return raw_range == "beginning", None
     if before < 1:
         return "before_sequence must be a positive integer."
     # An explicit position outranks `range`: it already says which part of the meeting.
@@ -1211,6 +1386,14 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
     if isinstance(parsed, str):
         return json.dumps({"error": parsed})
     from_beginning, before = parsed
+
+    # WT-929. TranscriptService decides WHO may read (host, a participant, and once the meeting
+    # has ended only while the record is shared — TranscriptReadAccess); it has no idea which
+    # workspace this chat turn belongs to. This gate adds that, with the bridge exemption: a
+    # participant of the room reads its transcript whatever workspace the room lives in.
+    access = await _authorize_meeting_access(ctx, meeting_id, subject="transcript")
+    if access.denial is not None:
+        return access.denial
 
     try:
         transcript_response = await ctx.transcript_client.get(
@@ -1260,11 +1443,10 @@ async def _get_transcript(ctx: ToolContext, arguments: dict[str, Any]) -> str:
         # on an id to come out as one chip; this kind is registered by exactly one tool, so the
         # only way to split it would be two get_transcript calls for the same meeting typed two
         # different ways — and the price of that is a duplicate chip, not a wrong one.
-        marker = (
-            _cite(ctx, "transcript", await _meeting_title(ctx, meeting_id), meeting_id)
-            if ordered
-            else None
-        )
+        #
+        # The title comes from the room the gate already read — no second request for it.
+        title = str(access.room.get("title") or "").strip() or None
+        marker = _cite(ctx, "transcript", title, meeting_id) if ordered else None
         result: dict[str, Any] = {
             "transcriptId": transcript_id,
             "status": transcript.get("status"),
@@ -2431,7 +2613,9 @@ TOOLS: list[ChatTool] = [
             "meetings rules.) The questions appear as a card the user picks from; their answer "
             "arrives "
             "as a normal message on your next turn. Ask everything you need in ONE call: three "
-            "questions in one card is a form, three cards in a row is an interrogation."
+            "questions in one card is a form, three cards in a row is an interrogation. Write "
+            "every question, header and option in the language you are replying in (see the "
+            "Language rule) - not in the language of the meeting text you are asking about."
         ),
         parameters={
             "type": "object",
@@ -2483,6 +2667,9 @@ TOOLS: list[ChatTool] = [
             "required": ["questions"],
         },
         handler=_ask_user,
+        category="conversation",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="create_meeting",
@@ -2595,14 +2782,15 @@ TOOLS: list[ChatTool] = [
                     "enum": list(EXTERNAL_PROVIDER_CHOICES),
                     "description": (
                         "NONE for an ordinary WarpTalk meeting - which is nearly always the "
-                        "answer. GOOGLE_MEET only when a Google Meet link was just created "
-                        "by a plugin tool and this room should bridge to it."
+                        "answer. GOOGLE_MEET only to bridge an existing Google Meet link the "
+                        "user gave you. Never for a Google Meet you just created with the "
+                        "plugin tool - WarpBot already puts that one on the WarpTalk calendar."
                     ),
                 },
                 "external_meeting_url": {
                     "type": "string",
                     "description": (
-                        "Exact Google Meet URL returned by the plugin tool. Must start with "
+                        "Exact Google Meet URL, as the user or a tool gave it. Must start with "
                         "https://meet.google.com/ - never compose or guess one."
                     ),
                 },
@@ -2618,6 +2806,9 @@ TOOLS: list[ChatTool] = [
             "required": ["title", "translation_room_type", "source_language", "target_languages"],
         },
         handler=_create_meeting,
+        category="meetings",
+        effect="write",
+        audience="member",
     ),
     ChatTool(
         name="create_action_item",
@@ -2672,6 +2863,9 @@ TOOLS: list[ChatTool] = [
             "required": ["task", "owner"],
         },
         handler=_create_action_item,
+        category="meetings",
+        effect="write",
+        audience="member",
     ),
     ChatTool(
         name="create_glossary",
@@ -2711,6 +2905,9 @@ TOOLS: list[ChatTool] = [
             "required": ["name", "source_language", "target_language"],
         },
         handler=_create_glossary,
+        category="glossary",
+        effect="write",
+        audience="member",
     ),
     ChatTool(
         name="add_glossary_term",
@@ -2742,6 +2939,9 @@ TOOLS: list[ChatTool] = [
             "required": ["source_term", "target_term"],
         },
         handler=_add_glossary_term,
+        category="glossary",
+        effect="write",
+        audience="member",
     ),
     ChatTool(
         name="share_meeting_minutes",
@@ -2765,6 +2965,9 @@ TOOLS: list[ChatTool] = [
             "required": ["email"],
         },
         handler=_share_meeting_minutes,
+        category="meetings",
+        effect="write",
+        audience="host",
     ),
     ChatTool(
         name="search_workspace_members",
@@ -2787,6 +2990,9 @@ TOOLS: list[ChatTool] = [
             "required": [],
         },
         handler=_search_workspace_members,
+        category="workspace",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="search_terminology",
@@ -2804,6 +3010,9 @@ TOOLS: list[ChatTool] = [
             "required": ["query"],
         },
         handler=_search_terminology,
+        category="glossary",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="list_recent_meetings",
@@ -2823,6 +3032,9 @@ TOOLS: list[ChatTool] = [
             "required": [],
         },
         handler=_list_recent_meetings,
+        category="meetings",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="translate_text",
@@ -2842,6 +3054,9 @@ TOOLS: list[ChatTool] = [
             "required": ["text", "target_language"],
         },
         handler=_translate_text,
+        category="translation",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="search_facts",
@@ -2872,6 +3087,9 @@ TOOLS: list[ChatTool] = [
             "required": [],
         },
         handler=_search_facts,
+        category="knowledge",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="semantic_search",
@@ -2890,6 +3108,9 @@ TOOLS: list[ChatTool] = [
             "required": ["query"],
         },
         handler=_semantic_search,
+        category="knowledge",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="get_meeting_summary",
@@ -2910,6 +3131,9 @@ TOOLS: list[ChatTool] = [
             "required": ["meeting_id"],
         },
         handler=_get_meeting_summary,
+        category="meetings",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="get_room_detail",
@@ -2931,6 +3155,9 @@ TOOLS: list[ChatTool] = [
             "required": ["room_id"],
         },
         handler=_get_room_detail,
+        category="meetings",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="get_transcript",
@@ -2970,15 +3197,18 @@ TOOLS: list[ChatTool] = [
                     "type": "integer",
                     "description": (
                         "Page backwards: return the segments immediately before this sequence "
-                        "number (those with a smaller one), ending right before it. A positive "
-                        "integer — pass the returnedFrom of the previous call to read the part "
-                        "before it."
+                        "number (those with a smaller one), ending right before it. Only set it "
+                        "to the returnedFrom of a previous call whose omittedEarlier was true; "
+                        "otherwise omit it (0 is treated as omitted) and use range."
                     ),
                 },
             },
             "required": ["meeting_id"],
         },
         handler=_get_transcript,
+        category="meetings",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="search_documents",
@@ -3009,6 +3239,9 @@ TOOLS: list[ChatTool] = [
             "required": [],
         },
         handler=_search_documents,
+        category="documents",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="get_document",
@@ -3029,6 +3262,9 @@ TOOLS: list[ChatTool] = [
             "required": ["document_id"],
         },
         handler=_get_document,
+        category="documents",
+        effect="read",
+        audience="member",
     ),
     ChatTool(
         name="get_platform_analytics",
@@ -3077,6 +3313,9 @@ TOOLS: list[ChatTool] = [
             "required": ["reports"],
         },
         handler=_get_platform_analytics,
+        category="platform",
+        effect="read",
+        audience="platform_staff",
     ),
     ChatTool(
         name=CONTINUE_IN_WIDGET_TOOL,
@@ -3100,6 +3339,10 @@ TOOLS: list[ChatTool] = [
             "required": [],
         },
         handler=_continue_in_widget,
+        category="conversation",
+        effect="read",
+        audience="member",
+        listed=False,
     ),
 ]
 

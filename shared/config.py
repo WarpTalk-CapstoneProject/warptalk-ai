@@ -87,6 +87,12 @@ class LiveKitSettings(BaseSettings):
     url: str = "ws://localhost:7880"
     api_key: str = "YOUR_LIVEKIT_API_KEY"
     api_secret: str = "YOUR_LIVEKIT_API_SECRET"
+    # How long an interpreter bot with nothing to say stays in the room (LIVEKIT_TTS_BOT_IDLE_
+    # TIMEOUT_S). It was 60s, and every sentence after a minute's silence paid a fresh LiveKit
+    # join ahead of its audio: 2.5-3.6s on prod 3 Oct, 4.5-17.6s under CPU pressure. Ten minutes
+    # covers the pauses of an ordinary meeting; a room that pauses, ends or stops translating
+    # releases its bots at once instead (LiveKitTTSPublisher.retire_meeting).
+    tts_bot_idle_timeout_s: float = 600.0
 
 
 class WorkerSettings(BaseSettings):
@@ -134,9 +140,10 @@ class WorkerSettings(BaseSettings):
     #
     # WHY IT IS ON THE LIVE PATH AT ALL
     #   "um so we uh we need to finalize the budget" is what STT hears and what a subtitle,
-    #   a dub and a translation should NOT say. The prepass is pure CPU, rule-based and
-    #   sub-millisecond on a sentence, so it can sit in front of translation without costing
-    #   the meeting any latency — which the LLM tier (transcript_clean_worker) cannot.
+    #   a dub and a translation should NOT say. The prepass is pure CPU, rule-based, and measured
+    #   at about 1ms (en), 2ms (vi) and 5ms (ja) per segment on an M-series Mac, synchronously on
+    #   the STT event loop -- cheap enough to sit in front of translation without a meaningful
+    #   latency cost, which the LLM tier (transcript_clean_worker) cannot promise.
     #
     # WHY A KILL SWITCH
     #   The rules delete words. A rule that is wrong for some real room deletes the wrong
@@ -145,10 +152,19 @@ class WorkerSettings(BaseSettings):
     #   `display_text` == raw `text`, i.e. exactly what the pipeline did before WT-716 — no
     #   deploy of any other worker needed to get back there.
     #
-    # Env TRANSCRIPT_CLEAN_ENABLED. Read by the STT worker only (the producer); consumers key
+    # WHY THIS IS A SEPARATE SWITCH FROM TRANSCRIPT_CLEAN_ENABLED (WT-716 review)
+    #   That flag now governs only transcript_clean_worker's tier-2 view
+    #   (TranscriptCleanSettings.enabled): flipping it changes a stored `transcript:clean`
+    #   stream that nothing downstream of the room depends on for what gets said. This flag
+    #   changes what is TRANSLATED and DUBBED, live, for every listener in the room. An
+    #   operator has to be able to turn tier 2 off (e.g. to stop LLM spend) without silently
+    #   losing tier-1 cleaning on the live path, and vice versa -- one variable could not
+    #   express that.
+    #
+    # Env STT_CLEAN_PREPASS_ENABLED. Read by the STT worker only (the producer); consumers key
     # off the presence of the fields, never off this flag, so replicas that disagree during a
     # rollout cannot produce a message that means two things.
-    transcript_clean_enabled: bool = True
+    stt_clean_prepass_enabled: bool = True
 
     # Max only for uninterrupted speech; ordinary short turns still flush on VAD silence.
     # Six seconds gives the model enough lexical context for natural Vietnamese sentences
@@ -329,6 +345,65 @@ class WorkerSettings(BaseSettings):
     near_field_gate_min_baseline_chunks: int = 2
     near_field_gate_baseline_ema_alpha: float = 0.3
 
+    # Speaker-relative energy floor (ingress worker only, see
+    # livekit_ingress_worker/speech_level_floor.py). Lowers — never raises — the absolute 0.02
+    # floor for a speaker whose own voice has proven quiet: a chunk under it is still accepted at
+    # >= this fraction of the median speech level of the track's last
+    # `ingress_energy_baseline_window` chunks that cleared the absolute floor, once there are
+    # `ingress_energy_baseline_min_chunks` of them. 0.4 is 8 dB under the speaker's own level;
+    # measured, dropped real speech sat at 0.56-0.77 of it and noise at <= 0.23. 0 disables.
+    ingress_energy_relative_ratio: float = 0.4
+    ingress_energy_baseline_min_chunks: int = 3
+    ingress_energy_baseline_window: int = 8
+
+    # FAR-SIDE SAME-SOURCE GATE (ingress worker only, see livekit_ingress_worker/far_side_gate.py).
+    #
+    # In a Meet-bridged room a WarpTalk user who is ALSO in the Meet is heard twice: their own
+    # mic under their own identity, and again inside the stand-in's mixed Meet feed a few hundred
+    # ms later. The gate zeroes a stand-in frame (32ms, never a whole turn) only when its content
+    # is explained by a real participant's own track, delayed and gain/EQ-shaped; a Meet-side
+    # person talking over a WarpTalk user is kept, as a native room would keep them. Unsure ->
+    # keep. The STT text dedupe (STT_FAR_SIDE_DEDUPE_*) remains the second layer.
+    #
+    # OFF BY DEFAULT. Synthetic evaluation (scripts/far_side_gate_eval: TTS speech through a
+    # simulated Meet chain with real libopus at ~31kbps, 3 seeds) at these defaults: ~1% of a
+    # Meet-side speaker's overlapped speech time is wrongly zeroed (worst case ~4% when they are
+    # 12dB quieter than the duplicate), 0% when only the Meet side talks — but only ~20% of the
+    # duplicate's frames are removed (~4% during crosstalk), as scattered frames that may leave
+    # the duplicate's text harder for the text dedupe to match. The speech is synthetic and the
+    # Meet path simulated: turn on only after checking a real bridged Meet recording.
+    #
+    # Env: FAR_SIDE_GATE_<NAME> for every field below.
+    far_side_gate_enabled: bool = False
+    # Where to look for a participant's copy, relative to their own track (arrival clock).
+    # Meet's path is expected around 300-600ms+ but not measured across networks, so the range is
+    # wide and the lag is tracked, not assumed. A peak on the range's edge is ignored.
+    far_side_gate_lag_min_ms: int = 150
+    far_side_gate_lag_max_ms: int = 1200
+    # Feature history kept per track. Raised to lag_max + 1500 if set lower.
+    far_side_gate_history_ms: int = 4000
+    # Lag lock: the ~1s band-envelope correlation peak needed to (re)confirm a participant's lag,
+    # and how long a lock lives without re-confirmation (no lock -> nothing is zeroed).
+    far_side_gate_lock_min_corr: float = 0.5
+    far_side_gate_lock_hold_ms: int = 8000
+    # Per-hop duplicate test: the ~64ms spectro-temporal patch similarity required (0..1) ...
+    far_side_gate_frame_min_corr: float = 0.7
+    # ... and at most this share of the stand-in's power may sit more than residual_margin_db
+    # above what the reference predicts.
+    far_side_gate_residual_margin_db: float = 6.0
+    far_side_gate_residual_max_ratio: float = 0.15
+    # A reference hop counts as speech this many dB above that track's own noise floor.
+    far_side_gate_ref_active_db: float = 15.0
+    # Second voice: when 3 of the last 5 hops put >= second_voice_ratio of the stand-in's power
+    # more than second_voice_margin_db above the prediction, somebody else is talking and
+    # nothing is zeroed for second_voice_hold_ms. This hangover is the main crosstalk guard:
+    # shorter holds remove more of the duplicate and more of the Meet-side speaker (300ms with
+    # second_voice_ratio 0.3 / frame_min_corr 0.6: ~50% of the duplicate, ~12% of overlapped
+    # crosstalk in the same evaluation).
+    far_side_gate_second_voice_margin_db: float = 12.0
+    far_side_gate_second_voice_ratio: float = 0.15
+    far_side_gate_second_voice_hold_ms: int = 1500
+
     # Keep the speech forwarded to STT, so a meeting can be transcribed a second time after
     # it ends — see livekit_ingress_worker/audio_archive.py for why the existing recording
     # cannot serve that purpose. Off by default because it writes files and uploads them;
@@ -425,6 +500,15 @@ class STTSettings(BaseSettings):
     # retention stops improving. ViMedCSS (Vietnamese-English code-switching, 34.6h),
     # CanVEC and the relevant FLEURS split are suitable sources.
     min_avg_logprob_by_language: dict[str, float] = {}
+    # TEXT LANGUAGE-ID (stt_worker/text_language_id.py). The Realtime model returns no language,
+    # so between two Latin-script room languages (vi/en) a line used to carry the speaker's
+    # DECLARED language unless it held a Vietnamese-unique letter — "Anh làm gì?" from a host
+    # declared en was English, "Morning is great." from a Meet side declared vi was Vietnamese
+    # (bridge room 01a10069). With this on, such a line is identified among the ROOM's own
+    # Latin-script languages only, and relabelled only above a confidence floor and a minimum
+    # length. Env: STT_TEXT_LANGUAGE_ID_ENABLED (the kill switch).
+    text_language_id_enabled: bool = True
+    text_language_id_min_confidence: float = 0.9
     # Warm WebSockets are claimed by the first active speakers so their first utterance
     # does not pay the ~1–2s Realtime connection handshake.
     realtime_pool_size: int = 4
@@ -441,6 +525,70 @@ class STTSettings(BaseSettings):
     # on purpose — a different room means a different microphone, and a baseline built in one is
     # not a description of how they sound in the other.
     prosody_baseline_ttl_seconds: int = 21600  # 6h
+
+    # FAR-SIDE TEXT DEDUPE (stt_worker/far_side_dedupe.py). The second line of defence behind
+    # the ingress overlap gate: a bridge stand-in segment whose text matches a line a NAMED
+    # WarpTalk speaker in the same room just said is that speaker heard back through Meet, and
+    # is dropped. Env: STT_FAR_SIDE_DEDUPE_*.
+    far_side_dedupe_enabled: bool = True
+    # How far apart (by chunk timestamp) the two copies may be. Meet's path delay is sub-second;
+    # the slack is for the named speaker's chunk closing on a different pause than the stand-in's.
+    far_side_dedupe_window_ms: int = 15_000
+    # SequenceMatcher ratio at or above which two normalized lines are the same line.
+    far_side_dedupe_min_ratio: float = 0.8
+    # Shorter stand-in lines are never dropped — "ok", "yeah" are said by real far-side people.
+    far_side_dedupe_min_chars: int = 8
+    # Require the two segments' languages to agree when both are known.
+    far_side_dedupe_same_language: bool = True
+    # DIRECTION, by AUDIO start (anchor_ms + start_ms), never by publish order: the stand-in is
+    # dropped only when its audio starts this much LATER than the named line's. The floor
+    # matches FAR_SIDE_GATE_LAG_MIN_MS; a smaller lag (stand-in first or simultaneous) is the
+    # LEAK case below, where the stand-in is the true copy. Unknown timing on either side keeps
+    # both lines.
+    far_side_dedupe_min_lag_ms: int = 150
+    far_side_dedupe_max_lag_ms: int = 2_000
+
+    # FAR-SIDE LEAK DEDUPE (reverse). Host on laptop speakers: Meet audio played by Chrome leaks
+    # into the host's real mic (Electron's AEC has no cross-process reference), so the host's
+    # line repeats what the stand-in already carried first. With this on, a NAMED line whose
+    # audio starts between `far_side_dedupe_min_lag_ms` before and `far_side_leak_max_named_
+    # delay_ms` after an already-published stand-in line with the same text is dropped as the
+    # leak. Bridge rooms only (it needs a stand-in line to exist). Env: STT_FAR_SIDE_LEAK_*.
+    #
+    # OFF BY DEFAULT: audio start is chunk-granular (a sentence mid-chunk carries its chunk's
+    # start), so a forward echo whose two chunks were cut differently can land in the leak band
+    # and the WarpTalk user's line would be re-attributed to the stand-in. Turn on after
+    # measuring on real bridge sessions.
+    far_side_leak_dedupe_enabled: bool = False
+    # Stricter than the forward thresholds: what this drops is a WarpTalk user's line.
+    far_side_leak_min_ratio: float = 0.85
+    far_side_leak_min_chars: int = 12
+    far_side_leak_max_named_delay_ms: int = 1_000
+
+    # FAR-SPEAKER HINTS (shared/far_speaker.py): names read from Meet captions by the desktop,
+    # attached to stand-in segments as far_speaker_name/source/confidence. Env: STT_FAR_SPEAKER_*.
+    far_speaker_hints_enabled: bool = True
+    # How long after the words a caption is observed. Hints are shifted back by this much.
+    # 1000 (was 500, bug B3): Meet's captions trail speech by ~0.5-1.5 s (desktop
+    # meet-captions.ts), so 500 put most hints after the words they name. Change together with
+    # TTS_FAR_SPEAKER_CLONE_HINT_LAG_MS.
+    far_speaker_hint_lag_ms: int = 1000
+    # A hint outside the segment window but within this gap still names it, at reduced confidence.
+    far_speaker_hint_max_gap_ms: int = 1500
+    # The confidence from which the gateway SHOWS a live name: Bridge:FarSpeakerNameMinConfidence
+    # in warptalk-backend (WarpTalk.Shared.FarSpeakerNames, 0.6). Keep the two equal - this one
+    # decides which lines went out unnamed and so get a late name (below), and which late answers
+    # are good enough to send.
+    far_speaker_name_min_confidence: float = 0.6
+    # LATE NAMES (shared/far_speaker_late.py, PO 2026-10-03). A stand-in line published without a
+    # shown name is asked about again this many ms after it was finalized, stopping at the first
+    # confident answer, which goes out on stt:far_speaker_late keyed by segment_id. The publish of
+    # the line itself is never delayed. Empty () turns it off. Env (JSON):
+    # STT_FAR_SPEAKER_LATE_DELAYS_MS='[1000,2500]'. Bounded to 4 attempts within 10 s.
+    far_speaker_late_delays_ms: tuple[int, ...] = (1000, 2500)
+    # Lines waiting for a late name at once, across all rooms on this replica. A line beyond this
+    # is not scheduled (and logs far_speaker_late_skipped). 0 turns it off.
+    far_speaker_late_max_pending: int = 256
 
 
 class TranslationSettings(BaseSettings):
@@ -528,6 +676,23 @@ class TTSSettings(BaseSettings):
     # seconds of ACCEPTED speech (see tts_worker/clone_sample_quality.py) is enough for the
     # clone to carry a person's timbre rather than their microphone check.
     voice_clone_min_seconds: float = 20.0
+    # PROGRESSIVE CLONE (owner, 3 Oct 2026: "cứ phát giọng chưa đạt chuẩn trước ... rồi từ từ bắt
+    # giọng tiếp để nói giọng càng chuẩn, không để chờ đủ 20s mới phát").
+    #
+    # Waiting for twenty accepted seconds meant the first half-minute to a minute of every new
+    # speaker went out in a stranger's catalog voice. So a speaker with no voice at all is cloned
+    # PROVISIONALLY at each rung below `voice_clone_min_seconds`, from the same growing buffer,
+    # and once more at each rung above it. Every rung is a longer reference than the last, so the
+    # voice converges on the person instead of jumping between strangers. Cartesia documents no
+    # hard minimum ("10 seconds is enough to get started", up to 60 for accent); the first rung
+    # trades likeness for being their own voice from the second sentence on.
+    #
+    # Provisional rungs (below min_seconds) are never carried into the next meeting; only a rung at
+    # or above min_seconds is good enough to be somebody's voice next time.
+    voice_clone_ladder_seconds: tuple[float, ...] = (3.0, 8.0, 45.0)
+    # How long the FIRST dub of a speaker whose first clone is in flight may wait for it, rather
+    # than going out in a catalog voice and switching one sentence later.
+    voice_clone_first_wait_ms: int = 2500
     # How much audio may be held while waiting for a clip that passes the quality gate. Rejected
     # audio slides out of the front of the buffer; without a cap a speaker in a noisy room would
     # accumulate the whole meeting in memory and never clone.
@@ -610,18 +775,75 @@ class TTSSettings(BaseSettings):
     # roughly three quarters of what a listener waits for on the FIRST sentence of every turn —
     # 0.669s cold against 0.180s warm, confirmed end to end at 0.721s -> 0.251s.
     #
-    # Two rather than STT's four: a connection is claimed per spoken TURN, not per utterance, and
-    # a turn lasts seconds. Two covers two speakers starting at once, which is already the
-    # uncommon case, and the pool refills in the background the moment one is taken.
-    tts_warm_pool_size: int = 2
+    # A connection is claimed per prosody CONTEXT and closed with it, and a context now ends as
+    # soon as no sentence is waiting for it — so most sentences take one. At most
+    # `cartesia_max_concurrency` contexts can be open at once (each holds a concurrency slot), so
+    # the pool matches that: a burst on every slot at once is served warm, and the pool refills
+    # in the background the moment one is taken.
+    #
+    # Pooled connections do NOT hold concurrency slots — verified with the production key
+    # (2026-10-01, PR #220 review): with 4 websocket connections open that never created a
+    # context, 3 parallel /tts/bytes requests still got TTFB ~1.2s, not blocked. What counts
+    # against the plan is an open CONTEXT (see cartesia_max_concurrency), not a socket, so a
+    # pool this size costs no slot.
+    tts_warm_pool_size: int = 3
 
     # How many Cartesia generations this process may have in flight at once. The account's plan
-    # caps concurrency (currently 2: `429 concurrency_limited ... Current limit: 2`), and the
-    # consume loop dispatches up to 8 keys at a time, so without a gate a meeting with a few
-    # speakers and target languages overruns the plan and every excess sentence fails outright.
-    # Waiting for a slot costs a fraction of a sentence; a 429 costs the whole one. Keep this at
-    # the plan's limit divided by the number of TTS replicas (tts-worker is a singleton).
-    cartesia_max_concurrency: int = 2
+    # caps concurrency, and the consume loop dispatches up to 8 keys at a time, so without a gate
+    # a meeting with a few speakers and target languages overruns the plan. Keep this at the
+    # plan's limit divided by the number of TTS replicas (tts-worker is a singleton).
+    #
+    # The plan is Pro since 2026-10: 3 concurrent generations. Measured from the tts-worker pod
+    # with the production key on 2026-10-01 — eight parallel /tts/bytes requests all returned 200
+    # and finished in waves of three (~5s, ~10s, ~13.5s): Cartesia queued the excess requests
+    # instead of answering 429. Under the old plan (limit 2, Sept 27-29) the excess failed
+    # outright with `429 concurrency_limited`. Either way a slot the gate does not hand out is
+    # pure delay, and a gate above the plan buys nothing: the vendor queues it, out of our sight.
+    #
+    # A slot covers what Cartesia COUNTS, which is not only generation. Measured 2026-10-01 with
+    # the production key: three websocket contexts that had each spoken a sentence and were then
+    # left open and idle pushed three parallel /tts/bytes requests from ~0.7s to ~4.0s to first
+    # byte, and those requests started only when the server retired the idle contexts by itself,
+    # ~4.7-5.2s after their last flush_done. Ending the contexts right after flush_done (empty
+    # transcript, continue=false) got `done` back within ~0.2s and the next three requests ran at
+    # ~0.7s again. An open prosody context holds a vendor slot from its first push until `done`,
+    # idle or not.
+    #
+    # So a slot is held for a one-shot request's flight, or for a prosody context's WHOLE life —
+    # taken before its first push, given back when its end is confirmed — and never for playout
+    # (that made a third speaker wait out somebody else's dub). The worker does not leave a
+    # context open between sentences unless the next sentence for that speaker and language is
+    # already queued, so that whole life is normally one sentence's generation plus ~0.2s. See
+    # tts_worker.synthesizer.GenerationLease and TTSWorker._synthesize_sentence. The previous
+    # version of this comment said an idle context "was never inside the slot"; the measurement
+    # above is what showed it was, invisibly, since #189.
+    #
+    # How long a sentence waited for a slot is logged (`cartesia_slot_waited`, and `slot_wait_ms`
+    # on `audio_synthesized`) and recorded as the `tts_slot_wait` stage, because the vendor's own
+    # queueing makes no noise at all and this gate's is the only queueing we can see.
+    cartesia_max_concurrency: int = 3
+
+    # What happens to a sentence Cartesia failed. It used to be logged and acknowledged — the
+    # sentence was gone, silently, with no retry and no record anywhere to replay it from.
+    #
+    # Retried ONLY for failures that are about the moment, not the request: a dropped
+    # connection, a 5xx, a timeout. Never a 4xx — 402 (out of credits), 401/403 (key) and 429
+    # (concurrency) answer the same way the next time, and retrying them only multiplies the load
+    # the vendor is already refusing (see the 429 logout storm). Those go straight to
+    # `translate:results:dead-letter` with the reason, as does a sentence whose retries ran out.
+    #
+    # ONE retry by default, because the Cartesia SDK (max_retries=2) has already retried a 5xx,
+    # 408, 409 or timeout on the one-shot HTTP call before it surfaces here. What it cannot retry
+    # is a stream that broke after it started, and a prosody-context failure followed by a failed
+    # fallback — those are what this catches.
+    #
+    # The retry runs inside the sentence's per-key lock, so nothing newer from the same speaker
+    # and language can play in between: a retried line is late, never out of order. That is also
+    # why the window exists — every second spent retrying holds that speaker's next line back —
+    # and why a failure that already took longer than the window is not retried at all.
+    synthesis_max_retries: int = 1
+    synthesis_retry_backoff_seconds: float = 0.5
+    synthesis_retry_window_seconds: float = 10.0
 
     # Delete in-meeting clones from the Cartesia account once nothing can reach them.
     #
@@ -645,6 +867,30 @@ class TTSSettings(BaseSettings):
     # reach it by any path. This is that bound doubled, so the sweep is wrong only if the TTL
     # above changes without this changing with it.
     orphan_voice_min_age_seconds: int = 86400  # 24h
+    # WT-933. Clone the voice of a Meet-side person (bridge stand-in) whose consent is recorded
+    # for the room. See tts_worker/far_speaker_clone.py. Env: TTS_FAR_SPEAKER_CLONE_ENABLED.
+    #
+    # ON by default, and that is not what turns cloning on for anybody. The switch that matters
+    # is per room and per person: the consent hash the bridge popup's "Voice clone mode" writes
+    # when the host ticks someone who agreed. A room with no entry — every native meeting, and
+    # every bridge room whose host never opened that mode — clones nothing, because only the
+    # stand-in's audio is ever looked at and only a consented name's audio is ever kept.
+    #
+    # So this is the platform's kill switch, not the feature's on switch: set it to false and
+    # the worker behaves byte-for-byte as it did before WT-933, with nothing below read.
+    far_speaker_clone_enabled: bool = True
+    # How long a stand-in chunk is held, counted from its own timestamp, before it is attributed
+    # to a caption name. Caption hints trail the speech by roughly 0.3-1.2 s, so a chunk
+    # attributed on arrival would be judged on hints that have not been written yet.
+    far_speaker_clone_hint_wait_ms: int = 2000
+    # The same shift stt_worker applies to a hint's timestamp (STT_FAR_SPEAKER_HINT_LAG_MS), so
+    # the capture and the transcript agree about who a stretch of audio belongs to. This worker
+    # does not read the STT_ settings; change the two together.
+    far_speaker_clone_hint_lag_ms: int = 1000
+    # How often the consent hash is compared with the clones that exist. Withdrawal is also
+    # noticed on every sentence and every chunk of that person; this is for the person who
+    # withdraws and then says nothing more.
+    far_speaker_clone_consent_poll_seconds: float = 5.0
     # Deliver the dub the way the speaker delivered it, using the prosody measured upstream
     # (STT_PROSODY_ENABLED) and carried on the translation message. Independent of the STT flag
     # so the measurement and its use can be turned off separately — which is what makes an A/B
@@ -699,7 +945,11 @@ class ChatAssistantSettings(BaseSettings):
     # `temperature` with a 400 on this endpoint. Kept configured so pointing the worker back at a
     # gpt-4 model still behaves as before.
     temperature: float = 0.4
-    max_tool_iterations: int = 5
+    # Rounds that may call tools; the loop adds one tool-free round after them to answer from
+    # what was fetched. 8, not 5: a plugin call the model gets the arguments wrong for costs a
+    # round, and on prod (3 Oct 2026) three rejected list_issues calls left two rounds for the
+    # work itself. Only a turn that needs them spends them.
+    max_tool_iterations: int = 8
     # OpenAI's HOSTED web_search tool, added to the /v1/responses tool list.
     #
     # No new vendor and no new key: it runs on the same credentials this worker already uses,
@@ -757,6 +1007,16 @@ class SuggestionSettings(BaseSettings):
     decide_max_tokens: int = 64  # a {should_suggest, category, confidence, reason} object
     generate_max_tokens: int = 200
     temperature: float = 0.2
+    # Reasoning effort for either stage when it runs on a gpt-5 model (ignored otherwise).
+    # Production generates on gpt-5.6-luna, whose token cap is shared between hidden
+    # reasoning and the visible answer. At its default effort a ~5.5k-token prompt spent
+    # 35-85 reasoning tokens per call in a probe (1 Oct 2026), so some draws exhaust the
+    # 200-token cap and OpenAI answers 400 "max_tokens or model output limit was reached"
+    # with nothing to show: 2 of 15 generate calls in prod that morning, with 3 more lost to
+    # the 8s timeout. "none" spent 0 reasoning tokens and answered in ~1.6s instead of
+    # 2-4s. The judgement this hint needs was already made by the decide stage.
+    # Supported values are per model: luna rejects "minimal".
+    reasoning_effort: str | None = "none"
     # A hung request would stall this consumer's whole loop, and a suggestion that arrives
     # after the conversation has moved on is worse than none — fail fast and stay quiet.
     request_timeout_seconds: float = 8.0
@@ -943,6 +1203,8 @@ DEFAULT_GLOBAL_STREAMS: tuple[str, ...] = (
     "audio:frames",
     "audio:chunks",
     "stt:results",
+    # Late far-side speaker names for lines already on stt:results (shared/far_speaker_late.py).
+    "stt:far_speaker_late",
     "translate:results",
     "tts:results",
     # Assistant, suggestions, knowledge.

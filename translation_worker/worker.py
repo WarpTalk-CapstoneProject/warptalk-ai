@@ -22,11 +22,16 @@ from typing import Any, cast
 
 from shared.base_worker import BaseWorker
 from shared.config import TranslationSettings, resolve_openai_api_key
-from shared.control_markers import is_control_marker, is_system_speaker
+from shared.control_markers import (
+    is_control_marker,
+    is_external_bridge_speaker,
+    is_system_speaker,
+)
 from shared.integration_status import OPENAI, IntegrationReport, credential_report
 from shared.lang import is_same_language
 from shared.languages import known_language_code
 from shared.schemas import (
+    STT_UNKNOWN_CONFIDENCE,
     ProsodyEnvelope,
     STTResultMessage,
     TranslationResultMessage,
@@ -180,6 +185,9 @@ class TranslationWorker(BaseWorker):
 
     # Bounds concurrent process() dispatch in _consume_loop — see its docstring.
     _CONCURRENCY_LIMIT = 8
+    # Messages dispatched and not yet finished, including those only waiting to publish behind
+    # their own speaker's previous line.
+    _MAX_IN_FLIGHT = 32
     _CONTEXT_MIN_CONFIDENCE = -0.35
     _CONTEXT_SEGMENTS = 4
     _SPECULATIVE_TTL_SECONDS = 15.0
@@ -418,7 +426,7 @@ class TranslationWorker(BaseWorker):
         concurrently (bounded by _CONCURRENCY_LIMIT) so sentence 2's translation can
         start while sentence 1's is still in flight.
 
-        RedisStreamClient.consume_concurrent ties XACK to successful handler
+        RedisStreamClient.consume_pipelined ties XACK to successful handler
         completion. Failed work remains pending for BaseWorker's reclaim/DLQ path.
         """
         self.logger.info(
@@ -432,7 +440,7 @@ class TranslationWorker(BaseWorker):
         tails: dict[tuple[str, str], asyncio.Event] = {}
 
         async def _run(message_id: bytes, data: dict[bytes, bytes]) -> None:
-            # Taken BEFORE the first await. consume_concurrent starts handlers in stream order and
+            # Taken BEFORE the first await. consume_pipelined starts handlers in stream order and
             # each one runs to its first suspension before the next begins, so the ticket order
             # is the order the speaker spoke in.
             key = _speaker_key(data)
@@ -450,23 +458,40 @@ class TranslationWorker(BaseWorker):
                 if tails.get(key) is done:
                     del tails[key]
 
+        # Keeps reading while earlier messages run (see RedisStreamClient.consume_pipelined): a
+        # batch read waited for its slowest translation — or for one held back for its own
+        # speaker's predecessor — before another speaker's next line was even read. Handlers
+        # still START in stream order, which is what the ticket order above relies on.
         while not self._shutdown_event.is_set():
             try:
-                await self._recover_stale_messages()
-                await self.redis.consume_concurrent(
+                await self.redis.consume_pipelined(
                     stream=self.input_stream,
                     group=self.consumer_group,
                     handler=_run,
+                    keep_running=lambda: not self._shutdown_event.is_set(),
                     consumer=self._consumer_name,
                     block_ms=2000,
                     count=self._CONCURRENCY_LIMIT,
-                    concurrency=self._CONCURRENCY_LIMIT,
+                    max_in_flight=self._MAX_IN_FLIGHT,
+                    in_flight_ids=self._in_flight_message_ids(),
+                    between_reads=self._recover_stale_messages,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger.exception("consume_loop_error")
                 await asyncio.sleep(1.0)
+
+    def _in_flight_message_ids(self) -> set[bytes]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        ids: set[bytes] | None = getattr(self, "_in_flight_ids", None)
+        if ids is None:
+            ids = set()
+            self._in_flight_ids = ids
+        return ids
+
+    def _is_in_flight(self, message_id: bytes) -> bool:
+        return message_id in self._in_flight_message_ids()
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Translate one STT result segment by chunking into sentences.
@@ -553,7 +578,7 @@ class TranslationWorker(BaseWorker):
         # WHAT GETS TRANSLATED IS THE CLEAN LINE, NOT THE RAW ONE (WT-716).
         #
         # `display_text` is `clean_text` when the STT worker's deterministic prepass produced
-        # one and the raw `text` otherwise, so a deployment with TRANSCRIPT_CLEAN_ENABLED off —
+        # one and the raw `text` otherwise, so a deployment with STT_CLEAN_PREPASS_ENABLED off —
         # or a message from a replica that predates the field — translates exactly what it
         # always did. Nothing here reads the flag: the presence of the field is the contract.
         #
@@ -602,7 +627,13 @@ class TranslationWorker(BaseWorker):
                         # Courier, not judge — billing_worker is what reads this. See
                         # STTResultMessage.is_early.
                         is_early=stt_result.is_early,
+                        chunk_id=stt_result.chunk_id,
+                        chunk_duration_ms=stt_result.chunk_duration_ms,
                         prosody=stt_result.prosody,
+                        # Carried for the same reason as on a translated sentence below: the
+                        # turn-closing marker belongs to the same Meet-side person (WT-932).
+                        far_speaker_name=stt_result.far_speaker_name,
+                        far_speaker_confidence=stt_result.far_speaker_confidence,
                     )
                     await self._publish_once(stt_result.meeting_id, result)
             return
@@ -619,7 +650,17 @@ class TranslationWorker(BaseWorker):
                 for target_lang in target_langs
             )
         )
-        if any(publish_results) and stt_result.confidence >= self._CONTEXT_MIN_CONFIDENCE:
+        # UNKNOWN IS NOT LOW. Production STT (gpt-live-transcribe) returns no logprobs, so every
+        # segment carries STT_UNKNOWN_CONFIDENCE (-1.0), which this floor (-0.35) read as "bad" —
+        # and the rolling context of what was just said stayed EMPTY in every production meeting.
+        # Each line, a fragment like "If you're" included, was translated with nothing before
+        # it. The same sentinel misreading starved the suggestion worker (see
+        # suggestion_worker's `confidence != STT_UNKNOWN_CONFIDENCE and ...`). A line that is
+        # here has already passed STT's script, blocklist and dub-echo filters.
+        if any(publish_results) and (
+            stt_result.confidence == STT_UNKNOWN_CONFIDENCE
+            or stt_result.confidence >= self._CONTEXT_MIN_CONFIDENCE
+        ):
             # The clean line, for the same reason it is what was translated: this context is fed
             # back to the model as "what has been said in this meeting", and a history of
             # "um, so, uh" teaches it nothing except to expect more of them.
@@ -920,6 +961,8 @@ class TranslationWorker(BaseWorker):
                 # Courier, not judge — billing_worker is what reads this. See
                 # STTResultMessage.is_early.
                 is_early=stt_result.is_early,
+                chunk_id=stt_result.chunk_id,
+                chunk_duration_ms=stt_result.chunk_duration_ms,
                 # Delivery is carried, not derived: how the speaker sounded is settled upstream
                 # at the audio, and translating the words does not change it. VALENCE is the one
                 # part that cannot come from the audio — anger and delight look alike on pitch
@@ -931,6 +974,13 @@ class TranslationWorker(BaseWorker):
                 # row ever written, which is why "translation is sometimes slow" has never been
                 # answerable after the fact.
                 latency_ms=sentence_latency_ms,
+                # Bridge stand-in only (None on every native segment): which Meet-side person
+                # said this, as stt_worker attributed it from the Meet captions. Every Meet
+                # participant shares one stand-in speaker_id, so this name is what lets
+                # tts_worker give each of them their own voice (WT-932). Carried, not judged —
+                # every sentence split out of the segment inherits the segment's attribution.
+                far_speaker_name=stt_result.far_speaker_name,
+                far_speaker_confidence=stt_result.far_speaker_confidence,
             )
 
             # Publish IMMEDIATELY so TTS can synthesize while next chunk is translated
@@ -956,6 +1006,8 @@ class TranslationWorker(BaseWorker):
                 # Flash mode: an early sentence is spoken but never billed. When a dub goes
                 # missing this says which half of the pipeline it belonged to.
                 is_early=stt_result.is_early,
+                chunk_id=stt_result.chunk_id,
+                chunk_duration_ms=stt_result.chunk_duration_ms,
                 speculative_hit=speculative_hit if idx == 0 else False,
                 stage_latency_ms=sentence_latency_ms,
                 pipeline_latency_ms=max(0, int(time.time() * 1000) - stt_result.timestamp_ms),
@@ -983,6 +1035,9 @@ class TranslationWorker(BaseWorker):
         """
         all_languages = await self.redis.hgetall(f"translationRoom:{meeting_id}:languages")
         targets: set[str] = set()
+        # How many OTHER participants listen in each language. Only read by the bridge line at
+        # the end of this method.
+        listeners: dict[str, int] = {}
         for raw_user_id, raw_lang in all_languages.items():
             user_id = raw_user_id.decode() if isinstance(raw_user_id, bytes) else raw_user_id
             if user_id == speaker_id:
@@ -1001,8 +1056,10 @@ class TranslationWorker(BaseWorker):
                 self._warn_unknown_target_once(meeting_id, lang)
                 continue
             targets.add(known)
+            listeners[known] = listeners.get(known, 0) + 1
 
         # No other participant registered yet — avoid assuming Vietnamese for all users.
+        fallback_english = not targets
         targets = targets or {"en"}
 
         # S6. The speaker's OWN language is not a translation target, and this is the only
@@ -1035,6 +1092,28 @@ class TranslationWorker(BaseWorker):
                     dropped=sorted(echoes),
                 )
                 targets -= echoes
+
+        # GOOGLE MEET BRIDGE STAND-IN ONLY: one line per Meet-side sentence saying which
+        # languages it will be translated and dubbed into, and from what.
+        #
+        # This set is the whole decision — tts_worker dubs every target it is sent and nothing
+        # else — and it could not be read back afterwards: an empty set (the only listener
+        # hears the language the Meet side spoke, so no dub is correct) logged a drop, a
+        # non-empty one only showed up later as chunk_translated's target_lang, and the "en"
+        # fallback for a room whose listener is missing from the hash (their hub socket is
+        # down, or never joined) looked exactly like a real English listener. The dub is
+        # published as `ai-interpreter-{target}-{stand-in}`, and a listener's client only plays
+        # the one in its own listen language, so "translated into the wrong language" and "not
+        # dubbed" are the same silence to the person in the call.
+        if is_external_bridge_speaker(speaker_id):
+            self.logger.info(
+                "far_side_dub_targets",
+                meeting_id=meeting_id,
+                source_lang=source_lang,
+                targets=sorted(targets),
+                listeners=listeners,
+                fallback_english=fallback_english,
+            )
 
         return targets
 

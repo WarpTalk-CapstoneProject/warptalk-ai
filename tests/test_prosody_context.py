@@ -202,6 +202,50 @@ async def test_closing_is_idempotent() -> None:
     assert transport.closed is True
 
 
+class _SlowToConfirmContext(_ScriptedContext):
+    """Answers the close with `done` only when told to — Cartesia took ~0.2s, measured."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.confirm = asyncio.Event()
+
+    def receive(self) -> Any:
+        async def _done_when_confirmed() -> Any:
+            await self.confirm.wait()
+            yield _Done()
+
+        return _done_when_confirmed()
+
+
+@pytest.mark.asyncio
+async def test_closing_waits_for_the_server_to_confirm() -> None:
+    """Cartesia counts a context against the plan until its `done` (measured 2026-10-01), and
+    the worker gives the context's concurrency slot back when this returns — so it returns when
+    the vendor lets go, not when the close has merely been sent."""
+    transport = _SlowToConfirmContext()
+    ctx = ProsodyContext(transport, SAMPLE_RATE)
+
+    closing = asyncio.create_task(ctx.aclose())
+    await asyncio.sleep(0.02)
+    assert transport.closed, "the close (continue=false) was not sent"
+    assert not closing.done(), "returned before Cartesia confirmed the end"
+
+    transport.confirm.set()
+    assert await asyncio.wait_for(closing, timeout=1.0) is True
+
+
+@pytest.mark.asyncio
+async def test_a_close_that_is_never_confirmed_gives_up_after_the_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A lost `done` must not keep a slot forever; the caller closes the socket either way.
+    monkeypatch.setattr("tts_worker.prosody_context.CONTEXT_CLOSE_ACK_SECONDS", 0.05)
+    ctx = ProsodyContext(_SlowToConfirmContext(), SAMPLE_RATE)
+
+    assert await asyncio.wait_for(ctx.aclose(), timeout=1.0) is False
+    assert ctx.is_closed
+
+
 @pytest.mark.asyncio
 async def test_abandoning_cancels_rather_than_draining() -> None:
     transport = _ScriptedContext([])

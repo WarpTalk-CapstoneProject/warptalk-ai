@@ -12,7 +12,7 @@ What each test here is protecting:
   * `text` is the record. Billing, retranscribe and corrections read it, and a cleaner that
     rewrites it would quietly delete the only copy of what was said;
   * a rule that throws must cost nothing but the clean fields — the sentence still goes out;
-  * TRANSCRIPT_CLEAN_ENABLED=false must produce byte-for-byte the pre-WT-716 message, because
+  * STT_CLEAN_PREPASS_ENABLED=false must produce byte-for-byte the pre-WT-716 message, because
     that is the whole value of a kill switch;
   * "Ờ." answering a question is a word; the same "ờ" opening a speaker's own sentence is a
     hesitation — so the previous turn has to be tracked, per meeting, per speaker.
@@ -238,7 +238,7 @@ class TestCleaningNeverCostsASegment:
             log_level="DEBUG",
             chunk_duration_ms=1000,
             redis=redis_settings,
-            transcript_clean_enabled=False,
+            stt_clean_prepass_enabled=False,
         )
         worker = _stt_worker(mock_redis_client, settings)
         worker.model.transcribe = _transcribes(_segment(_RAW_EN))

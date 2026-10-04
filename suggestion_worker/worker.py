@@ -26,6 +26,8 @@ from typing import Any
 from shared.base_worker import BaseWorker
 from shared.config import SuggestionSettings, resolve_openai_api_key
 from shared.integration_status import OPENAI, IntegrationReport, credential_report
+from shared.lang import is_same_language
+from shared.languages import known_language_code
 from shared.platform_settings import (
     FLAG_AI_SUGGEST,
     SUGGEST_COOLDOWN_SECONDS,
@@ -55,6 +57,11 @@ _INACTIVE_ROUTE_STATES = frozenset({"PAUSED", "ENDED", "FAILED", "CANCELLED", "T
 # enough that revoking external-LLM consent takes effect within a meeting, long enough that
 # the common path is not one extra Redis round trip per transcript segment.
 _POLICY_REFRESH_SECONDS = 60.0
+
+# WT-922: at most this many extra languages per hint. Each one is more output tokens on the
+# generate call a reader is already waiting for; a room with more distinct listen languages
+# than this is rare, and its remaining readers still get the speaker's-language copy.
+_MAX_READER_LANGUAGES = 4
 
 # Interrogatives that open or close a question without a question mark. Vietnamese marks
 # questions with particles rather than word order, so "gì", "sao", "à" carry the same signal an
@@ -385,6 +392,7 @@ class SuggestionWorker(BaseWorker):
             turn,
             decision,
             context_snapshot=context_snapshot,
+            reader_languages=await self._reader_languages(room_id, stt_result.language),
         )
         if suggestion is None or not suggestion.content.strip():
             return
@@ -552,6 +560,25 @@ class SuggestionWorker(BaseWorker):
             return ""
         return raw.decode("utf-8") if isinstance(raw, bytes) else raw
 
+    async def _reader_languages(self, room_id: str, source_language: str) -> list[str]:
+        """Every listen language in the room other than the one the hint is written in. WT-922.
+
+        The hash the backend keeps of each participant's listen language — the same one
+        translation_worker fans out to. Unlike translation, the speaker's own entry counts: the
+        speaker reads the badge too. A failed read costs the translations, never the hint.
+        """
+        try:
+            raw = await self.redis.hgetall(f"translationRoom:{room_id}:languages")
+        except Exception:
+            self.logger.warning("suggestion_reader_languages_unavailable", meeting_id=room_id)
+            return []
+        languages: set[str] = set()
+        for value in (raw or {}).values():
+            code = known_language_code(value.decode() if isinstance(value, bytes) else value)
+            if code and not is_same_language(code, source_language):
+                languages.add(code)
+        return sorted(languages)[:_MAX_READER_LANGUAGES]
+
     async def _publish(
         self,
         stt_result: STTResultMessage,
@@ -581,6 +608,26 @@ class SuggestionWorker(BaseWorker):
 
         await self.publish("ai_assistant:results", stt_result.meeting_id, message.to_redis())
 
+        # WT-922: one copy per reader language, each published like the original. The client
+        # keeps the copy matching the viewer's listen language and falls back to the original,
+        # so these need no new field anywhere between here and the badge. token_count stays on
+        # the original: one generate call produced all of them.
+        for language, (translated, translated_detail) in getattr(
+            suggestion, "translations", {}
+        ).items():
+            translated = " ".join(translated.split())
+            if len(translated) > limit:
+                translated = translated[:limit].rstrip()
+            copy = message.model_copy(
+                update={
+                    "content": translated,
+                    "detail": translated_detail,
+                    "language": language,
+                    "token_count": 0,
+                }
+            )
+            await self.publish("ai_assistant:results", stt_result.meeting_id, copy.to_redis())
+
         self.logger.info(
             "suggestion_published",
             meeting_id=stt_result.meeting_id,
@@ -588,4 +635,5 @@ class SuggestionWorker(BaseWorker):
             category=message.category,
             confidence=decision.confidence,
             tokens=message.token_count,
+            reader_languages=sorted(getattr(suggestion, "translations", {})),
         )

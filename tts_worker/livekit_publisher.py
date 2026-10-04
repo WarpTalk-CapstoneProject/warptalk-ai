@@ -30,6 +30,14 @@ logger = get_logger(__name__)
 
 FRAME_MS = 20
 
+# How much audio an AudioSource buffers ahead of real time. capture_frame() returns once a frame
+# is in this buffer and back-pressures when it is full, so a sentence's last capture returns with
+# at most this much of it still to be heard. LiveKit's own default, passed explicitly because
+# tts_worker reasons from it: a sentence of N ms cannot finish handing over sooner than
+# N - AUDIO_SOURCE_QUEUE_MS after its hand-over began, which bounds how soon the next sentence
+# of the same track can start (TTSWorker._after_flush).
+AUDIO_SOURCE_QUEUE_MS = 1000
+
 # A short pause after publish_track() before the first capture_frame(), as a safety
 # margin — isolated testing (see session notes) did not reproduce any failure with or
 # without this delay, but it's cheap insurance against a slow WebRTC negotiation.
@@ -43,8 +51,11 @@ _PUBLISH_SETTLE_S = 0.2
 # for that key. Nothing previously told this bot to disconnect, so it — and its LiveKit
 # room connection — would otherwise leak for the rest of the process's lifetime.
 # Cloud counts every connected interpreter bot toward concurrent participants and
-# participant minutes. One minute retains the handshake-reuse benefit without leaving
-# unused speaker/language/voice variants connected for five extra minutes.
+# participant minutes.
+#
+# Only the FALLBACK now: the live value is LiveKitSettings.tts_bot_idle_timeout_s (600s). One
+# minute made every sentence after a pause pay a fresh LiveKit join ahead of its audio, and the
+# leak this guards against is bounded by retire_meeting as well as by the timer.
 SESSION_IDLE_TIMEOUT_S = 60.0
 
 # Sweeping only from _get_or_create_bot is not enough on its own: that is the one place a
@@ -109,6 +120,33 @@ def _apply_fade(pcm_s16le: bytes, sample_rate: int) -> bytes:
 # extra track for listeners who explicitly picked that voice via SetVoicePreference.
 _BotKey = tuple[str, str, str, str]
 
+
+def interpreter_identity(target_lang: str, speaker_id: str, voice_key: str = "") -> str:
+    """The LiveKit participant identity a dub of `speaker_id` into `target_lang` joins under.
+
+    Language first so the frontend can match by a stable prefix (`ai-interpreter-{lang}-`) —
+    speaker_id is a GUID that contains its own hyphens, so putting it last keeps the language
+    token unambiguous. voice_key (when set — "voice-{id8}") sits between language and speaker; a
+    GUID never starts with "voice-", so the frontend can tell a voice-suffixed identity apart
+    from a bare default one unambiguously. The `ai-interpreter-` prefix still matches
+    livekit_ingress_worker's _is_ai_bot_identity filter, so this bot's own track is never
+    re-ingested.
+
+    Spelled once, here: the bot joins under it and tts_worker logs it (far_side_dub_decision), and
+    a log line naming an identity the room never saw would be worse than no line.
+    """
+    if voice_key:
+        return f"ai-interpreter-{target_lang}-{voice_key}-{speaker_id}"
+    return f"ai-interpreter-{target_lang}-{speaker_id}"
+
+
+#: The LiveKit participant attribute each dub bot carries saying WHOSE voice it speaks in:
+#: "cloned" (cloned from the speaker), "profile" (a voice the speaker picked), "default" (a
+#: stock catalogue voice assigned to them) or "preference" (a listener's pick). The meeting
+#: client plays a speaker's dub only when it is in the speaker's OWN voice — cloned or profile —
+#: and otherwise lets the listener hear the speaker as they actually sound.
+VOICE_KIND_ATTRIBUTE = "warptalk.voice"
+
 # How long close() may wait for queued audio to finish reaching the track before it gives up
 # and cancels the pump.
 #
@@ -122,6 +160,11 @@ _BotKey = tuple[str, str, str, str]
 # 30s because a dub is bounded by STT's 6-second chunk and comes back well under 15s even at
 # the slowest speed setting. Anything near this is already a failure, not a long sentence.
 _DRAIN_TIMEOUT_S = 30.0
+
+
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 class TrackStream:
@@ -167,6 +210,8 @@ class TrackStream:
         self._spoken_bytes = 0
         self._broken = False
         self._first_audio_at: float | None = None
+        # The bot this sentence will speak through, joining while Cartesia generates — see start.
+        self._bot_task: asyncio.Task[dict[str, Any]] | None = None
 
     @property
     def spoken_bytes(self) -> int:
@@ -188,10 +233,46 @@ class TrackStream:
             self._queue.put_nowait(pcm_s16le)
 
     def start(self) -> None:
+        """Start the pump, and start joining the room NOW rather than at the first chunk.
+
+        The bot used to be created inside `_capture`, i.e. only once Cartesia's first chunk had
+        arrived, so a cold key paid Cartesia's time to first byte and then the whole LiveKit
+        handshake (room.connect + publish_track) one after the other. A key is cold for every
+        speaker who resumes after SESSION_IDLE_TIMEOUT_S of silence, and on prod 3 Oct 2026 that
+        handshake took 4.5-17.6s under CPU pressure, ahead of every such sentence. Started here,
+        it overlaps with the generation instead of following it; a warm key returns at once.
+        """
         if self._pump is None:
             self._pump = asyncio.create_task(self._pump_loop())
+        if self._bot_task is None:
+            self._bot_task = asyncio.create_task(
+                self._publisher._get_or_create_bot(*self._key, self._sample_rate)
+            )
+            # Consumed by _capture when audio arrives; a sentence that never produces any must
+            # not leave an unretrieved exception behind.
+            self._bot_task.add_done_callback(_consume_task_exception)
 
     async def close(self) -> None:
+        try:
+            await self._close_pump()
+        finally:
+            await self._settle_bot_task()
+
+    async def _settle_bot_task(self) -> None:
+        """Let a join still in flight finish while this key's lock is still held.
+
+        A sentence with no audio leaves this block with the join running. Released mid-join, the
+        lock would let publish_pcm's one-shot fallback for the same key reach _get_or_create_bot
+        concurrently and put a second bot with the same identity in the room. Bounded like the
+        drain, so a wedged handshake cannot stop this speaker's dub for the rest of the meeting.
+        """
+        task, self._bot_task = self._bot_task, None
+        if task is None or task.done():
+            return
+        with suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(task), timeout=_DRAIN_TIMEOUT_S)
+
+    async def _close_pump(self) -> None:
         if self._pump is None:
             return
         self._queue.put_nowait(None)
@@ -260,7 +341,13 @@ class TrackStream:
         remaining = pcm_s16le
         for attempt in range(2):
             try:
-                bot = await self._publisher._get_or_create_bot(*self._key, self._sample_rate)
+                # The first attempt takes the join start() began; a retry follows an eviction
+                # below and has to make a fresh bot.
+                prewarm, self._bot_task = self._bot_task, None
+                if attempt == 0 and prewarm is not None:
+                    bot = await prewarm
+                else:
+                    bot = await self._publisher._get_or_create_bot(*self._key, self._sample_rate)
             except Exception:
                 logger.exception(
                     "livekit_tts_bot_connect_error",
@@ -334,6 +421,48 @@ class LiveKitTTSPublisher:
         # Started lazily by the first bot creation (see _ensure_reaper) rather than in
         # __init__, which runs outside any event loop.
         self._reaper: asyncio.Task[None] | None = None
+        # The voice kind each key was last told it speaks in (see VOICE_KIND_ATTRIBUTE). Kept
+        # apart from the bot so a bot created AFTER the kind was decided starts with it, and a
+        # bot that already exists is only re-announced when the kind actually changes.
+        self._voice_kinds: dict[_BotKey, str] = {}
+
+    async def set_voice_kind(
+        self,
+        meeting_id: str,
+        speaker_id: str,
+        target_lang: str,
+        voice_kind: str,
+        voice_key: str = "",
+    ) -> None:
+        """Record whose voice this key's track speaks in, and tell the room if it changed.
+
+        Called by the worker before each sentence, because the kind can change mid-meeting: a
+        speaker starts on the stock voice while their clone is captured, and moves to "cloned"
+        once it is ready (or back, if they withdraw consent). Never raises — an attribute that
+        failed to update must not cost the listener the sentence itself.
+        """
+        key: _BotKey = (meeting_id, speaker_id, target_lang, voice_key)
+        if self._voice_kinds.get(key) == voice_kind:
+            return
+        self._voice_kinds[key] = voice_kind
+        bot = self._bots.get(key)
+        if bot is not None:
+            await self._announce_voice_kind(bot["room"], voice_kind, key)
+
+    @staticmethod
+    async def _announce_voice_kind(room: Any, voice_kind: str, key: _BotKey) -> None:
+        try:
+            await room.local_participant.set_attributes({VOICE_KIND_ATTRIBUTE: voice_kind})
+        except Exception:
+            logger.warning(
+                "livekit_tts_voice_kind_failed",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                target_lang=key[2],
+                voice_key=key[3],
+                voice_kind=voice_kind,
+                exc_info=True,
+            )
 
     async def publish_pcm(
         self,
@@ -498,31 +627,25 @@ class LiveKitTTSPublisher:
         if cached is not None:
             return cached
 
-        # Language first so the frontend can match by a stable prefix
-        # (`ai-interpreter-{lang}-`) — speaker_id is a GUID that contains its own
-        # hyphens, so putting it last keeps the language token unambiguous. voice_key
-        # (when set — "voice-{id8}") sits between language and speaker; a GUID never
-        # starts with "voice-", so the frontend can tell a voice-suffixed identity
-        # apart from a bare default one unambiguously. The `ai-interpreter-` prefix
-        # still matches livekit_ingress_worker's _is_ai_bot_identity filter, so this
-        # bot's own track is never re-ingested.
-        identity = (
-            f"ai-interpreter-{target_lang}-{voice_key}-{speaker_id}"
-            if voice_key
-            else f"ai-interpreter-{target_lang}-{speaker_id}"
-        )
+        identity = interpreter_identity(target_lang, speaker_id, voice_key)
         token = (
             api.AccessToken(self.settings.api_key, self.settings.api_secret)
             .with_identity(identity)
             .with_name(f"AI Interpreter ({target_lang})")
-            .with_grants(api.VideoGrants(room_join=True, room=meeting_id))
+            .with_grants(
+                # can_update_own_metadata: without it LiveKit refuses set_attributes, and the
+                # client could never learn whose voice this bot speaks in.
+                api.VideoGrants(room_join=True, room=meeting_id, can_update_own_metadata=True)
+            )
             .to_jwt()
         )
 
         room = rtc.Room()
         await room.connect(self.settings.url, token)
 
-        source = rtc.AudioSource(sample_rate=sample_rate, num_channels=1)
+        source = rtc.AudioSource(
+            sample_rate=sample_rate, num_channels=1, queue_size_ms=AUDIO_SOURCE_QUEUE_MS
+        )
         track = rtc.LocalAudioTrack.create_audio_track("tts-audio", source)
         await room.local_participant.publish_track(
             track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
@@ -531,6 +654,10 @@ class LiveKitTTSPublisher:
 
         bot = {"room": room, "source": source, "last_used": time.monotonic()}
         self._bots[key] = bot
+        # Before the first frame lands, so the client never has to guess a new bot's voice.
+        voice_kind = self._voice_kinds.get(key)
+        if voice_kind:
+            await self._announce_voice_kind(room, voice_kind, key)
         logger.info(
             "livekit_tts_bot_published",
             meeting_id=meeting_id,
@@ -558,10 +685,13 @@ class LiveKitTTSPublisher:
 
     def _sweep_idle_bots(self) -> None:
         now = time.monotonic()
+        idle_timeout = float(
+            getattr(self.settings, "tts_bot_idle_timeout_s", SESSION_IDLE_TIMEOUT_S)
+        )
         stale = [
             k
             for k, b in self._bots.items()
-            if now - b["last_used"] > SESSION_IDLE_TIMEOUT_S and not self._is_publishing(k)
+            if now - b["last_used"] > idle_timeout and not self._is_publishing(k)
         ]
         for k in stale:
             bot = self._bots.pop(k)
@@ -574,6 +704,36 @@ class LiveKitTTSPublisher:
                 target_lang=k[2],
                 voice_key=k[3],
             )
+
+    def retire_meeting(self, meeting_id: str, reason: str) -> int:
+        """Release every bot of a meeting that has paused, ended or stopped translating.
+
+        The long idle timeout is only safe because of this. The web client treats a present
+        interpreter track as "this speaker is dubbed" and keeps the speaker's own microphone
+        muted for cross-language listeners, so a bot left behind after translation stops would
+        leave them hearing nothing at all. A bot mid-sentence is marked expired instead and the
+        reaper takes it the moment that sentence ends.
+        """
+        retired = 0
+        # Forgotten with the meeting: the next one decides each speaker's voice afresh.
+        for key in [k for k in self._voice_kinds if k[0] == meeting_id]:
+            del self._voice_kinds[key]
+        for key in [k for k in self._bots if k[0] == meeting_id]:
+            if self._is_publishing(key):
+                self._bots[key]["last_used"] = float("-inf")
+                continue
+            bot = self._bots.pop(key)
+            self._locks.pop(key, None)
+            asyncio.create_task(self._close_bot(bot))
+            retired += 1
+        if retired:
+            logger.info(
+                "livekit_tts_bots_retired_for_meeting",
+                meeting_id=meeting_id,
+                bots=retired,
+                reason=reason,
+            )
+        return retired
 
     def retire_voice_variants(
         self, meeting_id: str, speaker_id: str, target_lang: str, keep: set[str]
@@ -627,6 +787,52 @@ class LiveKitTTSPublisher:
                 reason="voice_variant_no_longer_rendered",
             )
         return [key[3] for key in stale]
+
+    def dub_targets(self) -> dict[tuple[str, str], dict[str, float]]:
+        """(meeting_id, speaker_id) -> {target language: monotonic time any of its bots (default
+        or voice variant) last published} for every bot this process holds."""
+        targets: dict[tuple[str, str], dict[str, float]] = {}
+        for (meeting_id, speaker_id, target_lang, _voice_key), bot in self._bots.items():
+            langs = targets.setdefault((meeting_id, speaker_id), {})
+            last_used = float(bot.get("last_used", 0.0))
+            langs[target_lang] = max(langs.get(target_lang, last_used), last_used)
+        return targets
+
+    def retire_target_language(
+        self, meeting_id: str, speaker_id: str, target_lang: str, reason: str
+    ) -> int:
+        """Disconnect EVERY bot (default track and voice variants) dubbing this speaker into
+        `target_lang`. Returns how many left.
+
+        For a target that stopped being one mid-meeting — the speaker switched to that very
+        language, or the last listener in it switched away. The track stayed for
+        SESSION_IDLE_TIMEOUT_S, and while it is in the room the web client counts the speaker
+        as dubbed into that language and MUTES their microphone for its listeners
+        (FilteredRoomAudio): a vi listener whose partner had just switched to vi heard nobody
+        for up to a minute and a quarter. Same rule as retire_voice_variants: a bot
+        mid-sentence is left for the reaper.
+        """
+        stale = [
+            key
+            for key in self._bots
+            if key[0] == meeting_id
+            and key[1] == speaker_id
+            and key[2] == target_lang
+            and not self._is_publishing(key)
+        ]
+        for key in stale:
+            bot = self._bots.pop(key)
+            self._locks.pop(key, None)
+            asyncio.create_task(self._close_bot(bot))
+            logger.info(
+                "livekit_tts_bot_retired",
+                meeting_id=meeting_id,
+                speaker_id=speaker_id,
+                target_lang=target_lang,
+                voice_key=key[3],
+                reason=reason,
+            )
+        return len(stale)
 
     def _is_publishing(self, key: _BotKey) -> bool:
         """Whether publish_pcm currently holds this key's lock.

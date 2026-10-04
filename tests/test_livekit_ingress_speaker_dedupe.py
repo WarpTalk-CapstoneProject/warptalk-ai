@@ -89,9 +89,12 @@ async def test_the_stale_reader_is_actually_cancelled() -> None:
 async def test_the_same_track_twice_is_refused() -> None:
     worker = _worker()
 
-    assert worker._start_audio_task(ROOM, SPEAKER, _track("TR_only")) is True
-    # A duplicate track_published for a microphone already being read changes nothing.
-    assert worker._start_audio_task(ROOM, SPEAKER, _track("TR_only")) is False
+    track = _track("TR_only")
+    assert worker._start_audio_task(ROOM, SPEAKER, track) is True
+    # A duplicate attach for the subscription already being read changes nothing. Same OBJECT,
+    # not merely the same sid: LiveKit hands out a new Track object for every subscription, and
+    # a new object with an old sid is a re-subscription — see test_ingress_resubscription.
+    assert worker._start_audio_task(ROOM, SPEAKER, track) is False
     assert len(worker.audio_tasks) == 1
 
     for task in worker.audio_tasks.values():

@@ -9,6 +9,7 @@ Pipeline:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -18,8 +19,21 @@ from typing import Any
 
 from shared.base_worker import TERMINAL_ROOM_STATUSES, BaseWorker
 from shared.config import STTSettings, resolve_openai_api_key
+from shared.control_markers import is_external_bridge_room, is_external_bridge_speaker
 from shared.disfluency import detect_question, prepass
 from shared.disfluency.normalize import resolve_language
+from shared.far_speaker import (
+    CaptionHintTracker,
+    FarSpeakerAttribution,
+    FarSpeakerTracker,
+    SegmentWindow,
+)
+from shared.far_speaker_late import (
+    FAR_SPEAKER_LATE_STREAM,
+    LateFarSpeakerName,
+    LateFarSpeakerNamer,
+    needs_late_attribution,
+)
 from shared.integration_status import OPENAI, IntegrationReport, credential_report
 from shared.prosody import (
     SpeakerBaseline,
@@ -38,7 +52,20 @@ from shared.schemas import (
     STTResultMessage,
 )
 from shared.text_utils import split_into_sentences
-from stt_worker.model import OpenAISTT, _normalize_language, _normalize_overheard_text
+from stt_worker.far_side_dedupe import (
+    DedupeConfig,
+    LeakConfig,
+    NamedSegmentRef,
+    audio_start_epoch_ms,
+    find_far_side_duplicate,
+    find_far_side_leak,
+)
+from stt_worker.model import (
+    WARM_POOL_MAINTENANCE_INTERVAL_S,
+    OpenAISTT,
+    _normalize_language,
+    _normalize_overheard_text,
+)
 
 
 def _decode_field(data: Mapping[Any, Any], key: str) -> str:
@@ -68,7 +95,16 @@ def _extract_speaker_key(
 # The room language set is derived from participants' declared speak-languages, which
 # change as people join/leave. Cache it briefly rather than per room-lifetime (unlike the
 # prompt) so a newly joined speaker's language is picked up within a few seconds.
+# This is the NATIVE meeting-room TTL and is unchanged.
 _ROOM_LANGUAGES_TTL_S = 15.0
+# GOOGLE MEET BRIDGE ROOMS ONLY (see STTWorker._is_bridge_room): the set also changes when
+# somebody re-picks mid-meeting (TranslationRoomHub SetSpeakLanguage /
+# SetExternalMeetingLanguage write the same hash). There this set is the candidate list the text
+# language-ID labels Latin-script lines from, and a list missing the language somebody just
+# switched to labels their sentences as one of the old languages — evidence
+# _learn_language_evidence then re-pins them with. So bridge rooms refresh every 5s, and the
+# speaker's OWN new pick does not wait even that (see _get_room_languages).
+_BRIDGE_ROOM_LANGUAGES_TTL_S = 5.0
 
 # Denoising modes the provider accepts. An unrecognised string fails the WHOLE session update,
 # taking the language hint and the keywords down with it — _degrade_session_config exists because
@@ -95,6 +131,14 @@ _DUB_ECHO_SCAN_COUNT = 48
 # seconds — a 2s-stale read can never miss the line it needs, and chunks arrive about once a
 # second per speaker, so this turns a per-chunk stream read into one every couple of seconds.
 _DUB_ECHO_CACHE_TTL_S = 2.0
+
+# FAR-SIDE DEDUPE (stt_worker/far_side_dedupe.py). stt:results entries to look back through for
+# recent lines. Bridge stand-in chunks pay this read (forward dedupe); named chunks pay it only
+# when STT_FAR_SIDE_LEAK_DEDUPE_ENABLED is on (reverse/leak dedupe).
+_FAR_SIDE_SCAN_COUNT = 64
+# Short, unlike the dub-echo cache: the named copy of a sentence and its Meet echo are published
+# within about a second of each other, and a 2s-stale read would miss exactly that line.
+_FAR_SIDE_CACHE_TTL_S = 0.5
 
 _RECENT_CONTEXT_SEGMENTS = 4
 _MAX_STT_PROMPT_CHARS = 600
@@ -124,6 +168,11 @@ _CLEAN_ERROR_LOG_INTERVAL_S = 60.0
 # its own. Matches the horizon the other per-room keys use.
 _TRANSCRIPT_ANCHOR_TTL_S = 6 * 60 * 60
 _CONTEXT_MIN_CONFIDENCE = -0.35
+# How long a speaker's next-turn frames may wait for their previous item to COMPLETE (see
+# STTWorker._append_speech_frame). commit -> completed is ~0.85 s at p50 and under 2.2 s at p99
+# in the meeting simulator; past this the turn falls back to its own chunk's audio, so a lost
+# completion can never stall a speaker.
+_HOLD_FOR_COMPLETION_S = 3.0
 
 
 def _language_hint_for_stt(language: str) -> str | None:
@@ -131,6 +180,46 @@ def _language_hint_for_stt(language: str) -> str | None:
     if not normalized or normalized == "auto":
         return None
     return normalized
+
+
+def _route_update_room_id(message: dict[str, Any]) -> str | None:
+    """The room an AUDIO_ROUTES_UPDATED pub/sub message is about, or None for anything else.
+
+    Same parsing as BaseWorker._handle_route_update_message: channel
+    `translationRoom:{roomId}:events`, falling back to the payload's roomId.
+    """
+    if message.get("type") != "pmessage":
+        return None
+    try:
+        data = json.loads(message["data"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("type") != "AUDIO_ROUTES_UPDATED":
+        return None
+    channel = message.get("channel", "")
+    if isinstance(channel, bytes):
+        channel = channel.decode("utf-8", errors="replace")
+    parts = str(channel).split(":")
+    room_id = parts[1] if len(parts) > 1 else data.get("roomId")
+    return room_id if isinstance(room_id, str) and room_id else None
+
+
+def _room_language_code(value: str | None) -> str:
+    """One room-language entry as a bare code, or "" for nothing/"auto".
+
+    "auto" is compared BEFORE normalising: _normalize_language cuts anything longer than two
+    letters to its first two, so the old `normalize(...) != "auto"` check let "auto" through as
+    "au". That value is real in bridge rooms — TranslationRoomHub writes "auto" as the Meet
+    stand-in's speak language when the far side speaks several languages (WT-909) — and it put
+    a non-language into the room set, the session's language list and the text language-ID's
+    candidates.
+
+    Used for Google Meet bridge rooms only; native rooms keep the old parsing unchanged.
+    """
+    stripped = (value or "").strip()
+    if not stripped or stripped.lower() == "auto":
+        return ""
+    return _normalize_language(stripped)
 
 
 def _chunk_audio_duration_ms(chunk: AudioChunkMessage) -> int:
@@ -150,6 +239,14 @@ def _chunk_audio_duration_ms(chunk: AudioChunkMessage) -> int:
 # `stt:chunk:published:{audio:chunks entry id}` — see STTWorker._chunk_already_published. As
 # long as a chunk can still be redelivered: five deliveries, each after the reclaim threshold,
 # and a consumer-group replay of the retained stream.
+# What prepares a speaker's Realtime socket ahead of their first sentence.
+#
+# WT-923: track_published alone fired at the first microphone, and a person who joins muted
+# unmutes in order to speak — so the "prewarm" ran at the same moment as the first sentence and
+# saved nothing. participant_joined fires when they connect. track_published stays: it re-pins
+# the session once the gateway has written the speaker's language, which a join usually beats.
+_PREWARM_EVENT_TYPES = ("meeting.track_published", "meeting.participant_joined")
+
 _CHUNK_PUBLISHED_KEY_PREFIX = "stt:chunk:published:"
 _CHUNK_PUBLISHED_TTL_SECONDS = 2 * 60 * 60
 
@@ -172,12 +269,36 @@ def _build_segment_id(
     return str(uuid.uuid5(uuid.NAMESPACE_URL, material))
 
 
+def _far_speaker_window(
+    result: STTResultMessage,
+    chunk: AudioChunkMessage,
+    chunk_epoch_start_ms: int,
+    chunk_offset_ms: int,
+) -> SegmentWindow:
+    """A stand-in line's span in unix-epoch ms, the clock caption hints are stamped in.
+
+    The segment's own span inside the chunk when the model gave one; the whole chunk when it did
+    not (early sentences carry start == end). One function so the attribution at publish time and
+    the late re-attribution (shared/far_speaker_late.py) ask about exactly the same window.
+    """
+    chunk_end_ms = chunk.timestamp_ms
+    if result.end_ms > result.start_ms:
+        start = chunk_epoch_start_ms + max(0, result.start_ms - chunk_offset_ms)
+        end = chunk_epoch_start_ms + max(0, result.end_ms - chunk_offset_ms)
+        return SegmentWindow(min(start, chunk_end_ms), min(end, chunk_end_ms))
+    return SegmentWindow(chunk_epoch_start_ms, chunk_end_ms)
+
+
 class STTWorker(BaseWorker):
     """Speech-to-Text worker using OpenAI gpt-transcribe."""
 
     worker_name = "stt"
     input_stream = "audio:chunks"
     consumer_group = "stt-workers"
+    # Chunks dispatched and not yet finished. Most of them, at any moment, are simply waiting
+    # for their own speaker's previous commit; the bound is on unacknowledged work, not on
+    # transcription concurrency (which is one commit per speaker by construction).
+    _MAX_IN_FLIGHT = 32
 
     def __init__(
         self,
@@ -202,6 +323,9 @@ class STTWorker(BaseWorker):
         # meeting_id -> (set of declared language codes, monotonic timestamp fetched).
         # Refreshed every _ROOM_LANGUAGES_TTL_S so late joiners' languages are picked up.
         self._room_languages: dict[str, tuple[set[str], float]] = {}
+        # Meetings known to be Google Meet EXTERNAL_BRIDGE rooms — see _is_bridge_room. Only
+        # positives are remembered; a room not (yet) in here is re-checked on every refresh.
+        self._bridge_rooms: set[str] = set()
         # (meeting_id, speaker_id) -> lock serializing THAT speaker's own chunks — see
         # _consume_loop for why.
         self._speaker_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -230,6 +354,32 @@ class STTWorker(BaseWorker):
         self._clean_error_logged_at = 0.0
         self._clean_errors_suppressed = 0
         self._prewarm_listener_task: asyncio.Task[None] | None = None
+        self._warm_pool_task: asyncio.Task[None] | None = None
+
+    async def _publish_live_text(
+        self, key: tuple[str, str], item_id: str, text: str, language: str | None
+    ) -> None:
+        """The words of an utterance still being spoken, for the live caption.
+
+        Pub/Sub, not the stt:results stream, on purpose: live text is a preview that the final
+        segment replaces. It must never be stored, billed, translated or replayed to a client that
+        joins later, and a stream entry would be all four. The gateway relays it to the room as
+        TranscriptInterimReceived; a listener who misses one simply sees the next.
+        """
+        meeting_id, speaker_id = key
+        await self.redis.redis.publish(
+            "stt:interim",
+            json.dumps(
+                {
+                    "meeting_id": meeting_id,
+                    "speaker_id": speaker_id,
+                    "item_id": item_id,
+                    "text": text,
+                    "language": language or "",
+                },
+                ensure_ascii=False,
+            ),
+        )
 
     def integration_reports(self) -> dict[str, IntegrationReport]:
         s = self.stt_settings
@@ -244,10 +394,14 @@ class STTWorker(BaseWorker):
             noise_reduction=self.stt_settings.noise_reduction,
             min_avg_logprob=self.stt_settings.min_avg_logprob,
             min_avg_logprob_by_language=self.stt_settings.min_avg_logprob_by_language,
+            text_language_id_enabled=self.stt_settings.text_language_id_enabled,
+            text_language_id_min_confidence=self.stt_settings.text_language_id_min_confidence,
         )
         await self.model.load()
+        self.model.on_live_text = self._publish_live_text
         await self.model.warm_up(pool_size=self.stt_settings.realtime_pool_size)
         self._prewarm_listener_task = asyncio.create_task(self._listen_for_track_prewarm())
+        self._warm_pool_task = asyncio.create_task(self._maintain_warm_pool())
         # Started unconditionally, and that is the point of flash mode being per ROOM.
         #
         # It used to be gated on `settings.stt_streaming_enabled`, which made the deployment
@@ -336,6 +490,112 @@ class STTWorker(BaseWorker):
             self.logger.debug("stt_frame_unreadable", exc_info=True)
             return
 
+        key = (frame.meeting_id, frame.speaker_id)
+        # THE SPEAKER'S PREVIOUS CHUNK IS BEING TRANSCRIBED. This frame is the opening of their
+        # next turn, and it used to be thrown away together with the rest of that turn
+        # (`commit_in_flight` — 99 of 205 chunks in tools/meeting_sim's product-launch meeting),
+        # so the next chunk had to be uploaded whole at its commit and decoded from scratch:
+        # the latency flash mode exists to remove, paid on every other sentence of a
+        # conversation. Worse, while that chunk was still before its commit, the new turn's
+        # frame cleared the buffer that held it (`previous_turn_never_committed`).
+        #
+        # Appending now would put it inside the commit about to be sent. So it is HELD, in
+        # order, and handed to the session the moment the committed item has COMPLETED — into
+        # the fresh buffer the commit left behind (see _release_held_frames), for at most
+        # _HOLD_FOR_COMPLETION_S. The commit's own transcript is unaffected: it reads only its
+        # own item (OpenAISTT._transcribe_via_session).
+        lock = self._speaker_locks.setdefault(key, asyncio.Lock())
+        mode = self._frame_modes().get(key)
+        if lock.locked() and mode != "direct":
+            if mode == "gave_up":
+                # This turn already waited out the bound below and fell back to its own chunk.
+                return
+            held = self._held_frames().setdefault(key, [])
+            since = self._held_since().setdefault(key, time.monotonic())
+            if time.monotonic() - since <= _HOLD_FOR_COMPLETION_S:
+                held.append(frame)
+                return
+            # BOUNDED. The previous item has not completed in this long — a lost completion must
+            # never stall a speaker. Stop holding: this turn goes the way every turn went before
+            # (its chunk carries its own audio and is uploaded whole at commit), and its remaining
+            # frames are dropped as a closed turn's would be.
+            dropped = len(held)
+            held.clear()
+            self._frame_modes()[key] = "gave_up"
+            self._close_turn(key, frame.turn_id)
+            self.logger.info(
+                "stt_held_frames_timed_out",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                frames=dropped + 1,
+                waited_ms=int((time.monotonic() - since) * 1000),
+            )
+            return
+        await self._append_frame(frame, locked_by_commit=mode == "direct")
+
+    def _held_since(self) -> dict[tuple[str, str], float]:
+        since: dict[tuple[str, str], float] | None = getattr(self, "_held_since_by_key", None)
+        if since is None:
+            since = {}
+            self._held_since_by_key = since
+        return since
+
+    def _frame_modes(self) -> dict[tuple[str, str], str]:
+        modes: dict[tuple[str, str], str] | None = getattr(self, "_frame_mode", None)
+        if modes is None:
+            modes = {}
+            self._frame_mode = modes
+        return modes
+
+    def _held_frames(self) -> dict[tuple[str, str], list[AudioFrameMessage]]:
+        held: dict[tuple[str, str], list[AudioFrameMessage]] | None = getattr(
+            self, "_held_frame_lists", None
+        )
+        if held is None:
+            held = {}
+            self._held_frame_lists = held
+        return held
+
+    async def _release_held_frames(self, key: tuple[str, str]) -> None:
+        """The previous item has COMPLETED: hand the session the next turn's frames held
+        meanwhile, in order, then let new ones straight in.
+
+        After completion, not merely after the commit was sent. The meeting simulator caught
+        gpt-live-transcribe stalling a committed item for 12 s — and returning it truncated —
+        when the next turn's audio was appended while that item was still being transcribed.
+        Waiting for `completed` costs the held audio ~0.85 s (commit -> completed, p50) of
+        streaming, which the live model then catches up on in one burst.
+
+        Called by `process` while it still holds this speaker's lock. Frames that land during
+        the hand-over join the queue rather than overtaking it: the mode only turns "direct"
+        once the queue is empty, with no await in between.
+        """
+        modes = self._frame_modes()
+        if modes.get(key) == "gave_up":
+            return
+        modes[key] = "draining"
+        held = self._held_frames().get(key, [])
+        while held:
+            await self._append_frame(held.pop(0), locked_by_commit=True)
+        modes[key] = "direct"
+
+    def _end_commit_window(self, key: tuple[str, str]) -> None:
+        """`process` is done with this speaker. Frames still held were never handed over — the
+        chunk ended without its item completing (no commit was sent, or the transcription
+        failed) — so they start no clean turn: dropped, and the rest of that turn falls back to
+        its own chunk's audio (the `frame_gap` path)."""
+        self._frame_modes().pop(key, None)
+        self._held_since().pop(key, None)
+        held = self._held_frames().pop(key, None)
+        if held:
+            self.logger.info(
+                "stt_held_frames_dropped_no_commit",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                frames=len(held),
+            )
+
+    async def _append_frame(self, frame: AudioFrameMessage, *, locked_by_commit: bool) -> None:
         key = (frame.meeting_id, frame.speaker_id)
         streaming: dict[tuple[str, str], tuple[str, int, int]] | None = getattr(
             self, "_streamed_turns", None
@@ -429,23 +689,25 @@ class STTWorker(BaseWorker):
             await abandon("frame_gap", expected_seq=expected_seq, got_seq=frame.seq)
             return
 
-        # A COMMIT FOR THIS SPEAKER IS IN FLIGHT. `_consume_loop`'s own docstring says why this
-        # lock exists: two things using one reused WebSocket session at once interleave the
-        # transcription stream. Appending mid-commit would put this frame — which belongs to the
-        # NEXT turn — inside the one being committed.
-        #
-        # Skipped rather than awaited: this loop serves every speaker in every room, and blocking
-        # it behind one speaker's commit (bounded by TRANSCRIBE_EVENT_TIMEOUT_S = 15s) would stall
-        # the frames of all the others.
+        # A COMMIT FOR THIS SPEAKER IS IN FLIGHT: this frame must not go into the buffer that
+        # commit is about to take. _append_speech_frame holds such frames; reaching here with the
+        # lock taken means either the committed item HAS completed (`locked_by_commit`: the
+        # buffer is the next turn's), or the frame was not held, in which case this turn falls
+        # back to its own chunk's audio, as it always did.
         lock = self._speaker_locks.setdefault(key, asyncio.Lock())
-        if lock.locked():
+        if lock.locked() and not locked_by_commit:
             await abandon("commit_in_flight")
             return
 
-        async with lock:
+        if locked_by_commit:
             epoch = await self._require_model().append_streamed_audio(
                 key, frame.audio_data, frame.sample_rate
             )
+        else:
+            async with lock:
+                epoch = await self._require_model().append_streamed_audio(
+                    key, frame.audio_data, frame.sample_rate
+                )
         if epoch is None:
             # No session yet (the prewarm has not opened one), or the append was refused.
             # Either way this turn is no longer whole.
@@ -474,7 +736,7 @@ class STTWorker(BaseWorker):
         while not self._shutdown_event.is_set():
             pubsub = self.redis.redis.pubsub()
             try:
-                await pubsub.subscribe("meeting.track_published")
+                await pubsub.subscribe(*_PREWARM_EVENT_TYPES)
                 while not self._shutdown_event.is_set():
                     message = await pubsub.get_message(
                         ignore_subscribe_messages=True,
@@ -503,13 +765,29 @@ class STTWorker(BaseWorker):
                 except Exception:
                     self.logger.warning("stt_prewarm_listener_close_failed")
 
+    async def _maintain_warm_pool(self) -> None:
+        """Keep the Realtime warm pool young, so a claim never meets an aged-out socket."""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(WARM_POOL_MAINTENANCE_INTERVAL_S)
+                model = self._require_model()
+                await model.rotate_warm_pool()
+                # The sockets people are TALKING into age too; replace them between turns
+                # rather than letting the max-age sweep close one under a sentence.
+                model.renew_aging_sessions()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The cost of a missed rotation is one cold handshake, never a stopped loop.
+                self.logger.exception("stt_warm_pool_maintenance_failed")
+
     async def _prewarm_from_track_event(self, serialized_event: bytes | str) -> None:
         try:
             envelope = json.loads(serialized_event)
         except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
             return
         if (
-            envelope.get("event_type") != "meeting.track_published"
+            envelope.get("event_type") not in _PREWARM_EVENT_TYPES
             or envelope.get("schema_version") != 1
             or envelope.get("producer") != "meeting-service"
         ):
@@ -552,7 +830,11 @@ class STTWorker(BaseWorker):
                 meeting_id=meeting_id,
                 speaker_id=speaker_id,
             )
-        allowed_languages = await self._get_room_languages(meeting_id)
+        if is_external_bridge_speaker(speaker_id):
+            self._mark_bridge_room(meeting_id)
+        allowed_languages = await self._get_room_languages(
+            meeting_id, _language_hint_for_stt(declared_language) if declared_language else None
+        )
         keywords = await self._get_stt_keywords(meeting_id)
         await self._require_model().prepare_session(
             meeting_id,
@@ -589,7 +871,7 @@ class STTWorker(BaseWorker):
         session concurrently would interleave the transcription stream. Locking keeps
         that path exactly as ordered as before; only cross-speaker work is now parallel.
 
-        RedisStreamClient.consume_concurrent ties XACK to successful handler
+        RedisStreamClient.consume_pipelined ties XACK to successful handler
         completion. Failed work remains pending for BaseWorker's reclaim/DLQ path.
         """
         self.logger.info(
@@ -599,29 +881,96 @@ class STTWorker(BaseWorker):
             consumer=self._consumer_name,
         )
 
-        async def _run(message_id: bytes, data: dict[bytes, bytes]) -> None:
-            key = _extract_speaker_key(data)
-            lock = self._speaker_locks.setdefault(key, asyncio.Lock())
-            async with lock:
-                await self._process_and_log_errors(message_id, data)
-
+        # READS WHILE A SPEAKER IS BUSY (see RedisStreamClient.consume_pipelined). This read a
+        # batch and waited for EVERY chunk in it before reading again, so one slow commit held up
+        # every other speaker's chunk that arrived after the batch was read. Measured in
+        # tools/meeting_sim: a backchannel's commit that took 7.1s kept the next speaker's chunk
+        # unread for 7s, and while it waited that speaker's next turn started streaming, found the
+        # previous turn still uncommitted and threw its buffer away
+        # (`previous_turn_never_committed`) — so the queued chunk then had to be re-sent and
+        # transcribed from scratch, slower again. Different speakers share nothing here; only
+        # the per-speaker lock below orders anything, and it is taken in stream order.
         while not self._shutdown_event.is_set():
             try:
-                await self._recover_stale_messages()
-                await self.redis.consume_concurrent(
+                await self.redis.consume_pipelined(
                     stream=self.input_stream,
                     group=self.consumer_group,
-                    handler=_run,
+                    handler=self._run_in_speaker_order,
+                    keep_running=lambda: not self._shutdown_event.is_set(),
                     consumer=self._consumer_name,
                     block_ms=2000,
                     count=8,
-                    concurrency=8,
+                    max_in_flight=self._MAX_IN_FLIGHT,
+                    in_flight_ids=self._in_flight_message_ids(),
+                    between_reads=self._recover_stale_messages,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger.exception("consume_loop_error")
                 await asyncio.sleep(1.0)
+
+    async def _run_in_speaker_order(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        key = _extract_speaker_key(data)
+        lock = self._speaker_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            await self._process_and_log_errors(message_id, data)
+
+    def _in_flight_message_ids(self) -> set[bytes]:
+        # getattr + assign back: the tests build workers with __new__ and never run __init__.
+        ids: set[bytes] | None = getattr(self, "_in_flight_ids", None)
+        if ids is None:
+            ids = set()
+            self._in_flight_ids = ids
+        return ids
+
+    def _is_in_flight(self, message_id: bytes) -> bool:
+        # A chunk queued behind its own speaker's commit is pending in Redis exactly like an
+        # abandoned one; the reclaim pass must not run it a second time.
+        return message_id in self._in_flight_message_ids()
+
+    async def _process_reclaimed(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
+        # Through the speaker's lock like any other chunk: two commits on one speaker's session
+        # at once would interleave its transcription stream.
+        await self._run_in_speaker_order(message_id, data)
+
+    async def _handle_route_update_message(self, message: dict[str, Any]) -> None:
+        """Base handling, then — in a Google Meet bridge room only — drop this room's cached
+        language set on AUDIO_ROUTES_UPDATED. Native rooms keep their cache for the TTL, as before.
+
+        A participant_language_changed (SetSpeakLanguage / SetListenLanguage /
+        SetExternalMeetingLanguage) makes translation-room rebuild the mesh, rewrite
+        `translationRoom:{id}:audio_routes` — whose `room_languages` is half of
+        _get_room_languages, and in a bridge room carries the Meet side's current language even
+        when its speak_languages entry is "auto" — and publish AUDIO_ROUTES_UPDATED on
+        `translationRoom:{id}:events`. The next chunk then re-reads both halves instead of
+        serving the old set for the rest of the TTL. The TTL stays as the backstop: pub/sub has
+        no replay, and a speak-language change that leaves the routes unchanged publishes nothing.
+        """
+        await super()._handle_route_update_message(message)
+        room_id = _route_update_room_id(message)
+        if room_id and self._is_bridge_room(room_id):
+            self._room_languages.pop(room_id, None)
+
+    def _is_bridge_room(self, meeting_id: str) -> bool:
+        """Whether this meeting is a Google Meet EXTERNAL_BRIDGE room. No Redis read.
+
+        Positives are learned for free: from `speak_languages` field names on every refresh in
+        _get_room_languages (the hash it reads anyway — shared.control_markers
+        .is_external_bridge_room), and from a chunk / prewarm by the stand-in itself. A positive
+        is kept for the room's lifetime (cleared in _cleanup_room); a negative is never stored,
+        so a room whose stand-in joins late becomes a bridge room on the next refresh.
+        """
+        return meeting_id in getattr(self, "_bridge_rooms", ())
+
+    def _mark_bridge_room(self, meeting_id: str) -> None:
+        bridge_rooms: set[str] | None = getattr(self, "_bridge_rooms", None)
+        if bridge_rooms is None:
+            bridge_rooms = set()
+            self._bridge_rooms = bridge_rooms
+        if meeting_id not in bridge_rooms:
+            bridge_rooms.add(meeting_id)
+            self.logger.info("stt_bridge_room_detected", meeting_id=meeting_id)
 
     def _cleanup_room(self, room_id: str) -> None:
         super()._cleanup_room(room_id)
@@ -634,8 +983,17 @@ class STTWorker(BaseWorker):
         getattr(self, "_last_final_turn", {}).pop(room_id, None)
         getattr(self, "_recent_transcripts", {}).pop(room_id, None)
         self._room_languages.pop(room_id, None)
+        getattr(self, "_bridge_rooms", set()).discard(room_id)
         getattr(self, "_room_noise_reduction", {}).pop(room_id, None)
         getattr(self, "_dub_echo_cache", {}).pop(room_id, None)
+        getattr(self, "_far_side_ref_cache", {}).pop(room_id, None)
+        tracker = getattr(self, "_far_speaker_tracker_impl", None)
+        if tracker is not None and hasattr(tracker, "forget"):
+            tracker.forget(room_id)
+        # A line still waiting for its late far-side name belongs to a meeting that is over.
+        namer: LateFarSpeakerNamer | None = getattr(self, "_late_far_speaker_namer_impl", None)
+        if namer is not None:
+            namer.cancel_meeting(room_id)
         # Same reasoning as the four above: one entry per (meeting, speaker) whose turn was
         # open when the room ended, held forever otherwise.
         for noise_key in [
@@ -656,8 +1014,13 @@ class STTWorker(BaseWorker):
             baselines.pop(key, None)
 
     async def _cleanup(self) -> None:
-        task = getattr(self, "_prewarm_listener_task", None)
-        if task is not None:
+        namer: LateFarSpeakerNamer | None = getattr(self, "_late_far_speaker_namer_impl", None)
+        if namer is not None:
+            namer.cancel_all()
+        for name in ("_prewarm_listener_task", "_warm_pool_task"):
+            task = getattr(self, name, None)
+            if task is None:
+                continue
             task.cancel()
             try:
                 await task
@@ -669,7 +1032,7 @@ class STTWorker(BaseWorker):
     def _clean_enabled(self) -> bool:
         # getattr: the test suites build workers with __new__, so `settings` may not exist.
         settings = getattr(self, "settings", None)
-        return bool(getattr(settings, "transcript_clean_enabled", True))
+        return bool(getattr(settings, "stt_clean_prepass_enabled", True))
 
     def _with_clean_text(self, result: STTResultMessage) -> STTResultMessage:
         """`result` with the WT-716 clean-transcript fields filled in, or `result` unchanged.
@@ -795,7 +1158,23 @@ class STTWorker(BaseWorker):
 
     async def process(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         """Process one audio chunk: transcribe and publish results."""
+        try:
+            await self._process_chunk(message_id, data)
+        finally:
+            # Whatever path the chunk took, the window in which this speaker's next frames were
+            # held or sent straight in closes with it (see _append_speech_frame).
+            self._end_commit_window(_extract_speaker_key(data))
+
+    async def _process_chunk(self, message_id: bytes, data: dict[bytes, bytes]) -> None:
         chunk = AudioChunkMessage.from_redis(data)
+        # What billing charges this chunk by, named on every segment it produces — early or
+        # completed — so the chunk is paid for once whichever arrives first. See
+        # STTResultMessage.chunk_id. The duration is the same PCM arithmetic the model uses for
+        # the completed segment's `end` (_pcm16_duration_seconds).
+        chunk_id = message_id.decode("utf-8", errors="replace")
+        chunk_duration_ms = (
+            int((len(chunk.audio_data) // 2) * 1000 / chunk.sample_rate) if chunk.sample_rate else 0
+        )
 
         if not await self._room_state_allows_stt(chunk.meeting_id):
             self.logger.info(
@@ -838,10 +1217,23 @@ class STTWorker(BaseWorker):
         # _cached_transcript_anchor.
         anchor_ms = self._cached_transcript_anchor(chunk.meeting_id)
         language_hint = _language_hint_for_stt(chunk.language)
-        allowed_languages = await self._get_room_languages(chunk.meeting_id)
+        if is_external_bridge_speaker(chunk.speaker_id):
+            self._mark_bridge_room(chunk.meeting_id)
+        allowed_languages = await self._get_room_languages(chunk.meeting_id, language_hint)
         keywords = await self._get_stt_keywords(chunk.meeting_id)
         noise_reduction = await self._get_noise_reduction(chunk.meeting_id, chunk.speaker_id)
         recent_dub_texts = await self._get_recent_dub_texts(chunk.meeting_id)
+        # BRIDGE STAND-IN: where this chunk sits on the epoch clock caption hints use. The
+        # far-side reference lines are read per segment AFTER recognition (_review_far_side /
+        # _is_far_side_leak), not here: the other copy of a sentence is racing through a
+        # different STT session, and the later the read, the more likely it has landed.
+        bridge_chunk = is_external_bridge_speaker(chunk.speaker_id)
+        leak_review = not bridge_chunk and self.stt_settings.far_side_leak_dedupe_enabled
+        # A streamed turn's chunk can carry no PCM of its own; its speech_ms still says how
+        # long the speaker talked.
+        chunk_epoch_start_ms = chunk.timestamp_ms - (
+            _chunk_audio_duration_ms(chunk) or max(0, chunk.speech_ms)
+        )
 
         # Measured CONCURRENTLY with recognition, not before it. Transcription is a
         # network round trip of hundreds of milliseconds; the measurement is single-digit
@@ -945,10 +1337,25 @@ class STTWorker(BaseWorker):
                     # start_ms == end_ms sends billing_worker down its zero-duration fallback,
                     # which prices a fifteen-second turn as four one-second ones.
                     is_early=True,
+                    chunk_id=chunk_id,
+                    chunk_duration_ms=chunk_duration_ms,
                     timestamp_ms=chunk.timestamp_ms,
                     prosody=None,
                 )
+                if bridge_chunk:
+                    reviewed = await self._review_far_side(
+                        result, chunk, chunk_epoch_start_ms, chunk_offset_ms
+                    )
+                    if reviewed is None:
+                        return
+                    result = reviewed
+                elif leak_review and await self._is_far_side_leak(result):
+                    return
                 result = await self._publish_stt_result(result, message_id)
+                if bridge_chunk:
+                    self._schedule_late_far_speaker(
+                        result, chunk, chunk_epoch_start_ms, chunk_offset_ms
+                    )
                 self.logger.info(
                     "stt_early_sentence",
                     meeting_id=chunk.meeting_id,
@@ -1009,6 +1416,9 @@ class STTWorker(BaseWorker):
                 chunk_offset_ms=chunk_offset_ms,
                 meeting_id=chunk.meeting_id,
                 speaker_id=chunk.speaker_id,
+                # Google Meet bridge rooms only: a changed declaration also wipes half-counted
+                # language evidence (OpenAISTT._note_declaration). Native rooms: unchanged.
+                bridge_room=self._is_bridge_room(chunk.meeting_id),
                 # Never send title/description/instruction prose to STT. A production
                 # failure transcribed and translated that prose verbatim. Keywords retain
                 # vocabulary bias without giving the model a sentence it can recite.
@@ -1053,6 +1463,8 @@ class STTWorker(BaseWorker):
                 # "too much text for this little audio" guard unable to fire at all.
                 speech_ms=chunk.speech_ms,
             )
+            # The item is complete: the next turn's held frames can go in now.
+            await self._release_held_frames((chunk.meeting_id, chunk.speaker_id))
         except Exception as exc:
             # Swallowed so the meeting keeps going, which is exactly why it must be counted:
             # this attempt produced no transcript. See BaseWorker.note_attempt_outcome.
@@ -1095,6 +1507,7 @@ class STTWorker(BaseWorker):
             chunk_index=chunk.chunk_index,
         )
 
+        published_segments = 0
         for segment in segments:
             if segment.confidence >= _CONTEXT_MIN_CONFIDENCE:
                 self._remember_transcript(chunk.meeting_id, segment.text)
@@ -1119,6 +1532,8 @@ class STTWorker(BaseWorker):
                 anchor_ms=anchor_ms,
                 chunk_index=chunk.chunk_index,
                 is_final_chunk=chunk.is_final_chunk,
+                chunk_id=chunk_id,
+                chunk_duration_ms=chunk_duration_ms,
                 timestamp_ms=chunk.timestamp_ms,
                 # Every segment recognised in this chunk shares the chunk's delivery. The
                 # measurement's granularity is the audio, and splitting it per segment would
@@ -1126,7 +1541,22 @@ class STTWorker(BaseWorker):
                 prosody=prosody,
             )
 
+            if bridge_chunk:
+                reviewed = await self._review_far_side(
+                    result, chunk, chunk_epoch_start_ms, chunk_offset_ms
+                )
+                if reviewed is None:
+                    continue
+                result = reviewed
+            elif leak_review and await self._is_far_side_leak(result):
+                continue
+
             result = await self._publish_stt_result(result, message_id)
+            published_segments += 1
+            if bridge_chunk:
+                self._schedule_late_far_speaker(
+                    result, chunk, chunk_epoch_start_ms, chunk_offset_ms
+                )
 
             self.logger.info(
                 "segment_transcribed",
@@ -1149,7 +1579,9 @@ class STTWorker(BaseWorker):
                 inference_ms=inference_ms,
             )
 
-        if not segments and chunk.is_final_chunk:
+        # On PUBLISHED segments, not recognised ones: a final chunk whose every line was a
+        # far-side duplicate (stand-in) or a far-side leak (named) still has to close its turn.
+        if not published_segments and chunk.is_final_chunk:
             result = STTResultMessage(
                 segment_id=_build_segment_id(
                     chunk.meeting_id,
@@ -1655,6 +2087,325 @@ class STTWorker(BaseWorker):
         cache[meeting_id] = (texts, now)
         return texts
 
+    def _far_side_dedupe_config(self) -> DedupeConfig:
+        s = self.stt_settings
+        return DedupeConfig(
+            window_ms=s.far_side_dedupe_window_ms,
+            min_ratio=s.far_side_dedupe_min_ratio,
+            min_chars=s.far_side_dedupe_min_chars,
+            same_language=s.far_side_dedupe_same_language,
+            min_lag_ms=s.far_side_dedupe_min_lag_ms,
+            max_lag_ms=s.far_side_dedupe_max_lag_ms,
+        )
+
+    def _far_side_leak_config(self) -> LeakConfig:
+        s = self.stt_settings
+        return LeakConfig(
+            min_ratio=s.far_side_leak_min_ratio,
+            min_chars=s.far_side_leak_min_chars,
+            same_language=s.far_side_dedupe_same_language,
+            max_named_delay_ms=s.far_side_leak_max_named_delay_ms,
+        )
+
+    async def _get_named_speaker_refs(self, meeting_id: str) -> list[NamedSegmentRef]:
+        """Recent lines NAMED speakers in this room published, for the forward dedupe."""
+        if not self.stt_settings.far_side_dedupe_enabled:
+            return []
+        return (await self._get_far_side_refs(meeting_id))[0]
+
+    async def _get_stand_in_refs(self, meeting_id: str) -> list[NamedSegmentRef]:
+        """Recent lines the bridge STAND-IN published, for the reverse (leak) dedupe.
+
+        Empty in every room without a bridge - which is what limits the leak check to bridge
+        rooms: no stand-in line, nothing for a named line to be a leaked copy of.
+        """
+        if not self.stt_settings.far_side_leak_dedupe_enabled:
+            return []
+        return (await self._get_far_side_refs(meeting_id))[1]
+
+    async def _get_far_side_refs(
+        self, meeting_id: str
+    ) -> tuple[list[NamedSegmentRef], list[NamedSegmentRef]]:
+        """(named lines, stand-in lines) recently published in this room. One read, cached.
+
+        Read from stt:results:{meeting} - every replica's output for the room, which an
+        in-memory list on this replica would not be. Fails open to ([], []) like the dub-echo
+        read. Each ref carries its AUDIO start (anchor_ms + start_ms), which is what the
+        direction rule decides on; None when the line stated no usable origin.
+        """
+        cache: (
+            dict[str, tuple[tuple[list[NamedSegmentRef], list[NamedSegmentRef]], float]] | None
+        ) = getattr(self, "_far_side_ref_cache", None)
+        if cache is None:
+            cache = {}
+            self._far_side_ref_cache = cache
+        now = time.monotonic()
+        cached = cache.get(meeting_id)
+        if cached is not None and now - cached[1] < _FAR_SIDE_CACHE_TTL_S:
+            return cached[0]
+
+        named: list[NamedSegmentRef] = []
+        standin: list[NamedSegmentRef] = []
+        # Twice the match window: the timestamp prefilter compares in both directions.
+        horizon_ms = 2 * self.stt_settings.far_side_dedupe_window_ms
+        try:
+            entries = (
+                await self.redis.redis.xrevrange(
+                    f"stt:results:{meeting_id}", count=_FAR_SIDE_SCAN_COUNT
+                )
+                or []
+            )
+            now_ms = int(time.time() * 1000)
+            for _entry_id, fields in entries:
+                if not fields:
+                    continue
+                data = {
+                    (key.decode() if isinstance(key, bytes) else key): (
+                        value.decode() if isinstance(value, bytes) else value
+                    )
+                    for key, value in fields.items()
+                }
+                try:
+                    ts = int(data.get("timestamp_ms", "0"))
+                except ValueError:
+                    continue
+                if now_ms - ts > horizon_ms:
+                    break
+                speaker = data.get("speaker_id", "")
+                if not speaker:
+                    continue
+                text = _normalize_overheard_text(data.get("text", ""))
+                if not text:
+                    continue
+                try:
+                    audio_start = audio_start_epoch_ms(
+                        int(data.get("anchor_ms") or 0), int(data.get("start_ms") or 0)
+                    )
+                except ValueError:
+                    audio_start = None
+                ref = NamedSegmentRef(
+                    speaker_id=speaker,
+                    text=text,
+                    language=data.get("language", ""),
+                    timestamp_ms=ts,
+                    audio_start_ms=audio_start,
+                )
+                (standin if is_external_bridge_speaker(speaker) else named).append(ref)
+        except Exception:
+            self.logger.warning("far_side_ref_lookup_failed", meeting_id=meeting_id, exc_info=True)
+            named, standin = [], []
+        cache[meeting_id] = ((named, standin), now)
+        return named, standin
+
+    async def _is_far_side_leak(self, result: STTResultMessage) -> bool:
+        """A NAMED line that is Meet audio leaking into this person's mic (reverse dedupe).
+
+        Checked only against stand-in lines ALREADY published: a named line recognised before
+        the stand-in's copy lands is kept, because stt:results has no retraction message to take
+        it back later. Fails open: any error keeps the line.
+        """
+        try:
+            refs = await self._get_stand_in_refs(result.meeting_id)
+            if not refs:
+                return False
+            audio_start = audio_start_epoch_ms(result.anchor_ms, result.start_ms)
+            match = find_far_side_leak(
+                _normalize_overheard_text(result.text),
+                result.language,
+                result.timestamp_ms,
+                refs,
+                self._far_side_dedupe_config(),
+                self._far_side_leak_config(),
+                audio_start_ms=audio_start,
+            )
+        except Exception:
+            self.logger.warning(
+                "far_side_leak_check_failed", meeting_id=result.meeting_id, exc_info=True
+            )
+            return False
+        if match is None:
+            return False
+        self._far_side_leaks_dropped = getattr(self, "_far_side_leaks_dropped", 0) + 1
+        self.logger.info(
+            "filtered_far_side_leak",
+            meeting_id=result.meeting_id,
+            speaker_id=result.speaker_id,
+            leak_of_speaker_id=match.speaker_id,
+            text=result.text[:80],
+            language=result.language,
+            is_early=result.is_early,
+            # Stand-in audio start minus this line's: <= 0 means the stand-in had it first.
+            lag_ms=(match.audio_start_ms or 0) - (audio_start or 0),
+            dropped_total=self._far_side_leaks_dropped,
+        )
+        return True
+
+    def _far_speaker_tracker(self) -> FarSpeakerTracker | None:
+        """Who-on-the-far-side source. Caption hints today; WT-677 swaps in diarization."""
+        if not self.stt_settings.far_speaker_hints_enabled:
+            return None
+        tracker: FarSpeakerTracker | None = getattr(self, "_far_speaker_tracker_impl", None)
+        if tracker is None:
+            redis = self.redis.redis
+
+            async def read_hints(key: str, count: int) -> Any:
+                return await redis.xrevrange(key, count=count)
+
+            tracker = CaptionHintTracker(
+                read_hints,
+                lag_ms=self.stt_settings.far_speaker_hint_lag_ms,
+                max_gap_ms=self.stt_settings.far_speaker_hint_max_gap_ms,
+            )
+            self._far_speaker_tracker_impl = tracker
+        return tracker
+
+    async def _review_far_side(
+        self,
+        result: STTResultMessage,
+        chunk: AudioChunkMessage,
+        chunk_epoch_start_ms: int,
+        chunk_offset_ms: int,
+    ) -> STTResultMessage | None:
+        """A bridge stand-in line: None when it echoes a named speaker, else labelled.
+
+        Dropped only when its audio started `min_lag_ms`..`max_lag_ms` AFTER the matching named
+        line's - the Meet round trip. Stand-in first or simultaneous is the leak case, where the
+        stand-in is the true copy and is kept; unknown timing keeps it too.
+        """
+        refs = await self._get_named_speaker_refs(result.meeting_id)
+        audio_start = audio_start_epoch_ms(result.anchor_ms, result.start_ms)
+        if refs:
+            match = find_far_side_duplicate(
+                _normalize_overheard_text(result.text),
+                result.language,
+                result.timestamp_ms,
+                refs,
+                self._far_side_dedupe_config(),
+                audio_start_ms=audio_start,
+            )
+            if match is not None:
+                self._far_side_duplicates_dropped = (
+                    getattr(self, "_far_side_duplicates_dropped", 0) + 1
+                )
+                self.logger.info(
+                    "filtered_far_side_duplicate",
+                    meeting_id=result.meeting_id,
+                    speaker_id=result.speaker_id,
+                    duplicate_of_speaker_id=match.speaker_id,
+                    text=result.text[:80],
+                    language=result.language,
+                    is_early=result.is_early,
+                    # Audio start of this stand-in line minus the named line's (both known).
+                    lag_ms=(audio_start or 0) - (match.audio_start_ms or 0),
+                    dropped_total=self._far_side_duplicates_dropped,
+                )
+                return None
+
+        tracker = self._far_speaker_tracker()
+        if tracker is None:
+            return result
+        window = _far_speaker_window(result, chunk, chunk_epoch_start_ms, chunk_offset_ms)
+        try:
+            attribution = await tracker.attribute(result.meeting_id, window)
+        except Exception:
+            self.logger.warning(
+                "far_speaker_attribution_failed", meeting_id=result.meeting_id, exc_info=True
+            )
+            return result
+        # Bug B3 observability: one line per stand-in segment, hit or miss, so a test call shows
+        # whether the caption names reached this worker and with what confidence (the gateway
+        # shows a name only at Bridge:FarSpeakerNameMinConfidence, 0.6 by default).
+        if attribution is None:
+            self.logger.info(
+                "far_speaker_unattributed",
+                meeting_id=result.meeting_id,
+                segment_id=result.segment_id,
+                is_early=result.is_early,
+                window_start_ms=window.start_ms,
+                window_end_ms=window.end_ms,
+            )
+            return result
+        self.logger.info(
+            "far_speaker_attributed",
+            meeting_id=result.meeting_id,
+            segment_id=result.segment_id,
+            is_early=result.is_early,
+            # A Meet participant is not a user and agreed to nothing: log a hash, not the name.
+            far_speaker_name_hash=hashlib.sha256(attribution.name.encode()).hexdigest()[:12],
+            far_speaker_confidence=attribution.confidence,
+            window_start_ms=window.start_ms,
+            window_end_ms=window.end_ms,
+        )
+        return result.model_copy(
+            update={
+                "far_speaker_name": attribution.name,
+                "far_speaker_source": attribution.source,
+                "far_speaker_confidence": attribution.confidence,
+            }
+        )
+
+    def _late_far_speaker_namer(self) -> LateFarSpeakerNamer | None:
+        """The late-name scheduler (shared/far_speaker_late.py), or None when it is off."""
+        tracker = self._far_speaker_tracker()
+        if tracker is None:
+            return None
+        namer: LateFarSpeakerNamer | None = getattr(self, "_late_far_speaker_namer_impl", None)
+        if namer is None:
+
+            async def publish_late(message: LateFarSpeakerName) -> None:
+                # Its own stream, never stt:results - see shared/far_speaker_late.py.
+                await self.publish(FAR_SPEAKER_LATE_STREAM, message.meeting_id, message.to_redis())
+
+            namer = LateFarSpeakerNamer(
+                tracker,
+                publish_late,
+                self.logger,
+                min_confidence=self.stt_settings.far_speaker_name_min_confidence,
+                delays_ms=self.stt_settings.far_speaker_late_delays_ms,
+                max_pending=self.stt_settings.far_speaker_late_max_pending,
+            )
+            self._late_far_speaker_namer_impl = namer
+        return namer if namer.enabled else None
+
+    def _schedule_late_far_speaker(
+        self,
+        result: STTResultMessage,
+        chunk: AudioChunkMessage,
+        chunk_epoch_start_ms: int,
+        chunk_offset_ms: int,
+    ) -> None:
+        """A stand-in line that just went out unnamed: ask again once its speaker's hints land.
+
+        THE HAND-OVER LINE (PO 2026-10-03). When the far side changes speaker, the new speaker's
+        first line is finalized before their captions reach the desktop, so it is published with
+        the fallback label. Called AFTER the publish and never awaits anything: the line, its
+        translation and its dub are not delayed. A line that went out with a name the gateway
+        shows is never scheduled - a late answer may turn the fallback into a name, never one
+        name into another. Best effort: nothing here may break the transcription path.
+        """
+        try:
+            shown: FarSpeakerAttribution | None = None
+            if result.far_speaker_name and result.far_speaker_confidence is not None:
+                shown = FarSpeakerAttribution(
+                    name=result.far_speaker_name,
+                    source=result.far_speaker_source or "",
+                    confidence=result.far_speaker_confidence,
+                )
+            namer = self._late_far_speaker_namer()
+            if namer is None or not needs_late_attribution(
+                shown, self.stt_settings.far_speaker_name_min_confidence
+            ):
+                return
+            namer.schedule(
+                result.meeting_id,
+                result.segment_id,
+                _far_speaker_window(result, chunk, chunk_epoch_start_ms, chunk_offset_ms),
+            )
+        except Exception:
+            self.logger.warning(
+                "far_speaker_late_schedule_failed", meeting_id=result.meeting_id, exc_info=True
+            )
+
     async def _get_stt_keywords(self, meeting_id: str) -> list[str]:
         """Return structured glossary terms for the provider's keyword-bias field."""
         caches: dict[str, list[str]] | None = getattr(self, "_stt_keywords", None)
@@ -1723,8 +2474,25 @@ class STTWorker(BaseWorker):
             if cleaned:
                 window.append(cleaned)
 
-    async def _get_room_languages(self, meeting_id: str) -> set[str]:
+    async def _get_room_languages(self, meeting_id: str, declared: str | None = None) -> set[str]:
         """Every language this meeting may contain.
+
+        NATIVE MEETING ROOMS: exactly the previous behaviour — cached for _ROOM_LANGUAGES_TTL_S
+        (15s), `declared` ignored, the old entry parsing.
+
+        GOOGLE MEET BRIDGE ROOMS (_is_bridge_room; detected from the very `speak_languages`
+        read below, so the detection costs no extra round trip):
+            `declared` is the language THIS chunk's speaker declared (AudioChunkMessage.language,
+            which livekit_ingress_worker reads fresh from `speak_languages` per utterance). A
+            declaration the cached set does not contain is a pick made since the cache was
+            filled — a mid-meeting SetSpeakLanguage / SetExternalMeetingLanguage — so the cache
+            is refetched at once instead of serving the old set for the rest of the (5s,
+            _BRIDGE_ROOM_LANGUAGES_TTL_S) TTL. It is also unioned into a non-empty result: the
+            ingress read it from the very hash this set is built from, so it IS one of the
+            room's languages even if this read raced the write. An empty set stays empty
+            ("nothing declared" has its own handling in _filter_segments). "auto" entries are
+            skipped (_room_language_code), and AUDIO_ROUTES_UPDATED drops the cache
+            (_handle_route_update_message).
 
         TWO SOURCES, AND THE SECOND ONE IS THE ANSWER TO A REAL BUG
             `speak_languages` is what the people currently in the room are SPEAKING —
@@ -1749,24 +2517,47 @@ class STTWorker(BaseWorker):
         """
         now = time.monotonic()
         cached = self._room_languages.get(meeting_id)
-        if cached is not None and now - cached[1] < _ROOM_LANGUAGES_TTL_S:
+        bridge = self._is_bridge_room(meeting_id)
+        declared_code = _room_language_code(declared) if bridge else ""
+        if bridge:
+            if (
+                cached is not None
+                and now - cached[1] < _BRIDGE_ROOM_LANGUAGES_TTL_S
+                and (not declared_code or declared_code in cached[0])
+            ):
+                return set(cached[0])
+        elif cached is not None and now - cached[1] < _ROOM_LANGUAGES_TTL_S:
             return cached[0]
 
         langs: set[str] = set()
 
         raw = await self.redis.hgetall(f"translationRoom:{meeting_id}:speak_languages")
+        if not bridge and is_external_bridge_room(raw or {}):
+            # The stand-in has joined: from this refresh on, bridge rules apply.
+            self._mark_bridge_room(meeting_id)
+            bridge = True
+            declared_code = _room_language_code(declared)
         for value in (raw or {}).values():
+            if bridge:
+                code = _room_language_code(value.decode() if isinstance(value, bytes) else value)
+                if code:
+                    langs.add(code)
+                continue
             code = value.decode() if isinstance(value, bytes) else value
             code = _normalize_language(code.strip()) if code else ""
             if code and code != "auto":
                 langs.add(code)
 
-        langs |= await self._get_configured_room_languages(meeting_id)
+        langs |= await self._get_configured_room_languages(meeting_id, bridge=bridge)
+        if bridge and langs and declared_code:
+            langs.add(declared_code)
 
         self._room_languages[meeting_id] = (langs, now)
-        return langs
+        return set(langs) if bridge else langs
 
-    async def _get_configured_room_languages(self, meeting_id: str) -> set[str]:
+    async def _get_configured_room_languages(
+        self, meeting_id: str, *, bridge: bool = False
+    ) -> set[str]:
         """The room's own language configuration, from the audio_routes payload.
 
         Same key `_room_state_allows_stt` already reads, so this adds no round trip
@@ -1774,6 +2565,9 @@ class STTWorker(BaseWorker):
         older-format payload (one published before `room_languages` existed) yields an
         empty set and the speak-languages half stands alone, which is exactly the previous
         behaviour.
+
+        `bridge` (Google Meet bridge rooms) skips "auto" before normalising
+        (_room_language_code); native rooms keep the old parsing.
         """
         try:
             raw = await self.redis.get(f"translationRoom:{meeting_id}:audio_routes")
@@ -1785,8 +2579,13 @@ class STTWorker(BaseWorker):
             for value in configured:
                 if not isinstance(value, str):
                     continue
-                code = _normalize_language(value.strip())
-                if code and code != "auto":
+                if bridge:
+                    code = _room_language_code(value)
+                else:
+                    code = _normalize_language(value.strip())
+                    if code == "auto":
+                        code = ""
+                if code:
                     langs.add(code)
             return langs
         except Exception:

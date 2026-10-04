@@ -41,17 +41,23 @@ class StubCompletions:
 
 
 def build_suggester(
-    payload: Any, total_tokens: int = 50
+    payload: Any,
+    total_tokens: int = 50,
+    *,
+    decide_model: str = "decide-model",
+    generate_model: str = "generate-model",
+    reasoning_effort: str | None = None,
 ) -> tuple[OpenAISuggester, StubCompletions]:
     suggester = OpenAISuggester(
         api_key="test-key",
-        decide_model="decide-model",
-        generate_model="generate-model",
+        decide_model=decide_model,
+        generate_model=generate_model,
         decide_max_tokens=64,
         generate_max_tokens=200,
         temperature=0.2,
         max_suggestion_chars=140,
         request_timeout_seconds=8.0,
+        reasoning_effort=reasoning_effort,
     )
     completions = StubCompletions(payload, total_tokens)
     suggester._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))  # type: ignore[assignment]
@@ -278,6 +284,83 @@ class TestGenerate:
         assert "140 characters" in request["messages"][0]["content"]
 
 
+class TestReasoningModelBudget:
+    """Production generates on gpt-5.6-luna, a reasoning model.
+
+    Its `max_completion_tokens` is shared between hidden reasoning and the visible answer. At
+    the default effort the 200-token cap was sometimes spent on reasoning alone, which OpenAI
+    reports as 400 "max_tokens or model output limit was reached" (prod, 1 Oct 2026).
+    """
+
+    APPROVED = TestGenerate.APPROVED
+
+    @pytest.mark.asyncio
+    async def test_generate_on_a_reasoning_model_sends_the_configured_effort(self) -> None:
+        suggester, completions = build_suggester(
+            {"content": "x"}, generate_model="gpt-5.6-luna", reasoning_effort="none"
+        )
+
+        await suggester.generate(WINDOW, SEGMENT, self.APPROVED)
+
+        request = completions.requests[0]
+        assert request["reasoning_effort"] == "none"
+        assert request["max_completion_tokens"] == 200
+        assert "max_tokens" not in request
+        assert "temperature" not in request
+
+    @pytest.mark.asyncio
+    async def test_decide_on_a_reasoning_model_sends_the_configured_effort(self) -> None:
+        suggester, completions = build_suggester(
+            {"should_suggest": False}, decide_model="gpt-5.6-luna", reasoning_effort="low"
+        )
+
+        await suggester.decide(WINDOW, SEGMENT)
+
+        assert completions.requests[0]["reasoning_effort"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_a_non_reasoning_model_never_receives_an_effort(self) -> None:
+        """gpt-4o-mini (prod's decide model) answers reasoning_effort with a 400."""
+        suggester, completions = build_suggester(
+            {"should_suggest": False}, decide_model="gpt-4o-mini", reasoning_effort="none"
+        )
+
+        await suggester.decide(WINDOW, SEGMENT)
+
+        assert "reasoning_effort" not in completions.requests[0]
+
+    def test_production_settings_turn_reasoning_off(self) -> None:
+        from shared.config import SuggestionSettings
+        from suggestion_worker.__main__ import build_suggester as build_from_settings
+
+        settings = SuggestionSettings(
+            enabled=True, api_key="test-key", generate_model="gpt-5.6-luna"
+        )
+        suggester = build_from_settings(settings)
+
+        assert settings.reasoning_effort == "none"
+        assert isinstance(suggester, OpenAISuggester)
+        assert suggester.reasoning_effort == "none"
+
+    @pytest.mark.asyncio
+    async def test_the_client_does_not_retry(self) -> None:
+        """The SDK default re-sent a timed-out hint twice: ~27s of a stalled consumer each."""
+        suggester = OpenAISuggester(
+            api_key="test-key",
+            decide_model="m",
+            generate_model="m",
+            decide_max_tokens=64,
+            generate_max_tokens=200,
+            temperature=0.2,
+            max_suggestion_chars=140,
+            request_timeout_seconds=8.0,
+        )
+
+        await suggester.load()
+
+        assert suggester._require_client().max_retries == 0
+
+
 class TestNullSuggester:
     @pytest.mark.asyncio
     async def test_declines_everything(self) -> None:
@@ -471,3 +554,83 @@ def test_term_fires_on_a_term_being_used_not_only_asked_about() -> None:
     question-shaped is why a plain mention produced nothing.
     """
     assert "fires on a term being USED as much as on one being asked about" in _DECIDE_SYSTEM_PROMPT
+
+
+class TestReaderLanguages:
+    """WT-922 — one generate call also writes the hint in every reader's language."""
+
+    APPROVED = SuggestionDecision(
+        should_suggest=True, category="term", confidence=0.9, reason="undefined acronym"
+    )
+
+    def test_the_prompt_asks_for_translations_only_when_there_are_readers(self) -> None:
+        assert "translations" not in _generate_system_prompt(140, "term")
+        prompt = _generate_system_prompt(140, "term", ["en", "ja"])
+        assert '"en" (English)' in prompt
+        assert '"ja" (Japanese)' in prompt
+        assert '"translations": object' in prompt
+
+    @pytest.mark.asyncio
+    async def test_translations_for_requested_languages_are_kept(self) -> None:
+        suggester, completions = build_suggester(
+            {
+                "content": "SLA là cam kết mức dịch vụ.",
+                "detail": "Bob nhắc SLA mà chưa giải thích.",
+                "translations": {
+                    "en": {
+                        "content": "SLA is a service-level agreement.",
+                        "detail": "Bob said SLA.",
+                    },
+                    "ja": {"content": "", "detail": "empty content is dropped"},
+                    "fr": {"content": "never requested", "detail": ""},
+                },
+            }
+        )
+
+        suggestion = await suggester.generate(
+            WINDOW, SEGMENT, self.APPROVED, reader_languages=["en", "ja"]
+        )
+
+        assert suggestion is not None
+        assert suggestion.content == "SLA là cam kết mức dịch vụ."
+        assert suggestion.translations == {
+            "en": ("SLA is a service-level agreement.", "Bob said SLA.")
+        }
+        assert '"en" (English)' in completions.requests[0]["messages"][0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_malformed_translations_cost_only_the_translations(self) -> None:
+        suggester, _ = build_suggester({"content": "Hint.", "translations": ["not", "a", "dict"]})
+
+        suggestion = await suggester.generate(
+            WINDOW, SEGMENT, self.APPROVED, reader_languages=["en"]
+        )
+
+        assert suggestion is not None
+        assert suggestion.content == "Hint."
+        assert suggestion.translations == {}
+
+    @pytest.mark.asyncio
+    async def test_the_token_budget_grows_with_each_reader_language(self) -> None:
+        """At a flat budget two translations truncated the JSON and lost the hint for everyone."""
+        suggester, completions = build_suggester({"content": "Hint."})
+
+        await suggester.generate(WINDOW, SEGMENT, self.APPROVED)
+        await suggester.generate(WINDOW, SEGMENT, self.APPROVED, reader_languages=["en", "ja"])
+
+        def budget(request: dict[str, Any]) -> int:
+            return request.get("max_completion_tokens") or request["max_tokens"]
+
+        assert budget(completions.requests[0]) == 200
+        assert budget(completions.requests[1]) == 600
+
+
+def test_a_reader_copy_translates_the_quote_too() -> None:
+    """A hint for an English reader quoted the Vietnamese line verbatim, in the middle of an
+    English sentence — the one part of the card that reader could not read (prod, 2 Oct)."""
+    from suggestion_worker.suggester import _translations_rule
+
+    rule = _translations_rule(["en"])
+
+    assert "INCLUDING anything quoted from the transcript" in rule
+    assert "keep the quoted words" not in rule

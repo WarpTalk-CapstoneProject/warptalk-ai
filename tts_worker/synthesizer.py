@@ -30,6 +30,64 @@ logger = get_logger(__name__)
 WARM_CONNECTION_MAX_IDLE_SECONDS = 90.0
 
 
+class GenerationLease:
+    """One claim on a Cartesia concurrency slot, held for exactly as long as Cartesia counts it.
+
+    WHAT CARTESIA COUNTS (measured 2026-10-01, production key, from the tts-worker pod)
+        The plan allows 3 concurrent generations and QUEUES the excess silently — no 429, no
+        log, only latency. A websocket context counts from its first push until the server's
+        `done`, and an idle one between two sentences counts exactly like a generating one:
+        three contexts left open after their flush_done pushed three /tts/bytes requests from
+        ~0.7s to ~4.0s to first byte, until the server retired the contexts by itself ~5s
+        later. Ending them right after flush_done brought it back to ~0.7s. So a lease covers:
+
+          * a one-shot request — from just before it is sent until its response has been read;
+          * a prosody context — from just before its first push until its end is confirmed:
+            the `done` that answers the close, the cancel, or the server ending it itself. One
+            lease per CONTEXT, not per sentence: a sentence spoken on an already-open context
+            takes no slot of its own, because Cartesia does not count it twice.
+
+        It does NOT cover playout. With streaming on (WT-397) a sentence finishes PLAYING long
+        after Cartesia has finished with it, and a slot held around the playout made a third
+        speaker wait out somebody else's dub. What used to make that safe for a context was the
+        claim that an idle context "was never inside the slot"; the measurement above is what
+        showed that claim false, and why the worker now ends a context as soon as no sentence is
+        waiting for it instead of leaving it open between sentences.
+
+    `waited_ms` is how long `acquire` sat behind other holders — the delay the gate added, and
+    the only place in-process queueing for Cartesia is visible. The worker logs and records it.
+
+    Idempotent both ways: `acquire` on a held lease and `release` on a free one are no-ops, so a
+    holder can release on every way out without counting how it got there. A holder never takes
+    a second lease while it still holds one — a sentence that falls back to the one-shot path
+    ends its context, giving that slot back, before it asks for another — because a nested
+    second acquire is how a gate this shape deadlocks itself under load.
+    """
+
+    def __init__(self, slots: asyncio.Semaphore) -> None:
+        self._slots = slots
+        self._held = False
+        self.waited_ms = 0
+
+    @property
+    def held(self) -> bool:
+        return self._held
+
+    async def acquire(self) -> None:
+        if self._held:
+            return
+        started = time.monotonic()
+        await self._slots.acquire()
+        self._held = True
+        self.waited_ms += int((time.monotonic() - started) * 1000)
+
+    def release(self) -> None:
+        if not self._held:
+            return
+        self._held = False
+        self._slots.release()
+
+
 class CartesiaSynthesizer:
     """Cartesia Sonic Turbo synthesizer with voice cloning.
 
@@ -67,16 +125,19 @@ class CartesiaSynthesizer:
         self._warm_connections: deque[tuple[Any, float]] = deque()
         self._warm_target = 0
         self._warm_refill_task: asyncio.Task[None] | None = None
-        # See TTSSettings.cartesia_max_concurrency. One gate for every generation this process
-        # starts, prosody context and one-shot alike, because Cartesia counts them together.
+        # See TTSSettings.cartesia_max_concurrency. One gate for every one-shot request and every
+        # open prosody context this process holds, because Cartesia counts them together.
         self._generation_slots = asyncio.Semaphore(max(1, max_concurrency))
 
     def generation_slot(self) -> asyncio.Semaphore:
-        """Hold for the whole of one sentence's generation, fallback included.
+        """The gate on what Cartesia counts against the plan: one-shot requests in flight and
+        prosody contexts open, idle ones included.
 
-        Held by the caller rather than inside `synthesize`, so a prosody-context sentence and
-        the one-shot fallback it drops into count as ONE generation, not as a second request
-        queued behind the first one's own slot.
+        Held by the caller rather than inside `synthesize` or `open_prosody_context`, because
+        only the caller knows when a context's life ends. A live dub takes it through a
+        `GenerationLease` — one per context, released when the context's end is confirmed, or
+        one per one-shot request — and never across playout; see that class. One-shot callers
+        that do not stream (the voice preview) can simply hold it with `async with`.
         """
         return self._generation_slots
 
@@ -200,11 +261,16 @@ class CartesiaSynthesizer:
         language: str,
         voice_id: str | None = None,
     ) -> tuple[ProsodyContext, Any]:
-        """A single prosodic thread for one spoken turn — see tts_worker/prosody_context.py.
+        """A single prosodic thread for one or more back-to-back sentences — see
+        tts_worker/prosody_context.py.
 
         Returns the context AND the connection that owns it, because the caller has to keep the
-        connection alive for the whole turn and close it afterwards; a context outliving its
-        socket is just a closed socket with extra steps.
+        connection alive for as long as the context is open and close it afterwards; a context
+        outliving its socket is just a closed socket with extra steps.
+
+        Opening is local bookkeeping plus, at most, the dial: Cartesia learns of the context
+        only at its first push. That is why the caller takes the context's concurrency slot
+        AFTER this returns and before speaking — a cold dial is not spent holding a slot.
 
         Raw PCM rather than a WAV container: this is a stream, so there is no total length to
         put in a header up front. ProsodyContext re-wraps each sentence in the 44-byte header

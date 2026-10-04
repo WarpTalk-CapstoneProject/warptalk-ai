@@ -33,7 +33,7 @@ from ai_assistant_worker.citations import SourceRegistry
 
 MEETING_ID = "019fd60a-e5f3-7342-804a-000000000002"
 TRANSCRIPT_ID = "019fd60a-e5f3-7342-804a-0000000000aa"
-ROOM = {"id": MEETING_ID, "workspaceId": "ws-1", "title": "Sprint review"}
+ROOM = {"id": MEETING_ID, "workspaceId": "ws-1", "title": "Sprint review", "status": "ENDED"}
 
 SEGMENTS = [{"speakerName": "Mai", "originalText": "Ship it Friday.", "sequenceOrder": 1}]
 
@@ -68,14 +68,18 @@ def _ctx(
     *,
     room: Any = ROOM,
     room_status: int = 200,
-    summary: dict[bytes, bytes] | None = None,
+    summary: str | None = "We shipped the exporter.",
     transcript_routes: dict[str, MagicMock] | None = None,
     history: Any = None,
 ) -> ToolContext:
-    redis = MagicMock()
-    redis.hgetall = AsyncMock(
-        return_value=summary if summary is not None else {b"content": b"We shipped the exporter."}
+    # WT-929: the summary is read through TranslationRoomService as the caller, not out of
+    # Redis. `summary=None` is a meeting that has none published.
+    renderings = (
+        [{"templateKey": "general", "language": "", "isCanonical": True}]
+        if summary is not None
+        else []
     )
+    summary_base = f"/api/v1/room-artifacts/rooms/{MEETING_ID}/summary"
     return ToolContext(
         workspace_id="ws-1",
         user_id="user-1",
@@ -86,11 +90,15 @@ def _ctx(
             {
                 "/api/v1/translation-rooms/history": _response(200, {"rooms": history or []}),
                 "/api/v1/translation-rooms/": _response(room_status, room),
+                f"{summary_base}/renderings": _response(200, renderings),
+                summary_base: _response(
+                    200, {"status": "ready", "content": summary, "isCanonical": True}
+                ),
             }
         ),
         openai_client=None,
         model="gpt-4.1",
-        redis=redis,
+        redis=MagicMock(),
         citations=registry,
     )
 
@@ -125,7 +133,7 @@ class TestMeetingSummaryIsCitable:
 
         result = json.loads(
             await _get_meeting_summary(
-                _ctx(registry, room={"id": MEETING_ID, "workspaceId": "ws-1", "title": ""}),
+                _ctx(registry, room={**ROOM, "title": ""}),
                 {"meeting_id": MEETING_ID},
             )
         )
@@ -154,7 +162,7 @@ class TestMeetingSummaryIsCitable:
         registry = SourceRegistry()
 
         result = json.loads(
-            await _get_meeting_summary(_ctx(registry, summary={}), {"meeting_id": MEETING_ID})
+            await _get_meeting_summary(_ctx(registry, summary=None), {"meeting_id": MEETING_ID})
         )
 
         assert result["summary"] is None
@@ -192,19 +200,35 @@ class TestTranscriptIsCitable:
         assert result["segments"] == []
         assert "marker" not in result
         assert registry.registered() == []
-        # And it did not spend a request learning a title for a chip nobody is offered.
-        ctx.translation_room_client.get.assert_not_awaited()
+        # The room is read exactly once — by the WT-929 gate, which every read now passes
+        # through — and no second request is spent on a title for a chip nobody is offered.
+        assert ctx.translation_room_client.get.await_count == 1
 
-    async def test_a_transcript_whose_meeting_cannot_be_named_still_answers(self) -> None:
+    async def test_a_transcript_whose_meeting_has_no_title_still_answers(self) -> None:
         """Losing the transcript because its footnote could not be labelled would be trading the
         answer for the citation."""
         registry = SourceRegistry()
-        ctx = _ctx(registry, room_status=503, transcript_routes=_segment_routes(SEGMENTS))
+        ctx = _ctx(
+            registry, room={**ROOM, "title": ""}, transcript_routes=_segment_routes(SEGMENTS)
+        )
 
         result = json.loads(await _get_transcript(ctx, {"meeting_id": MEETING_ID}))
 
         assert result["segments"][0]["text"] == "Ship it Friday."
         assert "marker" not in result
+        assert registry.registered() == []
+
+    async def test_a_transcript_whose_room_cannot_be_read_is_refused(self) -> None:
+        """WT-929 reverses what this used to pin. The room read is no longer a courtesy lookup
+        for a title — it is the gate that establishes which workspace the meeting belongs to,
+        and a gate that cannot be asked fails closed."""
+        registry = SourceRegistry()
+        ctx = _ctx(registry, room_status=503, transcript_routes=_segment_routes(SEGMENTS))
+
+        result = json.loads(await _get_transcript(ctx, {"meeting_id": MEETING_ID}))
+
+        assert result == {"error": "Could not look up the transcript right now."}
+        ctx.transcript_client.get.assert_not_awaited()
         assert registry.registered() == []
 
     async def test_a_transcript_and_its_summary_are_two_different_sources(self) -> None:

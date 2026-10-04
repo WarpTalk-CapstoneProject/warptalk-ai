@@ -3,14 +3,19 @@
 The sentence-boundary protocol itself is covered in test_prosody_context.py. This covers the
 wiring around it: when a context is opened, when it is reused, when it is closed, and — the part
 that matters most in a live meeting — that every failure still produces audio.
+
+A context is continued only when the next sentence is ALREADY QUEUED behind the one being spoken
+(an open Cartesia context holds a concurrency slot even while idle — see
+tests/test_tts_context_closes_on_drain.py). These tests call `_synthesize_sentence` directly, so
+`_queued_behind` stands in for the consume loop having that next sentence in hand.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -160,8 +165,7 @@ def _worker(
     worker.settings = WorkerSettings()
     worker.tts_settings = TTSSettings(prosody_continuity=continuity)
     worker.logger = MagicMock()
-    worker._turns = {}
-    worker._turn_connections = {}
+    worker._contexts = {}
     worker.livekit_publisher = publisher  # type: ignore[assignment]
     synthesizer = _FakeSynthesizer()
     worker.cartesia = synthesizer  # type: ignore[assignment]
@@ -180,6 +184,23 @@ def _msg(text: str, *, final: bool = False, chunk: int = 0) -> TranslationResult
         chunk_index=chunk,
         is_final_chunk=final,
     )
+
+
+@contextmanager
+def _queued_behind(worker: TTSWorker) -> Iterator[None]:
+    """The consume loop holding the NEXT sentence for (m1, s1, vi) while this one is spoken.
+
+    Two counts, because `_run_in_key_order` counts the message being spoken as well as the ones
+    waiting behind it, and these tests call `_synthesize_sentence` without going through it.
+    """
+    key = ("m1", "s1", "vi")
+    with worker._in_hand(key), worker._in_hand(key):
+        yield
+
+
+async def _settled(worker: TTSWorker) -> None:
+    """Let contexts that were taken out of service finish ending (close, `done`, slot back)."""
+    await asyncio.gather(*worker._retiring_contexts())
 
 
 async def _say(worker: TTSWorker, message: TranslationResultMessage, voice: str = "v1") -> Any:
@@ -211,11 +232,12 @@ async def test_turning_it_off_falls_back_to_the_proven_one_shot_path() -> None:
 
 @pytest.mark.asyncio
 async def test_the_sentences_of_one_turn_share_a_context() -> None:
-    """The whole point. Two sentences of the same turn must be one prosodic thread, not two
-    independent generations."""
+    """The whole point. Two back-to-back sentences of the same turn must be one prosodic thread,
+    not two independent generations."""
     worker, synth = _worker(continuity=True)
 
-    await _say(worker, _msg("Câu một.", chunk=0))
+    with _queued_behind(worker):
+        await _say(worker, _msg("Câu một.", chunk=0))
     await _say(worker, _msg("Câu hai.", chunk=1))
 
     assert len(synth.opened) == 1, "the second sentence opened a second context"
@@ -229,14 +251,18 @@ async def test_the_turn_ends_where_the_speaker_stopped() -> None:
     # where a chunk boundary happened to fall.
     worker, synth = _worker(continuity=True)
 
-    await _say(worker, _msg("Câu một.", chunk=0))
+    with _queued_behind(worker):
+        await _say(worker, _msg("Câu một.", chunk=0))
     assert synth.turns[0].closed is False
 
-    await _say(worker, _msg("Câu hai.", chunk=1, final=True))
+    # Even with another sentence queued: that one belongs to the speaker's NEXT turn.
+    with _queued_behind(worker):
+        await _say(worker, _msg("Câu hai.", chunk=1, final=True))
+    await _settled(worker)
 
     assert synth.turns[0].closed is True
     assert synth.connections[0].closed is True, "the socket outlived its context"
-    assert worker._turns == {}, "a finished turn must not be reused by the next one"
+    assert worker._contexts == {}, "a finished turn must not be reused by the next one"
 
 
 @pytest.mark.asyncio
@@ -255,14 +281,15 @@ async def test_a_broken_context_still_produces_audio() -> None:
     sentence falls back to the one-shot path, and the dead turn is discarded rather than
     retried into."""
     worker, synth = _worker(continuity=True)
-    await _say(worker, _msg("Câu một.", chunk=0))
+    with _queued_behind(worker):
+        await _say(worker, _msg("Câu một.", chunk=0))
     synth.turns[0].fail = True
 
     sentence = await _say(worker, _msg("Câu hai.", chunk=1))
 
     assert synth.one_shot_calls == ["Câu hai."]
     assert len(sentence.audio) > 44
-    assert worker._turns == {}, "the failed turn was kept and would fail again"
+    assert worker._contexts == {}, "the failed turn was kept and would fail again"
     assert sentence.already_spoken is False, (
         "nothing was streamed, so the fallback must still be played"
     )
@@ -274,7 +301,8 @@ async def test_a_voice_change_mid_meeting_does_not_continue_the_old_voice() -> N
     # different voice would be a worse seam than the one this removes.
     worker, synth = _worker(continuity=True)
 
-    await _say(worker, _msg("Câu một.", chunk=0), voice="voice-a")
+    with _queued_behind(worker):
+        await _say(worker, _msg("Câu một.", chunk=0), voice="voice-a")
     await _say(worker, _msg("Câu hai.", chunk=1), voice="voice-b")
 
     assert len(synth.opened) == 2
@@ -290,11 +318,17 @@ async def test_ending_a_room_abandons_its_turns_without_waiting() -> None:
     worker._room_routes = {}
     worker._translation_active = {}
     worker._paused_rooms = set()
-    await _say(worker, _msg("Câu một.", chunk=0))
+    with _queued_behind(worker):
+        await _say(worker, _msg("Câu một.", chunk=0))
+    assert worker._contexts, "the context should still be open for the queued sentence"
 
     worker._cleanup_room("m1")
+    await _settled(worker)
 
-    assert worker._turns == {}
+    assert worker._contexts == {}
+    assert synth.turns[0].abandoned is True
+    assert synth.connections[0].closed is True, "the room's socket outlived the room"
+    assert synth.generation_slot()._value == 64, "the room's context kept its Cartesia slot"
 
 
 # ── WT-397: who has already heard what ──────────────────────────────────────────────────────
@@ -326,7 +360,8 @@ async def test_a_context_that_dies_mid_sentence_does_not_speak_the_opening_twice
     """
     publisher = _FakePublisher()
     worker, synth = _worker(continuity=True, publisher=publisher)
-    await _say(worker, _msg("Câu một.", chunk=0))
+    with _queued_behind(worker):
+        await _say(worker, _msg("Câu một.", chunk=0))
     synth.turns[0].fail_after_streaming = True
 
     sentence = await _say(worker, _msg("Câu hai.", chunk=1))
@@ -344,7 +379,8 @@ async def test_a_context_that_dies_before_the_first_chunk_still_gets_its_fallbac
     # still reach the room, or a dead socket becomes silence.
     publisher = _FakePublisher()
     worker, synth = _worker(continuity=True, publisher=publisher)
-    await _say(worker, _msg("Câu một.", chunk=0))
+    with _queued_behind(worker):
+        await _say(worker, _msg("Câu một.", chunk=0))
     synth.turns[0].fail = True
 
     sentence = await _say(worker, _msg("Câu hai.", chunk=1))
@@ -363,7 +399,8 @@ async def test_a_track_that_swallowed_everything_is_not_counted_as_spoken() -> N
     publisher = _FakePublisher(deaf=True)
     worker, synth = _worker(continuity=True, publisher=publisher)
     synth_turn_msg = _msg("Câu một.", chunk=0)
-    await _say(worker, synth_turn_msg)
+    with _queued_behind(worker):
+        await _say(worker, synth_turn_msg)
     synth.turns[0].fail_after_streaming = True
 
     sentence = await _say(worker, _msg("Câu hai.", chunk=1))
@@ -550,7 +587,7 @@ async def test_a_context_cartesia_retired_is_replaced_not_reused() -> None:
 
     `_collect` treats Cartesia's `done` as an ordinary end of stream: it marks the context
     closed, breaks, and returns the audio it has. So `speak()` SUCCEEDS — the caller never
-    reaches the except branch that calls `_end_turn`, and the spent context stays in `_turns`.
+    reaches the except branch that ended the turn, and the spent context stayed in the map.
     The next sentence for the same key found it not-None, called `speak()`, and got
     "ProsodyContext is closed": one wasted sentence per `done`, re-synthesized one-shot with no
     streaming at all.
@@ -562,11 +599,15 @@ async def test_a_context_cartesia_retired_is_replaced_not_reused() -> None:
     """
     worker, synth = _worker(continuity=True)
 
-    first = await _say(worker, _msg("Một."))
+    with _queued_behind(worker):
+        first = await _say(worker, _msg("Một."))
     synth.turns[0].retire_after_speaking = True
-    # This sentence still succeeds — it is the one that receives `done`.
-    await _say(worker, _msg("Hai."))
+    # This sentence still succeeds — it is the one that receives `done`. Queued behind it or
+    # not, the spent context must not be left for the next sentence.
+    with _queued_behind(worker):
+        await _say(worker, _msg("Hai."))
     assert synth.turns[0].is_closed, "the fake must model a context retired by the server"
+    assert worker._contexts == {}, "a context the server ended was kept for the next sentence"
 
     second = await _say(worker, _msg("Ba."))
 
@@ -587,10 +628,14 @@ async def test_replacing_a_retired_context_releases_its_connection() -> None:
     lifetime of the meeting."""
     worker, synth = _worker(continuity=True)
 
-    await _say(worker, _msg("Một."))
+    with _queued_behind(worker):
+        await _say(worker, _msg("Một."))
     synth.turns[0].retire_after_speaking = True
-    await _say(worker, _msg("Hai."))
-    await _say(worker, _msg("Ba."))
+    with _queued_behind(worker):
+        await _say(worker, _msg("Hai."))
+    with _queued_behind(worker):
+        await _say(worker, _msg("Ba."))
+    await _settled(worker)
 
     assert len(synth.connections) == 2, (
         "A retired context was never replaced, so there is no second connection to check — "
@@ -602,12 +647,14 @@ async def test_replacing_a_retired_context_releases_its_connection() -> None:
 
 @pytest.mark.asyncio
 async def test_a_healthy_context_is_still_reused() -> None:
-    """The guard must not become 'open a new context every sentence' — that would silently
-    undo prosodic continuity while every test still passed."""
+    """The guard must not become 'open a new context every sentence' for back-to-back
+    sentences — that would silently undo prosodic continuity while every test still passed."""
     worker, synth = _worker(continuity=True)
 
-    await _say(worker, _msg("Một."))
-    await _say(worker, _msg("Hai."))
+    with _queued_behind(worker):
+        await _say(worker, _msg("Một."))
+    with _queued_behind(worker):
+        await _say(worker, _msg("Hai."))
     await _say(worker, _msg("Ba."))
 
     assert len(synth.opened) == 1, f"one turn, one context; opened={synth.opened}"

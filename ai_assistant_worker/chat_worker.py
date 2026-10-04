@@ -15,10 +15,13 @@ lightweight Redis-stream consumers with no need for a separate container.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import time
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -53,6 +56,9 @@ from ai_assistant_worker.mcp_tools import (
 from ai_assistant_worker.mcp_tools import (
     build_mcp_plugin_connection_action as _build_mcp_plugin_connection_action,
 )
+from ai_assistant_worker.mcp_tools import (
+    drop_blank_optional_arguments as _drop_blank_optional_arguments,
+)
 from ai_assistant_worker.mcp_tools import normalize_mcp_tool_payload as _normalize_mcp_tool_payload
 from ai_assistant_worker.mcp_tools import (
     parse_disabled_plugin_keys as _parse_disabled_plugin_keys,
@@ -68,10 +74,16 @@ from ai_assistant_worker.mcp_tools import split_mcp_tool_arguments as _split_mcp
 from ai_assistant_worker.mcp_tools import (
     with_mcp_confirmation_parameter as _with_mcp_confirmation_parameter,
 )
+from ai_assistant_worker.meet_rooms import file_meet_rooms
 from ai_assistant_worker.meeting_links import (
+    CalendarEvent,
     MeetingLink,
+    bridged_meet_code_from_tool_result,
+    calendar_event_from_tool_result,
     ensure_meeting_links,
+    meet_code_from_url,
     meeting_link_from_tool_result,
+    merge_calendar_events,
     strip_meeting_markers,
 )
 from ai_assistant_worker.platform_tools import (
@@ -79,11 +91,13 @@ from ai_assistant_worker.platform_tools import (
     PLATFORM_TOOLS_BY_NAME,
     build_platform_system_prompt,
 )
+from ai_assistant_worker.tool_call_log import function_call_entry, web_search_entry
 from ai_assistant_worker.tool_targets import (
     describe_tool_target,
     describe_web_search_target,
     split_reasoning_summary,
 )
+from ai_assistant_worker.tools_manifest import run_manifest_publisher
 from shared.base_worker import BaseWorker
 from shared.config import ChatAssistantSettings, resolve_openai_api_key
 from shared.integration_status import OPENAI, IntegrationReport, credential_report
@@ -93,6 +107,26 @@ from shared.provider_calls import observed_openai_http_client
 from shared.schemas import ChatRequestMessage, ChatResultMessage
 
 SIBLING_SERVICE_TIMEOUT_SECONDS = 15.0
+
+#: Set by AssistantService when the user presses Stop (3 Oct 2026); read here, never written.
+CHAT_CANCEL_KEY_PREFIX = "assistant:chat_cancel:"
+
+#: How often a streaming turn looks for that key. Once per delta would be a GET per few tokens;
+#: half a second is faster than anyone can notice and costs two reads a second at most.
+STOP_POLL_SECONDS = 0.5
+
+#: The failed result for a turn stopped before it wrote anything. The web drops failures for a
+#: turn it stopped, so this is only ever read in logs and in the stored message.
+STOPPED_BEFORE_ANSWER = "Stopped before WarpBot answered."
+
+
+class TurnStopped(Exception):  # noqa: N818 - a stop the user asked for, not an error
+    """The user pressed Stop. Carries what this turn had written so far, which is kept."""
+
+    def __init__(self, partial: str) -> None:
+        super().__init__("stopped by the user")
+        self.partial = partial
+
 
 #: What the reader sees when the model's stream goes silent past the read timeout (WT-881).
 STREAM_STALLED_MESSAGE = (
@@ -225,6 +259,11 @@ _MENTION_TOOL_HINTS = {
 # Minutes (biên bản) have no read tool: the only minutes endpoint this package calls is the
 # share grant. The closest existing read is the summary plus the room detail, and the model is
 # told so rather than left to present a summary as the signed minutes.
+#
+# WT-929: standing in for the minutes with the summary is only honest for somebody who may read
+# the minutes. A DRAFT is readable by the host alone (signing is the publish act), so before the
+# model is pointed at the summary the worker asks the minutes endpoint AS THE CALLER — see
+# _unreadable_minutes_mentions — and a refused mention is rendered as a refusal instead.
 _ARTIFACT_MENTION_READS = {
     "summary": (
         "meeting summary",
@@ -275,19 +314,74 @@ def _normalize_mention(mention: dict[str, Any]) -> tuple[str, str, str] | None:
     return entity_type, entity_id, str(label)
 
 
-def _format_mentions(mentions_json: str) -> str | None:
+def _parse_mentions(mentions_json: str) -> list[Any]:
+    if not mentions_json:
+        return []
+    try:
+        mentions = json.loads(mentions_json)
+    except json.JSONDecodeError:
+        return []
+    return mentions if isinstance(mentions, list) else []
+
+
+async def _unreadable_minutes_mentions(
+    mentions_json: str,
+    client: httpx.AsyncClient | None,
+    bearer_token: str,
+) -> frozenset[str]:
+    """The meeting ids whose @minutes mention this caller may NOT have answered. WT-929.
+
+    WHY THE WORKER ASKS, RATHER THAN A TOOL
+        There is no minutes read tool; the mention is served by the summary. So the minutes'
+        own gate — MeetingMinutesService.GetCurrentAsync: room read, and a DRAFT only for the
+        host, the designated secretary and a workspace Owner/Admin — is never reached by any
+        tool call, and a participant who @mentioned an unsigned draft was answered from the
+        content it was drawn from. `GET /rooms/{id}/minutes` with the caller's own token is
+        that gate, asked verbatim.
+
+    FAILS CLOSED: anything but a 200 — a refusal, no minutes at all, an unreachable service, no
+    client, no token, an id that is not a UUID — puts the id in the refused set.
+    """
+    refused: set[str] = set()
+    for mention in _parse_mentions(mentions_json):
+        if not isinstance(mention, dict):
+            continue
+        normalized = _normalize_mention(mention)
+        if normalized is None or normalized[0] != "minutes":
+            continue
+        meeting_id = normalized[1]
+        if meeting_id in refused:
+            continue
+        readable = False
+        try:
+            # The id is interpolated into a path, so it must be an id and nothing else.
+            uuid.UUID(meeting_id)
+            if client is not None and bearer_token:
+                response = await client.get(
+                    f"/api/v1/rooms/{meeting_id}/minutes",
+                    headers={"Authorization": bearer_token},
+                )
+                readable = response.status_code == 200
+        except Exception:
+            readable = False
+        if not readable:
+            refused.add(meeting_id)
+    return frozenset(refused)
+
+
+def _format_mentions(
+    mentions_json: str, refused_minutes: frozenset[str] = frozenset()
+) -> str | None:
     """Render the frontend's explicit @mention list into a system message. Unlike ambient
     page context, a mention is the user's own deliberate act of attaching a specific entity
     to this message — treat it as the primary subject, not just background. Malformed or
     empty payloads are silently ignored.
+
+    `refused_minutes` are the meeting ids _unreadable_minutes_mentions refused: their @minutes
+    line tells the model to decline instead of pointing it at the summary.
     """
-    if not mentions_json:
-        return None
-    try:
-        mentions = json.loads(mentions_json)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(mentions, list) or not mentions:
+    mentions = _parse_mentions(mentions_json)
+    if not mentions:
         return None
 
     lines: list[str] = []
@@ -307,6 +401,15 @@ def _format_mentions(mentions_json: str) -> str | None:
             lines.append(
                 f'- plugin "{label}" (id={entity_id}) — the user explicitly selected this '
                 "plugin for this request; prefer its tools over any other way of answering."
+            )
+            continue
+        if entity_type == "minutes" and entity_id in refused_minutes:
+            lines.append(
+                f'- meeting minutes of "{label}" (meeting id={entity_id}) — the user does NOT '
+                "have access to these minutes: they are either an unsigned draft only the host "
+                "can read, or not available to this user at all. Tell them so, suggest asking "
+                "the meeting's host, and do NOT answer about these minutes from the meeting's "
+                "summary, transcript or any other source."
             )
             continue
         artifact_read = _ARTIFACT_MENTION_READS.get(entity_type)
@@ -504,6 +607,27 @@ def _now_message(now: datetime | None = None) -> str:
     )
 
 
+_PLATFORM_PLUGIN_INSTRUCTION = (
+    "YOUR OWN PLUGINS: besides the admin tools you also have tools from plugins this staff member "
+    "connected to their own accounts (for example Linear or Notion). The read-only rule above is "
+    "about WarpTalk's platform data; these tools act on the staff member's own external accounts. "
+    "Use them when asked. A tool that changes something there shows the user a confirmation card "
+    "first - call it, and let the card ask, rather than refusing."
+)
+
+
+async def _close_stream(stream: Any) -> None:
+    """Close a Responses stream we are abandoning, so the HTTP response stops downloading tokens.
+    Best effort: the SDK's stream has `close()`, a test double may not."""
+    close = getattr(stream, "close", None)
+    if close is None:
+        return
+    with contextlib.suppress(Exception):
+        result = close()
+        if asyncio.iscoroutine(result):
+            await result
+
+
 def _is_platform_turn(request: Any) -> bool:
     """Whether this turn belongs to a system admin's platform-scope conversation.
 
@@ -565,6 +689,8 @@ class ChatAssistantWorker(BaseWorker):
         # every path behind them is gated by the platform admin policy server-side.
         self._billing_client: httpx.AsyncClient | None = None
         self._auth_client: httpx.AsyncClient | None = None
+        # Publishes the built-in tool manifest for AssistantService (tools_manifest.py).
+        self._manifest_task: asyncio.Task[None] | None = None
 
     async def load_model(self) -> None:
         api_key = resolve_openai_api_key(self.chat_settings.api_key)
@@ -601,6 +727,11 @@ class ChatAssistantWorker(BaseWorker):
             timeout=SIBLING_SERVICE_TIMEOUT_SECONDS,
         )
         self.logger.info("chat_assistant_ready", model=self.chat_settings.model)
+        # Redis is connected before load_model runs (BaseWorker.start), so the first write lands
+        # at startup. The loop never raises on a failed write; see tools_manifest.
+        self._manifest_task = asyncio.create_task(
+            run_manifest_publisher(self.redis, self.chat_settings, self.logger)
+        )
 
     def integration_reports(self) -> dict[str, IntegrationReport]:
         return {
@@ -611,6 +742,11 @@ class ChatAssistantWorker(BaseWorker):
         }
 
     async def _cleanup(self) -> None:
+        if self._manifest_task is not None:
+            self._manifest_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._manifest_task
+            self._manifest_task = None
         for client in (
             self._workspace_client,
             self._assistant_client,
@@ -679,7 +815,24 @@ class ChatAssistantWorker(BaseWorker):
         )
 
         try:
-            final_text, tool_call_log = await self._run_agent_loop(request, history, tool_context)
+            try:
+                final_text, tool_call_log = await self._run_agent_loop(
+                    request, history, tool_context
+                )
+            except TurnStopped as stopped:
+                # What the user already watched arrive is kept, as an answer they cut short; a turn
+                # stopped before it wrote anything is failed, so it never enters the next turn's
+                # history as an empty assistant message.
+                partial = strip_markers(stopped.partial).strip()
+                self.logger.info(
+                    "chat_turn_stopped", request_id=request.request_id, kept_chars=len(partial)
+                )
+                await self._publish_result(
+                    request,
+                    type_="completed" if partial else "failed",
+                    content=partial or STOPPED_BEFORE_ANSWER,
+                )
+                return
 
             # The intersection: sources genuinely retrieved this turn AND pointed at by the
             # answer. A marker the model invented resolves to nothing and is dropped in silence.
@@ -757,18 +910,30 @@ class ChatAssistantWorker(BaseWorker):
         # Responses carries the system prompt as `instructions` rather than as a leading
         # message, so the three system-role messages are joined into one.
         if _is_platform_turn(request):
+            # THE SCOPE BOUNDARY. A platform turn is offered the read-only admin tools, plus the
+            # plugins the staff member connected for their OWN account (3 Oct 2026) - nothing else:
+            # no workspace tool, no retrieval, no hosted web search. Which plugins is the
+            # backend's call: it offers them only to a caller holding warpbot.use, and returns an
+            # empty list to anyone else asking without a workspace.
+            platform_plugin_tools = await self._load_dynamic_mcp_tools(request, tool_context)
+            platform_parts = [build_platform_system_prompt(), _now_message()]
+            if platform_plugin_tools:
+                platform_parts.append(_PLATFORM_PLUGIN_INSTRUCTION)
+            platform_parts.append(citation_instruction())
             return await self._run_tool_loop(
                 request,
                 history,
                 tool_context,
-                instructions="\n\n".join(
-                    [build_platform_system_prompt(), _now_message(), citation_instruction()]
-                ),
-                # THE SCOPE BOUNDARY. A platform turn is offered the read-only admin tools and
-                # nothing else: no workspace tool, no retrieval, no plugin (MCP discovery is
-                # workspace-scoped and never called), no hosted web search.
-                tool_lookup=dict(PLATFORM_TOOLS_BY_NAME),
-                tool_schemas=[tool.to_openai_schema() for tool in PLATFORM_TOOLS],
+                instructions="\n\n".join(platform_parts),
+                # Admin tools last, so they win a name clash, as built-ins do in a workspace turn.
+                tool_lookup={
+                    **{tool.name: tool for tool in platform_plugin_tools},
+                    **PLATFORM_TOOLS_BY_NAME,
+                },
+                tool_schemas=[
+                    *(tool.to_openai_schema() for tool in PLATFORM_TOOLS),
+                    *(tool.to_openai_schema() for tool in platform_plugin_tools),
+                ],
             )
 
         template = resolve_template(
@@ -792,7 +957,16 @@ class ChatAssistantWorker(BaseWorker):
         page_context_message = _format_page_context(request.page_context_json)
         if page_context_message:
             instructions_parts.append(page_context_message)
-        mentions_message = _format_mentions(request.mentions_json)
+        mentions_message = _format_mentions(
+            request.mentions_json,
+            await _unreadable_minutes_mentions(
+                request.mentions_json,
+                # getattr: a context without the client refuses every @minutes mention rather
+                # than failing the turn.
+                getattr(tool_context, "translation_room_client", None),
+                request.bearer_token,
+            ),
+        )
         if mentions_message:
             instructions_parts.append(mentions_message)
         instructions_parts.append(citation_instruction())
@@ -863,20 +1037,44 @@ class ChatAssistantWorker(BaseWorker):
         # Meetings a tool created this turn. Their links are appended to the answer if the model
         # left them out - see meeting_links.
         created_meetings: list[MeetingLink] = []
+        # GMCAL1001: Calendar events chained onto a Meet this turn (folded onto its card), the Meet
+        # codes create_meeting already bridged (no second room), and the zone each Meet's time was
+        # given in (a bare date-time from the model is local, not UTC).
+        calendar_events: list[CalendarEvent] = []
+        bridged_meet_codes: set[str] = set()
+        meet_time_zones: dict[str, str] = {}
         final_text = ""
 
-        for _ in range(self.chat_settings.max_tool_iterations):
+        # max_tool_iterations rounds may call tools; one more round may not, so the turn ends with
+        # an answer built from what the tools already returned. Without it, the round that finally
+        # fetched the data was the last one: prod 3 Oct 2026, "@Linear lấy workspace ticket đi" —
+        # three list_issues calls rejected for their arguments, list_custom_views, then a
+        # list_issues that SUCCEEDED, and the user got "please try rephrasing" over the data.
+        answer_round = self.chat_settings.max_tool_iterations
+        for iteration in range(answer_round + 1):
+            # Before every model call: a stop pressed during a tool call lands here.
+            if await self._stop_requested(request):
+                raise TurnStopped(final_text)
+            tools_allowed = iteration < answer_round
             buffer = ""
             full_text = ""
             output_items: list[Any] = []
             # Per ITERATION, not per turn: a second round of searching is a second target, and
             # carrying the first one over would label the new step with the old query.
             web_search_detail = ""
+            # When each hosted search item was first seen, for its log entry's startedAt. The
+            # search runs server-side, so this is the only moment the worker can put on it.
+            web_search_seen_at: dict[str, datetime] = {}
             # The reasoning summary the model is currently writing. Accumulated across deltas
             # and published whole, because half a sentence appearing and then being completed
             # under the reader is worse than the sentence arriving a moment later.
             summary_buffer = ""
 
+            # The schemas stay on the answer round: they describe the function_call items already
+            # in `conversation`, and the model reads those results by them.
+            answer_round_options: dict[str, Any] = (
+                {} if tools_allowed or not tool_schemas else {"tool_choice": "none"}
+            )
             assert self._openai is not None, "OpenAI client must be initialized"
             stream = await self._openai.responses.create(
                 model=self.chat_settings.model,
@@ -889,10 +1087,17 @@ class ChatAssistantWorker(BaseWorker):
                 instructions=instructions,
                 input=cast(Any, conversation),
                 tools=cast(Any, tool_schemas),
+                **answer_round_options,
                 stream=True,
             )
 
+            last_stop_check = time.monotonic()
             async for event in stream:
+                if time.monotonic() - last_stop_check >= STOP_POLL_SECONDS:
+                    last_stop_check = time.monotonic()
+                    if await self._stop_requested(request):
+                        await _close_stream(stream)
+                        raise TurnStopped(full_text)
                 etype = getattr(event, "type", "")
 
                 # Text arrives as response.output_text.delta. Streaming it out as it
@@ -954,6 +1159,9 @@ class ChatAssistantWorker(BaseWorker):
                 elif etype in ("response.output_item.added", "response.output_item.done"):
                     item = getattr(event, "item", None)
                     if getattr(item, "type", "") == "web_search_call":
+                        item_id = str(getattr(item, "id", "") or "")
+                        if item_id:
+                            web_search_seen_at.setdefault(item_id, datetime.now(UTC))
                         found = describe_web_search_target(getattr(item, "action", None))
                         if found:
                             web_search_detail = found
@@ -982,9 +1190,36 @@ class ChatAssistantWorker(BaseWorker):
             if buffer:
                 await self._publish_result(request, type_="chunk", content=buffer)
 
+            # One entry per hosted search, with no query text. Logged from the completed output
+            # rather than the lifecycle events, so a search is counted once however many events
+            # it streamed.
+            for item in output_items:
+                if getattr(item, "type", "") == "web_search_call":
+                    item_id = str(getattr(item, "id", "") or "")
+                    tool_call_log.append(
+                        web_search_entry(
+                            item,
+                            started_at=web_search_seen_at.get(item_id) or datetime.now(UTC),
+                        )
+                    )
+
             function_calls = [
                 item for item in output_items if getattr(item, "type", "") == "function_call"
             ]
+            if function_calls and not tools_allowed:
+                # tool_choice="none" was ignored. Nothing more can be fetched, so answer with
+                # whatever text came with the call, or the fallback.
+                self.logger.warning(
+                    "chat_answer_round_requested_tools",
+                    request_id=request.request_id,
+                    tools=[getattr(call, "name", "") for call in function_calls],
+                )
+                final_text = (
+                    full_text
+                    or "I wasn't able to finish looking that up — please try rephrasing your "
+                    "question."
+                )
+                break
             if not function_calls:
                 # A turn that produced a message rather than a call is the final answer.
                 final_text = full_text
@@ -995,6 +1230,11 @@ class ChatAssistantWorker(BaseWorker):
                     for title, url, position in _web_citations(output_items):
                         tool_context.citations.note_cited("web", title, url, at=position)
                 break
+
+            # Not after the model asked for tools and before they run: a write must not go out
+            # once the user has said stop.
+            if await self._stop_requested(request):
+                raise TurnStopped(full_text)
 
             for call in function_calls:
                 call_id = getattr(call, "call_id", None) or f"call_{uuid.uuid4().hex}"
@@ -1017,17 +1257,23 @@ class ChatAssistantWorker(BaseWorker):
                 )
 
                 tool = tool_lookup.get(tool_name)
+                started_at = datetime.now(UTC)
+                started_clock = time.perf_counter()
+                error_code: str | None = None
                 if tool is None:
                     result_json = json.dumps({"error": f"Unknown tool '{tool_name}'."})
                     status = "failed"
+                    error_code = "unknown_tool"
                 else:
                     try:
                         result_json = await tool.handler(tool_context, arguments)
                         status = "completed"
-                    except Exception:
+                    except Exception as exc:
                         self.logger.exception("tool_execution_failed", tool=tool_name)
                         result_json = json.dumps({"error": "The tool failed to execute."})
                         status = "failed"
+                        error_code = type(exc).__name__
+                duration_seconds = time.perf_counter() - started_clock
 
                 await self._publish_result(
                     request,
@@ -1050,6 +1296,20 @@ class ChatAssistantWorker(BaseWorker):
                     created = meeting_link_from_tool_result(result_json)
                     if created is not None:
                         created_meetings.append(created)
+                    calendar_event = calendar_event_from_tool_result(result_json)
+                    if calendar_event is not None:
+                        calendar_events.append(calendar_event)
+                    bridged = bridged_meet_code_from_tool_result(result_json)
+                    if bridged:
+                        bridged_meet_codes.add(bridged)
+                    meet_code: str | None = None
+                    if created is not None and created.kind == "google_meet":
+                        meet_code = created.code or meet_code_from_url(created.url)
+                    elif calendar_event is not None:
+                        meet_code = calendar_event.meet_code
+                    time_zone = (arguments or {}).get("timeZone")
+                    if meet_code and isinstance(time_zone, str) and time_zone.strip():
+                        meet_time_zones.setdefault(meet_code.lower(), time_zone.strip())
 
                 if tool_name == "ask_user" and status == "completed":
                     await self._publish_result(
@@ -1096,21 +1356,42 @@ class ChatAssistantWorker(BaseWorker):
                         "output": result_json,
                     }
                 )
+                plugin_key = tool.plugin_key if tool is not None else None
                 tool_call_log.append(
-                    {
-                        "tool": tool_name,
-                        "arguments": raw_arguments,
-                        "result": result_json,
-                        "status": status,
-                    }
+                    function_call_entry(
+                        tool=tool_name,
+                        arguments=raw_arguments,
+                        result=result_json,
+                        status=status,
+                        source="plugin" if plugin_key else "builtin",
+                        plugin_key=plugin_key,
+                        started_at=started_at,
+                        duration_seconds=duration_seconds,
+                        error_code=error_code,
+                    )
                 )
         else:
-            # Hit max_tool_iterations while the model still wanted another tool.
+            # Unreachable while the answer round breaks out of the loop either way; kept so a
+            # future edit to that round cannot hand the user an empty turn.
             final_text = (
                 final_text
                 or "I wasn't able to finish looking that up — please try rephrasing your question."
             )
 
+        # One card per meeting: a Calendar event made for a Meet this turn lands on that Meet's
+        # card rather than beside it.
+        created_meetings = merge_calendar_events(created_meetings, calendar_events)
+        # Every Meet WarpBot created goes on WarpTalk's own calendar as an EXTERNAL_BRIDGE room,
+        # filed here rather than left to the model. Never raises - see meet_rooms.
+        try:
+            await file_meet_rooms(
+                tool_context,
+                created_meetings,
+                already_bridged=bridged_meet_codes,
+                time_zones=meet_time_zones,
+            )
+        except Exception:
+            self.logger.exception("meet_room_filing_failed")
         return ensure_meeting_links(final_text, created_meetings), tool_call_log
 
     async def _load_dynamic_mcp_tools(
@@ -1122,9 +1403,13 @@ class ChatAssistantWorker(BaseWorker):
         if not isinstance(assistant_client, httpx.AsyncClient):
             return []
 
+        # A platform turn has no workspace. Sent as "", the backend's Guid? would not bind it, so
+        # the parameter is left out instead, which is what "no workspace" means there.
+        params: dict[str, Any] = {}
+        if request.workspace_id:
+            params["workspaceId"] = request.workspace_id
         # WT-687: plugins switched off for this conversation are left out by AssistantService, so
         # the model is never told they exist. Sent as a repeated query parameter.
-        params: dict[str, Any] = {"workspaceId": request.workspace_id}
         disabled_plugin_keys = _parse_disabled_plugin_keys(request.disabled_plugin_keys_json)
         if disabled_plugin_keys:
             params["excludePluginKeys"] = disabled_plugin_keys
@@ -1185,7 +1470,14 @@ class ChatAssistantWorker(BaseWorker):
                         effect=effect,
                         policy=policy,
                     ),
-                    handler=self._build_mcp_tool_handler(plugin_key, name, request, label),
+                    handler=self._build_mcp_tool_handler(
+                        plugin_key,
+                        name,
+                        request,
+                        label,
+                        parameters=cast(dict[str, Any], parameters),
+                    ),
+                    plugin_key=plugin_key,
                 )
             )
 
@@ -1197,6 +1489,7 @@ class ChatAssistantWorker(BaseWorker):
         tool_name: str,
         request: ChatRequestMessage,
         tool_label: str | None = None,
+        parameters: dict[str, Any] | None = None,
     ) -> Callable[[ToolContext, dict[str, Any]], Awaitable[str]]:
         async def handler(ctx: ToolContext, arguments: dict[str, Any]) -> str:
             assistant_client = ctx.assistant_client
@@ -1205,10 +1498,14 @@ class ChatAssistantWorker(BaseWorker):
 
             always_allow = _read_mcp_always_allow(arguments)
             tool_arguments, confirmation_token = _split_mcp_tool_arguments(arguments)
+            # Before the confirmation token is checked server-side too: the confirm call re-sends
+            # the model's arguments and both are filtered the same way, so their hashes agree.
+            tool_arguments = _drop_blank_optional_arguments(tool_arguments, parameters)
             response = await assistant_client.post(
                 "/api/v1/assistant/mcp/tools/execute",
                 json={
-                    "workspaceId": request.workspace_id,
+                    # null, not "": System.Text.Json refuses "" for a Guid? and the call 400s.
+                    "workspaceId": request.workspace_id or None,
                     "pluginKey": plugin_key,
                     "toolName": tool_name,
                     "arguments": tool_arguments,
@@ -1282,6 +1579,14 @@ class ChatAssistantWorker(BaseWorker):
             return json.dumps(_redact_mcp_tool_payload_for_model(normalized))
 
         return handler
+
+    async def _stop_requested(self, request: ChatRequestMessage) -> bool:
+        """Whether the user pressed Stop on this turn. A Redis failure answers no: a stop that
+        cannot be read must not end a turn that nobody asked to end."""
+        try:
+            return bool(await self.redis.get(f"{CHAT_CANCEL_KEY_PREFIX}{request.request_id}"))
+        except Exception:
+            return False
 
     async def _publish_result(
         self,

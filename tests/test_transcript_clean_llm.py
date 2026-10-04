@@ -16,6 +16,7 @@ import asyncio
 import json
 import uuid
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -25,11 +26,13 @@ from transcript_clean_worker.config import TranscriptCleanSettings
 from transcript_clean_worker.llm_cleaner import (
     REJECT_BAD_INDEX,
     REJECT_BAD_JSON,
+    REJECT_CALL_FAILED,
     REJECT_NEGATION_OUTSIDE_MARKER,
     REJECT_NO_CHANGE,
     REJECT_NUMBER_WITHOUT_REPLACEMENT,
     REJECT_PROTECTED_TOKEN,
     REJECT_RATIO,
+    REJECT_REFINE_SKIPPED_BUSY,
     REJECT_REPARANDUM_LONGER_THAN_REPAIR,
     REJECT_TIMEOUT,
     LLMCleaner,
@@ -42,9 +45,15 @@ from transcript_clean_worker.worker import TranscriptCleanWorker
 
 
 class FakeCompletions:
-    def __init__(self, payloads: list[object], delay_s: float = 0.0) -> None:
+    def __init__(
+        self, payloads: list[object], delay_s: float = 0.0, usage: object | None = None
+    ) -> None:
         self.payloads = payloads
         self.delay_s = delay_s
+        # None by default: most tests here are about the deletion protocol, not billing, and
+        # `getattr(usage, "prompt_tokens", None)` in `LLMCleaner._record_usage` reads a missing
+        # usage exactly like a real SDK response would be missing one -- as "unknown", not a crash.
+        self.usage = usage
         self.calls: list[dict] = []
 
     async def create(self, **kwargs):
@@ -53,27 +62,35 @@ class FakeCompletions:
             await asyncio.sleep(self.delay_s)
         payload = self.payloads.pop(0)
         content = payload if isinstance(payload, str) else json.dumps(payload)
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            usage=self.usage,
+        )
 
 
 class FakeClient:
-    def __init__(self, payloads: list[object], delay_s: float = 0.0) -> None:
-        self.completions = FakeCompletions(payloads, delay_s)
+    def __init__(
+        self, payloads: list[object], delay_s: float = 0.0, usage: object | None = None
+    ) -> None:
+        self.completions = FakeCompletions(payloads, delay_s, usage)
         self.chat = SimpleNamespace(completions=self.completions)
 
     async def close(self) -> None:
         return None
 
 
-def cleaner(payloads: list[object], *, delay_s: float = 0.0, **kwargs) -> LLMCleaner:
+def cleaner(
+    payloads: list[object], *, delay_s: float = 0.0, usage: object | None = None, **kwargs
+) -> LLMCleaner:
     instance = LLMCleaner(
         api_key="test-key",
         model=str(kwargs.pop("model", "gpt-4.1-mini")),
         timeout_s=float(kwargs.pop("timeout_s", 8.0)),
         max_delete_ratio=float(kwargs.pop("max_delete_ratio", 0.4)),
         self_repair_max_delete_ratio=float(kwargs.pop("self_repair_max_delete_ratio", 0.7)),
+        concurrency=int(kwargs.pop("concurrency", 4)),
     )
-    instance._client = FakeClient(payloads, delay_s)  # type: ignore[assignment]
+    instance._client = FakeClient(payloads, delay_s, usage)  # type: ignore[assignment]
     return instance
 
 
@@ -90,6 +107,20 @@ class FakeRedis:
     async def publish(self, stream: str, data: dict[str, str]) -> bytes:
         self.published.append((stream, data))
         return b"1-0"
+
+
+class TestClientConstruction:
+    async def test_load_disables_sdk_retries(self):
+        # Revision 0 (tier-1 wording) is already published by the time this client makes a
+        # call, so a 429/5xx retried by the SDK itself only spends the 8s window on a second
+        # attempt instead of returning promptly. See llm_cleaner.load().
+        instance = LLMCleaner(api_key="test-key", model="gpt-4.1-mini")
+        await instance.load()
+        try:
+            assert instance._client is not None
+            assert instance._client.max_retries == 0
+        finally:
+            await instance.close()
 
 
 class TestAcceptedAnswers:
@@ -167,6 +198,22 @@ class TestRefusedAnswers:
         subject = cleaner([])  # popping from an empty list raises inside create()
         assert await subject.clean("um so we should ship it", "en") is None
         assert "call_failed" in subject.rejections
+
+    async def test_a_saturated_semaphore_skips_the_call_instead_of_queuing(self):
+        # Refine tasks are created one per sentence, uncapped, while only `concurrency` calls
+        # run at a time. Queuing behind the semaphore under backlog is what makes revision 1
+        # arrive late; skipping instead costs only this sentence its polish.
+        subject = cleaner([{"delete": [0], "self_repair": False}], concurrency=1)
+        await subject._semaphore.acquire()  # every permit already in use
+        try:
+            result = await subject.clean("um so we should ship it", "en")
+        finally:
+            subject._semaphore.release()
+
+        assert result is None
+        assert subject.rejections == {REJECT_REFINE_SKIPPED_BUSY: 1}
+        # Never even reached the API call -- the payload popped above is still queued.
+        assert subject._client.completions.calls == []
 
     async def test_without_a_client_nothing_is_attempted(self):
         subject = LLMCleaner(api_key="", model="gpt-4.1-mini")
@@ -458,6 +505,109 @@ class TestTheRequest:
         # An example whose right answer is an empty deletion, so the model has seen that
         # answering "nothing" is normal rather than a failure to do the job.
         assert '{"delete": [], "self_repair": false}' in system_message
+
+
+class TestUsageRecording:
+    """WT-830: every LLM call ATTEMPT logs what a later billing pass would need to price it.
+
+    `LLMCleaner._record_usage` is deliberately a log line, not a row in `subscription.
+    usage_records` -- see its docstring for why. What matters here is that it fires, with the
+    right model/tokens/meeting_id, on EVERY path out of `clean()` that placed a call at all,
+    including the ones that end in None: a rejected or timed-out call still spent the tokens.
+    """
+
+    @staticmethod
+    def _usage_events(mock_logger: MagicMock) -> list[dict]:
+        return [
+            call.kwargs
+            for call in mock_logger.info.call_args_list
+            if call.args and call.args[0] == "transcript_clean_llm_usage"
+        ]
+
+    async def test_an_accepted_call_records_model_tokens_and_meeting_id(self, monkeypatch):
+        import transcript_clean_worker.llm_cleaner as llm_cleaner_module
+
+        mock_logger = MagicMock()
+        monkeypatch.setattr(llm_cleaner_module, "logger", mock_logger)
+        usage = SimpleNamespace(prompt_tokens=713, completion_tokens=12, total_tokens=725)
+        subject = cleaner([{"delete": [0], "self_repair": False}], usage=usage)
+
+        result = await subject.clean("um so we should ship it", "en", meeting_id="meeting-42")
+
+        assert result is not None
+        [event] = self._usage_events(mock_logger)
+        assert event["meeting_id"] == "meeting-42"
+        assert event["model"] == "gpt-4.1-mini"
+        assert event["prompt_tokens"] == 713
+        assert event["completion_tokens"] == 12
+        assert event["total_tokens"] == 725
+        assert event["outcome"] == "accepted"
+        assert event["self_repair"] is False
+        assert isinstance(event["latency_ms"], int)
+
+    async def test_a_rejected_answer_still_records_its_usage(self, monkeypatch):
+        # The model answered (tokens spent) and the answer was thrown away for naming a token
+        # that does not exist -- the spend happened regardless of what verification decided.
+        import transcript_clean_worker.llm_cleaner as llm_cleaner_module
+
+        mock_logger = MagicMock()
+        monkeypatch.setattr(llm_cleaner_module, "logger", mock_logger)
+        usage = SimpleNamespace(prompt_tokens=700, completion_tokens=9, total_tokens=709)
+        subject = cleaner([{"delete": [0, 99], "self_repair": False}], usage=usage)
+
+        result = await subject.clean("um, so we should ship it", "en", meeting_id="meeting-1")
+
+        assert result is None
+        [event] = self._usage_events(mock_logger)
+        assert event["outcome"] == REJECT_BAD_INDEX
+        assert event["prompt_tokens"] == 700
+        assert event["completion_tokens"] == 9
+
+    async def test_a_timed_out_call_still_records_its_usage(self, monkeypatch):
+        # No response ever arrived, so the token counts are honestly unknown -- but the attempt
+        # itself, the model, and the meeting are still recorded: the prompt was already sent.
+        import transcript_clean_worker.llm_cleaner as llm_cleaner_module
+
+        mock_logger = MagicMock()
+        monkeypatch.setattr(llm_cleaner_module, "logger", mock_logger)
+        subject = cleaner([{"delete": [0], "self_repair": False}], delay_s=0.2, timeout_s=0.01)
+
+        result = await subject.clean("um so we should ship it", "en", meeting_id="meeting-7")
+
+        assert result is None
+        [event] = self._usage_events(mock_logger)
+        assert event["outcome"] == REJECT_TIMEOUT
+        assert event["prompt_tokens"] is None
+        assert event["completion_tokens"] is None
+        assert event["meeting_id"] == "meeting-7"
+        assert event["model"] == "gpt-4.1-mini"
+
+    async def test_a_call_failure_still_records_its_usage(self, monkeypatch):
+        import transcript_clean_worker.llm_cleaner as llm_cleaner_module
+
+        mock_logger = MagicMock()
+        monkeypatch.setattr(llm_cleaner_module, "logger", mock_logger)
+        subject = cleaner([])  # popping from an empty list raises inside create()
+
+        result = await subject.clean("um so we should ship it", "en", meeting_id="meeting-9")
+
+        assert result is None
+        [event] = self._usage_events(mock_logger)
+        assert event["outcome"] == REJECT_CALL_FAILED
+        assert event["prompt_tokens"] is None
+
+    async def test_a_skipped_call_records_no_usage(self):
+        # The semaphore-busy path never reaches the API at all -- nothing was spent, so nothing
+        # should be logged as spent. (Uses the real module logger; nothing to assert on except
+        # that this does not raise, `clean` returning None either way is covered elsewhere.)
+        subject = cleaner([{"delete": [0], "self_repair": False}], concurrency=1)
+        await subject._semaphore.acquire()
+        try:
+            result = await subject.clean("um so we should ship it", "en")
+        finally:
+            subject._semaphore.release()
+        assert result is None
+        assert subject._client.completions.calls == []  # type: ignore[union-attr]
 
 
 class TestPureHelpers:

@@ -4,8 +4,12 @@ from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 
+from security_worker.regex_scanners import scan_and_mask_regex_pii
 from shared.config import SecuritySettings
+from shared.logger import get_logger
 from shared.openai_options import completion_options
+
+logger = get_logger(__name__)
 
 # --- Constants ---
 # Fallbacks only. The live values come from SecuritySettings (SECURITY_MODEL,
@@ -46,9 +50,20 @@ BOUNDARY_SEARCH_WINDOW = 512
 # document.
 CHARS_PER_OUTPUT_TOKEN = 2
 
+# STILL TRUNCATED IN PRODUCTION (3 Oct 2026): two documents failed with ~19,800 characters analysed
+# against a ~10,000-token reply budget. Vietnamese and Japanese run denser than two characters per
+# token, and no ratio can be right for every script. So the ratio stays a first guess and the
+# reply decides: a chunk whose answer was cut is split in two at a line or word boundary and each
+# half is scanned again, down to this size. Below it the failure is real and is raised.
+MIN_SPLIT_CHARS = 1000
+
 # Room for the JSON envelope, the flags, the cited matches, and the redaction markers that make
 # masked text longer than the original.
 JSON_ENVELOPE_TOKENS = 512
+
+
+class ScanReplyTruncatedError(ValueError):
+    """The model ran out of output room before finishing this chunk's masked copy."""
 
 
 @dataclass(frozen=True)
@@ -164,30 +179,40 @@ class OpenAISecurityScanner:
         if not text:
             return SecurityScanReport(pii_detected=False, masked_content=text, dlp_terms_claimed=())
 
+        regex_pii_detected = False
+        text_to_process = text
+        if pii_enabled:
+            regex_result = scan_and_mask_regex_pii(text)
+            regex_pii_detected = regex_result.detected
+            text_to_process = regex_result.masked_text
+
         max_total = self.settings.max_total_analyze_length or MAX_TOTAL_ANALYZE_LENGTH
-        if len(text) > max_total:
+        if len(text_to_process) > max_total:
             # Fail rather than cover part of it. A guardrail that quietly inspects a prefix is
             # worse than one that says it could not cope: the first produces a document that looks
             # scanned, and only the second can be acted on.
             raise ValueError(
-                f"Document is {len(text)} characters, beyond the {max_total} this scan will read. "
-                "Raise SECURITY_MAX_TOTAL_ANALYZE_LENGTH (and SecurityScanBudget."
-                "MaxScannedCharacters on the backend with it) or split the document."
+                f"Document is {len(text_to_process)} characters, beyond the {max_total} "
+                "this scan will read. Raise SECURITY_MAX_TOTAL_ANALYZE_LENGTH (and "
+                "SecurityScanBudget.MaxScannedCharacters on the backend with it) or split "
+                "the document."
             )
 
         chunk_size = self.settings.max_analyze_length or MAX_ANALYZE_LENGTH
-        chunks = split_for_analysis(text, chunk_size)
+        chunks = split_for_analysis(text_to_process, chunk_size)
         limit = asyncio.Semaphore(self.settings.scan_concurrency or SCAN_CONCURRENCY)
 
         async def scan_one(chunk: str) -> SecurityScanReport:
             async with limit:
-                return await self._scan_chunk(chunk, pii_enabled, dlp_enabled, keywords_blacklist)
+                return await self._scan_splitting_on_truncation(
+                    chunk, pii_enabled, dlp_enabled, keywords_blacklist
+                )
 
         reports = await asyncio.gather(*(scan_one(chunk) for chunk in chunks))
 
         return SecurityScanReport(
-            # Any chunk is enough. The whole point of reading the tail is that a hit there counts.
-            pii_detected=any(report.pii_detected for report in reports),
+            # Any hit (from fast local regex or LLM chunks) counts.
+            pii_detected=regex_pii_detected or any(report.pii_detected for report in reports),
             # Concatenation, because `split_for_analysis` guarantees the pieces reassemble into the
             # original. This is what the backend indexes when PII was found.
             masked_content="".join(report.masked_content for report in reports),
@@ -197,6 +222,45 @@ class OpenAISecurityScanner:
                 dict.fromkeys(term for report in reports for term in report.dlp_terms_claimed)
             ),
         )
+
+    async def _scan_splitting_on_truncation(
+        self,
+        text_to_analyze: str,
+        pii_enabled: bool,
+        dlp_enabled: bool,
+        keywords_blacklist: list[str],
+    ) -> SecurityScanReport:
+        """`_scan_chunk`, halving the piece and scanning again when the reply was cut off.
+
+        Sequential, inside the caller's concurrency slot: re-entering the semaphore from here could
+        deadlock a document whose every chunk splits at once.
+        """
+        try:
+            return await self._scan_chunk(
+                text_to_analyze, pii_enabled, dlp_enabled, keywords_blacklist
+            )
+        except ScanReplyTruncatedError:
+            if len(text_to_analyze) <= MIN_SPLIT_CHARS:
+                raise
+            halves = split_for_analysis(text_to_analyze, len(text_to_analyze) // 2 + 1)
+            logger.warning(
+                "security_scan_chunk_split_after_truncation",
+                chars=len(text_to_analyze),
+                pieces=len(halves),
+            )
+            reports = [
+                await self._scan_splitting_on_truncation(
+                    half, pii_enabled, dlp_enabled, keywords_blacklist
+                )
+                for half in halves
+            ]
+            return SecurityScanReport(
+                pii_detected=any(report.pii_detected for report in reports),
+                masked_content="".join(report.masked_content for report in reports),
+                dlp_terms_claimed=tuple(
+                    dict.fromkeys(term for report in reports for term in report.dlp_terms_claimed)
+                ),
+            )
 
     async def _scan_chunk(
         self,
@@ -211,15 +275,20 @@ class OpenAISecurityScanner:
         system_prompt = (
             "You are a multi-language document security scanner supporting all "
             "languages (English, Japanese, Vietnamese, etc.).\n"
-            "Analyze the provided text for PII (emails, phone numbers, SSN, My "
-            "Number, CCCD/ID numbers, credit cards, full names, addresses) and "
-            "DLP keyword violations.\n\n"
+            "Analyze the provided text for PII (emails, phone numbers, SSN, My Number, "
+            "CCCD/CMND numbers, tax identification numbers / mã số thuế, credit cards, "
+            "full names, addresses) and DLP keyword violations.\n\n"
             "Instructions:\n"
             "1. If PII Detection is enabled (pii_enabled is true), detect any PII "
-            "in the text. Mask detected PII using [PII_REDACTED], "
-            "[EMAIL_REDACTED], [PHONE_REDACTED], [ID_REDACTED], "
-            "[CARD_REDACTED]. Set piiDetected to true if PII is found, otherwise "
-            "false.\n"
+            "in the text. Pay special attention to Vietnamese full names (e.g. Nguyễn Văn A), "
+            "Vietnamese CCCD (12 digits) or CMND (9 digits), "
+            "phone numbers (+84, 03x/05x/07x/08x/09x), tax IDs (mã số thuế), and addresses; "
+            "as well as Japanese My Number (12 digits), Japanese full names, addresses, "
+            "and phone numbers. "
+            "Mask detected PII using [PII_REDACTED], [EMAIL_REDACTED], [PHONE_REDACTED], "
+            "[ID_REDACTED], [CARD_REDACTED]. If the text already contains these redaction "
+            "markers, preserve them exactly. Set piiDetected to true if PII is found, "
+            "otherwise false.\n"
             "2. If DLP Detection is enabled (dlp_enabled is true), look for the blacklisted "
             "keywords (case-insensitive). In dlpMatches, list the matching substrings copied "
             "VERBATIM out of the text, character for character. Return an empty list if there "
@@ -277,7 +346,7 @@ class OpenAISecurityScanner:
         # API key and at Qdrant. `finish_reason` is the API telling us plainly that it ran out of
         # room, and it costs nothing to look.
         if choice.finish_reason == "length":
-            raise ValueError(
+            raise ScanReplyTruncatedError(
                 "OpenAI reply was truncated by the output token limit "
                 f"({len(text_to_analyze)} chars analysed). The scan returns the masked text in "
                 "full, so the output budget must exceed the input; raise SECURITY_MAX_TOKENS or "

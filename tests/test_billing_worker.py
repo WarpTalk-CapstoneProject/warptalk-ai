@@ -343,6 +343,78 @@ class TestEarlySegmentsAreNotCharged:
         worker.db.record_usage_and_charge.assert_awaited_once()
 
 
+class TestAChunkIsChargedOnce:
+    """A chunk whose every sentence went out early must still be paid for.
+
+    In flash mode the completed event of such a chunk has an empty remainder and is never
+    published, so "the completed segment pays" left the whole chunk free: 136 of 664 translated
+    chunks on prod over three days. The chunk is now named on every segment it produced and is
+    what the charge is keyed on.
+    """
+
+    MEETING = str(uuid.uuid4())
+
+    @classmethod
+    def _message(cls, *, is_early: bool, sentence: int = 0, target_lang: str = "vi") -> dict:
+        return TranslationResultMessage(
+            segment_id=f"{uuid.uuid4()}-{target_lang}-c{sentence}",
+            meeting_id=cls.MEETING,
+            speaker_id=str(uuid.uuid4()),
+            original_text="Hello there.",
+            translated_text="Xin chào.",
+            source_lang="en",
+            target_lang=target_lang,
+            start_ms=1000,
+            end_ms=1000 if is_early else 16000,
+            is_early=is_early,
+            chunk_id="1790926897937-0",
+            chunk_duration_ms=15000,
+        ).to_redis()
+
+    @staticmethod
+    def _charges(worker: BillingSettlementWorker) -> list[dict]:
+        return [call.kwargs for call in worker.db.record_usage_and_charge.await_args_list]
+
+    def test_an_early_sentence_pays_for_the_whole_chunk(self) -> None:
+        worker = TestEarlySegmentsAreNotCharged._worker()
+        asyncio.run(worker._handle_translation(self._message(is_early=True)))
+        (charge,) = self._charges(worker)
+        # The chunk's 15s — not the flat 1.0s an early segment's empty span falls back to.
+        assert charge["quantity"] == 15.0
+
+    def test_every_segment_of_one_chunk_names_the_same_charge(self) -> None:
+        worker = TestEarlySegmentsAreNotCharged._worker()
+        for payload in (
+            self._message(is_early=True, sentence=0),
+            self._message(is_early=True, sentence=1),
+            self._message(is_early=False),
+        ):
+            asyncio.run(worker._handle_translation(payload))
+        # Three segment ids, one key: the database settles the first and replays the others.
+        keys = {charge["idempotency_key"] for charge in self._charges(worker)}
+        assert keys == {f"TRANSLATION:chunk:{self.MEETING}:1790926897937-0:vi"}
+        assert {charge["quantity"] for charge in self._charges(worker)} == {15.0}
+
+    def test_each_target_language_is_its_own_charge(self) -> None:
+        worker = TestEarlySegmentsAreNotCharged._worker()
+        asyncio.run(worker._handle_translation(self._message(is_early=True, target_lang="vi")))
+        asyncio.run(worker._handle_translation(self._message(is_early=True, target_lang="ja")))
+        assert len({charge["idempotency_key"] for charge in self._charges(worker)}) == 2
+
+    def test_the_chunk_fields_survive_the_wire(self) -> None:
+        msg = TranslationResultMessage.from_redis(self._message(is_early=True))
+        assert (msg.chunk_id, msg.chunk_duration_ms) == ("1790926897937-0", 15000)
+
+    def test_a_producer_older_than_the_chunk_fields_keeps_the_segment_rule(self) -> None:
+        worker = TestEarlySegmentsAreNotCharged._worker()
+        payload = self._message(is_early=False)
+        del payload["chunk_id"], payload["chunk_duration_ms"]
+        asyncio.run(worker._handle_translation(payload))
+        (charge,) = self._charges(worker)
+        assert charge["quantity"] == 15.0
+        assert ":chunk:" not in charge["idempotency_key"]
+
+
 class _FakeConnection:
     """Records what was executed and replays canned rows, so settlement can be tested
     without a database. Only fetchrow is used by record_usage_and_charge."""

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import re
 import time
 from collections import Counter, deque
@@ -25,12 +26,20 @@ from openai import AsyncOpenAI
 from shared.config import STTSettings
 from shared.lang import base_language
 from shared.logger import get_logger
-from shared.openai_options import realtime_session_expired
+from shared.openai_options import REALTIME_SESSION_MAX_AGE_S, realtime_session_expired
 from shared.provider_calls import observed_openai_http_client
 from shared.schemas import STT_UNKNOWN_CONFIDENCE
 from shared.text_utils import split_into_sentences
+from stt_worker.text_language_id import MIN_WORDS_TO_LEARN, identify_room_language, word_count
 
 logger = get_logger(__name__)
+
+
+def _discard_on_done(
+    pending: set[tuple[str, str]], key: tuple[str, str], _task: asyncio.Task[Any]
+) -> None:
+    pending.discard(key)
+
 
 # Mirrors STTSettings.model — the value production code actually runs with
 # (stt_worker/worker.py always passes it explicitly). Sourcing the default from here
@@ -46,9 +55,70 @@ REALTIME_SAMPLE_RATE = 24000
 # that haven't been used in a while rather than leaking connections for the process
 # lifetime.
 SESSION_IDLE_TIMEOUT_S = 300.0
+# WT-923. A warm socket is retired and replaced at this age, BEFORE the cap above makes a claim
+# discard it. Checked every WARM_POOL_MAINTENANCE_INTERVAL_S, so the pool never holds a socket
+# older than the sum of the two — 46 minutes, safely under REALTIME_SESSION_MAX_AGE_S.
+#
+# 3 Oct 2026 — that bound was about the wrong thing. A socket rotated at 45 minutes could still be
+# CLAIMED at 44, and a claimed socket keeps the age it was opened with: room 01a100d8's host got
+# one at 15:19:41 that the max-age sweep closed at 15:24:58 (age_s 3000) — mid-meeting, five
+# minutes after "prewarming" it. The next turn's frames found no session (`append_failed`) and the
+# reconnect cost 2.8s inline. So the pool now rotates at half the cap and a claim refuses anything
+# with less than WARM_SOCKET_MIN_REMAINING_S left: whatever a speaker is handed has room for a
+# meeting, and the renewal below covers the rest.
+WARM_SOCKET_ROTATE_AGE_S = REALTIME_SESSION_MAX_AGE_S / 2
+WARM_SOCKET_MIN_REMAINING_S = 20 * 60.0
+WARM_POOL_MAINTENANCE_INTERVAL_S = 30.0
+# An ACTIVE speaker's session is replaced this long before the cap — on a fresh socket, configured
+# in the background, and swapped in at a moment their buffer holds nothing (no streamed turn, no
+# commit in flight). Before this the only exit was the max-age sweep, which closed the socket
+# under whoever was talking.
+SESSION_RENEW_LEAD_S = 10 * 60.0
+_RENEW_WAIT_FOR_QUIET_S = 120.0
+_RENEW_POLL_S = 0.25
+# A buffer nobody has appended to for this long belongs to a turn that was abandoned; it does not
+# block a renewal.
+_RENEW_STALE_BUFFER_S = 15.0
 
 # Guard against OpenAI never sending a completed/error event for a commit.
 TRANSCRIBE_EVENT_TIMEOUT_S = 15.0
+# Speech the ingress VAD measured in a turn, below which an empty streamed commit is believed
+# rather than retried — a cough, a breath, an "ừm".
+_EMPTY_STREAMED_RETRY_MIN_SPEECH_S = 0.8
+# How long a renewed-away socket stays open: a commit that started on it just before the swap
+# reads its completion from it, and that read is bounded by the timeout above.
+_RENEWED_SOCKET_GRACE_S = TRANSCRIBE_EVENT_TIMEOUT_S + 5.0
+# Items whose deltas arrived on a speaker's socket before (or without) their commit — see
+# _transcribe_via_session. Only the last few can still be committed; older ones were cleared.
+_MAX_PENDING_ITEMS = 8
+# Live text (the words of an utterance that is still being spoken) is published at most this
+# often per item. Deltas arrive roughly per word; a caption redrawn faster than this is flicker,
+# and every publish is a Redis message and a SignalR frame per listener.
+_LIVE_TEXT_MIN_INTERVAL_S = 0.15
+
+
+class _PumpClosed:
+    """Queued when a session's socket stops yielding events: the connection closed."""
+
+
+_PUMP_CLOSED = _PumpClosed()
+
+
+@dataclass(frozen=True)
+class _PumpFailed:
+    """Queued when reading a session's socket raised; `_collect` re-raises it unchanged."""
+
+    exc: BaseException
+
+
+def _log_live_text_failure(task: asyncio.Task[None]) -> None:
+    """A live caption that failed to publish is not worth more than a log line."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("stt_live_text_publish_failed", error=str(exc))
+
 
 # Every `filtered_*` line in this module logs at INFO, not DEBUG, and that is deliberate.
 #
@@ -220,6 +290,10 @@ class TranscribedSegment:
     confidence: float
     start_ms: int
     end_ms: int
+    #: Where `language` came from: "evidence" (script / Vietnamese-unique letters), "text_id"
+    #: (stt_worker/text_language_id among the room's languages), "declared" (the speaker's pinned
+    #: language) or "guess". `_learn_language_evidence` only learns from the first two.
+    language_source: str = "declared"
 
 
 # OpenAI full-language-name → ISO 639-1 code (returned when language=None)
@@ -367,6 +441,40 @@ def _detect_script_language(text: str) -> str | None:
     return None
 
 
+_HAN_RUN_RE = re.compile(r"[一-鿿]+")
+
+
+def _without_undeclared_han(
+    text: str,
+    room_languages: set[str],
+    speaker_language: str | None,
+) -> str:
+    """The text with its Han characters removed, when Han can only mean Chinese here.
+
+    WT-928, production room 01a0fb2e (2 Oct): a vi/en/ja meeting showed Chinese in its
+    transcript — 嗯, 可能, 都, and "嗯 Chào mừng mọi người đến với" from a Vietnamese speaker.
+    The script allow-list cannot catch it: Japanese is written in Han too, so a room that
+    declared ja permits Han, and _detect_script_language then labels any Han-without-kana
+    text `zh`. Two such lines in a row re-pinned the speaker to Chinese for the rest of the
+    meeting.
+
+    Han with no kana is Chinese, or a Japanese speaker writing only kanji. So when the room
+    did NOT declare Chinese, it is kept only for a speaker whose own language is written in
+    Han (ja, ko); for anyone else it is a hallucinated filler, and it is cut out of the line.
+    What is left is what they actually said. An empty result means the whole line was the
+    hallucination.
+
+    Kana anywhere in the line settles it as Japanese, and the line is left alone.
+    """
+    if not _HAN_RE.search(text) or _KANA_RE.search(text):
+        return text
+    if "zh" in {base_language(language) for language in room_languages}:
+        return text
+    if "han" in _LANGUAGE_SCRIPTS.get(base_language(speaker_language or ""), frozenset()):
+        return text
+    return " ".join(_HAN_RUN_RE.sub(" ", text).split())
+
+
 def _detect_unambiguous_language(text: str) -> str | None:
     """The language the TEXT proves, or None when the text proves nothing.
 
@@ -444,6 +552,44 @@ def _guess_language_from_text(text: str, allowed: set[str] | None = None) -> str
 # unambiguous, so this guards only against a stray mis-transcription, and every extra segment of
 # patience is another chunk decoded with the wrong language.
 _LANGUAGE_OVERRIDE_SEGMENTS = 2
+
+# The shortest plain-ASCII sentence that counts as evidence AGAINST a learned override. Shorter
+# lines — "OK", "Yeah.", "So" — are said in every language of this product and prove nothing.
+_RELEASE_MIN_WORDS = 3
+_WORD_RE = re.compile(r"[^\W\d_]+")
+
+
+def _release_verdict(text: str, learned: str, declaration: str) -> bool | None:
+    """Does this line show the speaker is back on their DECLARED language?
+
+    True supports releasing the override, False shows they are still speaking the learned
+    language, None proves nothing either way.
+
+    Unambiguous evidence decides first, in both directions. Otherwise only one shape of
+    Latin text counts: a sentence of `_RELEASE_MIN_WORDS` or more whose letters are all ASCII,
+    for a Latin-script declaration other than Vietnamese. ASCII, not "no Vietnamese-unique
+    character", because that class is deliberately narrow: "Tôi là Nam" carries none of it and
+    is still Vietnamese, but it is not ASCII. An English sentence is.
+    """
+    proven = _detect_unambiguous_language(text)
+    learned_base = base_language(learned)
+    declared_base = base_language(declaration)
+    if proven is not None:
+        if proven == learned_base:
+            return False
+        if proven == declared_base:
+            return True
+        # A third language — "嗯" from a cough — says nothing about this override.
+        return None
+
+    if declared_base == "vi" or declared_base in _LANGUAGE_SCRIPTS:
+        return None
+    if not all(ch.isascii() for ch in text if ch.isalpha()):
+        return None
+    if len(_WORD_RE.findall(text)) < _RELEASE_MIN_WORDS:
+        return None
+    return True
+
 
 _MIN_SPEECH_SECONDS_FOR_LONG_TEXT = 0.5
 _MAX_CHARS_FOR_SHORT_AUDIO = 20
@@ -713,8 +859,15 @@ def _expected_languages(
             ordered.append(normalized)
 
     add(primary_language)
-    for language in sorted(allowed_languages or ()):
-        add(language)
+    # The room's other languages only when the speaker has NOT declared one. Measured 4 Oct 2026:
+    # a speaker declared Japanese in a vi/ja room got `languages: [ja, en, vi]`, and the model took
+    # the invitation — "ấy ai" for "AI", "Xíu tô gà hayakuになります" — 6 of their 13 lines mixed
+    # Vietnamese into Japanese, and translation carried it through. Across prod, Japanese lines with
+    # Vietnamese in them ran 14-24% a day since 1 Oct. A declaration is the speaker telling us what
+    # they speak; the rest of the room is what OTHER people speak.
+    if not ordered:
+        for language in sorted(allowed_languages or ()):
+            add(language)
     # Product meetings frequently embed English product and engineering terms in an
     # otherwise non-English utterance. Advertising English as expected prevents the
     # model from forcing those terms into a phonetic translation of the primary language.
@@ -764,6 +917,29 @@ def _is_keyword_enumeration_echo(text: str, keywords: list[str] | None) -> bool:
 
     matched = sum(item in normalized_keywords for item in items)
     return matched >= _MIN_KEYWORD_ECHO_TERMS and matched / len(items) >= _MIN_KEYWORD_ECHO_RATIO
+
+
+def _after_flushed_prefix(final_text: str, flushed: str) -> str | None:
+    """What `final_text` says after the sentences already flushed early, or None when those
+    sentences are not its prefix.
+
+    BLIND TO WHITESPACE, AND ONLY TO WHITESPACE. Early sentences are re-joined with a space,
+    and the completed transcript does not always have one there: Japanese puts none between
+    sentences (flushed `すみません。 それは…`, completed `すみません。それは…`), and a number
+    the sentence splitter cut at each period comes back whole (flushed `0. 2. 27`, completed
+    `0.2.27`). A plain startswith() called those a revision, and the answer to a revision is
+    to drop the rest of the turn: `それともミンさんがその場で…` and every word after it, lost
+    in tools/meeting_sim on the same item where deltas and final agreed character for
+    character. Any difference other than whitespace is still a revision.
+    """
+    i = 0
+    for ch in "".join(flushed.split()):
+        while i < len(final_text) and final_text[i].isspace():
+            i += 1
+        if i >= len(final_text) or final_text[i] != ch:
+            return None
+        i += 1
+    return final_text[i:].strip()
 
 
 def _normalize_overheard_text(text: str) -> str:
@@ -827,8 +1003,15 @@ def _matches_recent_dub(
             continue
         if len(normalized_text) >= _DUB_ECHO_MIN_EXACT_CHARS and normalized_text == dub_text:
             return True
+        # The floor applies to BOTH sides of the containment. With it on the segment alone, a
+        # one-word dub line vetoed every longer sentence that merely contained it as a
+        # substring: tools/meeting_sim lost "Tám con cùng giành một đống backlog, con nào cũng
+        # OOM. 5xx lên cao nhất là đúng lúc đó." — 19 words of a Vietnamese speaker's own
+        # speech — because the room had dubbed "Right." as "Đúng." 20 s earlier; the opening
+        # of another sentence went the same way to a one-word dub, "Mà".
         if len(normalized_text) >= _DUB_ECHO_MIN_PARTIAL_CHARS and (
-            normalized_text in dub_text or dub_text in normalized_text
+            normalized_text in dub_text
+            or (len(dub_text) >= _DUB_ECHO_MIN_PARTIAL_CHARS and dub_text in normalized_text)
         ):
             return True
         if (
@@ -857,6 +1040,9 @@ def _filter_segments(
     min_avg_logprob: float = -0.7,
     min_avg_logprob_by_language: dict[str, float] | None = None,
     recent_dub_texts: Sequence[str] | None = None,
+    #: Floor for the room-restricted text language-ID (stt_worker/text_language_id); None turns
+    #: it off. Production passes STTSettings.text_language_id_min_confidence.
+    text_language_id_min_confidence: float | None = None,
 ) -> list[TranscribedSegment]:
     language_known = detected_language != "unknown"
     lang_code = _normalize_language(detected_language) if language_known else None
@@ -871,6 +1057,10 @@ def _filter_segments(
     # allow-list is not evidence that the room is all-Latin.
     languages_declared = bool(allowed_languages)
     allowed = {_normalize_language(lang) for lang in (allowed_languages or ())}
+    # The room's own set, before the speaker's language is added to it below. WT-928: with a
+    # learned override in place `lang_code` is the LEARNED language, so `allowed` alone cannot
+    # say whether the room ever declared it.
+    room_languages = set(allowed) if languages_declared else set()
     if not allowed:
         allowed = set(_DEFAULT_ALLOWED_LANGUAGES)
     # The speaker's OWN declared language is always allowed. STT is pinned to it on the
@@ -958,6 +1148,20 @@ def _filter_segments(
                 )
                 continue
 
+        # WT-928. Han the room cannot be speaking is cut out — see _without_undeclared_han.
+        if room_languages:
+            kept = _without_undeclared_han(text, room_languages, lang_code)
+            if kept != text:
+                logger.info(
+                    "filtered_undeclared_han",
+                    text=text[:80],
+                    kept=kept[:80],
+                    declared=sorted(room_languages),
+                )
+                if not kept:
+                    continue
+                text = kept
+
         # Realtime completed events expose token logprobs when explicitly requested in
         # the session include list. transcribe() averages those into avg_logprob;
         # STT_UNKNOWN_CONFIDENCE (-1.0) remains the compatibility fallback for an older
@@ -1028,10 +1232,52 @@ def _filter_segments(
         # for a vi/en room the first term was ALWAYS None and the declaration always won.
         # _detect_unambiguous_language adds the Vietnamese-unique evidence that was previously
         # locked inside the no-declaration fallback path.
-        seg_lang = (
-            _detect_unambiguous_language(text)
-            or lang_code
-            or _guess_language_from_text(text, allowed)
+        evidence = _detect_unambiguous_language(text)
+        # WT-928: evidence for a language the room never declared is not a label this room can
+        # carry. What survives the script check above in such a case is kanji-only Japanese
+        # (Han is Japanese's script too), which _detect_script_language calls `zh`; the speaker's
+        # own language is the right label for it. Without this, two such lines in a row taught
+        # _learn_language_evidence to re-pin the speaker to Chinese for the rest of the meeting.
+        if (
+            evidence
+            and room_languages
+            and base_language(evidence) not in {base_language(lang) for lang in room_languages}
+        ):
+            evidence = None
+        # Bridge room 01a10069: between two Latin-script room languages the text itself proves
+        # nothing to the rules above ("Anh làm gì?" has only à/ì, "Morning is great." is ASCII),
+        # so the declaration won and a vi host read as English, an English Meet side as
+        # Vietnamese. Ask a language identifier — restricted to the ROOM's Latin-script
+        # languages, above a confidence floor — before falling back to the declaration. Never
+        # when the room declared nothing (no candidates to restrict to) or the line carries a
+        # non-Latin script (that is the script rules' call).
+        identified: str | None = None
+        if (
+            evidence is None
+            and text_language_id_min_confidence is not None
+            and room_languages
+            and not _scripts_in(text)
+        ):
+            latin_room_languages = {
+                language
+                for language in room_languages
+                if base_language(language) not in _LANGUAGE_SCRIPTS
+            }
+            identified = identify_room_language(
+                text,
+                latin_room_languages,
+                min_confidence=text_language_id_min_confidence,
+                build_inline=False,
+            )
+        seg_lang = evidence or identified or lang_code or _guess_language_from_text(text, allowed)
+        language_source = (
+            "evidence"
+            if evidence
+            else "text_id"
+            if identified
+            else "declared"
+            if lang_code
+            else "guess"
         )
         # Before the contradiction log below, deliberately: an echoed dub is exactly a segment
         # whose language contradicts the declaration, and letting it write that log line is the
@@ -1206,6 +1452,7 @@ def _filter_segments(
                 confidence=round(avg_logprob, 4),
                 start_ms=chunk_offset_ms + int(seg.get("start", 0.0) * 1000),
                 end_ms=chunk_offset_ms + int(seg.get("end", 0.0) * 1000),
+                language_source=language_source,
             )
         )
 
@@ -1228,13 +1475,22 @@ class OpenAISTT:
         noise_reduction: str = _DEFAULTS.noise_reduction,
         min_avg_logprob: float = _DEFAULTS.min_avg_logprob,
         min_avg_logprob_by_language: dict[str, float] | None = None,
+        text_language_id_enabled: bool = _DEFAULTS.text_language_id_enabled,
+        text_language_id_min_confidence: float = _DEFAULTS.text_language_id_min_confidence,
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.noise_reduction = noise_reduction
         self.min_avg_logprob = min_avg_logprob
         self.min_avg_logprob_by_language = dict(min_avg_logprob_by_language or {})
+        self.text_language_id_enabled = text_language_id_enabled
+        self.text_language_id_min_confidence = text_language_id_min_confidence
         self._client: AsyncOpenAI | None = None
+        # Called with (key, item_id, text, language) while a speaker is still talking — the
+        # live caption. Set by the worker; None publishes nothing. See _pump_session_events.
+        self.on_live_text: (
+            Callable[[tuple[str, str], str, str, str | None], Awaitable[None]] | None
+        ) = None
         # (meeting_id, speaker_id) -> {"manager": ..., "conn": ..., "last_used": float}
         self._sessions: dict[tuple[str, str], dict[str, Any]] = {}
         # WHAT THIS SPEAKER IS ACTUALLY SPEAKING, when it contradicts what they declared.
@@ -1254,6 +1510,15 @@ class OpenAISTT:
         # because the override only holds while that declaration stands — a fresh pick in the
         # meeting bar releases it (see transcribe).
         self._language_override: dict[tuple[str, str], tuple[str, str | None]] = {}
+        # Consecutive lines showing a speaker is back on their declared language while an
+        # override pins them elsewhere — see _learn_release_evidence.
+        self._release_evidence: dict[tuple[str, str], int] = {}
+        # The declaration each speaker's previous chunk carried — see _note_declaration. Only
+        # kept for Google Meet bridge rooms (transcribe(bridge_room=True)). A change
+        # here is the only signal this process gets that the person re-picked their language
+        # mid-meeting (SetSpeakLanguage / SetExternalMeetingLanguage write the speak_languages
+        # hash, which livekit_ingress_worker reads per utterance into AudioChunkMessage.language).
+        self._declared_language: dict[tuple[str, str], str | None] = {}
         self._warm_sessions: deque[dict[str, Any]] = deque()
         # How many warm sockets to keep ready. Set by warm_up() and used by
         # _schedule_warm_refill to replace every socket a speaker claims.
@@ -1268,6 +1533,14 @@ class OpenAISTT:
             api_key=self.api_key, http_client=observed_openai_http_client("stt")
         )
         logger.info("openai_stt_ready", model=self.model)
+        if self._text_language_id_floor() is not None:
+            # The language-ID loads its n-gram models on first use (~0.25 s, ~90 MB for vi+en).
+            # _filter_segments runs on the event loop, so pay that here, off the loop, rather than
+            # on the first line of the first meeting. Other room sets load lazily (cheaper: the
+            # per-language models are shared).
+            await asyncio.to_thread(
+                identify_room_language, "warm up the language models", {"vi", "en"}
+            )
 
     async def _open_warm_socket(self) -> dict[str, Any]:
         client = self._client
@@ -1292,9 +1565,17 @@ class OpenAISTT:
             return None
 
         discarded = 0
+        now = time.monotonic()
         while warm_sessions:
-            candidate: dict[str, Any] = warm_sessions.popleft()
-            if not realtime_session_expired(candidate.get("opened_at")):
+            # The YOUNGEST first: the refill appends on the right, and the socket with the most
+            # life left is the one that will outlast this speaker's meeting.
+            candidate: dict[str, Any] = warm_sessions.pop()
+            opened_at = candidate.get("opened_at")
+            if (
+                opened_at is not None
+                and not realtime_session_expired(opened_at, now)
+                and REALTIME_SESSION_MAX_AGE_S - (now - opened_at) >= WARM_SOCKET_MIN_REMAINING_S
+            ):
                 if discarded:
                     logger.info("stt_warm_sockets_expired", discarded=discarded)
                 return candidate
@@ -1327,6 +1608,182 @@ class OpenAISTT:
             else:
                 warm_sessions.append(result)
         logger.info("stt_realtime_pool_warmed", connections=len(warm_sessions))
+
+    async def rotate_warm_pool(self, now: float | None = None) -> int:
+        """Retire warm sockets nearing the age cap and top the pool back up. WT-923.
+
+        The claim-time age check stops a dead socket from failing a sentence, but it does so by
+        throwing the socket away and paying the ~1–2s handshake inline. The pool is opened all at
+        once, so all of it ages out together: after any quiet 50 minutes the next speaker found
+        nothing but expired sockets, and their first sentence paid the handshake anyway. Rotating
+        ahead of the cap, off the request path, means a claim always finds a live one.
+
+        Also retries a refill that stopped on a provider error — otherwise only the next claim
+        would, and that claim is a person waiting.
+        """
+        warm_sessions = getattr(self, "_warm_sessions", None)
+        retired: list[dict[str, Any]] = []
+        if warm_sessions:
+            now = time.monotonic() if now is None else now
+            keep: list[dict[str, Any]] = []
+            for candidate in warm_sessions:
+                opened_at = candidate.get("opened_at")
+                if opened_at is None or now - opened_at >= WARM_SOCKET_ROTATE_AGE_S:
+                    retired.append(candidate)
+                else:
+                    keep.append(candidate)
+            # No await between reading and rewriting the deque, so a concurrent claim cannot
+            # interleave and take a socket that is being retired.
+            warm_sessions.clear()
+            warm_sessions.extend(keep)
+        for candidate in retired:
+            asyncio.create_task(self._close_session(candidate))
+        if retired:
+            logger.info("stt_warm_sockets_rotated", retired=len(retired))
+        self._schedule_warm_refill()
+        return len(retired)
+
+    def renew_aging_sessions(self, now: float | None = None) -> int:
+        """Start replacing every live speaker session within SESSION_RENEW_LEAD_S of the cap.
+
+        Returns how many renewals it started. Each runs in the background — see _renew_session.
+        """
+        now = time.monotonic() if now is None else now
+        renewing: set[tuple[str, str]] | None = getattr(self, "_renewing", None)
+        if renewing is None:
+            renewing = set()
+            self._renewing = renewing
+        started = 0
+        for key, session in list(getattr(self, "_sessions", {}).items()):
+            opened_at = session.get("opened_at")
+            if opened_at is None or key in renewing:
+                continue
+            if now - opened_at < REALTIME_SESSION_MAX_AGE_S - SESSION_RENEW_LEAD_S:
+                continue
+            renewing.add(key)
+            task = asyncio.create_task(self._renew_session(key, session))
+            task.add_done_callback(functools.partial(_discard_on_done, renewing, key))
+            started += 1
+        return started
+
+    @staticmethod
+    def _buffer_is_quiet(session: dict[str, Any], now: float) -> bool:
+        if session.get("in_flight"):
+            return False
+        if not session.get("dirty"):
+            return True
+        return now - float(session.get("last_used", now)) >= _RENEW_STALE_BUFFER_S
+
+    async def _renew_session(self, key: tuple[str, str], old: dict[str, Any]) -> None:
+        """Open and configure a replacement socket, then swap it in between two turns.
+
+        THE SWAP NEVER SPLITS A TURN. The new socket's buffer is empty, so a swap while frames of
+        a turn sit in the old buffer would leave that turn's beginning on a socket nothing will
+        commit. So this waits — off every request path — for the buffer to hold nothing and no
+        commit to be reading, and swaps with no await between that check and the assignment.
+        The epoch is bumped like any new session's, so a commit that still names the old one
+        sends its audio itself (append_streamed_audio's rule): slower, never lost.
+        """
+        client = self._client
+        if client is None:
+            return
+        warm = await self._claim_warm_socket()
+        if warm is not None:
+            manager, conn, opened_at = warm["manager"], warm["conn"], warm["opened_at"]
+            self._schedule_warm_refill()
+        else:
+            manager = client.realtime.connect(extra_query={"intent": "transcription"})
+            conn = await manager.__aenter__()
+            opened_at = time.monotonic()
+        fresh = {"manager": manager}
+        try:
+            await self._configure_and_swap(key, old, manager, conn, opened_at)
+        except Exception:
+            # Whatever went wrong, the speaker keeps the session they have — and the max-age sweep
+            # remains the backstop it always was. Never leak the socket we opened for them.
+            await self._close_session(fresh)
+            logger.warning("realtime_session_renew_failed", meeting_id=key[0], exc_info=True)
+
+    async def _configure_and_swap(
+        self,
+        key: tuple[str, str],
+        old: dict[str, Any],
+        manager: Any,
+        conn: Any,
+        opened_at: float,
+    ) -> None:
+        fresh = {"manager": manager}
+        language = old.get("language")
+        prompt = old.get("prompt")
+        allowed_languages = old.get("allowed_languages")
+        keywords = list(old.get("keywords") or ())
+        noise_reduction = old.get("noise_reduction")
+        try:
+            await conn.session.update(
+                session=cast(
+                    Any,
+                    self._session_payload(
+                        language,
+                        prompt,
+                        allowed_languages,
+                        keywords,
+                        noise_reduction=noise_reduction,
+                    ),
+                )
+            )
+        except Exception as exc:
+            if _is_connection_error(exc) or not (language or prompt or keywords):
+                await self._close_session(fresh)
+                logger.warning("realtime_session_renew_failed", meeting_id=key[0], error=str(exc))
+                return
+            await self._degrade_session_config(
+                conn, language, prompt, allowed_languages, keywords, noise_reduction
+            )
+
+        deadline = time.monotonic() + _RENEW_WAIT_FOR_QUIET_S
+        while True:
+            if self._sessions.get(key) is not old:
+                # Replaced meanwhile (a language change, the idle sweep): nothing to renew.
+                await self._close_session(fresh)
+                return
+            now = time.monotonic()
+            if self._buffer_is_quiet(old, now):
+                break
+            if now >= deadline:
+                # A speaker who never paused for two minutes. Try again next maintenance tick.
+                await self._close_session(fresh)
+                logger.info("realtime_session_renew_deferred", meeting_id=key[0])
+                return
+            await asyncio.sleep(_RENEW_POLL_S)
+
+        self._session_epoch = getattr(self, "_session_epoch", 0) + 1
+        renewed = {
+            **{
+                k: v
+                for k, v in old.items()
+                # The reader, its queue and its live text belong to the OLD socket.
+                if k
+                not in ("item_deltas", "event_queue", "event_pump", "live_items", "closed_items")
+            },
+            "manager": manager,
+            "conn": conn,
+            "epoch": self._session_epoch,
+            "opened_at": opened_at,
+            "dirty": False,
+            "in_flight": False,
+        }
+        self._sessions[key] = renewed
+        logger.info(
+            "realtime_session_renewed",
+            meeting_id=key[0],
+            speaker_id=key[1],
+            old_age_s=round(time.monotonic() - float(old.get("opened_at") or 0.0), 1),
+        )
+        asyncio.create_task(self._close_session_later(old, _RENEWED_SOCKET_GRACE_S))
+
+    async def _close_session_later(self, session: dict[str, Any], delay_s: float) -> None:
+        await asyncio.sleep(delay_s)
+        await self._close_session(session)
 
     def _schedule_warm_refill(self) -> None:
         """Top the warm pool back up, off the caller's critical path.
@@ -1422,6 +1879,7 @@ class OpenAISTT:
         streamed_epoch: int | None = None,
         recent_dub_texts: Sequence[str] | None = None,
         speech_ms: int = 0,
+        bridge_room: bool = False,
     ) -> list[TranscribedSegment]:
         """Transcribe raw audio bytes via the OpenAI Realtime API.
 
@@ -1431,6 +1889,10 @@ class OpenAISTT:
             language: ISO 639-1 hint or None for auto-detect (fed to the session as
                 input_audio_transcription.language — see _get_or_create_session)
             chunk_offset_ms: Timestamp offset to add to segment times
+            bridge_room: the meeting is a Google Meet EXTERNAL_BRIDGE room (STTWorker
+                detects it from the stand-in seat in `speak_languages`). Only there does a
+                changed declaration also wipe half-counted evidence — see _note_declaration.
+                False keeps native rooms exactly on the previous behaviour.
             speech_ms: how much of `audio_bytes` VAD called speech, as published by the
                 ingress worker. 0 means it did not say. Feeds the "too much text for this
                 little audio" guard, which against the chunk's PADDED duration could never
@@ -1471,7 +1933,9 @@ class OpenAISTT:
         # getattr, not attribute access: instances built without __init__ are a supported
         # shape here — see the same guard on _warm_sessions — and this must not be the thing
         # that decides whether transcription runs at all.
-        lang_arg = self._apply_language_override((meeting_id, speaker_id), lang_arg)
+        lang_arg = self._apply_language_override(
+            (meeting_id, speaker_id), lang_arg, bridge_room=bridge_room
+        )
 
         detected_language = lang_arg or "unknown"
 
@@ -1509,6 +1973,7 @@ class OpenAISTT:
                 min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
                 min_avg_logprob_by_language=getattr(self, "min_avg_logprob_by_language", None),
                 recent_dub_texts=recent_dub_texts,
+                text_language_id_min_confidence=self._text_language_id_floor(),
             )
             for seg in segs:
                 await on_early_segment(seg)
@@ -1542,6 +2007,7 @@ class OpenAISTT:
                 min_avg_logprob=getattr(self, "min_avg_logprob", -0.7),
                 min_avg_logprob_by_language=getattr(self, "min_avg_logprob_by_language", None),
                 recent_dub_texts=recent_dub_texts,
+                text_language_id_min_confidence=self._text_language_id_floor(),
             )
             for seg in segs:
                 await on_speculative_segment(seg)
@@ -1558,12 +2024,26 @@ class OpenAISTT:
 
         pcm_24k = _resample_pcm16(audio_bytes, sample_rate, REALTIME_SAMPLE_RATE)
 
+        # Counted so an empty completion can be told apart from one whose text all went out
+        # early, sentence by sentence — the latter is a complete turn, not a lost one.
+        emitted = 0
+        sentence_sink: Callable[[str], Awaitable[None]] | None = None
+        if on_sentence is not None:
+            inner_on_sentence = on_sentence
+
+            async def counting_on_sentence(sentence: str) -> None:
+                nonlocal emitted
+                emitted += 1
+                await inner_on_sentence(sentence)
+
+            sentence_sink = counting_on_sentence
+
         key = (meeting_id, speaker_id)
         try:
             text, avg_logprob = await self._transcribe_via_session(
                 key,
                 pcm_24k,
-                on_sentence,
+                sentence_sink,
                 lang_arg,
                 prompt,
                 allowed_languages,
@@ -1599,7 +2079,7 @@ class OpenAISTT:
                 text, avg_logprob = await self._transcribe_via_session(
                     key,
                     pcm_24k,
-                    on_sentence,
+                    sentence_sink,
                     lang_arg,
                     prompt,
                     allowed_languages,
@@ -1610,6 +2090,41 @@ class OpenAISTT:
             except Exception as e:
                 logger.error("openai_stt_error", error=str(e))
                 raise
+
+        if (
+            not text.strip()
+            and streamed_epoch is not None
+            and emitted == 0
+            and pcm_24k
+            and (speech_duration_s or 0.0) >= _EMPTY_STREAMED_RETRY_MIN_SPEECH_S
+        ):
+            # THE TURN WAS SPEECH AND THE STREAMED COMMIT CAME BACK WITH NOTHING. Room 01a100d8,
+            # 3 Oct: the host's first sentence (2.9s, rms 0.055) was committed against the
+            # prewarmed session's buffer and completed empty — no filter fired, so the opening of
+            # the meeting vanished without a line saying so. The chunk carries the whole turn's
+            # audio, so it is sent once more the pre-streaming way. Costs one round trip, and
+            # only on the path that would otherwise lose the sentence.
+            logger.warning(
+                "stt_streamed_commit_empty_retry",
+                meeting_id=meeting_id,
+                speaker_id=speaker_id,
+                speech_s=round(speech_duration_s or 0.0, 2),
+            )
+            try:
+                text, avg_logprob = await self._transcribe_via_session(
+                    key,
+                    pcm_24k,
+                    sentence_sink,
+                    lang_arg,
+                    prompt,
+                    allowed_languages,
+                    keywords,
+                    exclude_emitted_from_final=exclude_emitted_from_final,
+                    noise_reduction=noise_reduction,
+                )
+            except Exception as e:
+                logger.warning("stt_streamed_commit_retry_failed", error=str(e))
+                return []
 
         if not text.strip():
             return []
@@ -1649,6 +2164,7 @@ class OpenAISTT:
             # floor never applied to the completed path, the one place with real logprobs.
             min_avg_logprob_by_language=getattr(self, "min_avg_logprob_by_language", None),
             recent_dub_texts=recent_dub_texts,
+            text_language_id_min_confidence=self._text_language_id_floor(),
         )
         # Learned from the COMPLETED path only. Early and speculative segments are provisional
         # by construction, and re-pinning a session on a guess that a later completed event
@@ -1656,10 +2172,26 @@ class OpenAISTT:
         self._learn_language_evidence((meeting_id, speaker_id), lang_arg, segments)
         return segments
 
+    def _text_language_id_floor(self) -> float | None:
+        """The text language-ID floor for _filter_segments, or None when it is switched off.
+
+        getattr, like the other per-instance settings here: tests build this class with
+        __new__ and never run __init__.
+        """
+        if not getattr(self, "text_language_id_enabled", _DEFAULTS.text_language_id_enabled):
+            return None
+        return float(
+            getattr(
+                self, "text_language_id_min_confidence", _DEFAULTS.text_language_id_min_confidence
+            )
+        )
+
     def _apply_language_override(
         self,
         key: tuple[str, str],
         declared: str | None,
+        *,
+        bridge_room: bool = False,
     ) -> str | None:
         """The language to pin this chunk's session to: the declaration, unless a learned
         override still corrects it.
@@ -1684,7 +2216,13 @@ class OpenAISTT:
         something NEW about themselves, and that statement gets the same initial trust a
         join-time declaration does. If they are still actually speaking something else, the
         evidence loop simply re-learns — two unambiguous segments, same as the first time.
+
+        `bridge_room` (Google Meet EXTERNAL_BRIDGE rooms only) additionally runs
+        _note_declaration, which also wipes evidence still COUNTING toward an override when the
+        declaration changes. Native rooms skip it and keep exactly the behaviour above.
         """
+        if bridge_room:
+            self._note_declaration(key, declared)
         overrides: dict[tuple[str, str], tuple[str, str | None]] | None = getattr(
             self, "_language_override", None
         )
@@ -1702,6 +2240,9 @@ class OpenAISTT:
             evidence = getattr(self, "_language_evidence", None)
             if evidence is not None:
                 evidence.pop(key, None)
+            release_evidence = getattr(self, "_release_evidence", None)
+            if release_evidence is not None:
+                release_evidence.pop(key, None)
             logger.info(
                 "stt_language_override_released",
                 meeting_id=key[0],
@@ -1724,6 +2265,49 @@ class OpenAISTT:
 
         return declared
 
+    def _note_declaration(self, key: tuple[str, str], declared: str | None) -> None:
+        """Forget everything learned against the previous declaration when it changes.
+
+        A NEW DECLARATION IS A FRESH START, NOT ONLY FOR THE OVERRIDE.
+
+        _apply_language_override already drops an override whose declaration no longer stands.
+        What it could not see is the evidence still COUNTING toward one: a speaker declared en
+        with one Vietnamese line on the counter who then picks ja keeps that (vi, 1), and their
+        next stray vi-looking line re-pins them to Vietnamese — learned against a declaration
+        they withdrew. The release counter has the same shape. Both are cleared here, so a
+        mid-meeting pick (bridge host via SetSpeakLanguage, the Meet side via
+        SetExternalMeetingLanguage) gets exactly the initial trust a join-time pick gets.
+
+        BRIDGE ROOMS ONLY. Called from _apply_language_override only when the worker says the
+        meeting is a Google Meet EXTERNAL_BRIDGE room; native meeting rooms keep the previous
+        behaviour (only a finished override is released on a new declaration).
+
+        The first chunk a speaker sends records their declaration and clears nothing: there is
+        no previous claim to withdraw.
+        """
+        declarations: dict[tuple[str, str], str | None] | None = getattr(
+            self, "_declared_language", None
+        )
+        if declarations is None:
+            declarations = {}
+            self._declared_language = declarations
+        seen = key in declarations
+        previous = declarations.get(key)
+        declarations[key] = declared
+        if not seen or previous == declared:
+            return
+        for name in ("_language_evidence", "_release_evidence"):
+            counters = getattr(self, name, None)
+            if counters is not None:
+                counters.pop(key, None)
+        logger.info(
+            "stt_declared_language_changed",
+            meeting_id=key[0],
+            speaker_id=key[1],
+            old_declaration=previous,
+            new_declaration=declared,
+        )
+
     def _learn_language_evidence(
         self,
         key: tuple[str, str],
@@ -1732,10 +2316,12 @@ class OpenAISTT:
     ) -> None:
         """Let a speaker's actual speech correct the language they declared.
 
-        Only unambiguous evidence counts — a non-Latin writing system, or the Vietnamese-unique
-        character class — so ordinary Latin text never moves this. `_filter_segments` has
-        already resolved each segment's language through `_detect_unambiguous_language`, so a
-        label that differs from `declared` IS that evidence.
+        Only strong evidence counts — a non-Latin writing system, the Vietnamese-unique
+        character class, or a full sentence the room-restricted text language-ID placed above
+        its confidence floor (stt_worker/text_language_id; `language_source == "text_id"`).
+        `_filter_segments` has already resolved each segment's language from those, so a label
+        that differs from `declared` IS that evidence — and since the language-ID can answer
+        English, a speaker declared vi who speaks English is now re-pinned too.
 
         CONSECUTIVE, not cumulative. One contradicting segment in an otherwise consistent
         meeting is far more likely to be a stray mis-transcription than a person switching
@@ -1754,11 +2340,23 @@ class OpenAISTT:
             self._language_override = {}
 
         if key in self._language_override:
+            # `declared` here is what transcribe() pinned the session to, which with an override
+            # in place is the LEARNED language — the original declaration lives in the entry.
+            self._learn_release_evidence(key, segments)
             return
 
         for segment in segments:
             if segment.language == declared:
                 self._language_evidence.pop(key, None)
+                continue
+            # A label from the room-restricted text language-ID (bridge room 01a10069) is how a
+            # speaker declared vi who is audibly speaking English is learned at all — ASCII is
+            # never "unambiguous evidence". It moves the pin only from a full sentence: a short
+            # line proves nothing either way, so it neither counts nor resets.
+            if (
+                segment.language_source == "text_id"
+                and word_count(segment.text) < MIN_WORDS_TO_LEARN
+            ):
                 continue
 
             previous_language, count = self._language_evidence.get(key, (segment.language, 0))
@@ -1781,6 +2379,86 @@ class OpenAISTT:
                     after_segments=count,
                 )
                 return
+
+    def _learn_release_evidence(
+        self,
+        key: tuple[str, str],
+        segments: list[TranscribedSegment],
+    ) -> None:
+        """Let speech in the declared language take the microphone back from an override.
+
+        The override used to have exactly one exit: declaring a different language. Speaking
+        the declared one was not an exit, because the learning loop returned early while an
+        override existed, and English carries none of the evidence that loop looks for.
+
+        Production meeting 01a0fbe6 (2 Oct). A speaker declared en said two short Vietnamese
+        lines; the override (en -> vi) was learned at 16:18:19, correctly. They then spoke
+        English for the rest of the meeting — "Good morning.", "AI is great.", "I use it for
+        reports." — and every sentence was stored as vi. The vi listener received NONE of it:
+        source vi, target vi, dropped as same-language. Nobody re-declared, because nothing on
+        screen said the microphone had been re-pinned.
+
+        Symmetric with learning: _LANGUAGE_OVERRIDE_SEGMENTS consecutive supporting lines, any
+        line proving the learned language resets the count, and neutral lines ("Yeah.", a
+        stray "嗯") neither count nor reset. On release, this chunk's own lines are relabelled
+        — the ones that proved the point would otherwise ship under the language they just
+        disproved. Lines already published from earlier chunks are not.
+        """
+        entry = self._language_override.get(key)
+        if not entry:
+            return
+        learned, declaration = entry
+        if not declaration:
+            return
+
+        if getattr(self, "_release_evidence", None) is None:
+            self._release_evidence = {}
+
+        for segment in segments:
+            verdict = _release_verdict(segment.text, learned, declaration)
+            if (
+                verdict is None
+                and segment.language_source == "text_id"
+                and word_count(segment.text) >= MIN_WORDS_TO_LEARN
+            ):
+                # The text language-ID speaks in both directions too: a vi-declared speaker
+                # re-pinned to English takes the mic back with Vietnamese that carries no
+                # Vietnamese-unique letter ("Anh làm gì vậy?"), which _release_verdict cannot see.
+                if base_language(segment.language) == base_language(declaration):
+                    verdict = True
+                elif base_language(segment.language) == base_language(learned):
+                    verdict = False
+            if verdict is None:
+                continue
+            if verdict is False:
+                self._release_evidence.pop(key, None)
+                continue
+
+            count = self._release_evidence.get(key, 0) + 1
+            self._release_evidence[key] = count
+            if count < _LANGUAGE_OVERRIDE_SEGMENTS:
+                continue
+
+            self._language_override.pop(key, None)
+            self._release_evidence.pop(key, None)
+            for line in segments:
+                if line.language_source == "text_id" and base_language(
+                    line.language
+                ) != base_language(declaration):
+                    continue
+                if _detect_unambiguous_language(line.text) in (None, base_language(declaration)):
+                    line.language = declaration
+            logger.warning(
+                "stt_language_override_released",
+                meeting_id=key[0],
+                speaker_id=key[1],
+                was_speaking=learned,
+                old_declaration=declaration,
+                new_declaration=declaration,
+                reason="speech_matches_declaration",
+                after_segments=count,
+            )
+            return
 
     async def _transcribe_via_session(
         self,
@@ -1805,56 +2483,88 @@ class OpenAISTT:
             noise_reduction=noise_reduction,
         )
         conn = session["conn"]
+        # Read by renew_aging_sessions: a socket a commit is still reading from is not swapped.
+        session["in_flight"] = True
+        try:
+            # ALREADY IN THE BUFFER? Then commit it rather than sending it twice.
+            #
+            # When STT_STREAMING_ENABLED is on, the frames of this turn were appended by
+            # `append_streamed_audio` while the speaker was still talking — so by the time this runs
+            # the model has already heard the utterance and the commit below is all that is left.
+            # That is the entire latency win: what used to be "send five seconds, then wait for the
+            # model to hear it" becomes "say go".
+            #
+            # The epoch check is what makes it safe. `append_streamed_audio` returns the epoch its
+            # audio landed in, and a session recreated since then — a language change, an idle
+            # sweep, a restart — took that buffer with it. A mismatch therefore falls through to the
+            # ordinary append below, which is exactly the behaviour this method had before streaming
+            # existed. Wrong here means slow; it never means silent.
+            already_buffered = streamed_epoch is not None and int(session.get("epoch", 0)) == int(
+                streamed_epoch
+            )
 
-        # ALREADY IN THE BUFFER? Then commit it rather than sending it twice.
-        #
-        # When STT_STREAMING_ENABLED is on, the frames of this turn were appended by
-        # `append_streamed_audio` while the speaker was still talking — so by the time this runs
-        # the model has already heard the utterance and the commit below is all that is left.
-        # That is the entire latency win: what used to be "send five seconds, then wait for the
-        # model to hear it" becomes "say go".
-        #
-        # The epoch check is what makes it safe. `append_streamed_audio` returns the epoch its
-        # audio landed in, and a session recreated since then — a language change, an idle
-        # sweep, a restart — took that buffer with it. A mismatch therefore falls through to the
-        # ordinary append below, which is exactly the behaviour this method had before streaming
-        # existed. Wrong here means slow; it never means silent.
-        already_buffered = streamed_epoch is not None and int(session.get("epoch", 0)) == int(
-            streamed_epoch
-        )
+            if not already_buffered:
+                # Ingress has already assembled a VAD-bounded speech utterance.
+                # Sending that as ten-to-fifteen separately awaited 100ms websocket messages
+                # added pure transport overhead before the model could start. Keep a conservative
+                # 2s raw-PCM cap for unusually long replay/test chunks; production uses one append.
+                append_bytes = REALTIME_SAMPLE_RATE * 2 * 2
+                for i in range(0, len(pcm_24k), append_bytes):
+                    frame = pcm_24k[i : i + append_bytes]
+                    await conn.input_audio_buffer.append(audio=base64.b64encode(frame).decode())
 
-        if not already_buffered:
-            # Ingress has already assembled a VAD-bounded speech utterance.
-            # Sending that as ten-to-fifteen separately awaited 100ms websocket messages
-            # added pure transport overhead before the model could start. Keep a conservative
-            # 2s raw-PCM cap for unusually long replay/test chunks; production uses one append.
-            append_bytes = REALTIME_SAMPLE_RATE * 2 * 2
-            for i in range(0, len(pcm_24k), append_bytes):
-                frame = pcm_24k[i : i + append_bytes]
-                await conn.input_audio_buffer.append(audio=base64.b64encode(frame).decode())
+            await conn.input_audio_buffer.commit()
+            # Every item spoken into this buffer so far is this commit's: its words now go out as
+            # segments, so live text for it stops here.
+            closed: set[str] = session.setdefault("closed_items", set())
+            closed.update(session.get("live_items", {}).keys())
+            session["last_used"] = time.monotonic()
+            # The commit took the buffer. Frames of the speaker's next turn may land on it again
+            # before this call returns, and they set it back.
+            session["dirty"] = False
 
-        await conn.input_audio_buffer.commit()
-        session["last_used"] = time.monotonic()
+            # DELTAS BELONG TO AN ITEM, AND NOT EVERY ITEM ON THIS SOCKET IS THIS COMMIT'S.
+            #
+            # gpt-live-transcribe transcribes audio AS IT IS APPENDED, so the connection carries
+            # deltas for audio this call never committed: a streamed turn that was abandoned and
+            # cleared after the model had already spoken its first words, or the opening of the
+            # speaker's next turn. Every event says which item it is about. This loop used to
+            # ignore that and add every delta to one buffer, so words from one turn were published
+            # as the start of another ("Ai Vậy mình cắt…", "…the onboarding flow Two more はい…"),
+            # the variety guard then discarded whole sentences as repetitions, and the completed
+            # transcript no longer started with what had been flushed — `stt_delta_final_mismatch`,
+            # whose answer is to drop the rest of the turn. Measured in tools/meeting_sim: within
+            # one item the deltas always add up to the completed transcript; mixed across items
+            # they did not, and that is where the lost sentences came from.
+            #
+            # So deltas are kept per item until `input_audio_buffer.committed` names the item this
+            # commit created, and only that item's text is ever flushed or compared. Deltas for any
+            # other item stay on the session for the call that commits it. An event with no item id
+            # (an older SDK, the tests' scripted events) is taken as this commit's, which is
+            # exactly what the loop did before.
+            pending_items: dict[str, str] = session.setdefault("item_deltas", {})
 
-        async def _collect() -> tuple[str, float]:
-            buffer = ""
-            flushed = ""
-            # gpt-realtime-whisper occasionally gets stuck on trailing silence/noise and
-            # emits the same short sentence over and over in the delta stream instead of
-            # ever reaching "completed" — with no per-chunk confidence signal to catch
-            # this after the fact (see _filter_segments), each repeat gets flushed early
-            # and independently translated/spoken, which sounds like TTS stuck in a loop.
-            # Cut the turn short once the same sentence repeats 3x in a row.
-            last_sentence: str | None = None
-            repeat_count = 0
-            async for event in conn:
-                etype = getattr(event, "type", "")
-                if etype == "conversation.item.input_audio_transcription.delta":
+            async def _collect() -> tuple[str, float]:
+                buffer = ""
+                flushed = ""
+                # The item this commit created. None until `input_audio_buffer.committed` says.
+                mine: str | None = None
+                # gpt-realtime-whisper occasionally gets stuck on trailing silence/noise and
+                # emits the same short sentence over and over in the delta stream instead of
+                # ever reaching "completed" — with no per-chunk confidence signal to catch
+                # this after the fact (see _filter_segments), each repeat gets flushed early
+                # and independently translated/spoken, which sounds like TTS stuck in a loop.
+                # Cut the turn short once the same sentence repeats 3x in a row.
+                last_sentence: str | None = None
+                repeat_count = 0
+
+                async def take_delta(delta: str) -> None:
+                    nonlocal buffer, flushed, last_sentence, repeat_count
                     if on_sentence is None:
-                        continue
-                    buffer += getattr(event, "delta", "") or ""
+                        return
+                    buffer += delta
                     if not buffer:
-                        continue
+                        return
                     ends_clean = buffer[-1] in ".!?"
                     sentences = split_into_sentences(buffer)
                     flush_count = len(sentences) if ends_clean else len(sentences) - 1
@@ -1874,45 +2584,83 @@ class OpenAISTT:
                             await on_sentence(sentence)
                             flushed += sentence + " "
                         buffer = "" if ends_clean else sentences[-1]
-                elif etype == "conversation.item.input_audio_transcription.completed":
-                    final_text = (getattr(event, "transcript", "") or "").strip()
-                    token_logprobs = [
-                        float(value)
-                        for item in (getattr(event, "logprobs", None) or [])
-                        if (
-                            value := (
-                                item.get("logprob")
-                                if isinstance(item, dict)
-                                else getattr(item, "logprob", None)
-                            )
-                        )
-                        is not None
-                    ]
-                    avg_logprob = (
-                        sum(token_logprobs) / len(token_logprobs) if token_logprobs else -1.0
-                    )
-                    if not exclude_emitted_from_final:
-                        return final_text, avg_logprob
-                    flushed_stripped = flushed.strip()
-                    if not flushed_stripped:
-                        return final_text, avg_logprob
-                    if final_text.startswith(flushed_stripped):
-                        return final_text[len(flushed_stripped) :].strip(), avg_logprob
-                    # Model revised something inside the already-flushed prefix — we
-                    # can't safely recompute the diff (would risk re-publishing text
-                    # that was already billed/translated). Drop the trailing part
-                    # rather than risk a duplicate charge or duplicate translation.
-                    logger.warning(
-                        "stt_delta_final_mismatch",
-                        flushed=flushed_stripped[:60],
-                        final=final_text[:60],
-                    )
-                    return "", avg_logprob
-                elif etype == "error":
-                    raise RuntimeError(f"realtime_transcription_error: {event}")
-            raise RuntimeError("realtime_connection_closed_before_completed")
 
-        return await asyncio.wait_for(_collect(), timeout=TRANSCRIBE_EVENT_TIMEOUT_S)
+                events = self._session_event_queue(key, session)
+                while True:
+                    event = await events.get()
+                    if event is _PUMP_CLOSED:
+                        break
+                    if isinstance(event, _PumpFailed):
+                        raise event.exc
+                    etype = getattr(event, "type", "")
+                    item_id = getattr(event, "item_id", None)
+                    item_id = item_id if isinstance(item_id, str) and item_id else None
+                    if etype == "input_audio_buffer.committed":
+                        if mine is None and item_id is not None:
+                            mine = item_id
+                            session.setdefault("closed_items", set()).add(item_id)
+                            # What the model already said about this audio while it was being
+                            # streamed in — the reason flash mode is fast — is this commit's text.
+                            early = pending_items.pop(mine, "")
+                            if early:
+                                await take_delta(early)
+                        continue
+                    if etype == "conversation.item.input_audio_transcription.delta":
+                        delta = getattr(event, "delta", "") or ""
+                        if item_id is not None and item_id != mine:
+                            pending_items[item_id] = pending_items.get(item_id, "") + delta
+                            while len(pending_items) > _MAX_PENDING_ITEMS:
+                                pending_items.pop(next(iter(pending_items)))
+                            continue
+                        await take_delta(delta)
+                    elif etype == "conversation.item.input_audio_transcription.completed":
+                        if item_id is not None and item_id != mine:
+                            # Another item finishing. The server confirms a commit before it
+                            # transcribes it, so a completion that arrives ahead of this commit's
+                            # `committed` — or for any other item — is not this call's to report.
+                            pending_items.pop(item_id, None)
+                            continue
+                        final_text = (getattr(event, "transcript", "") or "").strip()
+                        token_logprobs = [
+                            float(value)
+                            for item in (getattr(event, "logprobs", None) or [])
+                            if (
+                                value := (
+                                    item.get("logprob")
+                                    if isinstance(item, dict)
+                                    else getattr(item, "logprob", None)
+                                )
+                            )
+                            is not None
+                        ]
+                        avg_logprob = (
+                            sum(token_logprobs) / len(token_logprobs) if token_logprobs else -1.0
+                        )
+                        if not exclude_emitted_from_final:
+                            return final_text, avg_logprob
+                        flushed_stripped = flushed.strip()
+                        if not flushed_stripped:
+                            return final_text, avg_logprob
+                        rest = _after_flushed_prefix(final_text, flushed_stripped)
+                        if rest is not None:
+                            return rest, avg_logprob
+                        # Model revised something inside the already-flushed prefix — we
+                        # can't safely recompute the diff (would risk re-publishing text
+                        # that was already billed/translated). Drop the trailing part
+                        # rather than risk a duplicate charge or duplicate translation.
+                        logger.warning(
+                            "stt_delta_final_mismatch",
+                            flushed=flushed_stripped[:60],
+                            final=final_text[:60],
+                        )
+                        return "", avg_logprob
+                    elif etype == "error":
+                        raise RuntimeError(f"realtime_transcription_error: {event}")
+                raise RuntimeError("realtime_connection_closed_before_completed")
+
+            return await asyncio.wait_for(_collect(), timeout=TRANSCRIBE_EVENT_TIMEOUT_S)
+        finally:
+            session["in_flight"] = False
 
     async def _degrade_session_config(
         self,
@@ -2250,8 +2998,14 @@ class OpenAISTT:
             "language": language,
             "prompt": prompt,
             "languages": languages,
+            "allowed_languages": set(allowed_languages) if allowed_languages else None,
             "keywords": normalized_keywords,
             "noise_reduction": noise_reduction,
+            # Whether the input buffer holds appended audio no commit has taken yet, and
+            # whether a commit is reading its completion right now. A renewal swaps the socket
+            # only when both are false — see renew_aging_sessions.
+            "dirty": False,
+            "in_flight": False,
         }
         self._sessions[key] = session
         logger.info(
@@ -2263,6 +3017,98 @@ class OpenAISTT:
             keyword_count=len(normalized_keywords),
         )
         return session
+
+    def _session_event_queue(
+        self, key: tuple[str, str], session: dict[str, Any]
+    ) -> asyncio.Queue[Any]:
+        """The queue this session's events arrive on, starting its reader if none is running.
+
+        ONE READER PER SOCKET. gpt-live-transcribe transcribes audio as it is appended, so in flash
+        mode the model is already producing words while the speaker talks. Nothing read them: the
+        socket was only iterated inside `_collect`, after the commit, so every word spoken waited
+        out the speaker's whole turn plus the silence hangover before anybody saw it. A reader that
+        runs for the socket's whole life can show those words as they come (the live caption) and
+        still hand `_collect` exactly the events it used to read, in order, through this queue.
+        """
+        queue = session.get("event_queue")
+        pump = session.get("event_pump")
+        if queue is not None and pump is not None and not pump.done():
+            return cast("asyncio.Queue[Any]", queue)
+        if queue is None or pump is not None:
+            # A reader that already finished left its end-of-stream marker in the old queue;
+            # a reader started over must not inherit it.
+            queue = asyncio.Queue()
+            session["event_queue"] = queue
+        session["event_pump"] = asyncio.create_task(self._pump_session_events(key, session, queue))
+        return cast("asyncio.Queue[Any]", queue)
+
+    async def _pump_session_events(
+        self, key: tuple[str, str], session: dict[str, Any], queue: asyncio.Queue[Any]
+    ) -> None:
+        live: dict[str, str] = session.setdefault("live_items", {})
+        last_sent: dict[str, float] = {}
+        try:
+            async for event in session["conn"]:
+                if (
+                    getattr(event, "type", "")
+                    == "conversation.item.input_audio_transcription.delta"
+                ):
+                    item_id = getattr(event, "item_id", None)
+                    if isinstance(item_id, str) and item_id:
+                        self._note_live_delta(
+                            key,
+                            session,
+                            item_id,
+                            getattr(event, "delta", "") or "",
+                            live,
+                            last_sent,
+                        )
+                await queue.put(event)
+        except Exception as exc:  # noqa: BLE001 - handed to `_collect`, which decides what it means
+            await queue.put(_PumpFailed(exc))
+            return
+        await queue.put(_PUMP_CLOSED)
+
+    def _note_live_delta(
+        self,
+        key: tuple[str, str],
+        session: dict[str, Any],
+        item_id: str,
+        delta: str,
+        live: dict[str, str],
+        last_sent: dict[str, float],
+    ) -> None:
+        """Accumulate one word of a turn still being spoken, and publish it when it is worth it.
+
+        Only items that have NOT been committed: once the turn is committed its words go out as
+        real segments (early sentences, then the completion), and live text for it as well would
+        show the same words twice. Live text is never billed, translated or stored — it is a
+        preview the final segment replaces.
+        """
+        live[item_id] = live.get(item_id, "") + delta
+        while len(live) > _MAX_PENDING_ITEMS:
+            live.pop(next(iter(live)))
+        hook = getattr(self, "on_live_text", None)
+        if hook is None or item_id in session.get("closed_items", ()):
+            return
+        text = " ".join(live[item_id].split())
+        if not text:
+            return
+        now = time.monotonic()
+        ends_sentence = text[-1] in ".!?…。？！"
+        if not ends_sentence and now - last_sent.get(item_id, 0.0) < _LIVE_TEXT_MIN_INTERVAL_S:
+            return
+        # The same writing-system rule the final segment is held to: a delta in a script nobody
+        # in the room speaks is the hallucination class that got early partials switched off once
+        # (Han inside a Vietnamese sentence). Skipped, not cut — the next clean delta replaces it.
+        allowed = _allowed_scripts(
+            {session.get("language") or ""} | set(session.get("allowed_languages") or ())
+        )
+        if _scripts_in(text) - allowed:
+            return
+        last_sent[item_id] = now
+        task = asyncio.create_task(hook(key, item_id, text, session.get("language")))
+        task.add_done_callback(_log_live_text_failure)
 
     async def append_streamed_audio(
         self,
@@ -2295,6 +3141,8 @@ class OpenAISTT:
             await session["conn"].input_audio_buffer.append(
                 audio=base64.b64encode(pcm_24k).decode()
             )
+            # Read while the speaker talks, so their words can be shown as they come.
+            self._session_event_queue(key, session)
         except Exception:
             # A frame that does not land is not an error anybody needs to act on: the closed
             # utterance still carries the whole turn. Debug, because this fires per 96ms window.
@@ -2302,6 +3150,7 @@ class OpenAISTT:
             return None
 
         session["last_used"] = time.monotonic()
+        session["dirty"] = True
         return int(session.get("epoch", 0))
 
     async def discard_streamed_audio(self, key: tuple[str, str]) -> None:
@@ -2317,6 +3166,7 @@ class OpenAISTT:
             return
         try:
             await session["conn"].input_audio_buffer.clear()
+            session["dirty"] = False
         except Exception:
             logger.debug("stt_stream_clear_failed", meeting_id=key[0], exc_info=True)
 
